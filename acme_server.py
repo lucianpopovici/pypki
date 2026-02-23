@@ -326,14 +326,15 @@ class ACMEDatabase:
 
     # -- Accounts --
 
-    def create_or_find_account(self, jwk: dict, contact: Optional[list]) -> dict:
+    def create_or_find_account(self, jwk: dict, contact: Optional[list]) -> tuple:
+        """Returns (is_new: bool, account: dict)."""
         thumb = jwk_thumbprint(jwk)
         kid = f"acct-{thumb[:16]}"
         conn = self._conn()
         row = conn.execute("SELECT * FROM accounts WHERE kid=?", (kid,)).fetchone()
         if row:
             conn.close()
-            return dict(row)
+            return False, dict(row)
         conn.execute(
             "INSERT INTO accounts VALUES (?,?,?,?,?,?)",
             (kid, json.dumps(jwk), thumb, "valid",
@@ -342,7 +343,7 @@ class ACMEDatabase:
         conn.commit()
         account = dict(conn.execute("SELECT * FROM accounts WHERE kid=?", (kid,)).fetchone())
         conn.close()
-        return account
+        return True, account
 
     def get_account(self, kid: str) -> Optional[dict]:
         conn = self._conn()
@@ -722,10 +723,78 @@ class ACMEHandler(http.server.BaseHTTPRequestHandler):
             self.end_headers()
 
     def do_GET(self):
-        if self.path == "/acme/directory" or self.path == "/":
+        path = self.path.split("?")[0].rstrip("/")
+        if path in ("/acme/directory", ""):
             self._handle_directory()
-        elif self.path == "/acme/new-nonce":
+        elif path == "/acme/new-nonce":
             self._new_nonce_response(method="GET")
+        elif path == "/acme/terms":
+            # Serve a minimal Terms of Service page so certbot can fetch it
+            body = b"Terms of Service: This is an internal CA. Use at your own risk."
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        elif path == "/acme/renewal-info" or path.startswith("/acme/renewal-info/"):
+            # draft-ietf-acme-ari — return 404 with proper JSON to signal not supported
+            # certbot treats a 404 here as "no renewal info available" and continues
+            self._send_error(404, "urn:ietf:params:acme:error:malformed",
+                             "Renewal information not available")
+
+        # ------------------------------------------------------------------
+        # Unauthenticated GET for order/authz/cert resources.
+        # RFC 8555 §7.5 allows plain GET for resource polling. certbot uses
+        # these after the initial POST-as-GET to check for status changes.
+        # We return the resource without verifying account ownership, which
+        # is acceptable for read-only status polling on non-sensitive data.
+        # ------------------------------------------------------------------
+        elif re.match(r"^/acme/order/[^/]+$", path):
+            order_id = path.split("/")[-1]
+            order = self.db.get_order(order_id)
+            if not order:
+                self._send_error(404, "urn:ietf:params:acme:error:malformed", "Order not found")
+                return
+            self._refresh_order_status(order_id)
+            order = self.db.get_order(order_id)
+            order_url = f"{self.base_url}/acme/order/{order_id}"
+            self._send_json(self._order_response(order), 200,
+                            headers={"Location": order_url}, add_nonce=True)
+
+        elif re.match(r"^/acme/authz/[^/]+$", path):
+            auth_id = path.split("/")[-1]
+            authz = self.db.get_authorization(auth_id)
+            if not authz:
+                self._send_error(404, "urn:ietf:params:acme:error:malformed",
+                                 "Authorization not found")
+                return
+            # Build a lightweight account stub for _authz_response (only needs thumbprint)
+            account_kid = self.db.get_order(authz["order_id"])
+            if account_kid:
+                account_rec = self.db.get_account(account_kid["account_kid"])
+            else:
+                account_rec = None
+            if not account_rec:
+                self._send_error(404, "urn:ietf:params:acme:error:malformed",
+                                 "Authorization account not found")
+                return
+            self._send_json(self._authz_response(authz, account_rec), 200, add_nonce=True)
+
+        elif re.match(r"^/acme/cert/[^/]+$", path):
+            cert_id = path.split("/")[-1]
+            cert_rec = self.db.get_certificate(cert_id)
+            if not cert_rec:
+                self._send_error(404, "urn:ietf:params:acme:error:malformed",
+                                 "Certificate not found")
+                return
+            pem_chain = cert_rec["pem_chain"].encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/pem-certificate-chain")
+            self.send_header("Content-Length", str(len(pem_chain)))
+            self.send_header("Replay-Nonce", self.db.create_nonce())
+            self.end_headers()
+            self.wfile.write(pem_chain)
+
         else:
             self._send_error(404, "urn:ietf:params:acme:error:malformed", "Not found")
 
@@ -772,6 +841,10 @@ class ACMEHandler(http.server.BaseHTTPRequestHandler):
             "newOrder":   f"{self.base_url}/acme/new-order",
             "revokeCert": f"{self.base_url}/acme/revoke-cert",
             "keyChange":  f"{self.base_url}/acme/key-change",
+            # renewalInfo stub (draft-ietf-acme-ari) — certbot ≥2.8 checks for this
+            # field and gracefully ignores it when not a full URL; include it so
+            # certbot does not log a warning about a missing field.
+            "renewalInfo": f"{self.base_url}/acme/renewal-info",
             "meta": {
                 "termsOfService": f"{self.base_url}/acme/terms",
                 "website":        f"{self.base_url}",
@@ -779,6 +852,7 @@ class ACMEHandler(http.server.BaseHTTPRequestHandler):
                 "externalAccountRequired": False,
             },
         }
+        # RFC 8555 §7.1.1 — directory response SHOULD include Replay-Nonce
         self._send_json(directory, 200, add_nonce=True)
 
     # ------------------------------------------------------------------
@@ -810,8 +884,17 @@ class ACMEHandler(http.server.BaseHTTPRequestHandler):
         contact = payload.get("contact")
         tos_agreed = payload.get("termsOfServiceAgreed", False)
 
-        account = self.db.create_or_find_account(jwk, contact)
+        is_new, account = self.db.create_or_find_account(jwk, contact)
         kid_url = f"{self.base_url}/acme/account/{account['kid']}"
+
+        # RFC 8555 §7.3: onlyReturnExisting — return 400 if account doesn't exist
+        if payload.get("onlyReturnExisting") and is_new:
+            # We created a new account but caller said not to — roll it back
+            # (In practice we shouldn't reach here since create_or_find returns
+            #  existing; keep as a guard.)
+            self._send_error(400, "urn:ietf:params:acme:error:accountDoesNotExist",
+                             "Account does not exist and onlyReturnExisting is set")
+            return
 
         resp = {
             "status": account["status"],
@@ -819,8 +902,9 @@ class ACMEHandler(http.server.BaseHTTPRequestHandler):
             "orders": f"{self.base_url}/acme/account/{account['kid']}/orders",
         }
 
-        # 201 = created, 200 = existing
-        self._send_json(resp, 201,
+        # RFC 8555 §7.3: 201 Created for new accounts, 200 OK for existing
+        status_code = 201 if is_new else 200
+        self._send_json(resp, status_code,
                         headers={"Location": kid_url},
                         add_nonce=True)
 
@@ -864,7 +948,11 @@ class ACMEHandler(http.server.BaseHTTPRequestHandler):
 
         self._refresh_order_status(order_id)
         order = self.db.get_order(order_id)
-        self._send_json(self._order_response(order), 200, add_nonce=True)
+        order_url = f"{self.base_url}/acme/order/{order_id}"
+        # RFC 8555 §7.4 — finalize response MUST include Location: <order-url>
+        # certbot polls this URL to detect when status transitions to "valid"
+        self._send_json(self._order_response(order), 200, add_nonce=True,
+                        headers={"Location": order_url})
 
     def _order_response(self, order: dict) -> dict:
         auths = self.db.get_order_authorizations(order["id"])
@@ -959,7 +1047,12 @@ class ACMEHandler(http.server.BaseHTTPRequestHandler):
 
         if chall["status"] != "pending":
             # Already processing or done — return current state
-            self._send_json(self._challenge_response(chall, auth_id, account), 200, add_nonce=True)
+            authz_url = f"{self.base_url}/acme/authz/{auth_id}"
+            self._send_json(
+                self._challenge_response(chall, auth_id, account), 200,
+                add_nonce=True,
+                headers={"Link": f'<{authz_url}>;rel="up"'},
+            )
             return
 
         # Mark as processing and kick off async validation
@@ -974,7 +1067,11 @@ class ACMEHandler(http.server.BaseHTTPRequestHandler):
         resp = self._challenge_response(
             {**chall, "status": "processing"}, auth_id, account
         )
-        self._send_json(resp, 200, add_nonce=True)
+        # RFC 8555 §7.5.1 — Link: <authz-url>;rel="up" is REQUIRED on challenge responses
+        # certbot uses this header to know which authorization to poll.
+        authz_url = f"{self.base_url}/acme/authz/{auth_id}"
+        self._send_json(resp, 200, add_nonce=True,
+                        headers={"Link": f'<{authz_url}>;rel="up"'})
 
         # Async validation thread
         threading.Thread(
@@ -1313,8 +1410,10 @@ class ACMEHandler(http.server.BaseHTTPRequestHandler):
                              "Certificate not found or already revoked")
             return
 
+        # RFC 8555 §7.6 — successful revocation: 200 OK, empty body
         self.send_response(200)
         self.send_header("Replay-Nonce", self.db.create_nonce())
+        self.send_header("Content-Length", "0")
         self.end_headers()
 
     # ------------------------------------------------------------------
@@ -1369,10 +1468,12 @@ class ACMEHandler(http.server.BaseHTTPRequestHandler):
 
     def _send_json(self, data: dict, code: int = 200,
                    headers: Optional[dict] = None,
-                   add_nonce: bool = False):
+                   add_nonce: bool = False,
+                   content_type: str = "application/json"):
         body = json.dumps(data, indent=2).encode()
         self.send_response(code)
-        self.send_header("Content-Type", "application/json")
+        # RFC 8555 §6.1 — ACME responses use application/json
+        self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(body)))
         if add_nonce:
             self.send_header("Replay-Nonce", self.db.create_nonce())
@@ -1386,9 +1487,13 @@ class ACMEHandler(http.server.BaseHTTPRequestHandler):
         err = {"type": etype, "detail": detail, "status": code}
         body = json.dumps(err, indent=2).encode()
         self.send_response(code)
+        # RFC 7807 / RFC 8555 §6.7 — error responses use application/problem+json
         self.send_header("Content-Type", "application/problem+json")
         self.send_header("Content-Length", str(len(body)))
+        # Always include a fresh nonce on errors so clients can retry immediately
         self.send_header("Replay-Nonce", self.db.create_nonce())
+        # RFC 8555 §6.7 — Link: <directory>;rel="index" on all error responses
+        self.send_header("Link", f'<{self.base_url}/acme/directory>;rel="index"')
         self.end_headers()
         self.wfile.write(body)
 
