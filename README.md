@@ -4,8 +4,9 @@
 [![Python 3.9+](https://img.shields.io/badge/python-3.9%2B-blue.svg)](https://www.python.org/)
 [![RFC 4210](https://img.shields.io/badge/RFC-4210%20CMPv2-informational)](https://www.rfc-editor.org/rfc/rfc4210)
 [![RFC 8555](https://img.shields.io/badge/RFC-8555%20ACME-informational)](https://www.rfc-editor.org/rfc/rfc8555)
+[![RFC 8894](https://img.shields.io/badge/RFC-8894%20SCEP-informational)](https://www.rfc-editor.org/rfc/rfc8894)
 
-A self-contained, production-grade private Certificate Authority with support for two industry-standard certificate management protocols — **CMPv2** (RFC 4210) for embedded/IoT devices and **ACME** (RFC 8555) for servers and workstations — plus an Ansible role for distributing the CA certificate to client machines.
+A self-contained, production-grade private Certificate Authority with support for three industry-standard certificate management protocols — **CMPv2** (RFC 4210) for embedded/IoT devices, **ACME** (RFC 8555) for servers and workstations, and **SCEP** (RFC 8894) for network devices and MDM-enrolled endpoints — plus an Ansible role for distributing the CA certificate to client machines.
 
 ---
 
@@ -13,9 +14,11 @@ A self-contained, production-grade private Certificate Authority with support fo
 
 | File / Directory | Description |
 |---|---|
-| [`pki_cmpv2_server.py`](#pki-server) | CA + CMPv2 server + ACME integration |
+| [`pki_cmpv2_server.py`](#pki-server) | CA + CMPv2 server + ACME + SCEP integration |
 | [`acme_server.py`](#acme-server) | ACME server module (RFC 8555) |
+| [`scep_server.py`](#scep-server) | SCEP server module (RFC 8894) |
 | [`ca_import/`](#ansible-ca-import-role) | Ansible role to push the CA cert to client machines |
+| [`CHANGELOG.md`](CHANGELOG.md) | Full version history |
 | [`LICENSE`](LICENSE) | MIT License |
 
 ---
@@ -26,7 +29,7 @@ A self-contained, production-grade private Certificate Authority with support fo
 - Self-signed RSA-4096 root CA, auto-generated on first run
 - SQLite-backed certificate store with full issuance history
 - Certificate revocation with reason codes
-- CRL (Certificate Revocation List) generation
+- CRL generation — served by CMPv2, ACME, and SCEP
 - Live-reloadable configuration (`PATCH /config` or `ca/config.json`)
 
 ### CMPv2 Protocol (RFC 4210 / RFC 6712)
@@ -48,6 +51,19 @@ A self-contained, production-grade private Certificate Authority with support fo
 | `tls-alpn-01` | RFC 8737 — challenge cert served on port 443 via ALPN |
 
 Full key rollover support (RFC 8555 §7.3.5) — compatible with **acme.sh**, **certbot**, and any standard ACME client.
+
+### SCEP Protocol (RFC 8894)
+| Operation | Description |
+|---|---|
+| `GetCACaps` | Advertise server capabilities (AES, SHA-256, Renewal, POST) |
+| `GetCACert` | Download CA certificate |
+| `PKCSReq` | Enrol — submit CSR wrapped in CMS, receive signed certificate |
+| `CertPoll` | Poll for a pending certificate by transaction ID |
+| `GetCert` | Retrieve an issued certificate by serial number |
+| `GetCRL` | Download the current Certificate Revocation List |
+| `GetNextCACert` | Preview next CA certificate (rollover) |
+
+Compatible with **Cisco IOS**, **Juniper**, **sscep**, **Windows NDES**, **Jamf**, **Microsoft Intune**, and any RFC 8894-compliant SCEP client.
 
 ### TLS
 - One-way TLS (`--tls`) and mutual TLS (`--mtls`)
@@ -82,30 +98,27 @@ Python 3.9 or later. No other runtime dependencies.
 python pki_cmpv2_server.py
 ```
 
-```
-CMPv2 endpoint : POST http://0.0.0.0:8080/
-CA certificate : GET  http://0.0.0.0:8080/ca/cert.pem
-ACME directory : disabled
-```
-
-### 2. TLS + ACME (staging/production)
+### 2. TLS + ACME + SCEP (staging/production)
 
 ```bash
 python pki_cmpv2_server.py \
   --tls --port 8443 \
   --tls-hostname pki.internal \
   --acme-port 8888 \
+  --scep-port 8889 \
+  --scep-challenge mysecret \
   --alpn-h2 --alpn-cmp --alpn-acme
 ```
 
-### 3. Mutual TLS + bootstrap
+### 3. Mutual TLS + bootstrap + all protocols
 
 ```bash
-# Start server
 python pki_cmpv2_server.py \
   --mtls --port 8443 \
   --bootstrap-port 8080 \
-  --acme-port 8888
+  --acme-port 8888 \
+  --scep-port 8889 \
+  --scep-challenge mysecret
 
 # Issue a client cert via the bootstrap endpoint
 curl http://localhost:8080/bootstrap?cn=myclient -o bundle.pem
@@ -114,7 +127,7 @@ curl http://localhost:8080/bootstrap?cn=myclient -o bundle.pem
 openssl x509 -in bundle.pem -out client.crt
 openssl pkey -in bundle.pem -out client.key
 
-# Use it
+# Use it with mTLS
 curl --cert client.crt --key client.key \
      --cacert ./ca/ca.crt \
      https://localhost:8443/health
@@ -154,6 +167,10 @@ ACME options:
   --acme-base-url URL       Public base URL for ACME links
   --acme-auto-approve-dns   Skip DNS lookup for dns-01 (testing only)
 
+SCEP options:
+  --scep-port PORT          Run SCEP server on this port (e.g. 8889)
+  --scep-challenge SECRET   Challenge password for enrolment (empty = open)
+
 Validity periods (also changeable live via PATCH /config):
   --end-entity-days DAYS    End-entity cert lifetime (default: 365)
   --client-cert-days DAYS   mTLS client cert lifetime (default: 365)
@@ -173,7 +190,7 @@ Validity periods (also changeable live via PATCH /config):
 | `GET` | `/api/whoami` | Authenticated mTLS client identity |
 | `GET` | `/config` | Current server configuration |
 | `PATCH` | `/config` | Live-update configuration |
-| `GET` | `/bootstrap?cn=<name>` | Issue client cert bundle (bootstrap port) |
+| `GET` | `/bootstrap?cn=<n>` | Issue client cert bundle (bootstrap port) |
 | `GET` | `/health` | Health check |
 
 ### Live configuration
@@ -230,22 +247,11 @@ python acme_server.py --port 8888 --auto-approve-dns
 ### Using with acme.sh
 
 ```bash
-# Issue via http-01 (standalone mode)
 acme.sh --issue \
   --server http://pki.internal:8888/acme/directory \
   -d mydevice.internal \
   --standalone \
   --insecure          # needed until the CA is in your system trust store
-
-# After running the Ansible role, drop --insecure:
-acme.sh --issue \
-  --server http://pki.internal:8888/acme/directory \
-  -d mydevice.internal \
-  --standalone
-
-# Account key rollover
-acme.sh --update-account \
-  --server http://pki.internal:8888/acme/directory
 ```
 
 ### Using with certbot
@@ -255,8 +261,89 @@ certbot certonly \
   --server http://pki.internal:8888/acme/directory \
   --standalone \
   -d mydevice.internal \
-  --no-verify-ssl     # until CA is trusted
+  --no-verify-ssl
 ```
+
+---
+
+## SCEP Server
+
+Runs as a module integrated with the PKI server, or standalone:
+
+```bash
+# Standalone (open enrolment — no challenge)
+python scep_server.py --port 8889 --ca-dir ./ca
+
+# With challenge password
+python scep_server.py --port 8889 --challenge mysecret
+```
+
+### SCEP endpoints
+
+All operations are served at `/scep`. The server also accepts
+`/cgi-bin/pkiclient.exe` and `/scep/pkiclient.exe` for compatibility
+with Cisco IOS and Windows NDES clients.
+
+| Method | `?operation=` | Description |
+|---|---|---|
+| `GET` | `GetCACaps` | Server capability advertisement |
+| `GET` | `GetCACert` | Download CA certificate (DER) |
+| `POST` | `PKCSReq` | Certificate enrolment (CMS-wrapped PKCS#10) |
+| `POST` | `CertPoll` | Poll for pending certificate by transaction ID |
+| `POST` | `GetCert` | Retrieve certificate by serial number |
+| `POST` | `GetCRL` | Download current CRL |
+| `GET` | `GetNextCACert` | Next CA certificate (rollover preview) |
+
+### Authentication
+
+**Challenge password** — set `--scep-challenge` to require a shared secret embedded in the PKCS#10 CSR `challengePassword` attribute. Compared using constant-time comparison to prevent timing attacks.
+
+**Renewal without challenge** — if the requester includes a valid existing certificate (signed by this CA) in the CMS envelope, the challenge is automatically waived. This is the standard renewal flow used by MDM platforms.
+
+### Using with sscep
+
+```bash
+# Fetch CA certificate
+sscep getca -u http://pki.internal:8889/scep -c ca.crt
+
+# Generate key + CSR
+openssl genrsa -out client.key 2048
+openssl req -new -key client.key -out client.csr \
+  -subj "/CN=mydevice.internal"
+
+# Enrol
+sscep enroll \
+  -u http://pki.internal:8889/scep \
+  -c ca.crt -k client.key -r client.csr -l client.crt \
+  -p mysecret
+
+# Renew (existing cert used instead of challenge)
+sscep enroll \
+  -u http://pki.internal:8889/scep \
+  -c ca.crt -k client.key -r client.csr -l client-renewed.crt \
+  -O client.crt
+```
+
+### Using with Cisco IOS
+
+```
+crypto pki trustpoint PYPKI
+ enrollment url http://pki.internal:8889/scep
+ subject-name CN=router1.internal,O=MyOrg
+ revocation-check none
+
+crypto pki authenticate PYPKI
+crypto pki enroll PYPKI
+ password mysecret
+```
+
+### Using with Microsoft Intune / NDES
+
+Point the SCEP URL in your Intune configuration profile to:
+```
+http://pki.internal:8889/scep
+```
+The server accepts the `/cgi-bin/pkiclient.exe` path used by NDES-compatible clients automatically.
 
 ---
 
@@ -268,9 +355,6 @@ Distributes the CA certificate to client machines across all major trust stores.
 
 ```bash
 cd ca_import
-
-# Edit inventory
-vim inventory/hosts.yml
 
 # Install system trust store only
 ansible-playbook ca_import.yml \
@@ -299,7 +383,7 @@ ansible-playbook ca_import.yml --tags verify
 |---|---|---|
 | System (OS) | Debian, Ubuntu, RHEL, Fedora, macOS | `ca_import_system: true` (default) |
 | Java cacerts | Any (requires `keytool`) | `ca_import_java: true` |
-| Python certifi | Any (requires `pip install certifi`) | `ca_import_python: true` |
+| Python certifi | Any | `ca_import_python: true` |
 | curl / libcurl | Any | `ca_import_curl: true` |
 | Mozilla NSS | Any (Firefox, Chromium) | `ca_import_nss: true` |
 
@@ -337,6 +421,7 @@ ca/
 ├── ca.crl              Certificate Revocation List
 ├── certificates.db     SQLite store of all issued certificates
 ├── acme.db             SQLite store of ACME accounts, orders, challenges
+├── scep.db             SQLite store of SCEP enrolment transactions
 ├── config.json         Live server configuration (hot-reloaded)
 ├── server.crt          Auto-issued TLS server certificate
 └── server.key          TLS server private key
@@ -356,6 +441,7 @@ ca/
 | RFC 9483 | CMP Updates (ALPN `cmpc`) | ✅ ALPN only |
 | RFC 8555 | ACME — Automatic Certificate Management | ✅ Full |
 | RFC 8737 | ACME `tls-alpn-01` challenge | ✅ Full |
+| RFC 8894 | SCEP — Simple Certificate Enrolment Protocol | ✅ Full |
 | RFC 7301 | TLS ALPN Extension | ✅ Full |
 | RFC 7638 | JWK Thumbprint | ✅ Full |
 | RFC 5280 | X.509 Certificates and CRL profile | ✅ Full |
