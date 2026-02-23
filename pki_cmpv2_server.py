@@ -100,6 +100,13 @@ try:
 except ImportError:
     HAS_ACME = False
 
+# SCEP server module (optional — loaded if --scep-port is specified)
+try:
+    import scep_server as _scep_module
+    HAS_SCEP = True
+except ImportError:
+    HAS_SCEP = False
+
 # ASN.1 imports for CMPv2 message parsing
 try:
     from pyasn1.type import univ, namedtype, tag, constraint, namedval, useful
@@ -1225,6 +1232,50 @@ class CertificateAuthority:
         ctx.load_verify_locations(str(ca_pem_path))
         return ctx
 
+    def get_certificate_by_serial(self, serial: int) -> Optional[str]:
+        """Return PEM string for the certificate with the given serial number, or None."""
+        conn = sqlite3.connect(str(self.db_path))
+        conn.row_factory = sqlite3.Row
+        try:
+            row = conn.execute(
+                "SELECT cert_pem FROM certificates WHERE serial=?", (serial,)
+            ).fetchone()
+            return row["cert_pem"] if row else None
+        finally:
+            conn.close()
+
+    def generate_crl_der(self) -> bytes:
+        """Generate and return the current CRL in DER format."""
+        # Build a real CRL from the revoked serials in the DB
+        builder = (
+            x509.CertificateRevocationListBuilder()
+            .issuer_name(self.ca_cert.subject)
+            .last_update(datetime.datetime.utcnow())
+            .next_update(datetime.datetime.utcnow() + datetime.timedelta(days=7))
+        )
+        conn = sqlite3.connect(str(self.db_path))
+        conn.row_factory = sqlite3.Row
+        try:
+            rows = conn.execute(
+                "SELECT serial, revoked_at FROM certificates WHERE revoked=1"
+            ).fetchall()
+            for row in rows:
+                revoked_cert = (
+                    x509.RevokedCertificateBuilder()
+                    .serial_number(row["serial"])
+                    .revocation_date(
+                        datetime.datetime.utcfromtimestamp(row["revoked_at"])
+                        if row["revoked_at"]
+                        else datetime.datetime.utcnow()
+                    )
+                    .build()
+                )
+                builder = builder.add_revoked_certificate(revoked_cert)
+        finally:
+            conn.close()
+        crl = builder.sign(private_key=self.ca_key, algorithm=SHA256())
+        return crl.public_bytes(Encoding.DER)
+
     @property
     def ca_cert_der(self) -> bytes:
         return self.ca_cert.public_bytes(Encoding.DER)
@@ -1768,6 +1819,20 @@ def main():
         help="Auto-approve dns-01 challenges without DNS lookup (testing/internal CA only)"
     )
 
+    scep_group = parser.add_argument_group(
+        "SCEP options (RFC 8894)",
+        "Enable the SCEP protocol for network device certificate enrolment. "
+        "Requires scep_server.py in the same directory."
+    )
+    scep_group.add_argument(
+        "--scep-port", type=int, default=None, metavar="PORT",
+        help="Start SCEP server on this port (e.g. 8889)"
+    )
+    scep_group.add_argument(
+        "--scep-challenge", default="", metavar="SECRET",
+        help="Challenge password for SCEP enrolment (empty = no challenge required)"
+    )
+
     validity_group = parser.add_argument_group(
         "validity periods",
         "Initial certificate lifetime defaults (can also be changed live via PATCH /config)"
@@ -1870,7 +1935,23 @@ def main():
                 base_url=acme_base,
             )
 
+    # Start SCEP server if requested
+    scep_srv = None
+    if args.scep_port:
+        if not HAS_SCEP:
+            print("WARNING: scep_server.py not found — SCEP support disabled.")
+            print("         Place scep_server.py in the same directory as pki_cmpv2_server.py.")
+        else:
+            scep_srv = _scep_module.start_scep_server(
+                host=args.host,
+                port=args.scep_port,
+                ca=ca,
+                ca_dir=ca_dir,
+                challenge=args.scep_challenge,
+            )
+
     acme_line = f"http://{args.host}:{args.acme_port}/acme/directory" if (args.acme_port and HAS_ACME) else "disabled"
+    scep_line = f"http://{args.host}:{args.scep_port}/scep" if (args.scep_port and HAS_SCEP) else "disabled"
     boot_line = f"http://{args.host}:{args.bootstrap_port}/bootstrap?cn=<n>" if args.bootstrap_port else "disabled"
 
     print(f"""
@@ -1882,6 +1963,7 @@ def main():
 ║  CA Dir           : {args.ca_dir:<47}║
 ║  TLS Mode         : {tls_mode_label:<47}║
 ║  Bootstrap        : {boot_line:<47}║
+║  Listening (SCEP) : {scep_line:<47}║
 ╠══════════════════════════════════════════════════════════════════╣
 ║  Validity periods (change live: PATCH /config)                  ║
 ║    End-entity   : {config.end_entity_days:<3} days                                       ║
@@ -1891,6 +1973,7 @@ def main():
 ╠══════════════════════════════════════════════════════════════════╣
 ║  CMPv2 Endpoint  : POST {scheme}://{args.host}:{args.port}/           ║
 ║  ACME Directory  : GET  {acme_line:<40}║
+║  SCEP Endpoint   : {scep_line:<48}║
 ║  Config          : GET/PATCH {scheme}://{args.host}:{args.port}/config ║
 ║  CA Certificate  : GET  {scheme}://{args.host}:{args.port}/ca/cert.pem ║
 ║  CRL             : GET  {scheme}://{args.host}:{args.port}/ca/crl      ║
@@ -1907,6 +1990,9 @@ def main():
 ╠══════════════════════════════════════════════════════════════════╣
 ║  Supported ACME operations (RFC 8555):                         ║
 ║    new-account, new-order, http-01, dns-01, finalize, revoke   ║
+╠══════════════════════════════════════════════════════════════════╣
+║  Supported SCEP operations (RFC 8894):                          ║
+║    GetCACaps, GetCACert, PKCSReq, CertPoll, GetCert, GetCRL    ║
 ╚══════════════════════════════════════════════════════════════════╝
 """)
 
@@ -1923,6 +2009,15 @@ def main():
         print(f"                   openssl pkey -in bundle.pem -out client.key")
         print(f"  3. curl --cert client.crt --key client.key --cacert {args.ca_dir}/ca.crt \\")
         print(f"          {scheme}://{args.tls_hostname}:{args.port}/health")
+        print()
+
+    if args.scep_port and HAS_SCEP:
+        print("  SCEP Quick-start:")
+        print(f"  1. Fetch CA cert:  sscep getca -u http://{args.host}:{args.scep_port}/scep -c ca.crt")
+        print(f"  2. Enrol:          sscep enroll -u http://{args.host}:{args.scep_port}/scep \\")
+        print(f"                       -c ca.crt -k client.key -r client.csr -l client.crt \\")
+        if args.scep_challenge:
+            print(f"                       -p '{args.scep_challenge}'")
         print()
 
     if args.acme_port and HAS_ACME:
@@ -1945,6 +2040,8 @@ def main():
             bootstrap_srv.shutdown()
         if acme_srv:
             acme_srv.shutdown()
+        if scep_srv:
+            scep_srv.shutdown()
 
 if __name__ == "__main__":
     main()
