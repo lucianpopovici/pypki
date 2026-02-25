@@ -11,11 +11,321 @@ This project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [0.8.0] — 2026-02-25
+
+### Added — RFC 9549/9598 IDNA, RFC 5280 §4.2.1.4 CertificatePolicies, 30 new tests
+
+#### RFC 9549 / RFC 9598 — Internationalized Names (`pki_server.py`)
+
+**Priority 2 from the v0.7.0 RFC compliance audit.**
+
+New helper functions (module-level, importable):
+- `_idna_encode_label(label)` — single DNS label U→A via Python's built-in IDNA codec;
+  implicitly enforces `UseSTD3ASCIIRules` per RFC 6818 §5
+- `_idna_encode_domain(domain)` — full FQDN, label-by-label, with `*` wildcard passthrough
+- `_encode_smtp_utf8_mailbox(mailbox)` — DER UTF8String (tag `0x0C`) wrapping the UTF-8
+  address; used as the `OtherName` value for `SmtpUTF8Mailbox`
+- `_split_email(email)` — splits on `@`, raises `ValueError` on malformed input
+- `_has_non_ascii(s)` — returns `True` if any code-point > U+007F
+
+New OID constant:
+- `OID_SMTP_UTF8_MAILBOX = x509.ObjectIdentifier("1.3.6.1.5.5.7.8.9")`
+
+`issue_certificate()` — three new wiring points:
+
+**`san_dns` — RFC 9549 §4.1: U-label → A-label**
+- Every DNS SAN value passes through `_idna_encode_domain()` before being stored
+- `münchen.de` → `xn--mnchen-3ya.de`; `sub.münchen.de` → `sub.xn--mnchen-3ya.de`
+- Pure-ASCII domains pass through unchanged (no encoding overhead)
+- Wildcard labels (`*`) preserved; only the non-wildcard labels are encoded
+- `ValueError` from the IDNA codec is caught; a warning is logged and the value
+  stored as-is (graceful degradation for edge-case inputs)
+
+**`san_emails` — RFC 9549 §4.2 / RFC 9598: two-path routing**
+- ASCII local-part + ASCII host → `rfc822Name` unchanged (`alice@example.com`)
+- ASCII local-part + IDN host → `rfc822Name` with A-label host
+  (`bob@münchen.de` → `bob@xn--mnchen-3ya.de`)
+- Non-ASCII local-part → `SmtpUTF8Mailbox` `OtherName`
+  (OID `1.3.6.1.5.5.7.8.9`, DER UTF8String value per RFC 9598 §3)
+- Malformed addresses (no `@`) log a warning and are skipped
+
+**`subject_str` / `DC=` — RFC 6818 §5 / RFC 9549 §4**
+- `DC` added to `oid_map` → `NameOID.DOMAIN_COMPONENT`
+- IDN `DC=` values (e.g. `DC=münchen`) automatically A-label encoded
+- Pure-ASCII labels (e.g. `DC=example`, `DC=com`) pass through unchanged
+
+#### RFC 5280 §4.2.1.4 / RFC 6818 §3 — CertificatePolicies (`pki_server.py`)
+
+**Priority 3 from the v0.7.0 RFC compliance audit.**
+
+New helper function:
+- `_build_policy_information(oid, cps_uri=None, notice_text=None)`  
+  Builds an `x509.PolicyInformation` with optional CPS URI qualifier (`id-qt-cps`)
+  and/or `UserNotice` qualifier; `explicit_text` is always encoded as UTF8String
+  per RFC 6818 §3
+
+New OID constants:
+- `OID_ANY_POLICY = x509.ObjectIdentifier("2.5.29.32.0")`
+- `OID_POLICY_DV  = x509.ObjectIdentifier("2.23.140.1.2.1")` — CA/B Forum DV
+- `OID_POLICY_OV  = x509.ObjectIdentifier("2.23.140.1.2.2")` — CA/B Forum OV
+- `OID_POLICY_IV  = x509.ObjectIdentifier("2.23.140.1.2.3")` — CA/B Forum IV
+- `OID_POLICY_EV  = x509.ObjectIdentifier("2.23.140.1.1")`   — CA/B Forum EV
+- `OID_QT_CPS     = x509.ObjectIdentifier("1.3.6.1.5.5.7.2.1")` — id-qt-cps
+- `OID_QT_UNOTICE = x509.ObjectIdentifier("1.3.6.1.5.5.7.2.2")` — id-qt-unotice
+
+`issue_certificate()` — new `certificate_policies: Optional[List[dict]]` parameter:
+- Each dict: `{"oid": "...", "cps_uri": "...", "notice_text": "..."}`
+- `oid` is required; `cps_uri` and `notice_text` are optional
+- Dict entries missing `oid` are silently skipped
+- Empty list produces no extension
+- Falls back to `CertProfile.get(profile).get("certificate_policies")` if the
+  explicit parameter is `None`, so profiles can declare default policies
+- Explicit parameter always overrides the profile default
+- Extension is always non-critical (RFC 5280 §4.2.1.4 SHOULD)
+
+#### Unit Test Suite expansion (`test_pki_server.py`)
+
+30 new tests — total is now **178** across **20 test classes**.
+
+`TestRFC9549IDNA` (13 tests):
+- `test_ascii_dns_passes_through` — pure ASCII domain unchanged
+- `test_u_label_dns_converted_to_a_label` — `münchen.de` → `xn--mnchen-3ya.de`
+- `test_multi_label_idn_all_labels_encoded` — `sub.münchen.de` → `sub.xn--mnchen-3ya.de`
+- `test_wildcard_label_preserved` — `*.example.com` stays unchanged
+- `test_ascii_email_ascii_host_unchanged` — `alice@example.com` → `rfc822Name` as-is
+- `test_ascii_local_idn_host_encoded` — `bob@münchen.de` → `bob@xn--mnchen-3ya.de` in `rfc822Name`
+- `test_non_ascii_local_uses_smtp_utf8_mailbox` — `üser@münchen.de` → `SmtpUTF8Mailbox`; absent from `rfc822Name`
+- `test_smtp_utf8_mailbox_oid_is_correct` — OID must be `1.3.6.1.5.5.7.8.9`
+- `test_smtp_utf8_mailbox_value_is_utf8string` — first byte of value must be `0x0C`
+- `test_smtp_utf8_mailbox_contains_original_address` — UTF-8 payload matches input
+- `test_mixed_email_list_correct_routing` — mixed list routed correctly per address type
+- `test_dc_attribute_accepted_in_subject` — `DC=` parsed to `DOMAIN_COMPONENT`
+- `test_idn_dc_attribute_a_label_encoded` — `DC=münchen` stored as `DC=xn--mnchen-3ya`
+
+`TestCertificatePolicies` (17 tests):
+- `test_no_policies_by_default` — extension absent when not requested
+- `test_single_policy_oid_added` — OID appears in extension
+- `test_extension_is_non_critical` — `critical=False`
+- `test_multiple_policies` — both OIDs present
+- `test_cps_uri_qualifier_added` — CPS URI in policy qualifiers
+- `test_policy_without_qualifiers_has_none` — `policy_qualifiers` is `None`
+- `test_user_notice_added` — `UserNotice` in qualifiers
+- `test_user_notice_explicit_text_utf8` — non-ASCII text survives DER round-trip
+- `test_cps_uri_and_notice_together` — both qualifiers on same policy
+- `test_cab_forum_dv_oid_constant` — `OID_POLICY_DV` == `2.23.140.1.2.1`
+- `test_cab_forum_ov_oid_constant` — `OID_POLICY_OV` == `2.23.140.1.2.2`
+- `test_cab_forum_ev_oid_constant` — `OID_POLICY_EV` == `2.23.140.1.1`
+- `test_any_policy_oid_constant` — `OID_ANY_POLICY` == `2.5.29.32.0`
+- `test_entry_missing_oid_skipped` — bad entry silently skipped
+- `test_empty_policies_list_no_extension` — empty list → no extension
+- `test_profile_level_policies_applied` — profile default applied
+- `test_explicit_policies_override_profile_policies` — explicit overrides profile
+
+### Changed
+
+- `issue_certificate()` docstring substantially expanded: `certificate_policies`,
+  `san_dns`, and `san_emails` parameter behaviour now fully documented
+- Module docstring updated: RFC 9549/9598 and RFC 5280 §4.2.1.4 listed in features
+- RFC compliance notes table in README updated: all ⚠️ rows promoted to ✅
+
+### Fixed
+
+- No bug fixes in this release; all changes are additive
+
+---
+
+## [0.7.0] — 2026-02-25
+
+### Added — RFC 9608 (noRevAvail), Unit Test Suite, Module Rename
+
+#### RFC 9608 — No Revocation Available Extension (`pki_server.py`, `acme_server.py`)
+
+- New `OID_NO_REV_AVAIL = x509.ObjectIdentifier("2.5.29.56")` constant
+- New `NO_REV_AVAIL_THRESHOLD_DAYS = 7` default threshold constant
+- New `short_lived` certificate profile — adds `id-ce-noRevAvail`, suppresses CDP and AIA-OCSP per RFC 9608 §4
+- `issue_certificate()` gains `no_rev_avail: Optional[bool]` parameter:
+  - If `None` (default): inherited from the profile
+  - If `True`: forces extension on; CDP and AIA-OCSP suppressed
+  - Always forced `False` for CA certificates (RFC 9608 §4 MUST NOT)
+- AIA OCSP extension now gated on `suppress_ocsp_aia` — suppressed automatically when `noRevAvail` is set
+- CDP extension now gated on `suppress_cdp` — suppressed automatically when `noRevAvail` is set
+- Extension encoding: OID `2.5.29.56`, `critical=False`, value = ASN.1 NULL (`05 00`)
+- `acme_server.py`: `ACMEHandler` gains `cert_validity_days` (default 90) and `short_lived_threshold_days` (default 7) class attributes
+- `acme_server.py`: `_handle_finalize()` auto-selects `short_lived` profile when `validity_days ≤ threshold`
+- `acme_server.py`: `make_acme_handler()` and `start_acme_server()` accept `cert_validity_days` and `short_lived_threshold_days` parameters
+- New CLI flags in `pki_server.py`:
+  - `--acme-cert-days DAYS` — validity period for ACME-issued certificates (default: 90)
+  - `--acme-short-lived-threshold DAYS` — noRevAvail auto-apply threshold (default: 7)
+
+#### Unit + RFC Compliance Test Suite (`test_pki_server.py`)
+
+- New file — 148 tests across 18 test classes, zero external dependencies (stdlib + `cryptography` only)
+- RFC 5280 §4.1 — `TestRFC5280CertStructure` (9 tests): version v3, serial positivity/uniqueness/max-20-octets, SHA-256 signature, non-empty issuer, issuer matches CA subject, UTCTime/GeneralizedTime validity encoding, non-empty subject
+- RFC 5280 §4.2 — `TestRFC5280Extensions` (9 tests): AKI present and matches CA SKI, SKI in all certs, KeyUsage critical, BasicConstraints critical + cA=False for end-entity, SAN DNS names, AIA OCSP URL, CDP URL
+- RFC 5280 §5 — `TestRFC5280CRL` (11 tests): issuer, thisUpdate, nextUpdate ordering, SHA-256 signature, signature verification against CA key, revoked cert appears, good cert absent, delta CRL indicator present + critical, delta CRL incremental correctness
+- RFC 9608 — `TestRFC9608NoRevAvail` (9 tests): extension present, non-critical, NULL value, CDP suppressed, AIA OCSP suppressed, absent from CA certs, explicit parameter, CA cert exemption enforced, standard cert unaffected
+- `TestCertificateProfiles` (13 tests): all 8 profiles verified for EKU, KeyUsage bits, BasicConstraints, ocsp-nocheck, noRevAvail
+- `TestSubCAIssuance` (7 tests): pathLenConstraint=0, 4096-bit key, issuer chain, cryptographic signature verification, keyCertSign/cRLSign usage, DB storage
+- `TestPKCS12Export` (6 tests): export without error, cert present in bundle, CA chain present, no private key stored, unknown serial returns None, password-protected export
+- `TestCSRValidation` (6 tests): valid CSR passes, missing CN, no SAN for tls_server profile, invalid FQDN, RSA key < 2048 bits, invalid signature
+- `TestAuditLog` (7 tests): record/retrieve, newest-first ordering, limit enforcement, ISO 8601 timestamps, SQLite persistence across instances, issuance + revocation recording
+- `TestRateLimiter` (6 tests): allows up to limit, blocks over, per-IP independence, status dict, unknown IP, thread safety under concurrent load
+- `TestCertificateAuthority` (15 tests): all public methods, SAN IP/email, validity_days, PEM/DER properties, persistence across CA restart, full DN parsing
+- `TestServerConfig` (6 tests): defaults, patch, unknown keys ignored, dict output, disk write, reload from disk
+- `TestHTTPAPI` (16 tests): all endpoints live-tested over real HTTP — health, config, CA cert PEM/DER, list certs, full CRL, delta CRL, revoke (valid + nonexistent), sub-CA issuance, PEM/P12 download, rate-limit status, audit log, 404 fallback, HTTP 429 enforcement
+- `TestOCSPParsing` (4 tests): module importable, OCSP server starts and responds, signing cert has id-pkix-ocsp-nocheck, signing cert has OCSPSigning EKU, signing cert is not a CA
+- `TestCMPMessageStructure` (6 tests): CMPv2/v3 handler instantiation, garbage rejection returns valid error response, `build_pki_message` returns bytes, well-known URI constant, pvno constants
+- `TestACMERFC9608Integration` (5 tests): profile selection logic below/above threshold, noRevAvail end-to-end, ACME module attributes, `start_acme_server` signature
+- `TestESTModule` (3 tests): module importable, required operations present, `build_csrattrs` returns valid DER SEQUENCE
+- `TestModuleStructure` (5 tests): all required classes/functions/constants exported, all 8 profiles present, noRevAvail OID value correct
+
+#### Module Rename
+
+- `pki_server.py` → **`pki_server.py`** — all internal cross-references, docstrings, CLI examples, and inter-module imports updated
+- `cmpv2_client.py` updated to reference `pki_server.py`
+- All other modules (`acme_server.py`, `est_server.py`, `scep_server.py`, `ocsp_server.py`, `web_ui.py`) updated
+
+### Changed
+
+- `CertProfile.PROFILES` now contains 8 entries — `short_lived` added alongside the existing 7
+- `issue_certificate()` docstring updated to document `no_rev_avail` parameter and `short_lived` profile
+- ACME `_handle_finalize()` now logs `profile=short_lived` or `profile=tls_server` per issued cert
+- Startup banner updated: ACME line mentions RFC 9608 noRevAvail auto-apply
+
+### Fixed
+
+- No bug fixes in this release
+
+---
+
+## [0.6.0] — 2026-02-23
+
+### Added — OCSP, Certificate Profiles, Sub-CA, PKCS#12, Delta CRL, CSR Validation, Rate Limiting, Audit Log, Web UI
+
+#### OCSP Responder — RFC 6960 + RFC 5019 (`ocsp_server.py`)
+
+- New standalone module with `start_ocsp_server()` integration hook
+- **`POST /ocsp`** — RFC 6960 §A.1 HTTP POST binding; accepts DER-encoded OCSPRequest
+- **`GET  /ocsp/<base64>`** — RFC 5019 §5 GET binding; CDN/proxy-cacheable with `Cache-Control: max-age`
+- **`OCSPRequestParser`** — pure-Python DER parser extracting `CertID` (serial, issuer name hash, issuer key hash) and optional nonce from `requestExtensions`
+- **`OCSPResponseBuilder`** — builds signed `BasicOCSPResponse` with:
+  - SHA-256 CertID in every response
+  - `good` [0] IMPLICIT NULL / `revoked` [1] RevokedInfo (with reason code) / `unknown` [2] IMPLICIT NULL
+  - Nonce echo-back in `responseExtensions` (RFC 6960 §4.2.1)
+  - Responder ID by SubjectKeyIdentifier ([2] byKey)
+  - Signing cert included in `[0] certs` field
+- **`provision_ocsp_signing_cert()`** — auto-issues a dedicated OCSP signing cert with:
+  - EKU `OCSPSigning` (`1.3.6.1.5.5.7.3.9`)
+  - `id-pkix-ocsp-nocheck` extension (`1.3.6.1.5.5.7.48.1.5`) so clients skip revocation checking on the OCSP cert itself
+  - 30-day validity, auto-renewed on start if within 7 days of expiry
+- **`OCSPResponseCache`** — TTL-based in-memory cache (default 300 s) keyed by serial; GET requests without nonce are cached; POST requests with nonce bypass cache
+- Integrated into `pki_server.py` via `--ocsp-port` and `--ocsp-cache-seconds`
+
+#### AIA + CDP Extensions in Issued Certificates (`pki_server.py`)
+
+- `issue_certificate()` now accepts `ocsp_url` and `crl_url` parameters
+- `CertificateAuthority.__init__()` accepts `--ocsp-url` and `--crl-url` CLI values stored as `_ocsp_url` / `_crl_url`
+- Every issued certificate gets:
+  - `authorityInfoAccess` (AIA) extension with OCSP access description if `ocsp_url` or `--ocsp-url` is set
+  - `cRLDistributionPoints` (CDP) extension with full-name URI if `crl_url` or `--crl-url` is set
+- New CLI flags `--ocsp-url URL` and `--crl-url URL`
+
+#### Certificate Profiles (`pki_server.py`)
+
+- New `CertProfile` class with seven built-in profiles:
+  - `tls_server` — `serverAuth` EKU, `digitalSignature + keyEncipherment`, SAN recommended
+  - `tls_client` — `clientAuth` EKU, `digitalSignature`
+  - `code_signing` — `codeSigning` EKU, `digitalSignature + contentCommitment`
+  - `email` — `emailProtection` EKU, `digitalSignature + keyEncipherment + contentCommitment`
+  - `ocsp_signing` — `OCSPSigning` EKU, `nocheck` extension auto-added
+  - `sub_ca` — `BasicConstraints cA=True`, `keyCertSign + cRLSign`
+  - `default` — all key usages, no EKU restriction (previous behaviour)
+- `issue_certificate()` `profile=` parameter controls which profile is applied
+- Profile name stored in `certificates.db` (new `profile` column with migration guard)
+- New `--default-profile` CLI flag for CMPv2 issuance (default: `default`)
+- `san_emails` and `san_ips` parameters added to `issue_certificate()` alongside existing `san_dns`
+
+#### Subordinate CA Issuance (`pki_server.py`)
+
+- New `CertificateAuthority.issue_sub_ca(cn, validity_days, path_length)` method
+  generates a 4096-bit RSA key pair and issues a CA certificate (BasicConstraints `cA=True`,
+  path length 0, `sub_ca` profile)
+- New `POST /api/sub-ca` HTTP endpoint — body `{"cn": "...", "validity_days": 1825}`;
+  returns JSON with `cert_pem` and `key_pem`
+- Accessible from web dashboard Sub-CA page
+
+#### PKCS#12 / PFX Export (`pki_server.py`)
+
+- New `CertificateAuthority.export_pkcs12(serial, password=None)` — uses
+  `cryptography.hazmat.primitives.serialization.pkcs12`; bundles issued cert + CA chain;
+  private key is never included (not stored server-side)
+- New `GET /api/certs/<serial>/p12` HTTP endpoint — returns `application/x-pkcs12` with
+  `Content-Disposition: attachment`
+- New `GET /api/certs/<serial>/pem` HTTP endpoint — returns single cert PEM by serial
+
+#### Delta CRL — RFC 5280 §5.2.4 (`pki_server.py`)
+
+- New `CertificateAuthority.generate_delta_crl(base_crl_number)` method
+- Only includes revocations since the last base CRL snapshot stored in new `crl_base` SQLite table
+- Adds `deltaCRLIndicator` critical extension with the base CRL number
+- Automatically records the current full CRL as the new base after generation
+- New `GET /ca/delta-crl` HTTP endpoint; 6-hour `nextUpdate`
+
+#### CSR Policy Validation (`pki_server.py`)
+
+- New `CertificateAuthority.validate_csr(csr, profile)` method returns list of violation strings
+- Checks: CSR signature validity, presence of CN, minimum RSA key size (2048 bits)
+- Profile-specific: `tls_server` profile enforces FQDN-like CN and SAN extension presence
+- Returns empty list if valid — callers can reject or log violations
+
+#### Rate Limiting (`pki_server.py`)
+
+- New `RateLimiter` class — token-bucket per IP address (sliding 60-second window)
+- Applied at the top of `do_POST()` before CMP processing; returns HTTP `429 Too Many Requests`
+  with `Retry-After: 60` header
+- New `--rate-limit N` CLI flag (0 = disabled, default)
+- New `GET /api/rate-limit` endpoint shows current request count for the caller's IP
+- `RateLimiter` instance shared with Web UI
+
+#### Structured Audit Log (`pki_server.py`)
+
+- New `AuditLog` class backed by `ca/audit.db` SQLite database
+- Schema: `id, ts (ISO-8601), event, detail, ip`
+- Events recorded: `startup`, `shutdown`, `issue`, `issue_sub_ca`, `revoke`, `config_patch`
+- New `--audit` (default on) / `--no-audit` CLI flags
+- New `GET /api/audit` endpoint — returns last 200 events as JSON
+- `AuditLog` instance passed to web UI and all issuance paths
+
+#### Web Dashboard (`web_ui.py`)
+
+- New standalone module; starts on `--web-port` (e.g. 8090); plain HTTP (no TLS needed — serve behind a reverse proxy in production)
+- Pages:
+  - **Dashboard** — stats grid (total/active/revoked/expired), CA info, active endpoints
+  - **Certificates** — searchable/filterable table; per-cert PEM download, PKCS#12 download, one-click revoke button
+  - **Revocation** — CRL/OCSP URL display, revoke-by-serial form with reason dropdown
+  - **Sub-CA** — form to issue subordinate CA cert; result shown as JSON
+  - **Config** — live config viewer + validity period editor (calls `PATCH /config`)
+  - **Audit Log** — last 100 events in a table
+  - **API Docs** — quick-reference endpoint table
+- Pure HTML/CSS/JS — no external dependencies; single-file, no npm/webpack
+- REST API used by dashboard JS: `GET /api/certs`, `POST /api/revoke`, `POST /api/config`,
+  `POST /api/issue-sub-ca`, `GET /api/audit`
+- Shared `CertificateAuthority`, `AuditLog`, and `RateLimiter` objects (no duplicate state)
+
+#### Database migration (`pki_server.py`)
+
+- `_init_db()` adds `profile TEXT DEFAULT 'default'` column to `certificates` table
+  with `ALTER TABLE ... ADD COLUMN` inside a try/except (no-op on new DBs, migration on existing)
+- New `crl_base` table for delta CRL base snapshots
+- New `audit.db` database for structured audit events
+
+---
+
 ## [0.5.0] — 2026-02-23
 
 ### Added — CMPv3 (RFC 9480) + EST (RFC 7030)
 
-#### CMPv3 — RFC 9480 CMP Updates (`pki_cmpv2_server.py`)
+#### CMPv3 — RFC 9480 CMP Updates (`pki_server.py`)
 
 - **`pvno` version negotiation** — new `CMPv3Handler` class (extends `CMPv2Handler`);
   reads `pvno` from the incoming PKIHeader and mirrors it back — clients sending
@@ -96,7 +406,7 @@ This project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `extensionRequest` attribute hinting SAN and EKU
 - **`ESTUserStore`** — thread-safe in-memory user registry; `add_user()`,
   `authenticate()`, `has_users()`
-- **Integration into `pki_cmpv2_server.py`**:
+- **Integration into `pki_server.py`**:
   - `est_server` imported at startup with `HAS_EST` guard
   - EST server started in background daemon thread alongside ACME, SCEP, CMPv3
   - New CLI argument group `EST options (RFC 7030)`:
@@ -118,7 +428,7 @@ This project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 #### SCEP server (`scep_server.py`)
 
 - New standalone module following the same pattern as `acme_server.py` —
-  shares `CertificateAuthority` from `pki_cmpv2_server.py` and can run
+  shares `CertificateAuthority` from `pki_server.py` and can run
   standalone or integrated via `--scep-port`
 - SQLite-backed transaction log (`ca/scep.db`) recording all enrolment
   requests with status, subject, CSR PEM, issued cert PEM, requester IP,
@@ -157,7 +467,7 @@ This project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `/scep/pkiclient.exe` — the three paths used by different SCEP clients
   (Cisco IOS, Juniper, sscep, Windows NDES)
 
-#### Integration into `pki_cmpv2_server.py`
+#### Integration into `pki_server.py`
 
 - New CLI argument group `SCEP options (RFC 8894)`:
   - `--scep-port PORT` — start SCEP server on this port (e.g. 8889)
@@ -227,7 +537,7 @@ This project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 #### ACME server (`acme_server.py`)
 
 - Full RFC 8555 ACME server implemented as a standalone module that shares
-  the `CertificateAuthority` from `pki_cmpv2_server.py`
+  the `CertificateAuthority` from `pki_server.py`
 - SQLite-backed store for accounts, orders, authorizations, challenges and
   certificates (`ca/acme.db`)
 - **Challenge types:**
@@ -246,10 +556,10 @@ This project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   leaf + CA chain
 - **Revocation** — `POST /acme/revoke-cert` authenticated by account key or
   certificate key
-- Integrated into `pki_cmpv2_server.py` via `--acme-port`; can also run
+- Integrated into `pki_server.py` via `--acme-port`; can also run
   standalone
 
-#### ALPN support (`pki_cmpv2_server.py`)
+#### ALPN support (`pki_server.py`)
 
 - `build_tls_context()` extended with `alpn_protocols` parameter (RFC 7301)
 - Four named constants on `CertificateAuthority`:
@@ -357,11 +667,34 @@ v0.2.0   ACME (RFC 8555) + ALPN + key rollover + Ansible CA import role
 v0.3.0   certbot compatibility — 11 RFC 8555 compliance fixes
 v0.4.0   SCEP protocol (RFC 8894) + CRL generation + GetCert by serial
 v0.5.0   CMPv3 (RFC 9480) + EST (RFC 7030) + well-known CMP URI (RFC 9811)
+v0.6.0   OCSP (RFC 6960) + profiles + sub-CA + PKCS#12 + delta CRL + audit + rate-limit + Web UI
 ```
 
 ```bash
 # Tag and push the new release
-git add scep_server.py est_server.py pki_cmpv2_server.py CHANGELOG.md README.md
+git add ocsp_server.py web_ui.py pki_server.py CHANGELOG.md README.md
+git commit -m "v0.6.0: OCSP + profiles + sub-CA + PKCS#12 + delta CRL + audit + Web UI
+
+- ocsp_server.py: RFC 6960 + RFC 5019 OCSP responder with signing cert + cache
+- AIA/CDP extensions embedded in all issued certificates
+- CertProfile: 7 built-in profiles (tls_server, tls_client, code_signing, email, sub_ca, ...)
+- CertificateAuthority.issue_sub_ca() + POST /api/sub-ca
+- CertificateAuthority.export_pkcs12() + GET /api/certs/<serial>/p12
+- generate_delta_crl() + GET /ca/delta-crl (RFC 5280 §5.2.4)
+- validate_csr() naming + key-size policy enforcement
+- RateLimiter: token-bucket per IP, --rate-limit N, HTTP 429
+- AuditLog: SQLite ca/audit.db, GET /api/audit
+- web_ui.py: HTML dashboard with cert inventory, revocation, sub-CA, config, audit"
+
+git tag -a v0.6.0 -m "v0.6.0: OCSP + profiles + sub-CA + PKCS#12 + delta CRL + audit + Web UI"
+git push && git push origin v0.6.0
+
+# Create a GitHub Release
+gh release create v0.6.0 \
+  --title "v0.6.0 — OCSP, Profiles, Sub-CA, PKCS#12, Delta CRL, Audit Log, Web UI" \
+  --notes-file CHANGELOG.md
+
+git add scep_server.py est_server.py pki_server.py CHANGELOG.md README.md
 git commit -m "v0.5.0: CMPv3 (RFC 9480) + EST (RFC 7030)
 
 CMPv3:
@@ -387,4 +720,69 @@ gh release create v0.5.0 \
 
 # Or in the browser:
 # https://github.com/lucianpopovici/network/releases/new
+```
+
+---
+
+## Releasing v0.7.0
+
+```bash
+git add pki_server.py acme_server.py test_pki_server.py CHANGELOG.md README.md
+git commit -m "v0.7.0: RFC 9608 noRevAvail + unit test suite + rename to pki_server.py
+
+RFC 9608:
+- id-ce-noRevAvail (OID 2.5.29.56) extension, non-critical, ASN.1 NULL value
+- New short_lived certificate profile
+- CDP and AIA-OCSP suppressed when noRevAvail is set (RFC 9608 §4)
+- ACME auto-applies short_lived profile for certs with validity <= threshold
+- --acme-cert-days and --acme-short-lived-threshold CLI flags
+
+Testing:
+- test_pki_server.py: 148 tests, 18 test classes
+- RFC 5280 §4/§5, RFC 9608, all profiles, all HTTP API endpoints
+- Zero external test dependencies (stdlib + cryptography)
+
+Rename:
+- pki_server.py renamed from pki_cmpv2_server.py
+- All cross-module references updated"
+
+git tag -a v0.7.0 -m "v0.7.0: RFC 9608 noRevAvail + unit tests + pki_server.py rename"
+git push && git push origin v0.7.0
+
+# Create a GitHub Release
+gh release create v0.7.0 \
+  --title "v0.7.0 — RFC 9608 noRevAvail + Unit Tests + Rename" \
+  --notes-file CHANGELOG.md
+```
+
+---
+
+## Releasing v0.8.0
+
+```bash
+git add pki_server.py test_pki_server.py CHANGELOG.md README.md
+git commit -m "v0.8.0: IDNA (RFC 9549/9598) + CertificatePolicies (RFC 5280 §4.2.1.4)
+
+IDNA (Priority 2):
+- san_dns: U-label to A-label via built-in IDNA codec (RFC 9549 §4.1)
+- san_emails: ASCII local+IDN host -> rfc822Name A-label; non-ASCII local -> SmtpUTF8Mailbox
+- DC= in subject_str: domainComponent with IDNA encoding (RFC 6818 §5)
+- New helpers: _idna_encode_domain, _encode_smtp_utf8_mailbox, OID_SMTP_UTF8_MAILBOX
+
+CertificatePolicies (Priority 3):
+- certificate_policies parameter on issue_certificate()
+- CPS URI (id-qt-cps) and UserNotice (UTF8String, RFC 6818) qualifiers
+- Profile-level default policies; explicit parameter overrides profile
+- OID constants: OID_POLICY_DV/OV/IV/EV, OID_ANY_POLICY, OID_QT_CPS/UNOTICE
+
+Tests: 30 new (178 total, 20 test classes)
+- TestRFC9549IDNA: 13 tests covering all routing paths and edge cases
+- TestCertificatePolicies: 17 tests covering OIDs, qualifiers, DER round-trip, profile defaults"
+
+git tag -a v0.8.0 -m "v0.8.0: IDNA (RFC 9549/9598) + CertificatePolicies (RFC 5280 §4.2.1.4)"
+git push && git push origin v0.8.0
+
+gh release create v0.8.0 \
+  --title "v0.8.0 — IDNA + CertificatePolicies" \
+  --notes-file CHANGELOG.md
 ```

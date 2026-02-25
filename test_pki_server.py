@@ -1580,6 +1580,445 @@ class TestModuleStructure(unittest.TestCase):
                          "noRevAvail OID must be 2.5.29.56 per RFC 9608")
 
 
+
+# ===========================================================================
+# 19. RFC 9549 / RFC 9598 — IDNA normalisation + SmtpUTF8Mailbox
+# ===========================================================================
+
+class TestRFC9549IDNA(unittest.TestCase):
+    """RFC 9549 §4.1 — dNSName U-labels MUST be converted to A-labels."""
+
+    def setUp(self):
+        self._tmp = tempfile.mkdtemp()
+        self.ca = _make_ca(self._tmp)
+        self.key = _gen_key()
+
+    def _san_dns(self, cert):
+        san = cert.extensions.get_extension_for_class(x509.SubjectAlternativeName)
+        return san.value.get_values_for_type(x509.DNSName)
+
+    def _san_emails(self, cert):
+        san = cert.extensions.get_extension_for_class(x509.SubjectAlternativeName)
+        return san.value.get_values_for_type(x509.RFC822Name)
+
+    def _san_other_names(self, cert):
+        san = cert.extensions.get_extension_for_class(x509.SubjectAlternativeName)
+        return san.value.get_values_for_type(x509.OtherName)
+
+    # ── DNS SAN — U-label -> A-label ──────────────────────────────────────────
+
+    def test_ascii_dns_passes_through(self):
+        """Pure ASCII domain names must pass through unchanged."""
+        cert = self.ca.issue_certificate(
+            "CN=ascii", self.key.public_key(),
+            san_dns=["example.com", "www.example.com"]
+        )
+        names = self._san_dns(cert)
+        self.assertIn("example.com", names)
+        self.assertIn("www.example.com", names)
+
+    def test_u_label_dns_converted_to_a_label(self):
+        """RFC 9549 §4.1: U-label dNSName MUST be stored as A-label."""
+        cert = self.ca.issue_certificate(
+            "CN=idn", self.key.public_key(),
+            san_dns=["münchen.de"]
+        )
+        names = self._san_dns(cert)
+        self.assertIn("xn--mnchen-3ya.de", names,
+                      "RFC 9549 §4.1: München→xn--mnchen-3ya must be A-label encoded")
+        self.assertNotIn("münchen.de", names,
+                         "U-label must not appear in the encoded cert")
+
+    def test_multi_label_idn_all_labels_encoded(self):
+        """Each label of a multi-label IDN domain must be encoded independently."""
+        cert = self.ca.issue_certificate(
+            "CN=idn-multi", self.key.public_key(),
+            san_dns=["sub.münchen.de"]
+        )
+        names = self._san_dns(cert)
+        self.assertIn("sub.xn--mnchen-3ya.de", names,
+                      "sub-label IDN must encode the IDN segment only")
+
+    def test_wildcard_label_preserved(self):
+        """Wildcard label (*) must be preserved; only IDN labels encoded."""
+        cert = self.ca.issue_certificate(
+            "CN=wildcard", self.key.public_key(),
+            san_dns=["*.example.com"]
+        )
+        names = self._san_dns(cert)
+        self.assertIn("*.example.com", names, "Wildcard label must be preserved")
+
+    # ── Email SAN — ASCII local + IDN host -> rfc822Name with A-label host ────
+
+    def test_ascii_email_ascii_host_unchanged(self):
+        """Plain ASCII email must be stored as rfc822Name unchanged."""
+        cert = self.ca.issue_certificate(
+            "CN=email-ascii", self.key.public_key(),
+            san_emails=["user@example.com"]
+        )
+        emails = self._san_emails(cert)
+        self.assertIn("user@example.com", emails)
+
+    def test_ascii_local_idn_host_encoded(self):
+        """RFC 9549 §4.2: ASCII local-part with IDN host -> rfc822Name, A-label host."""
+        cert = self.ca.issue_certificate(
+            "CN=email-idn-host", self.key.public_key(),
+            san_emails=["user@münchen.de"]
+        )
+        emails = self._san_emails(cert)
+        self.assertIn("user@xn--mnchen-3ya.de", emails,
+                      "ASCII local-part + IDN host must produce rfc822Name with A-label host")
+        self.assertNotIn("user@münchen.de", emails,
+                         "U-label host must not appear in rfc822Name")
+
+    def test_non_ascii_local_uses_smtp_utf8_mailbox(self):
+        """RFC 9598 §3: non-ASCII local-part MUST use SmtpUTF8Mailbox otherName."""
+        cert = self.ca.issue_certificate(
+            "CN=email-utf8", self.key.public_key(),
+            san_emails=["üser@münchen.de"]
+        )
+        # Must NOT appear as rfc822Name
+        emails = self._san_emails(cert)
+        self.assertEqual(emails, [],
+                         "Non-ASCII local-part must NOT be stored as rfc822Name")
+        # MUST appear as SmtpUTF8Mailbox otherName
+        others = self._san_other_names(cert)
+        smtp_others = [o for o in others
+                       if o.type_id.dotted_string == "1.3.6.1.5.5.7.8.9"]
+        self.assertEqual(len(smtp_others), 1,
+                         "Non-ASCII local-part MUST produce exactly one SmtpUTF8Mailbox OtherName")
+
+    def test_smtp_utf8_mailbox_oid_is_correct(self):
+        """SmtpUTF8Mailbox OID must be 1.3.6.1.5.5.7.8.9 per RFC 9598."""
+        cert = self.ca.issue_certificate(
+            "CN=oid-check", self.key.public_key(),
+            san_emails=["müller@example.com"]
+        )
+        others = self._san_other_names(cert)
+        self.assertTrue(any(o.type_id.dotted_string == "1.3.6.1.5.5.7.8.9"
+                            for o in others),
+                        "SmtpUTF8Mailbox OID must be 1.3.6.1.5.5.7.8.9")
+
+    def test_smtp_utf8_mailbox_value_is_utf8string(self):
+        """SmtpUTF8Mailbox value must be a DER UTF8String (tag 0x0C)."""
+        cert = self.ca.issue_certificate(
+            "CN=utf8-value", self.key.public_key(),
+            san_emails=["üser@münchen.de"]
+        )
+        others = self._san_other_names(cert)
+        smtp_val = next(o.value for o in others
+                        if o.type_id.dotted_string == "1.3.6.1.5.5.7.8.9")
+        self.assertEqual(smtp_val[0], 0x0C,
+                         "SmtpUTF8Mailbox value MUST begin with UTF8String tag (0x0C)")
+
+    def test_smtp_utf8_mailbox_contains_original_address(self):
+        """SmtpUTF8Mailbox UTF8String value must contain the original UTF-8 mailbox."""
+        mailbox = "üser@münchen.de"
+        cert = self.ca.issue_certificate(
+            "CN=utf8-content", self.key.public_key(),
+            san_emails=[mailbox]
+        )
+        others = self._san_other_names(cert)
+        smtp_val = next(o.value for o in others
+                        if o.type_id.dotted_string == "1.3.6.1.5.5.7.8.9")
+        # Skip tag + length bytes; remainder is the UTF-8 content
+        # Tag=0x0C, length is 1 or 2 bytes
+        if smtp_val[1] < 0x80:
+            payload = smtp_val[2:]
+        elif smtp_val[1] == 0x81:
+            payload = smtp_val[3:]
+        else:
+            payload = smtp_val[4:]
+        self.assertEqual(payload.decode("utf-8"), mailbox,
+                         "SmtpUTF8Mailbox payload must be the original UTF-8 mailbox address")
+
+    def test_mixed_email_list_correct_routing(self):
+        """Mixed list of ASCII and non-ASCII emails must be routed independently."""
+        cert = self.ca.issue_certificate(
+            "CN=mixed-email", self.key.public_key(),
+            san_emails=["alice@example.com", "bob@münchen.de", "müller@example.com"]
+        )
+        emails = self._san_emails(cert)
+        others = self._san_other_names(cert)
+        smtp_others = [o for o in others
+                       if o.type_id.dotted_string == "1.3.6.1.5.5.7.8.9"]
+        self.assertIn("alice@example.com", emails)
+        self.assertIn("bob@xn--mnchen-3ya.de", emails,
+                      "IDN host email must be A-label encoded in rfc822Name")
+        self.assertEqual(len(smtp_others), 1,
+                         "Exactly one SmtpUTF8Mailbox for the non-ASCII local-part email")
+
+    # ── domainComponent in subject DN ─────────────────────────────────────────
+
+    def test_dc_attribute_accepted_in_subject(self):
+        """DC= in subject string must produce a DOMAIN_COMPONENT attribute."""
+        from cryptography.x509.oid import NameOID
+        cert = self.ca.issue_certificate(
+            "CN=dc.test,DC=example,DC=com", self.key.public_key()
+        )
+        dc_attrs = cert.subject.get_attributes_for_oid(NameOID.DOMAIN_COMPONENT)
+        self.assertEqual(len(dc_attrs), 2,
+                         "Two DC= components must be parsed from subject string")
+
+    def test_idn_dc_attribute_a_label_encoded(self):
+        """RFC 6818 §5 / RFC 9549 §4: IDN domainComponent labels MUST be A-labels."""
+        from cryptography.x509.oid import NameOID
+        cert = self.ca.issue_certificate(
+            "CN=idn-dc,DC=münchen,DC=de", self.key.public_key()
+        )
+        dc_attrs = cert.subject.get_attributes_for_oid(NameOID.DOMAIN_COMPONENT)
+        values = [a.value for a in dc_attrs]
+        self.assertIn("xn--mnchen-3ya", values,
+                      "IDN domainComponent must be A-label encoded per RFC 6818 §5")
+        self.assertNotIn("münchen", values,
+                         "U-label must not appear in domainComponent")
+
+
+# ===========================================================================
+# 20. RFC 5280 §4.2.1.4 / RFC 6818 — CertificatePolicies
+# ===========================================================================
+
+class TestCertificatePolicies(unittest.TestCase):
+    """RFC 5280 §4.2.1.4 and RFC 6818 §3 — CertificatePolicies extension."""
+
+    def setUp(self):
+        self._tmp = tempfile.mkdtemp()
+        self.ca = _make_ca(self._tmp)
+        self.key = _gen_key()
+
+    def _cp(self, cert) -> x509.CertificatePolicies:
+        return cert.extensions.get_extension_for_class(
+            x509.CertificatePolicies
+        ).value
+
+    # ── Basic presence ────────────────────────────────────────────────────────
+
+    def test_no_policies_by_default(self):
+        """CertificatePolicies MUST NOT be present if not requested."""
+        cert = self.ca.issue_certificate("CN=no-pol", self.key.public_key())
+        ext_oids = _ext_oids(cert)
+        self.assertNotIn("2.5.29.32", ext_oids,
+                         "CertificatePolicies must not be added unless requested")
+
+    def test_single_policy_oid_added(self):
+        """A single policy OID must produce exactly one PolicyInformation."""
+        cert = self.ca.issue_certificate(
+            "CN=one-pol", self.key.public_key(),
+            certificate_policies=[{"oid": "2.23.140.1.2.1"}]
+        )
+        ext_oids = _ext_oids(cert)
+        self.assertIn("2.5.29.32", ext_oids,
+                      "CertificatePolicies extension must be present")
+        cp = self._cp(cert)
+        oids = [pi.policy_identifier.dotted_string for pi in cp]
+        self.assertIn("2.23.140.1.2.1", oids,
+                      "Policy OID 2.23.140.1.2.1 (CA/B Forum DV) must be present")
+
+    def test_extension_is_non_critical(self):
+        """RFC 5280 §4.2.1.4: CertificatePolicies SHOULD be non-critical."""
+        cert = self.ca.issue_certificate(
+            "CN=cp-crit", self.key.public_key(),
+            certificate_policies=[{"oid": "2.23.140.1.2.1"}]
+        )
+        ext = cert.extensions.get_extension_for_class(x509.CertificatePolicies)
+        self.assertFalse(ext.critical,
+                         "RFC 5280: CertificatePolicies SHOULD be non-critical")
+
+    def test_multiple_policies(self):
+        """Multiple policy OIDs must all appear in the extension."""
+        policies = [
+            {"oid": "2.23.140.1.2.1"},  # DV
+            {"oid": "2.23.140.1.2.2"},  # OV
+        ]
+        cert = self.ca.issue_certificate(
+            "CN=multi-pol", self.key.public_key(),
+            certificate_policies=policies
+        )
+        cp = self._cp(cert)
+        oids = [pi.policy_identifier.dotted_string for pi in cp]
+        self.assertIn("2.23.140.1.2.1", oids)
+        self.assertIn("2.23.140.1.2.2", oids)
+        self.assertEqual(len(oids), 2)
+
+    # ── CPS URI qualifier ─────────────────────────────────────────────────────
+
+    def test_cps_uri_qualifier_added(self):
+        """CPS URI qualifier must be present when requested."""
+        cert = self.ca.issue_certificate(
+            "CN=cps", self.key.public_key(),
+            certificate_policies=[{
+                "oid": "2.23.140.1.2.1",
+                "cps_uri": "https://pki.example.com/cps",
+            }]
+        )
+        cp = self._cp(cert)
+        pi = next(p for p in cp if p.policy_identifier.dotted_string == "2.23.140.1.2.1")
+        self.assertIsNotNone(pi.policy_qualifiers,
+                             "Policy qualifiers must be present when cps_uri is given")
+        cps_uris = [q for q in pi.policy_qualifiers if isinstance(q, str)]
+        self.assertIn("https://pki.example.com/cps", cps_uris,
+                      "CPS URI must appear in policy qualifiers")
+
+    def test_policy_without_qualifiers_has_none(self):
+        """Policy OID without qualifiers must have policy_qualifiers=None."""
+        cert = self.ca.issue_certificate(
+            "CN=no-qual", self.key.public_key(),
+            certificate_policies=[{"oid": "2.23.140.1.2.1"}]
+        )
+        cp = self._cp(cert)
+        pi = cp[0]
+        self.assertIsNone(pi.policy_qualifiers,
+                          "Policy without qualifiers must have policy_qualifiers=None")
+
+    # ── UserNotice / explicitText ─────────────────────────────────────────────
+
+    def test_user_notice_added(self):
+        """UserNotice qualifier must be present when notice_text is given."""
+        notice = "This certificate was issued under PyPKI test policy."
+        cert = self.ca.issue_certificate(
+            "CN=notice", self.key.public_key(),
+            certificate_policies=[{
+                "oid": "2.23.140.1.2.2",
+                "notice_text": notice,
+            }]
+        )
+        cp = self._cp(cert)
+        pi = next(p for p in cp if p.policy_identifier.dotted_string == "2.23.140.1.2.2")
+        self.assertIsNotNone(pi.policy_qualifiers)
+        notices = [q for q in pi.policy_qualifiers
+                   if isinstance(q, x509.UserNotice)]
+        self.assertEqual(len(notices), 1, "Exactly one UserNotice must be present")
+        self.assertEqual(notices[0].explicit_text, notice,
+                         "UserNotice explicit_text must match the requested notice_text")
+
+    def test_user_notice_explicit_text_utf8(self):
+        """RFC 6818 §3: explicitText must use UTF8String encoding (cryptography default)."""
+        # The cryptography library always encodes UserNotice.explicit_text as UTF8String.
+        # We verify by round-tripping through DER and confirming the text survives.
+        notice = "Política de prueba: üçéàñ"  # non-ASCII to stress UTF-8 path
+        cert = self.ca.issue_certificate(
+            "CN=utf8-notice", self.key.public_key(),
+            certificate_policies=[{
+                "oid": "2.23.140.1.2.1",
+                "notice_text": notice,
+            }]
+        )
+        # Round-trip through DER
+        der = cert.public_bytes(x509.Certificate.__mro__[0].__module__ and
+                                 __import__("cryptography.hazmat.primitives.serialization",
+                                            fromlist=["Encoding"]).Encoding.DER)
+        cert2 = x509.load_der_x509_certificate(der)
+        cp = cert2.extensions.get_extension_for_class(x509.CertificatePolicies).value
+        pi = cp[0]
+        notices = [q for q in pi.policy_qualifiers if isinstance(q, x509.UserNotice)]
+        self.assertEqual(notices[0].explicit_text, notice,
+                         "explicit_text must survive DER round-trip (UTF-8 preserved)")
+
+    def test_cps_uri_and_notice_together(self):
+        """Both CPS URI and UserNotice qualifiers may appear on the same policy."""
+        cert = self.ca.issue_certificate(
+            "CN=both-qual", self.key.public_key(),
+            certificate_policies=[{
+                "oid": "2.23.140.1.2.1",
+                "cps_uri": "https://pki.example.com/cps",
+                "notice_text": "Test policy",
+            }]
+        )
+        cp = self._cp(cert)
+        pi = cp[0]
+        cps_uris = [q for q in pi.policy_qualifiers if isinstance(q, str)]
+        notices = [q for q in pi.policy_qualifiers if isinstance(q, x509.UserNotice)]
+        self.assertEqual(len(cps_uris), 1, "CPS URI must be present")
+        self.assertEqual(len(notices), 1, "UserNotice must be present")
+
+    # ── CA/B Forum well-known OIDs ────────────────────────────────────────────
+
+    def test_cab_forum_dv_oid_constant(self):
+        """OID_POLICY_DV must equal 2.23.140.1.2.1 (CA/B Forum DV)."""
+        import pki_server as pki_mod
+        self.assertEqual(pki_mod.OID_POLICY_DV.dotted_string, "2.23.140.1.2.1")
+
+    def test_cab_forum_ov_oid_constant(self):
+        """OID_POLICY_OV must equal 2.23.140.1.2.2 (CA/B Forum OV)."""
+        import pki_server as pki_mod
+        self.assertEqual(pki_mod.OID_POLICY_OV.dotted_string, "2.23.140.1.2.2")
+
+    def test_cab_forum_ev_oid_constant(self):
+        """OID_POLICY_EV must equal 2.23.140.1.1 (CA/B Forum EV)."""
+        import pki_server as pki_mod
+        self.assertEqual(pki_mod.OID_POLICY_EV.dotted_string, "2.23.140.1.1")
+
+    def test_any_policy_oid_constant(self):
+        """OID_ANY_POLICY must equal 2.5.29.32.0."""
+        import pki_server as pki_mod
+        self.assertEqual(pki_mod.OID_ANY_POLICY.dotted_string, "2.5.29.32.0")
+
+    def test_entry_missing_oid_skipped(self):
+        """Policy dict without 'oid' key must be silently skipped."""
+        cert = self.ca.issue_certificate(
+            "CN=skip-bad", self.key.public_key(),
+            certificate_policies=[
+                {"cps_uri": "https://example.com/cps"},  # no oid — skipped
+                {"oid": "2.23.140.1.2.1"},               # valid
+            ]
+        )
+        cp = self._cp(cert)
+        self.assertEqual(len(list(cp)), 1,
+                         "Invalid entry (missing oid) must be skipped silently")
+
+    def test_empty_policies_list_no_extension(self):
+        """Empty certificate_policies list must not add the extension."""
+        cert = self.ca.issue_certificate(
+            "CN=empty-pol", self.key.public_key(),
+            certificate_policies=[]
+        )
+        ext_oids = _ext_oids(cert)
+        self.assertNotIn("2.5.29.32", ext_oids,
+                         "Empty policies list must not produce a CertificatePolicies extension")
+
+    # ── Profile-level default policies ───────────────────────────────────────
+
+    def test_profile_level_policies_applied(self):
+        """Policies defined in a CertProfile must be applied automatically."""
+        import pki_server as pki_mod
+        # Temporarily add a policy to the tls_server profile for this test
+        original = pki_mod.CertProfile.PROFILES["tls_server"].copy()
+        pki_mod.CertProfile.PROFILES["tls_server"]["certificate_policies"] = [
+            {"oid": "2.23.140.1.2.1"}
+        ]
+        try:
+            cert = self.ca.issue_certificate(
+                "CN=profile-pol", self.key.public_key(),
+                profile="tls_server", san_dns=["profile.test"]
+            )
+            ext_oids = _ext_oids(cert)
+            self.assertIn("2.5.29.32", ext_oids,
+                          "Profile-level certificate_policies must be applied automatically")
+        finally:
+            pki_mod.CertProfile.PROFILES["tls_server"] = original
+
+    def test_explicit_policies_override_profile_policies(self):
+        """Explicit certificate_policies parameter must override profile default."""
+        import pki_server as pki_mod
+        original = pki_mod.CertProfile.PROFILES["tls_server"].copy()
+        pki_mod.CertProfile.PROFILES["tls_server"]["certificate_policies"] = [
+            {"oid": "2.23.140.1.2.1"}
+        ]
+        try:
+            cert = self.ca.issue_certificate(
+                "CN=override-pol", self.key.public_key(),
+                profile="tls_server", san_dns=["override.test"],
+                certificate_policies=[{"oid": "2.23.140.1.2.2"}]
+            )
+            cp = self._cp(cert)
+            oids = [pi.policy_identifier.dotted_string for pi in cp]
+            self.assertIn("2.23.140.1.2.2", oids,
+                          "Explicit parameter OID must appear")
+            self.assertNotIn("2.23.140.1.2.1", oids,
+                             "Profile default OID must be overridden by explicit parameter")
+        finally:
+            pki_mod.CertProfile.PROFILES["tls_server"] = original
+
 # ===========================================================================
 # Entry point
 # ===========================================================================

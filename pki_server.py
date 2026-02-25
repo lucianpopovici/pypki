@@ -42,6 +42,12 @@ Features:
       * Clients must present a valid certificate signed by the CA
       * Client certificate subject logged and made available to handlers
       * Bootstrap endpoint (plain HTTP) to issue an initial client cert
+  - Certificate profiles (tls_server, tls_client, code_signing, email, ocsp_signing,
+    sub_ca, short_lived, default)
+  - RFC 9608: id-ce-noRevAvail extension for short-lived certs (CDP/AIA suppressed)
+  - RFC 9549/9598: IDNA U-label->A-label for dNSName SANs and domainComponent;
+    SmtpUTF8Mailbox otherName for non-ASCII email addresses
+  - RFC 5280 §4.2.1.4 / RFC 6818: CertificatePolicies with CPS URI + UserNotice
 
 Dependencies:
     pip install cryptography pyasn1 pyasn1-modules
@@ -94,6 +100,18 @@ from cryptography.x509.oid import NameOID, ExtendedKeyUsageOID
 # RFC 9608 — No Revocation Available extension OID (id-ce 56)
 OID_NO_REV_AVAIL = x509.ObjectIdentifier("2.5.29.56")
 NO_REV_AVAIL_THRESHOLD_DAYS = 7  # certs valid <=7 days SHOULD carry noRevAvail
+
+# RFC 8398/9598 — SmtpUTF8Mailbox otherName OID for non-ASCII email in SAN
+OID_SMTP_UTF8_MAILBOX = x509.ObjectIdentifier("1.3.6.1.5.5.7.8.9")
+
+# RFC 5280 §4.2.1.14 — Well-known CA/B Forum policy OIDs (for CertificatePolicies)
+OID_ANY_POLICY          = x509.ObjectIdentifier("2.5.29.32.0")
+OID_POLICY_DV           = x509.ObjectIdentifier("2.23.140.1.2.1")  # CA/B Forum DV
+OID_POLICY_OV           = x509.ObjectIdentifier("2.23.140.1.2.2")  # CA/B Forum OV
+OID_POLICY_IV           = x509.ObjectIdentifier("2.23.140.1.2.3")  # CA/B Forum IV
+OID_POLICY_EV           = x509.ObjectIdentifier("2.23.140.1.1")    # CA/B Forum EV
+OID_QT_CPS              = x509.ObjectIdentifier("1.3.6.1.5.5.7.2.1") # id-qt-cps
+OID_QT_UNOTICE          = x509.ObjectIdentifier("1.3.6.1.5.5.7.2.2") # id-qt-unotice
 from cryptography.hazmat.primitives.serialization import pkcs12
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from cryptography.hazmat.primitives import padding as sym_padding
@@ -163,6 +181,116 @@ DEFAULT_CONFIG = {
         "ca_days":          3650,   # CA self-signed cert (only on first creation)
     }
 }
+
+
+# ---------------------------------------------------------------------------
+# RFC 9549 / RFC 8399 — IDNA helpers
+# ---------------------------------------------------------------------------
+
+def _idna_encode_label(label: str) -> str:
+    """
+    Encode a single DNS label using Python's built-in IDNA codec (RFC 3490).
+
+    The built-in codec implicitly applies UseSTD3ASCIIRules (RFC 6818 §7.3):
+    labels with invalid characters (spaces, underscores etc.) raise UnicodeError.
+
+    Returns the ACE (A-label) form, e.g. 'münchen' → 'xn--mnchen-3ya'.
+    Raises ValueError if the label cannot be IDNA-encoded.
+    """
+    try:
+        return label.encode("idna").decode("ascii")
+    except (UnicodeError, UnicodeDecodeError) as exc:
+        raise ValueError(f"IDNA encoding failed for label {label!r}: {exc}") from exc
+
+
+def _idna_encode_domain(domain: str) -> str:
+    """
+    Convert a fully-qualified domain name to its A-label form per RFC 9549 §4.1.
+
+    Each label is encoded independently so multi-level domains work correctly,
+    e.g. 'sub.münchen.de' → 'sub.xn--mnchen-3ya.de'.
+
+    Pure-ASCII domains pass through unchanged.  Raises ValueError on failure.
+    """
+    if not domain:
+        return domain
+    # Already pure ASCII — skip encoding (avoids roundtrip issues with wildcards)
+    try:
+        domain.encode("ascii")
+        return domain
+    except UnicodeEncodeError:
+        pass
+    parts = domain.split(".")
+    encoded = []
+    for part in parts:
+        if part == "*":
+            encoded.append("*")          # preserve wildcard label
+        else:
+            encoded.append(_idna_encode_label(part))
+    return ".".join(encoded)
+
+
+def _encode_smtp_utf8_mailbox(mailbox: str) -> bytes:
+    """
+    Encode a SmtpUTF8Mailbox value per RFC 9598 §3.
+
+    The encoding is a DER UTF8String (tag 0x0C) containing the UTF-8 mailbox.
+    This is used as the value of an OtherName with type-id OID_SMTP_UTF8_MAILBOX.
+    """
+    data = mailbox.encode("utf-8")
+    length = len(data)
+    if length < 0x80:
+        len_bytes = bytes([length])
+    elif length < 0x100:
+        len_bytes = bytes([0x81, length])
+    else:
+        len_bytes = bytes([0x82, length >> 8, length & 0xFF])
+    return b"\x0c" + len_bytes + data
+
+
+def _split_email(email: str):
+    """Return (local_part, host_part) for an RFC 5321 address, or raise ValueError."""
+    if "@" not in email:
+        raise ValueError(f"Invalid email address (no @): {email!r}")
+    local, _, host = email.partition("@")
+    return local, host
+
+
+def _has_non_ascii(s: str) -> bool:
+    """Return True if the string contains any code point > 0x7F."""
+    return any(ord(c) > 0x7F for c in s)
+
+
+# ---------------------------------------------------------------------------
+# RFC 5280 §4.2.1.4 — CertificatePolicies helpers
+# ---------------------------------------------------------------------------
+
+def _build_policy_information(policy_oid: str,
+                               cps_uri: Optional[str] = None,
+                               notice_text: Optional[str] = None
+                               ) -> "x509.PolicyInformation":
+    """
+    Build a single PolicyInformation object for use in CertificatePolicies.
+
+    Args:
+        policy_oid  : dotted-string OID, e.g. "2.23.140.1.2.1" (CA/B Forum DV)
+        cps_uri     : optional CPS URL added as id-qt-cps qualifier
+        notice_text : optional human-readable text added as id-qt-unotice UserNotice
+                      RFC 6818 §4.2.1.4 requires explicitText to use UTF8String —
+                      the cryptography library encodes it as UTF8String automatically.
+
+    Returns a cryptography x509.PolicyInformation instance.
+    """
+    qualifiers = []
+    if cps_uri:
+        qualifiers.append(cps_uri)           # library wraps in CPSUri automatically
+    if notice_text:
+        qualifiers.append(x509.UserNotice(notice_reference=None,
+                                           explicit_text=notice_text))
+    return x509.PolicyInformation(
+        policy_identifier=x509.ObjectIdentifier(policy_oid),
+        policy_qualifiers=qualifiers if qualifiers else None,
+    )
 
 
 class ServerConfig:
@@ -1046,21 +1174,40 @@ class CertificateAuthority:
         ocsp_url: Optional[str] = None,
         crl_url: Optional[str] = None,
         no_rev_avail: Optional[bool] = None,
+        certificate_policies: Optional[List[dict]] = None,
         audit: Optional["AuditLog"] = None,
         requester_ip: str = "",
     ) -> x509.Certificate:
         """
         Issue a certificate signed by this CA.
 
-        profile      : one of the CertProfile names (tls_server, tls_client,
-                       code_signing, email, ocsp_signing, sub_ca, short_lived, default)
-        ocsp_url     : if set, adds an AIA extension with OCSP access description
-        crl_url      : if set, adds a CRL Distribution Points extension
-        no_rev_avail : if True, adds the RFC 9608 id-ce-noRevAvail (OID 2.5.29.56)
-                       extension and suppresses CDP and AIA-OCSP extensions.
-                       If None (default), determined automatically from the profile.
-                       RFC 9608 §4: MUST NOT appear in CA certs; MUST NOT coexist
-                       with CDP or AIA OCSP AccessDescription.
+        profile             : one of the CertProfile names (tls_server, tls_client,
+                              code_signing, email, ocsp_signing, sub_ca, short_lived, default)
+        ocsp_url            : if set, adds an AIA extension with OCSP access description
+        crl_url             : if set, adds a CRL Distribution Points extension
+        no_rev_avail        : if True, adds the RFC 9608 id-ce-noRevAvail (OID 2.5.29.56)
+                              extension and suppresses CDP and AIA-OCSP extensions.
+                              If None (default), determined automatically from the profile.
+                              RFC 9608 §4: MUST NOT appear in CA certs; MUST NOT coexist
+                              with CDP or AIA OCSP AccessDescription.
+        certificate_policies: list of policy dicts for RFC 5280 §4.2.1.4 CertificatePolicies.
+                              Each dict may contain:
+                                "oid"         (str, required) — policy OID, e.g. "2.23.140.1.2.1"
+                                "cps_uri"     (str, optional) — CPS URI qualifier
+                                "notice_text" (str, optional) — UserNotice explicitText (UTF8String
+                                              per RFC 6818 §3)
+                              Example:
+                                [{"oid": "2.23.140.1.2.1",
+                                  "cps_uri": "https://pki.example.com/cps",
+                                  "notice_text": "Internal use only"}]
+        san_dns             : DNS SANs; U-labels are automatically converted to A-labels
+                              per RFC 9549 §4.1 using Python's built-in IDNA codec
+                              (IDNA2003, UseSTD3ASCIIRules enforced by the codec).
+        san_emails          : email SANs. Routing per RFC 9549 §4.2 / RFC 9598:
+                              - ASCII local-part + ASCII-or-IDN host -> rfc822Name
+                                (IDN host converted to A-label automatically)
+                              - Non-ASCII local-part -> SmtpUTF8Mailbox otherName
+                                (OID 1.3.6.1.5.5.7.8.9, UTF8String value)
         """
         prof = CertProfile.get(profile)
         is_ca = is_ca or prof.get("bc_ca", False)
@@ -1095,9 +1242,19 @@ class CertificateAuthority:
                 "L": NameOID.LOCALITY_NAME,
                 "ST": NameOID.STATE_OR_PROVINCE_NAME,
                 "EMAIL": NameOID.EMAIL_ADDRESS,
+                # RFC 6818 §5 / RFC 9549 §4: domainComponent
+                "DC": NameOID.DOMAIN_COMPONENT,
             }
-            if key.strip().upper() in oid_map:
-                attrs.append(x509.NameAttribute(oid_map[key.strip().upper()], val.strip()))
+            k = key.strip().upper()
+            if k in oid_map:
+                v = val.strip()
+                # RFC 6818 §5 / RFC 9549 §4: domainComponent labels MUST be A-labels
+                if k == "DC" and v:
+                    try:
+                        v = _idna_encode_label(v)
+                    except ValueError:
+                        pass  # non-IDN label (e.g. "com", "org") — store as-is
+                attrs.append(x509.NameAttribute(oid_map[k], v))
 
         if not attrs:
             attrs = [x509.NameAttribute(NameOID.COMMON_NAME, subject_str)]
@@ -1164,13 +1321,38 @@ class CertificateAuthority:
             )
 
         # SAN — collect DNS names, emails, IPs
+        # RFC 9549 §4.1 / RFC 8399 §2.4: dNSName U-labels MUST be converted to A-labels.
+        # RFC 9549 §4.2 / RFC 9598: email routing —
+        #   ASCII local-part  -> rfc822Name (IDN host encoded as A-label)
+        #   Non-ASCII local   -> SmtpUTF8Mailbox otherName (OID 1.3.6.1.5.5.7.8.9)
         san_names = []
         if san_dns:
             for d in san_dns:
-                san_names.append(x509.DNSName(d))
+                try:
+                    san_names.append(x509.DNSName(_idna_encode_domain(d)))
+                except ValueError:
+                    logger.warning(f"IDNA encoding failed for DNS SAN {d!r}; stored as-is")
+                    san_names.append(x509.DNSName(d))
         if san_emails:
             for e in san_emails:
-                san_names.append(x509.RFC822Name(e))
+                try:
+                    local, host = _split_email(e)
+                except ValueError:
+                    logger.warning(f"Invalid email SAN {e!r}; skipping")
+                    continue
+                if _has_non_ascii(local):
+                    # RFC 9598 §3: non-ASCII local-part -> SmtpUTF8Mailbox otherName
+                    san_names.append(
+                        x509.OtherName(OID_SMTP_UTF8_MAILBOX,
+                                       _encode_smtp_utf8_mailbox(e))
+                    )
+                else:
+                    # RFC 9549 §4.2: ASCII local-part with IDN host -> rfc822Name (A-label host)
+                    try:
+                        a_host = _idna_encode_domain(host)
+                    except ValueError:
+                        a_host = host
+                    san_names.append(x509.RFC822Name(f"{local}@{a_host}"))
         if san_ips:
             import ipaddress
             for ip in san_ips:
@@ -1223,6 +1405,26 @@ class CertificateAuthority:
                 "Suppressed CDP: RFC 9608 §4 prohibits CRL Distribution Points "
                 "when noRevAvail is set"
             )
+
+        # CertificatePolicies (RFC 5280 §4.2.1.4 / RFC 6818 §3)
+        # certificate_policies parameter OR profile default
+        pol_list = certificate_policies or prof.get("certificate_policies")
+        if pol_list:
+            policy_infos = []
+            for pol in pol_list:
+                oid = pol.get("oid")
+                if not oid:
+                    continue
+                policy_infos.append(_build_policy_information(
+                    oid,
+                    cps_uri=pol.get("cps_uri"),
+                    notice_text=pol.get("notice_text"),
+                ))
+            if policy_infos:
+                builder = builder.add_extension(
+                    x509.CertificatePolicies(policy_infos),
+                    critical=False,
+                )
 
         cert = builder.sign(self.ca_key, SHA256())
 
