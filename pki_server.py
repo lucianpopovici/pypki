@@ -54,7 +54,7 @@ Dependencies:
 
 Usage:
     # Plain HTTP (no mTLS)
-    python pki_server.py [--host 0.0.0.0] [--port 8080] [--ca-dir ./ca]
+    python pki_server.py [--host 127.0.0.1] [--port 8080] [--ca-dir ./ca]
 
     # mTLS enabled
     python pki_server.py --mtls --port 8443 [--ca-dir ./ca]
@@ -428,7 +428,6 @@ class ServerConfig:
     def as_dict(self) -> Dict[str, Any]:
         self._maybe_reload()
         with self._lock:
-
             return copy.deepcopy(self._effective())
 
     # ------------------------------------------------------------------
@@ -1137,42 +1136,46 @@ class CertificateAuthority:
 
     def _init_db(self):
         conn = sqlite3.connect(str(self.db_path))
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS certificates (
-                serial      INTEGER PRIMARY KEY,
-                subject     TEXT NOT NULL,
-                not_before  TEXT NOT NULL,
-                not_after   TEXT NOT NULL,
-                der         BLOB NOT NULL,
-                revoked     INTEGER DEFAULT 0,
-                revoked_at  TEXT,
-                reason      INTEGER,
-                profile     TEXT DEFAULT 'default'
-            )
-        """)
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS serial_counter (
-                id    INTEGER PRIMARY KEY,
-                value INTEGER NOT NULL
-            )
-        """)
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS crl_base (
-                id          INTEGER PRIMARY KEY,
-                issued_at   TEXT NOT NULL,
-                this_update TEXT NOT NULL,
-                next_update TEXT NOT NULL,
-                der         BLOB NOT NULL
-            )
-        """)
-        conn.execute("INSERT OR IGNORE INTO serial_counter VALUES (1, 1000)")
-        # Migrate: add profile column if missing (for existing DBs)
         try:
-            conn.execute("ALTER TABLE certificates ADD COLUMN profile TEXT DEFAULT 'default'")
-        except Exception:
-            pass
-        conn.commit()
-        conn.close()
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS certificates (
+                    serial      INTEGER PRIMARY KEY,
+                    subject     TEXT NOT NULL,
+                    not_before  TEXT NOT NULL,
+                    not_after   TEXT NOT NULL,
+                    der         BLOB NOT NULL,
+                    revoked     INTEGER DEFAULT 0,
+                    revoked_at  TEXT,
+                    reason      INTEGER,
+                    profile     TEXT DEFAULT 'default'
+                )
+            """)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS serial_counter (
+                    id    INTEGER PRIMARY KEY,
+                    value INTEGER NOT NULL
+                )
+            """)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS crl_base (
+                    id          INTEGER PRIMARY KEY,
+                    issued_at   TEXT NOT NULL,
+                    this_update TEXT NOT NULL,
+                    next_update TEXT NOT NULL,
+                    der         BLOB NOT NULL
+                )
+            """)
+            conn.execute("INSERT OR IGNORE INTO serial_counter VALUES (1, 1000)")
+            # Migrate: add profile column if missing (for existing DBs)
+            try:
+                conn.execute("ALTER TABLE certificates ADD COLUMN profile TEXT DEFAULT 'default'")
+            except Exception:
+                pass
+            conn.commit()
+        finally:
+            conn.close()
+        # Create key_archive table (also idempotent)
+        self._init_key_archive_table()
 
     _serial_lock = threading.Lock()
 
@@ -4123,7 +4126,7 @@ def start_bootstrap_server(host: str, port: int, ca: CertificateAuthority, cmp_h
 
 def main():
     parser = argparse.ArgumentParser(description="PKI Server with CMPv2 Support + mTLS")
-    parser.add_argument("--host", default="0.0.0.0", help="Bind address (default: 0.0.0.0)")
+    parser.add_argument("--host", default="127.0.0.1", help="Bind address (default: 127.0.0.1)")
     parser.add_argument("--port", type=int, default=8080, help="Port (default: 8080)")
     parser.add_argument("--ca-dir", default="./ca", help="CA data directory (default: ./ca)")
     parser.add_argument("--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"])
@@ -4627,6 +4630,8 @@ def main():
                 scep_base_url=_scep_base,
                 est_base_url=_est_base,
                 ocsp_base_url=_ocsp_base,
+                admin_api_key=admin_api_key,
+                admin_allowed_cns=admin_allowed_cns,
             )
 
     acme_line = f"http://{args.host}:{args.acme_port}/acme/directory" if (args.acme_port and HAS_ACME) else "disabled"
@@ -4638,55 +4643,55 @@ def main():
     rl_info   = f"{args.rate_limit}/min per IP" if getattr(args,"rate_limit",0) > 0 else "disabled"
     audit_info = "ca/audit.db" if getattr(args,"audit",True) else "disabled"
     boot_line = f"http://{args.host}:{args.bootstrap_port}/bootstrap?cn=<n>" if args.bootstrap_port else "disabled"
-
+    space = " "
     print(f"""
 ╔══════════════════════════════════════════════════════════════════╗
-║         PyPKI CMPv2 + ACME Server (RFC 4210 / RFC 8555 + TLS)  ║
+║         PyPKI CMPv2 + ACME Server (RFC 4210 / RFC 8555 + TLS)    ║
 ╠══════════════════════════════════════════════════════════════════╣
-║  Listening (CMPv2): {scheme}://{args.host}:{args.port:<32}║
-║  Listening (ACME) : {acme_line:<47}║
-║  CA Dir           : {args.ca_dir:<47}║
-║  TLS Mode         : {tls_mode_label:<47}║
-║  Bootstrap        : {boot_line:<47}║
-║  Listening (SCEP) : {scep_line:<47}║
-║  Listening (EST)  : {est_line:<47}║
-║  Listening (OCSP) : {ocsp_line:<47}║
-║  Web Dashboard    : {web_line:<47}║
-║  CMP Well-Known   : {cmp_wk:<47}║
-║  Rate Limiting    : {rl_info:<47}║
-║  Audit Log        : {audit_info:<47}║
-║  Metrics          : {scheme}://{args.host}:{args.port}/metrics                      ║
-║  Expiry Monitor   : {str(_expiry_days)+"d" if _expiry_days else "disabled":<47}║
+║  Listening (CMPv2): {scheme}://{args.host}:{args.port:<28}║
+║  Listening (ACME) : {acme_line:<45}║
+║  CA Dir           : {args.ca_dir:<45}║
+║  TLS Mode         : {tls_mode_label:<45}║
+║  Bootstrap        : {boot_line:<45}║
+║  Listening (SCEP) : {scep_line:<45}║
+║  Listening (EST)  : {est_line:<45}║
+║  Listening (OCSP) : {ocsp_line:<45}║
+║  Web Dashboard    : {web_line:<45}║
+║  CMP Well-Known   : {cmp_wk:<45}║
+║  Rate Limiting    : {rl_info:<45}║
+║  Audit Log        : {audit_info:<45}║
+║  Metrics          : {scheme}://{args.host}:{args.port}/metrics                ║
+║  Expiry Monitor   : {str(_expiry_days)+"d" if _expiry_days else "disabled":<45}║
 ╠══════════════════════════════════════════════════════════════════╣
-║  Validity periods (change live: PATCH /config)                  ║
+║  Validity periods (change live: PATCH /config)                   ║
 ║    End-entity   : {config.end_entity_days:<3} days                                       ║
 ║    Client cert  : {config.client_cert_days:<3} days                                       ║
 ║    TLS server   : {config.tls_server_days:<3} days                                       ║
 ║    CA cert      : {config.ca_days:<4} days                                      ║
 ╠══════════════════════════════════════════════════════════════════╣
-║  CMPv2 Endpoint  : POST {scheme}://{args.host}:{args.port}/           ║
-║  ACME Directory  : GET  {acme_line:<40}║
-║  SCEP Endpoint   : {scep_line:<48}║
-║  Config          : GET/PATCH {scheme}://{args.host}:{args.port}/config ║
-║  CA Certificate  : GET  {scheme}://{args.host}:{args.port}/ca/cert.pem ║
-║  CRL             : GET  {scheme}://{args.host}:{args.port}/ca/crl      ║
-║  Health Check    : GET  {scheme}://{args.host}:{args.port}/health      ║
+║  CMPv2 Endpoint  : POST {scheme}://{args.host}:{args.port}/{space:<8}           ║
+║  ACME Directory  : GET  {acme_line:<41}║
+║  SCEP Endpoint   : {scep_line:<46}║
+║  Config          : GET/PATCH {scheme}://{args.host}:{args.port}/config{space:<8}║
+║  CA Certificate  : GET  {scheme}://{args.host}:{args.port}/ca/cert.pem{space:<7} ║
+║  CRL             : GET  {scheme}://{args.host}:{args.port}/ca/crl{space:<13}║
+║  Health Check    : GET  {scheme}://{args.host}:{args.port}/health{space:<13}║
 ╠══════════════════════════════════════════════════════════════════╣
-║  Supported CMPv2/CMPv3 operations:                              ║
-║    ir, cr, kur, rr, certConf, genm, p10cr (CMPv2 / RFC 4210)   ║
-║    pollReq/pollRep - extended polling (CMPv3 / RFC 9480)        ║
-║    genm GetCACerts, GetRootCACertUpdate, GetCertReqTemplate     ║
-║    Well-known URI: POST/GET /.well-known/cmp[/p/<label>]        ║
+║  Supported CMPv2/CMPv3 operations:                               ║
+║    ir, cr, kur, rr, certConf, genm, p10cr (CMPv2 / RFC 4210)     ║
+║    pollReq/pollRep - extended polling (CMPv3 / RFC 9480)         ║
+║    genm GetCACerts, GetRootCACertUpdate, GetCertReqTemplate      ║
+║    Well-known URI: POST/GET /.well-known/cmp[/p/<label>]         ║
 ╠══════════════════════════════════════════════════════════════════╣
-║  Supported ACME operations (RFC 8555 + RFC 9608):              ║
-║    new-account, new-order, http-01, dns-01, finalize, revoke   ║
-║    noRevAvail (RFC 9608) auto-applied to short-lived certs     ║
+║  Supported ACME operations (RFC 8555 + RFC 9608):                ║
+║    new-account, new-order, http-01, dns-01, finalize, revoke     ║
+║    noRevAvail (RFC 9608) auto-applied to short-lived certs       ║
 ╠══════════════════════════════════════════════════════════════════╣
-║  Supported SCEP operations (RFC 8894):                          ║
-║    GetCACaps, GetCACert, PKCSReq, CertPoll, GetCert, GetCRL    ║
+║  Supported SCEP operations (RFC 8894):                           ║
+║    GetCACaps, GetCACert, PKCSReq, CertPoll, GetCert, GetCRL      ║
 ╠══════════════════════════════════════════════════════════════════╣
-║  Supported EST operations (RFC 7030):                           ║
-║    cacerts, simpleenroll, simplereenroll, csrattrs, serverkeygen║
+║  Supported EST operations (RFC 7030):                            ║
+║    cacerts, simpleenroll, simplereenroll, csrattrs, serverkeygen ║
 ╚══════════════════════════════════════════════════════════════════╝
 """)
 

@@ -21,16 +21,24 @@ All state comes from the shared CertificateAuthority and AuditLog objects.
 """
 
 import datetime
+import html
+import hmac
 import http.server
 import json
 import logging
 import os
+import re
 import threading
 import urllib.parse
 from pathlib import Path
 from typing import Optional
 
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.serialization import Encoding
+
 logger = logging.getLogger("web-ui")
+
+__version__ = "0.9.0"
 
 
 # ---------------------------------------------------------------------------
@@ -145,7 +153,7 @@ def _page(title: str, body: str, active: str = "") -> str:
 <body>
   <div class="topbar">
     <h1>🔐 PyPKI Certificate Authority</h1>
-    <span class="badge">v0.9.0</span>
+    <span class="badge">v{__version__}</span>
   </div>
   <nav class="nav">{nav}</nav>
   <div class="container">{body}</div>
@@ -164,11 +172,48 @@ class WebUIHandler(http.server.BaseHTTPRequestHandler):
     ca: "CertificateAuthority" = None
     audit_log: "AuditLog" = None
     rate_limiter: "RateLimiter" = None
+    admin_api_key: Optional[str] = None   # If set, required for mutating endpoints
+    admin_allowed_cns: Optional[list] = None  # mTLS CN allowlist
     cmp_base_url: str = "http://localhost:8080"
     acme_base_url: str = ""
     scep_base_url: str = ""
     est_base_url: str = ""
     ocsp_base_url: str = ""
+
+    # POST endpoints that require admin auth
+    _ADMIN_POST_PATHS = {"/api/revoke", "/api/renew", "/api/config", "/api/issue-sub-ca"}
+
+    def _require_admin(self) -> bool:
+        """Check admin auth. Returns True if allowed, False if denied (sends 403)."""
+        if not self.admin_api_key and not self.admin_allowed_cns:
+            return True  # No auth configured — allow (backward compat)
+
+        # Check API key header
+        if self.admin_api_key:
+            provided = self.headers.get("X-Admin-Key", "")
+            if provided and hmac.compare_digest(provided, self.admin_api_key):
+                return True
+
+        # Check mTLS client CN allowlist
+        if self.admin_allowed_cns:
+            # Try to extract CN from TLS peer cert if available
+            try:
+                peer_cert = self.connection.getpeercert()
+                if peer_cert:
+                    for rdn in peer_cert.get("subject", ()):
+                        for attr_type, attr_value in rdn:
+                            if attr_type == "commonName" and attr_value in self.admin_allowed_cns:
+                                return True
+            except Exception:
+                pass
+
+        body = json.dumps({"error": "admin authentication required"}).encode()
+        self.send_response(403)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+        return False
 
     def log_message(self, fmt, *args):
         logger.debug(f"WebUI {self.client_address[0]} - {fmt % args}")
@@ -176,7 +221,43 @@ class WebUIHandler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
         path = self.path.split("?")[0].rstrip("/") or "/"
         try:
-            if path == "/" or path == "/dashboard":
+            # Dynamic routes: /api/certs/<serial>/<fmt>
+            if path.startswith("/api/certs/"):
+                parts = path.split("/")
+                if len(parts) == 5:
+                    try:
+                        serial = int(parts[3])
+                        fmt = parts[4]
+                        if fmt in ("pem", "p12"):
+                            self.do_GET_api_cert(serial, fmt)
+                            return
+                    except (ValueError, IndexError):
+                        pass
+                # Fall through to 404
+
+            # CA certificate and CRL downloads
+            elif path in ("/ca/cert.pem", "/ca/cert"):
+                data = self.ca.ca_cert_pem
+                self.send_response(200)
+                self.send_header("Content-Type", "application/x-pem-file")
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+                return
+            elif path == "/ca/crl":
+                try:
+                    data = self.ca.generate_crl()
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/pkix-crl")
+                    self.send_header("Content-Length", str(len(data)))
+                    self.end_headers()
+                    self.wfile.write(data)
+                except Exception as e:
+                    self._send_json({"error": str(e)}, 500)
+                return
+
+            # Static pages
+            elif path == "/" or path == "/dashboard":
                 self._dashboard()
             elif path == "/certs":
                 self._certs_page()
@@ -210,12 +291,37 @@ class WebUIHandler(http.server.BaseHTTPRequestHandler):
 
     def do_POST(self):
         path = self.path.split("?")[0].rstrip("/")
+        self._handle_write(path)
+
+    def do_PATCH(self):
+        path = self.path.split("?")[0].rstrip("/")
+        self._handle_write(path)
+
+    def _handle_write(self, path: str):
         length = int(self.headers.get("Content-Length", 0))
         body = self.rfile.read(length)
         try:
             data = json.loads(body) if body else {}
-        except Exception:
-            data = {}
+        except json.JSONDecodeError as e:
+            self._send_json({"error": f"invalid JSON: {e}"}, 400)
+            return
+
+        # Require admin auth for mutating endpoints
+        if path in self._ADMIN_POST_PATHS:
+            # CSRF check: verify Origin or Referer header for browser requests
+            origin = self.headers.get("Origin", "")
+            referer = self.headers.get("Referer", "")
+            content_type = self.headers.get("Content-Type", "")
+            # Allow requests with API key (non-browser clients)
+            has_api_key = bool(self.headers.get("X-Admin-Key", ""))
+            if not has_api_key and "application/json" in content_type:
+                # Browser fetch() with JSON — check Origin
+                if origin and not origin.startswith(f"http://{self.headers.get('Host', '')}") and \
+                   not origin.startswith(f"https://{self.headers.get('Host', '')}"):
+                    self._send_json({"error": "CSRF check failed: invalid Origin"}, 403)
+                    return
+            if not self._require_admin():
+                return
 
         try:
             if path == "/api/revoke":
@@ -255,7 +361,7 @@ class WebUIHandler(http.server.BaseHTTPRequestHandler):
   <div class="stat-box"><div class="val" style="color:#f59e0b">{expired}</div><div class="lbl">Expired</div></div>
 </div>"""
 
-        ca_subject = self.ca.ca_cert.subject.rfc4514_string()
+        ca_subject = html.escape(self.ca.ca_cert.subject.rfc4514_string())
         ca_expires = self.ca.ca_cert.not_valid_after_utc.strftime("%Y-%m-%d")
         ca_serial  = self.ca.ca_cert.serial_number
 
@@ -305,11 +411,12 @@ class WebUIHandler(http.server.BaseHTTPRequestHandler):
             else:
                 status = '<span class="badge-ok">Active</span>'
                 action = f'<button class="btn btn-danger" onclick="revoke({c["serial"]})">Revoke</button>'
+            subj = html.escape(c["subject"])
             rows += f"""<tr>
               <td><code>{c["serial"]}</code></td>
-              <td>{c["subject"]}</td>
-              <td>{c["not_before"][:10]}</td>
-              <td>{c["not_after"][:10]}</td>
+              <td>{subj}</td>
+              <td>{html.escape(c["not_before"][:10])}</td>
+              <td>{html.escape(c["not_after"][:10])}</td>
               <td>{status}</td>
               <td>
                 <a href="/api/certs/{c["serial"]}/pem" class="btn btn-secondary">PEM</a>
@@ -404,7 +511,7 @@ class WebUIHandler(http.server.BaseHTTPRequestHandler):
 
     def _config_page(self):
         cfg = self.ca.config.as_dict() if self.ca.config else {}
-        cfg_json = json.dumps(cfg, indent=2)
+        cfg_json = html.escape(json.dumps(cfg, indent=2))
         body = f"""
 <div class="card">
   <div class="card-head"><h2>Live Configuration</h2></div>
@@ -414,7 +521,7 @@ class WebUIHandler(http.server.BaseHTTPRequestHandler):
     <h3 style="font-size:.95rem;margin-bottom:12px">Update Validity Periods</h3>
     <div class="grid-2">
       <div class="form-row"><label>End-entity cert days</label>
-        <input id="ee_days" type="number" value="{cfg.get('validity',{{}}).get('end_entity_days',365)}">
+        <input id="ee_days" type="number" value="{cfg.get('validity',{}).get('end_entity_days',365)}">
       </div>
     </div>
     <button class="btn btn-primary" onclick="patchConfig()">Apply</button>
@@ -430,7 +537,7 @@ class WebUIHandler(http.server.BaseHTTPRequestHandler):
 
         rows = ""
         for e in events:
-            rows += f"<tr><td>{e.get('ts','')[:19]}</td><td>{e.get('event','')}</td><td>{e.get('detail','')}</td><td>{e.get('ip','')}</td></tr>"
+            rows += f"<tr><td>{html.escape(e.get('ts','')[:19])}</td><td>{html.escape(e.get('event',''))}</td><td>{html.escape(e.get('detail',''))}</td><td>{html.escape(e.get('ip',''))}</td></tr>"
 
         body = f"""
 <div class="card">
@@ -472,8 +579,8 @@ class WebUIHandler(http.server.BaseHTTPRequestHandler):
             action = f'<button class="btn btn-primary" onclick="renewCert({c["serial"]})">Renew</button>'
             rows += f"""<tr>
               <td><code>{c["serial"]}</code></td>
-              <td>{c["subject"]}</td>
-              <td>{c.get("not_after","")[:10]}</td>
+              <td>{html.escape(str(c["subject"]))}</td>
+              <td>{html.escape(c.get("not_after","")[:10])}</td>
               <td style="color:{color};font-weight:600">{days}d</td>
               <td>{action}</td>
             </tr>"""
@@ -517,7 +624,7 @@ function renewCert(serial) {
     <p style="color:#6b7280;font-size:.85rem;margin-bottom:12px">
       Compatible with <code>prometheus.io/scrape</code>. Scrape endpoint: <code>/api/metrics</code>
     </p>
-    <pre>{raw}</pre>
+    <pre>{html.escape(raw)}</pre>
   </div>
 </div>"""
         self._send_html(200, _page("Prometheus Metrics", body, "metrics-ui"))
@@ -536,7 +643,7 @@ function renewCert(serial) {
         <tr><td>POST</td><td><code>/api/revoke</code></td><td>Revoke cert — body: {"serial": N, "reason": 0}</td></tr>
         <tr><td>POST</td><td><code>/api/renew</code></td><td>Renew cert — body: {"serial": N}</td></tr>
         <tr><td>GET</td><td><code>/api/config</code></td><td>View current config</td></tr>
-        <tr><td>POST</td><td><code>/api/config</code></td><td>Patch config — body: {"validity": {...}}</td></tr>
+        <tr><td>PATCH</td><td><code>/api/config</code></td><td>Update config — body: {"validity": {...}}</td></tr>
         <tr><td>POST</td><td><code>/api/issue-sub-ca</code></td><td>Issue sub-CA cert — body: {"cn": "...", "validity_days": N}</td></tr>
         <tr><td>GET</td><td><code>/api/audit</code></td><td>Audit log (JSON)</td></tr>
         <tr><td>GET</td><td><code>/api/metrics</code></td><td>Prometheus metrics (text/plain)</td></tr>
@@ -562,7 +669,6 @@ function renewCert(serial) {
         cert = None
         try:
             from cryptography import x509 as _x509
-            from cryptography.hazmat.primitives.serialization import Encoding as _Enc
             cert = _x509.load_der_x509_certificate(der)
         except Exception:
             pass
@@ -598,6 +704,9 @@ function renewCert(serial) {
                 self.wfile.write(p12)
             except Exception as e:
                 self._send_json({"error": f"PKCS#12 generation failed: {e}"}, 500)
+
+        else:
+            self._send_json({"error": f"unknown format: {fmt}. Use 'pem' or 'p12'."}, 400)
 
     def _api_renew(self, data: dict):
         serial = data.get("serial")
@@ -662,13 +771,14 @@ function renewCert(serial) {
 
     def _api_issue_sub_ca(self, data: dict):
         cn = data.get("cn", "Intermediate CA")
+        # Sanitize CN — only allow safe characters
+        cn = re.sub(r'[^a-zA-Z0-9._\- ]', '_', cn)[:64]
         validity_days = int(data.get("validity_days", 1825))
         try:
             sub_ca_key, sub_ca_cert = self.ca.issue_sub_ca(cn, validity_days)
-            from cryptography.hazmat.primitives.serialization import Encoding as _Enc
-            cert_pem = sub_ca_cert.public_bytes(_Enc.PEM).decode()
+            cert_pem = sub_ca_cert.public_bytes(Encoding.PEM).decode()
             key_pem = sub_ca_key.private_bytes(
-                _Enc.PEM,
+                Encoding.PEM,
                 serialization.PrivateFormat.TraditionalOpenSSL,
                 serialization.NoEncryption()
             ).decode()
@@ -693,11 +803,14 @@ function renewCert(serial) {
     # Helpers
     # ------------------------------------------------------------------
 
-    def _send_html(self, code: int, html: str):
-        body = html.encode()
+    def _send_html(self, code: int, html_content: str):
+        body = html_content.encode()
         self.send_response(code)
         self.send_header("Content-Type", "text/html; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
+        self.send_header("X-Frame-Options", "DENY")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Cache-Control", "no-store")
         self.end_headers()
         self.wfile.write(body)
 
@@ -706,54 +819,10 @@ function renewCert(serial) {
         self.send_response(code)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Cache-Control", "no-store")
         self.end_headers()
         self.wfile.write(body)
-
-
-# ---------------------------------------------------------------------------
-# Route /api/certs/<serial>/<fmt> in do_GET
-# ---------------------------------------------------------------------------
-
-_orig_do_GET = WebUIHandler.do_GET
-
-def _patched_do_GET(self):
-    path = self.path.split("?")[0].rstrip("/")
-    # Handle /api/certs/<serial>/pem and /api/certs/<serial>/p12
-    if path.startswith("/api/certs/"):
-        parts = path.split("/")
-        # ['', 'api', 'certs', '<serial>', '<fmt>']
-        if len(parts) == 5:
-            try:
-                serial = int(parts[3])
-                fmt = parts[4]
-                if fmt in ("pem", "p12"):
-                    self.do_GET_api_cert(serial, fmt)
-                    return
-            except (ValueError, IndexError):
-                pass
-    # Handle /ca/cert.pem and /ca/crl from main CA handler
-    elif path in ("/ca/cert.pem", "/ca/cert"):
-        data = self.ca.ca_cert_pem
-        self.send_response(200)
-        self.send_header("Content-Type", "application/x-pem-file")
-        self.send_header("Content-Length", str(len(data)))
-        self.end_headers()
-        self.wfile.write(data)
-        return
-    elif path == "/ca/crl":
-        try:
-            data = self.ca.generate_crl()
-            self.send_response(200)
-            self.send_header("Content-Type", "application/pkix-crl")
-            self.send_header("Content-Length", str(len(data)))
-            self.end_headers()
-            self.wfile.write(data)
-        except Exception as e:
-            self._send_json({"error": str(e)}, 500)
-        return
-    _orig_do_GET(self)
-
-WebUIHandler.do_GET = _patched_do_GET
 
 
 # ---------------------------------------------------------------------------
@@ -771,6 +840,8 @@ def start_web_ui(
     scep_base_url: str = "",
     est_base_url: str = "",
     ocsp_base_url: str = "",
+    admin_api_key: Optional[str] = None,
+    admin_allowed_cns: Optional[list] = None,
 ) -> http.server.HTTPServer:
     """Start the web UI in a background daemon thread."""
 
@@ -785,6 +856,8 @@ def start_web_ui(
     BoundWebUIHandler.scep_base_url = scep_base_url
     BoundWebUIHandler.est_base_url = est_base_url
     BoundWebUIHandler.ocsp_base_url = ocsp_base_url
+    BoundWebUIHandler.admin_api_key = admin_api_key
+    BoundWebUIHandler.admin_allowed_cns = admin_allowed_cns
 
     import http.server as _hs
 

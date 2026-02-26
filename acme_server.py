@@ -243,92 +243,99 @@ class ACMEDatabase:
 
     def _init(self):
         conn = self._conn()
-        conn.executescript("""
-            CREATE TABLE IF NOT EXISTS nonces (
-                value TEXT PRIMARY KEY,
-                created_at REAL NOT NULL
-            );
+        try:
+            conn.executescript("""
+                CREATE TABLE IF NOT EXISTS nonces (
+                    value TEXT PRIMARY KEY,
+                    created_at REAL NOT NULL
+                );
 
-            CREATE TABLE IF NOT EXISTS accounts (
-                kid         TEXT PRIMARY KEY,
-                jwk_json    TEXT NOT NULL,
-                thumbprint  TEXT NOT NULL,
-                status      TEXT NOT NULL DEFAULT 'valid',
-                contact     TEXT,
-                created_at  REAL NOT NULL
-            );
+                CREATE TABLE IF NOT EXISTS accounts (
+                    kid         TEXT PRIMARY KEY,
+                    jwk_json    TEXT NOT NULL,
+                    thumbprint  TEXT NOT NULL,
+                    status      TEXT NOT NULL DEFAULT 'valid',
+                    contact     TEXT,
+                    created_at  REAL NOT NULL
+                );
 
-            CREATE TABLE IF NOT EXISTS orders (
-                id          TEXT PRIMARY KEY,
-                account_kid TEXT NOT NULL,
-                status      TEXT NOT NULL DEFAULT 'pending',
-                identifiers TEXT NOT NULL,
-                not_before  TEXT,
-                not_after   TEXT,
-                cert_id     TEXT,
-                created_at  REAL NOT NULL,
-                expires_at  REAL NOT NULL
-            );
+                CREATE TABLE IF NOT EXISTS orders (
+                    id          TEXT PRIMARY KEY,
+                    account_kid TEXT NOT NULL,
+                    status      TEXT NOT NULL DEFAULT 'pending',
+                    identifiers TEXT NOT NULL,
+                    not_before  TEXT,
+                    not_after   TEXT,
+                    cert_id     TEXT,
+                    created_at  REAL NOT NULL,
+                    expires_at  REAL NOT NULL
+                );
 
-            CREATE TABLE IF NOT EXISTS authorizations (
-                id          TEXT PRIMARY KEY,
-                order_id    TEXT NOT NULL,
-                identifier  TEXT NOT NULL,
-                status      TEXT NOT NULL DEFAULT 'pending',
-                created_at  REAL NOT NULL,
-                expires_at  REAL NOT NULL
-            );
+                CREATE TABLE IF NOT EXISTS authorizations (
+                    id          TEXT PRIMARY KEY,
+                    order_id    TEXT NOT NULL,
+                    identifier  TEXT NOT NULL,
+                    status      TEXT NOT NULL DEFAULT 'pending',
+                    created_at  REAL NOT NULL,
+                    expires_at  REAL NOT NULL
+                );
 
-            CREATE TABLE IF NOT EXISTS challenges (
-                id          TEXT PRIMARY KEY,
-                auth_id     TEXT NOT NULL,
-                type        TEXT NOT NULL,
-                token       TEXT NOT NULL,
-                status      TEXT NOT NULL DEFAULT 'pending',
-                validated_at REAL,
-                error       TEXT
-            );
+                CREATE TABLE IF NOT EXISTS challenges (
+                    id          TEXT PRIMARY KEY,
+                    auth_id     TEXT NOT NULL,
+                    type        TEXT NOT NULL,
+                    token       TEXT NOT NULL,
+                    status      TEXT NOT NULL DEFAULT 'pending',
+                    validated_at REAL,
+                    error       TEXT
+                );
 
-            CREATE TABLE IF NOT EXISTS certificates (
-                id          TEXT PRIMARY KEY,
-                order_id    TEXT NOT NULL,
-                pem_chain   TEXT NOT NULL,
-                serial      INTEGER,
-                created_at  REAL NOT NULL
-            );
-        """)
-        conn.commit()
-        conn.close()
+                CREATE TABLE IF NOT EXISTS certificates (
+                    id          TEXT PRIMARY KEY,
+                    order_id    TEXT NOT NULL,
+                    pem_chain   TEXT NOT NULL,
+                    serial      INTEGER,
+                    created_at  REAL NOT NULL
+                );
+            """)
+            conn.commit()
+        finally:
+            conn.close()
 
     # -- Nonces --
 
     def create_nonce(self) -> str:
         nonce = b64url_encode(os.urandom(16))
         conn = self._conn()
-        conn.execute("INSERT INTO nonces VALUES (?, ?)", (nonce, time.time()))
-        conn.commit()
-        conn.close()
+        try:
+            conn.execute("INSERT INTO nonces VALUES (?, ?)", (nonce, time.time()))
+            conn.commit()
+        finally:
+            conn.close()
         return nonce
 
     def consume_nonce(self, nonce: str) -> bool:
         """Returns True if nonce was valid and is now consumed."""
         with self._lock:
             conn = self._conn()
-            row = conn.execute("SELECT value FROM nonces WHERE value=?", (nonce,)).fetchone()
-            if not row:
+            try:
+                row = conn.execute("SELECT value FROM nonces WHERE value=?", (nonce,)).fetchone()
+                if not row:
+                    return False
+                conn.execute("DELETE FROM nonces WHERE value=?", (nonce,))
+                conn.commit()
+            finally:
                 conn.close()
-                return False
-            conn.execute("DELETE FROM nonces WHERE value=?", (nonce,))
-            conn.commit()
-            conn.close()
             return True
 
     def purge_old_nonces(self, max_age_secs: int = 3600):
         cutoff = time.time() - max_age_secs
         conn = self._conn()
-        conn.execute("DELETE FROM nonces WHERE created_at < ?", (cutoff,))
-        conn.commit()
-        conn.close()
+        try:
+            conn.execute("DELETE FROM nonces WHERE created_at < ?", (cutoff,))
+            conn.commit()
+        finally:
+            conn.close()
 
     # -- Accounts --
 
@@ -337,41 +344,48 @@ class ACMEDatabase:
         thumb = jwk_thumbprint(jwk)
         kid = f"acct-{thumb[:16]}"
         conn = self._conn()
-        row = conn.execute("SELECT * FROM accounts WHERE kid=?", (kid,)).fetchone()
-        if row:
+        try:
+            row = conn.execute("SELECT * FROM accounts WHERE kid=?", (kid,)).fetchone()
+            if row:
+                return False, dict(row)
+            conn.execute(
+                "INSERT INTO accounts VALUES (?,?,?,?,?,?)",
+                (kid, json.dumps(jwk), thumb, "valid",
+                 json.dumps(contact) if contact else None, time.time())
+            )
+            conn.commit()
+            account = dict(conn.execute("SELECT * FROM accounts WHERE kid=?", (kid,)).fetchone())
+        finally:
             conn.close()
-            return False, dict(row)
-        conn.execute(
-            "INSERT INTO accounts VALUES (?,?,?,?,?,?)",
-            (kid, json.dumps(jwk), thumb, "valid",
-             json.dumps(contact) if contact else None, time.time())
-        )
-        conn.commit()
-        account = dict(conn.execute("SELECT * FROM accounts WHERE kid=?", (kid,)).fetchone())
-        conn.close()
         return True, account
 
     def get_account(self, kid: str) -> Optional[dict]:
         conn = self._conn()
-        row = conn.execute("SELECT * FROM accounts WHERE kid=?", (kid,)).fetchone()
-        conn.close()
+        try:
+            row = conn.execute("SELECT * FROM accounts WHERE kid=?", (kid,)).fetchone()
+        finally:
+            conn.close()
         return dict(row) if row else None
 
     def get_account_by_thumbprint(self, thumb: str) -> Optional[dict]:
         conn = self._conn()
-        row = conn.execute("SELECT * FROM accounts WHERE thumbprint=?", (thumb,)).fetchone()
-        conn.close()
+        try:
+            row = conn.execute("SELECT * FROM accounts WHERE thumbprint=?", (thumb,)).fetchone()
+        finally:
+            conn.close()
         return dict(row) if row else None
 
     def update_account_key(self, kid: str, new_jwk: dict, new_thumbprint: str):
         """Replace the JWK and thumbprint for an existing account (key rollover)."""
         conn = self._conn()
-        conn.execute(
-            "UPDATE accounts SET jwk_json=?, thumbprint=? WHERE kid=?",
-            (json.dumps(new_jwk), new_thumbprint, kid)
-        )
-        conn.commit()
-        conn.close()
+        try:
+            conn.execute(
+                "UPDATE accounts SET jwk_json=?, thumbprint=? WHERE kid=?",
+                (json.dumps(new_jwk), new_thumbprint, kid)
+            )
+            conn.commit()
+        finally:
+            conn.close()
 
     # -- Orders --
 
@@ -380,41 +394,45 @@ class ACMEDatabase:
         now = time.time()
         expires = now + 86400  # 24 hours
         conn = self._conn()
-        conn.execute(
-            "INSERT INTO orders VALUES (?,?,?,?,?,?,?,?,?)",
-            (order_id, account_kid, "pending",
-             json.dumps(identifiers), None, None, None, now, expires)
-        )
-        conn.commit()
-
-        # Create authorizations for each identifier
-        auth_ids = []
-        for ident in identifiers:
-            auth_id = b64url_encode(os.urandom(12))
+        try:
             conn.execute(
-                "INSERT INTO authorizations VALUES (?,?,?,?,?,?)",
-                (auth_id, order_id, json.dumps(ident), "pending", now, expires)
+                "INSERT INTO orders VALUES (?,?,?,?,?,?,?,?,?)",
+                (order_id, account_kid, "pending",
+                 json.dumps(identifiers), None, None, None, now, expires)
             )
-            # Create http-01, dns-01, and tls-alpn-01 challenges for each authorization
-            for ctype in ("http-01", "dns-01", "tls-alpn-01"):
-                chall_id = b64url_encode(os.urandom(12))
-                token = b64url_encode(os.urandom(32))
-                conn.execute(
-                    "INSERT INTO challenges VALUES (?,?,?,?,?,?,?)",
-                    (chall_id, auth_id, ctype, token, "pending", None, None)
-                )
-            auth_ids.append(auth_id)
+            conn.commit()
 
-        conn.commit()
-        order = dict(conn.execute("SELECT * FROM orders WHERE id=?", (order_id,)).fetchone())
-        conn.close()
+            # Create authorizations for each identifier
+            auth_ids = []
+            for ident in identifiers:
+                auth_id = b64url_encode(os.urandom(12))
+                conn.execute(
+                    "INSERT INTO authorizations VALUES (?,?,?,?,?,?)",
+                    (auth_id, order_id, json.dumps(ident), "pending", now, expires)
+                )
+                # Create http-01, dns-01, and tls-alpn-01 challenges for each authorization
+                for ctype in ("http-01", "dns-01", "tls-alpn-01"):
+                    chall_id = b64url_encode(os.urandom(12))
+                    token = b64url_encode(os.urandom(32))
+                    conn.execute(
+                        "INSERT INTO challenges VALUES (?,?,?,?,?,?,?)",
+                        (chall_id, auth_id, ctype, token, "pending", None, None)
+                    )
+                auth_ids.append(auth_id)
+
+            conn.commit()
+            order = dict(conn.execute("SELECT * FROM orders WHERE id=?", (order_id,)).fetchone())
+        finally:
+            conn.close()
         order["auth_ids"] = auth_ids
         return order
 
     def get_order(self, order_id: str) -> Optional[dict]:
         conn = self._conn()
-        row = conn.execute("SELECT * FROM orders WHERE id=?", (order_id,)).fetchone()
-        conn.close()
+        try:
+            row = conn.execute("SELECT * FROM orders WHERE id=?", (order_id,)).fetchone()
+        finally:
+            conn.close()
         return dict(row) if row else None
 
     def update_order(self, order_id: str, **kwargs):
@@ -423,24 +441,30 @@ class ACMEDatabase:
         sets = ", ".join(f"{k}=?" for k in kwargs)
         vals = list(kwargs.values()) + [order_id]
         conn = self._conn()
-        conn.execute(f"UPDATE orders SET {sets} WHERE id=?", vals)
-        conn.commit()
-        conn.close()
+        try:
+            conn.execute(f"UPDATE orders SET {sets} WHERE id=?", vals)
+            conn.commit()
+        finally:
+            conn.close()
 
     def get_order_authorizations(self, order_id: str) -> list:
         conn = self._conn()
-        rows = conn.execute(
-            "SELECT * FROM authorizations WHERE order_id=?", (order_id,)
-        ).fetchall()
-        conn.close()
+        try:
+            rows = conn.execute(
+                "SELECT * FROM authorizations WHERE order_id=?", (order_id,)
+            ).fetchall()
+        finally:
+            conn.close()
         return [dict(r) for r in rows]
 
     # -- Authorizations --
 
     def get_authorization(self, auth_id: str) -> Optional[dict]:
         conn = self._conn()
-        row = conn.execute("SELECT * FROM authorizations WHERE id=?", (auth_id,)).fetchone()
-        conn.close()
+        try:
+            row = conn.execute("SELECT * FROM authorizations WHERE id=?", (auth_id,)).fetchone()
+        finally:
+            conn.close()
         return dict(row) if row else None
 
     def update_authorization(self, auth_id: str, **kwargs):
@@ -449,24 +473,30 @@ class ACMEDatabase:
         sets = ", ".join(f"{k}=?" for k in kwargs)
         vals = list(kwargs.values()) + [auth_id]
         conn = self._conn()
-        conn.execute(f"UPDATE authorizations SET {sets} WHERE id=?", vals)
-        conn.commit()
-        conn.close()
+        try:
+            conn.execute(f"UPDATE authorizations SET {sets} WHERE id=?", vals)
+            conn.commit()
+        finally:
+            conn.close()
 
     # -- Challenges --
 
     def get_challenge(self, chall_id: str) -> Optional[dict]:
         conn = self._conn()
-        row = conn.execute("SELECT * FROM challenges WHERE id=?", (chall_id,)).fetchone()
-        conn.close()
+        try:
+            row = conn.execute("SELECT * FROM challenges WHERE id=?", (chall_id,)).fetchone()
+        finally:
+            conn.close()
         return dict(row) if row else None
 
     def get_auth_challenges(self, auth_id: str) -> list:
         conn = self._conn()
-        rows = conn.execute(
-            "SELECT * FROM challenges WHERE auth_id=?", (auth_id,)
-        ).fetchall()
-        conn.close()
+        try:
+            rows = conn.execute(
+                "SELECT * FROM challenges WHERE auth_id=?", (auth_id,)
+            ).fetchall()
+        finally:
+            conn.close()
         return [dict(r) for r in rows]
 
     def update_challenge(self, chall_id: str, **kwargs):
@@ -475,27 +505,33 @@ class ACMEDatabase:
         sets = ", ".join(f"{k}=?" for k in kwargs)
         vals = list(kwargs.values()) + [chall_id]
         conn = self._conn()
-        conn.execute(f"UPDATE challenges SET {sets} WHERE id=?", vals)
-        conn.commit()
-        conn.close()
+        try:
+            conn.execute(f"UPDATE challenges SET {sets} WHERE id=?", vals)
+            conn.commit()
+        finally:
+            conn.close()
 
     # -- Certificates --
 
     def store_certificate(self, order_id: str, pem_chain: str, serial: int) -> str:
         cert_id = b64url_encode(os.urandom(12))
         conn = self._conn()
-        conn.execute(
-            "INSERT INTO certificates VALUES (?,?,?,?,?)",
-            (cert_id, order_id, pem_chain, serial, time.time())
-        )
-        conn.commit()
-        conn.close()
+        try:
+            conn.execute(
+                "INSERT INTO certificates VALUES (?,?,?,?,?)",
+                (cert_id, order_id, pem_chain, serial, time.time())
+            )
+            conn.commit()
+        finally:
+            conn.close()
         return cert_id
 
     def get_certificate(self, cert_id: str) -> Optional[dict]:
         conn = self._conn()
-        row = conn.execute("SELECT * FROM certificates WHERE id=?", (cert_id,)).fetchone()
-        conn.close()
+        try:
+            row = conn.execute("SELECT * FROM certificates WHERE id=?", (cert_id,)).fetchone()
+        finally:
+            conn.close()
         return dict(row) if row else None
 
 

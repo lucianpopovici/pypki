@@ -9,6 +9,170 @@ This project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+#### Admin API Authentication
+
+All sensitive management endpoints (`/api/revoke`, `/api/sub-ca`, `/api/certs/<serial>/archive`,
+`/api/certs/<serial>/recover`, `/api/certs/<serial>/renew`, `PATCH /config`) now support
+token-based and mTLS CN-based authentication.
+
+CLI flags:
+- `--admin-api-key KEY` — require `X-Admin-Key` header on admin endpoints (also `PYPKI_ADMIN_API_KEY` env var)
+- `--admin-allowed-cns CN1,CN2` — comma-separated mTLS client CN allowlist for admin operations
+- `--bootstrap-token TOKEN` — shared secret required for `/bootstrap` endpoint (`X-Bootstrap-Token` header or `?token=` query param)
+
+When no admin key or CN allowlist is configured, all endpoints remain open for backward compatibility.
+
+#### CA Private Key Encryption
+
+The root CA private key can now be encrypted at rest with a passphrase.
+
+CLI flag:
+- `--ca-key-passphrase PASS` — encrypts `ca.key` with `BestAvailableEncryption` (also `PYPKI_CA_KEY_PASSPHRASE` env var)
+
+The key file permissions are set to `0600` on creation. If no passphrase is provided, a warning is logged.
+
+#### Web Dashboard Security
+
+- **Authentication** — web UI mutating endpoints (`/api/revoke`, `/api/renew`, `/api/config`,
+  `/api/issue-sub-ca`) now enforce the same `--admin-api-key` / `--admin-allowed-cns` checks
+  as the main PKI server
+- **XSS prevention** — all user-sourced data (certificate subjects, audit log fields, config JSON,
+  Prometheus metrics) is HTML-escaped before rendering via `html.escape()`
+- **Security headers** — all responses include `X-Frame-Options: DENY`,
+  `X-Content-Type-Options: nosniff`, and `Cache-Control: no-store`
+- **CSRF protection** — write endpoints check the `Origin` header to prevent cross-site request forgery
+- **CN sanitization** — sub-CA common names are sanitized with the same regex filter as bootstrap
+  (`[a-zA-Z0-9._\- ]`, max 64 chars)
+
+#### Web Dashboard `PATCH /config` Support
+
+The config editor on the web dashboard now works correctly. Added `do_PATCH` handler to
+`WebUIHandler` to match the JavaScript `fetch()` call that sends `method: 'PATCH'`.
+
+---
+
+### Fixed
+
+#### Critical — Runtime Crashes
+
+- **`NameError` in CMP message parser** — `parse_pki_message()` referenced undefined variable
+  `data` instead of `der_data` (line 586). All CMPv2/v3 message processing was broken.
+
+- **`NameError` in web UI** — `do_GET_api_cert()` and `_api_issue_sub_ca()` referenced
+  `Encoding` and `serialization` without importing them. PEM download, P12 download, and
+  sub-CA issuance via the web dashboard all crashed with `NameError`.
+
+- **`sqlite3.OperationalError` in `get_certificate_by_serial()`** — queried non-existent
+  `cert_pem` column; the table stores `der`. Fixed to query `der` and convert to PEM.
+
+- **`TypeError` in CRL generation** — `generate_crl_der()` called `fromtimestamp()` on ISO 8601
+  date strings instead of `fromisoformat()`. Every CRL containing revoked certificates crashed.
+
+#### High — Security
+
+- **Unencrypted CA private key** — `ca.key` was written to disk with `NoEncryption()`. Now
+  supports passphrase encryption via `--ca-key-passphrase` with `BestAvailableEncryption`.
+
+- **No API authentication** — management endpoints (revoke, sub-CA, key recovery, config) had
+  zero authentication. Added `--admin-api-key` and `--admin-allowed-cns` with `hmac.compare_digest`.
+
+- **Web UI bypassed admin auth** — the web dashboard ran on a separate port and called CA methods
+  directly, bypassing all admin authentication on the main server. Fixed by enforcing the same
+  auth checks in `WebUIHandler`.
+
+- **Sub-CA private key exposed without auth** — `/api/issue-sub-ca` returned a CA-grade private
+  key in cleartext JSON to any caller. Now gated by admin authentication.
+
+- **Stored XSS in web dashboard** — certificate subjects, audit log details, and other
+  DB-sourced fields were interpolated into HTML without escaping. An attacker enrolling a
+  certificate with `CN=<script>...` achieved persistent XSS on the dashboard.
+
+- **Bootstrap endpoint unrestricted** — issued client certificates over plain HTTP to any
+  caller with no rate limiting, no challenge, and no CN sanitization. Added rate limiting,
+  optional `--bootstrap-token`, and CN regex filter (64-char limit).
+
+- **Serial number race condition** — `_next_serial()` had a read-then-write race under
+  concurrent requests. Fixed with `threading.Lock` + `BEGIN EXCLUSIVE` transaction.
+
+#### High — Reliability
+
+- **SQLite connection leaks** — 7 methods in `pki_server.py`, 19 in `acme_server.py`, and
+  6 in `scep_server.py` lacked `try/finally` guards around `conn.close()`. Under load, leaked
+  connections accumulated until the process hit the file descriptor limit. All sites now wrapped.
+
+- **Tracing span closed prematurely** — `revoke_certificate()` closed the OpenTelemetry span
+  before the DB work executed. Timing data was meaningless and exceptions were not captured.
+  Moved DB work inside the `with` block.
+
+- **Duplicate CRL generators** — `generate_crl()` (1-day validity) and `generate_crl_der()`
+  (7-day validity, different date parsing) had divergent behavior. Consolidated
+  `generate_crl_der()` to delegate to `generate_crl()`.
+
+#### Medium
+
+- **Fragile revocation serial extraction** — used a heuristic ("first INTEGER > 1000") to find
+  the serial in CMP revocation requests. Replaced with proper CertTemplate `[1] serialNumber`
+  field parsing per RFC 4210 §5.3.9.
+
+- **Name constraints DB mismatch** — `issue_certificate_with_name_constraints()` stored one cert
+  in the DB but returned a different re-signed cert with the same serial. Fixed to update the DB
+  with the re-signed certificate.
+
+- **Pending confirmations memory leak** — `_pending_confirmations` dict grew without bound for
+  unconfirmed enrollments. Added timestamps and 5-minute TTL eviction.
+
+- **`_init_db()` connection leak** — the database initialization method had no `try/finally`
+  guard. Fixed.
+
+- **`_init_key_archive_table()` called per-operation** — ran `CREATE TABLE IF NOT EXISTS` on
+  every archive/recover call. Now called once during `_init_db()`.
+
+- **Web UI config editor broken** — JavaScript sent `method: 'PATCH'` but `WebUIHandler` only
+  had `do_POST`. Added `do_PATCH` handler.
+
+- **Web UI silent JSON error** — malformed POST bodies were silently swallowed and set to `{}`.
+  Now returns 400 Bad Request.
+
+- **Web UI monkey-patch fragility** — `/api/certs/<serial>/<fmt>` routes were added via
+  monkey-patching `do_GET` at module level. Moved into `do_GET` directly.
+
+#### Low
+
+- **Prometheus label escaping** — `profile.replace('"', '\"')` was a no-op in Python. Fixed
+  to `replace('"', '\\"')`.
+
+- **Redundant inline imports** — three `import copy` statements inside methods and one
+  `import tempfile, os` removed; all already imported at module level.
+
+- **Fragile `dir()` checks** — `if 'est_srv' not in dir()` replaced with proper `None`
+  initialization (already present earlier in the code).
+
+- **Duplicate handler factories** — `make_handler()` and `make_cmpv3_handler()` were identical
+  copies. `make_cmpv3_handler()` now delegates to `make_handler()`.
+
+- **Missing security headers** — web UI responses had no `X-Frame-Options`, `X-Content-Type-Options`,
+  or `Cache-Control` headers. Added to prevent clickjacking and caching of sensitive pages.
+
+- **No CSRF protection** — web UI POST endpoints had no Origin/Referer checks. Added Origin
+  header validation on write requests.
+
+- **API docs mismatch** — web UI API docs page listed `POST` for config update; actual method
+  is `PATCH`. Fixed to show `PATCH`.
+
+- **Version badge hardcoded** — web UI showed `v0.9.0` as a string literal. Replaced with
+  `__version__` module variable.
+
+---
+
+### Changed
+
+- `CertificateAuthority.__init__()` now accepts `ca_key_passphrase: Optional[bytes]` parameter
+- `make_handler()` / `make_cmpv3_handler()` accept `admin_api_key`, `admin_allowed_cns`, `bootstrap_token` parameters
+- `start_web_ui()` accepts `admin_api_key` and `admin_allowed_cns` parameters
+- Web UI `_send_html()` parameter renamed from `html` to `html_content` to avoid shadowing the `html` module import
+
 ---
 
 ## [0.9.0] — 2026-02-26

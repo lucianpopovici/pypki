@@ -688,61 +688,73 @@ class SCEPDatabase:
 
     def _init_db(self):
         conn = self._conn()
-        conn.executescript("""
-            CREATE TABLE IF NOT EXISTS scep_transactions (
-                transaction_id  TEXT PRIMARY KEY,
-                status          TEXT NOT NULL DEFAULT 'pending',
-                subject         TEXT,
-                csr_pem         TEXT,
-                cert_pem        TEXT,
-                fail_info       TEXT,
-                fail_reason     TEXT,
-                requester_ip    TEXT,
-                created_at      REAL,
-                updated_at      REAL
-            );
-        """)
-        conn.commit()
-        conn.close()
+        try:
+            conn.executescript("""
+                CREATE TABLE IF NOT EXISTS scep_transactions (
+                    transaction_id  TEXT PRIMARY KEY,
+                    status          TEXT NOT NULL DEFAULT 'pending',
+                    subject         TEXT,
+                    csr_pem         TEXT,
+                    cert_pem        TEXT,
+                    fail_info       TEXT,
+                    fail_reason     TEXT,
+                    requester_ip    TEXT,
+                    created_at      REAL,
+                    updated_at      REAL
+                );
+            """)
+            conn.commit()
+        finally:
+            conn.close()
 
     def create_transaction(self, txid: str, subject: str, csr_pem: str, ip: str):
         conn = self._conn()
-        now = time.time()
-        conn.execute(
-            "INSERT OR REPLACE INTO scep_transactions VALUES (?,?,?,?,?,?,?,?,?,?)",
-            (txid, "pending", subject, csr_pem, None, None, None, ip, now, now)
-        )
-        conn.commit()
-        conn.close()
+        try:
+            now = time.time()
+            conn.execute(
+                "INSERT OR REPLACE INTO scep_transactions VALUES (?,?,?,?,?,?,?,?,?,?)",
+                (txid, "pending", subject, csr_pem, None, None, None, ip, now, now)
+            )
+            conn.commit()
+        finally:
+            conn.close()
 
     def set_success(self, txid: str, cert_pem: str):
         conn = self._conn()
-        conn.execute(
-            "UPDATE scep_transactions SET status='success', cert_pem=?, updated_at=? WHERE transaction_id=?",
-            (cert_pem, time.time(), txid)
-        )
-        conn.commit()
-        conn.close()
+        try:
+            conn.execute(
+                "UPDATE scep_transactions SET status='success', cert_pem=?, updated_at=? WHERE transaction_id=?",
+                (cert_pem, time.time(), txid)
+            )
+            conn.commit()
+        finally:
+            conn.close()
 
     def set_failure(self, txid: str, fail_info: str, reason: str):
         conn = self._conn()
-        conn.execute(
-            "UPDATE scep_transactions SET status='failure', fail_info=?, fail_reason=?, updated_at=? WHERE transaction_id=?",
-            (fail_info, reason, time.time(), txid)
-        )
-        conn.commit()
-        conn.close()
+        try:
+            conn.execute(
+                "UPDATE scep_transactions SET status='failure', fail_info=?, fail_reason=?, updated_at=? WHERE transaction_id=?",
+                (fail_info, reason, time.time(), txid)
+            )
+            conn.commit()
+        finally:
+            conn.close()
 
     def get(self, txid: str) -> Optional[Dict[str, Any]]:
         conn = self._conn()
-        row = conn.execute("SELECT * FROM scep_transactions WHERE transaction_id=?", (txid,)).fetchone()
-        conn.close()
+        try:
+            row = conn.execute("SELECT * FROM scep_transactions WHERE transaction_id=?", (txid,)).fetchone()
+        finally:
+            conn.close()
         return dict(row) if row else None
 
     def all_transactions(self) -> list:
         conn = self._conn()
-        rows = conn.execute("SELECT * FROM scep_transactions ORDER BY created_at DESC").fetchall()
-        conn.close()
+        try:
+            rows = conn.execute("SELECT * FROM scep_transactions ORDER BY created_at DESC").fetchall()
+        finally:
+            conn.close()
         return [dict(r) for r in rows]
 
 

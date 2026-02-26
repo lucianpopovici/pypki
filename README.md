@@ -153,6 +153,8 @@ python pki_server.py
 python pki_server.py \
   --tls --port 8443 \
   --tls-hostname pki.internal \
+  --ca-key-passphrase "$(cat /run/secrets/ca-passphrase)" \
+  --admin-api-key "$(cat /run/secrets/admin-key)" \
   --acme-port 8888 \
   --scep-port 8889 --scep-challenge mysecret \
   --est-port 8444 \
@@ -169,7 +171,10 @@ python pki_server.py \
 ```bash
 python pki_server.py \
   --mtls --port 8443 \
+  --ca-key-passphrase "$CA_PASSPHRASE" \
+  --admin-api-key "$ADMIN_KEY" \
   --bootstrap-port 8080 \
+  --bootstrap-token "$BOOTSTRAP_SECRET" \
   --acme-port 8888 \
   --scep-port 8889 --scep-challenge mysecret \
   --est-port 8444 --est-user admin:secret \
@@ -180,8 +185,9 @@ python pki_server.py \
   --rate-limit 20 \
   --audit
 
-# Issue a client cert via the bootstrap endpoint
-curl http://localhost:8080/bootstrap?cn=myclient -o bundle.pem
+# Issue a client cert via the bootstrap endpoint (token required)
+curl -H "X-Bootstrap-Token: $BOOTSTRAP_SECRET" \
+     http://localhost:8080/bootstrap?cn=myclient -o bundle.pem
 
 # Split the bundle
 openssl x509 -in bundle.pem -out client.crt
@@ -260,6 +266,12 @@ Validity periods (also changeable live via PATCH /config):
   --client-cert-days DAYS   mTLS client cert lifetime (default: 365)
   --tls-server-days DAYS    TLS server cert lifetime (default: 365)
   --ca-days DAYS            CA cert lifetime on first creation (default: 3650)
+
+Security options:
+  --ca-key-passphrase PASS  Encrypt CA private key on disk (also PYPKI_CA_KEY_PASSPHRASE env)
+  --admin-api-key KEY       Require X-Admin-Key header for admin endpoints (also PYPKI_ADMIN_API_KEY env)
+  --admin-allowed-cns CNs   Comma-separated mTLS client CNs allowed admin access
+  --bootstrap-token TOKEN   Shared secret for /bootstrap endpoint (X-Bootstrap-Token header or ?token=)
 ```
 
 ### API endpoints
@@ -279,22 +291,25 @@ Validity periods (also changeable live via PATCH /config):
 | `GET` | `/ca/delta-crl` | Delta CRL (RFC 5280 §5.2.4) |
 | `GET` | `/api/certs/<serial>/pem` | Download certificate PEM |
 | `GET` | `/api/certs/<serial>/p12` | Download PKCS#12 bundle (cert + CA chain) |
-| `POST` | `/api/sub-ca` | Issue subordinate CA cert `{"cn":"...", "validity_days":1825}` |
-| `POST` | `/api/revoke` | Revoke certificate `{"serial": N, "reason": 0}` |
+| `POST` | `/api/sub-ca` | Issue subordinate CA cert `{"cn":"...", "validity_days":1825}` 🔒 |
+| `POST` | `/api/revoke` | Revoke certificate `{"serial": N, "reason": 0}` 🔒 |
 | `GET` | `/api/audit` | Structured audit log (last 200 events) |
 | `GET` | `/api/rate-limit` | Rate limit status for calling IP |
 | `POST` | `/.well-known/cmp` | RFC 9811 well-known CMP endpoint |
 | `POST` | `/.well-known/cmp/p/<label>` | Named CA CMP endpoint (RFC 9811) |
 | `GET` | `/.well-known/cmp` | CA certificate (RFC 9811 discovery) |
 
+> 🔒 = Requires `X-Admin-Key` header or mTLS CN in allowlist when `--admin-api-key` / `--admin-allowed-cns` is configured.
+
 ### Live configuration
 
 Validity periods can be changed without restarting:
 
 ```bash
-# Via HTTP API
+# Via HTTP API (include admin key if configured)
 curl -X PATCH http://localhost:8080/config \
   -H "Content-Type: application/json" \
+  -H "X-Admin-Key: $ADMIN_KEY" \
   -d '{"validity": {"end_entity_days": 90, "client_cert_days": 30}}'
 
 # Via config file (hot-reloaded on next request)
@@ -562,6 +577,7 @@ openssl ocsp \
 # After revoking (serial 1001):
 curl -X POST http://localhost:8080/api/revoke \
   -H 'Content-Type: application/json' \
+  -H "X-Admin-Key: $ADMIN_KEY" \
   -d '{"serial": 1001, "reason": 1}'
 
 # Re-check — now shows revoked + reason
@@ -595,9 +611,10 @@ Use `--default-profile tls_server` to apply a profile to all CMPv2-issued certs,
 Issue a path-length-0 intermediate CA certificate:
 
 ```bash
-# Via REST API
+# Via REST API (requires admin auth if configured)
 curl -X POST http://localhost:8080/api/sub-ca \
   -H 'Content-Type: application/json' \
+  -H "X-Admin-Key: $ADMIN_KEY" \
   -d '{"cn": "PyPKI Intermediate CA 1", "validity_days": 1825}'
 
 # Response includes cert_pem and key_pem
@@ -677,9 +694,18 @@ Exceeding the limit returns `HTTP 429 Too Many Requests` with `Retry-After: 60`.
 A browser-based management UI running on a dedicated port (no TLS required — serve behind a reverse proxy in production):
 
 ```bash
-python pki_server.py --web-port 8090 ...
+python pki_server.py --web-port 8090 --admin-api-key "$ADMIN_KEY" ...
 # Open http://localhost:8090
 ```
+
+**Security:** When `--admin-api-key` or `--admin-allowed-cns` is set, all mutating operations
+(revoke, renew, config update, sub-CA issuance) require authentication. The dashboard JavaScript
+sends the `X-Admin-Key` header automatically when configured. Read-only pages (dashboard,
+certificate list, audit log, metrics) are always accessible.
+
+The web UI also includes XSS protection (all DB-sourced values are HTML-escaped), security headers
+(`X-Frame-Options: DENY`, `X-Content-Type-Options: nosniff`, `Cache-Control: no-store`), and
+CSRF protection (Origin header validation on write requests).
 
 Pages:
 
@@ -702,12 +728,12 @@ REST API exposed by the dashboard (also consumable directly):
 | `GET` | `/api/certs` | List all certificates (JSON) |
 | `GET` | `/api/certs/<serial>/pem` | Download certificate as PEM |
 | `GET` | `/api/certs/<serial>/p12` | Download certificate + CA chain as PKCS#12 |
-| `POST` | `/api/revoke` | Revoke a certificate — body: `{"serial": N, "reason": 0}` |
-| `POST` | `/api/renew` | Renew a certificate — body: `{"serial": N}` |
+| `POST` | `/api/revoke` | Revoke a certificate — body: `{"serial": N, "reason": 0}` 🔒 |
+| `POST` | `/api/renew` | Renew a certificate — body: `{"serial": N}` 🔒 |
 | `GET` | `/api/metrics` | Prometheus metrics (`text/plain`, scrape-compatible) |
 | `GET` | `/api/config` | View live configuration (JSON) |
-| `PATCH` | `/api/config` | Update validity periods — body: `{"validity": {...}}` |
-| `POST` | `/api/issue-sub-ca` | Issue sub-CA cert — body: `{"cn": "...", "validity_days": N}` |
+| `PATCH` | `/api/config` | Update validity periods — body: `{"validity": {...}}` 🔒 |
+| `POST` | `/api/issue-sub-ca` | Issue sub-CA cert — body: `{"cn": "...", "validity_days": N}` 🔒 |
 | `GET` | `/api/audit` | Audit log — last 200 events (JSON) |
 | `GET` | `/ca/cert.pem` | CA certificate (PEM, for trust store import) |
 | `GET` | `/ca/crl` | Certificate Revocation List (DER) |
@@ -1215,7 +1241,7 @@ Project root:
 └── server.key          TLS server private key
 ```
 
-> **Security note:** `ca.key` and `server.key` are stored unencrypted. In production, replace with an HSM or KMS-backed key store and restrict filesystem permissions accordingly.
+> **Security note:** `ca.key` is stored unencrypted by default. Use `--ca-key-passphrase` to encrypt it at rest with a passphrase. In production, combine with an HSM or KMS-backed key store and restrict filesystem permissions accordingly. File permissions are set to `0600` automatically on creation.
 
 ---
 
