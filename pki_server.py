@@ -76,7 +76,6 @@ import json
 import logging
 import os
 import re
-import ipaddress
 import socket
 import sqlite3
 import ssl
@@ -164,9 +163,8 @@ except ImportError:
     HAS_PYASN1 = False
     print("WARNING: pyasn1 not found. Install with: pip install pyasn1 pyasn1-modules")
 
-import copy
-
-logging.basicConfig(    level=logging.INFO,
+logging.basicConfig(
+    level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s"
 )
 logger = logging.getLogger("pki-cmpv2")
@@ -428,6 +426,7 @@ class ServerConfig:
     def as_dict(self) -> Dict[str, Any]:
         self._maybe_reload()
         with self._lock:
+            import copy
             return copy.deepcopy(self._effective())
 
     # ------------------------------------------------------------------
@@ -451,7 +450,7 @@ class ServerConfig:
 
     def _effective(self) -> Dict[str, Any]:
         """Merge: defaults ← file ← CLI overrides ← in-memory edits."""
-
+        import copy
         result = copy.deepcopy(DEFAULT_CONFIG)
         self._deep_merge(result, self._data)
         self._deep_merge(result, self._cli)
@@ -481,7 +480,7 @@ class ServerConfig:
         self._file_mtime = self._config_path.stat().st_mtime
 
     def _write_defaults(self):
-
+        import copy
         merged = copy.deepcopy(DEFAULT_CONFIG)
         self._deep_merge(merged, self._cli)
         with open(self._config_path, "w") as f:
@@ -584,8 +583,8 @@ class CMPv2ASN1:
 
         try:
             # PKIMessage ::= SEQUENCE { header, body, [0] protection, [1] extraCerts }
-            if der_data[0] != 0x30:
-                raise ValueError(f"Expected SEQUENCE (0x30), got 0x{der_data[0]:02x}")
+            if data[0] != 0x30:
+                raise ValueError(f"Expected SEQUENCE (0x30), got 0x{data[0]:02x}")
 
             # Unwrap outer SEQUENCE
             _, outer, _ = cls._decode_tlv(der_data, 0)
@@ -936,41 +935,35 @@ class AuditLog:
 
     def _init(self):
         conn = sqlite3.connect(str(self._db))
-        try:
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS audit (
-                    id      INTEGER PRIMARY KEY AUTOINCREMENT,
-                    ts      TEXT NOT NULL,
-                    event   TEXT NOT NULL,
-                    detail  TEXT,
-                    ip      TEXT
-                )
-            """)
-            conn.commit()
-        finally:
-            conn.close()
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS audit (
+                id      INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts      TEXT NOT NULL,
+                event   TEXT NOT NULL,
+                detail  TEXT,
+                ip      TEXT
+            )
+        """)
+        conn.commit()
+        conn.close()
 
     def record(self, event: str, detail: str = "", ip: str = ""):
         ts = datetime.datetime.now(datetime.timezone.utc).isoformat()
         conn = sqlite3.connect(str(self._db))
-        try:
-            conn.execute("INSERT INTO audit(ts,event,detail,ip) VALUES(?,?,?,?)",
-                         (ts, event, detail, ip))
-            conn.commit()
-        finally:
-            conn.close()
+        conn.execute("INSERT INTO audit(ts,event,detail,ip) VALUES(?,?,?,?)",
+                     (ts, event, detail, ip))
+        conn.commit()
+        conn.close()
         logger.info(f"AUDIT [{event}] {detail}")
 
     def recent(self, n: int = 100) -> List[Dict[str, Any]]:
         conn = sqlite3.connect(str(self._db))
-        try:
-            conn.row_factory = sqlite3.Row
-            rows = conn.execute(
-                "SELECT ts,event,detail,ip FROM audit ORDER BY id DESC LIMIT ?", (n,)
-            ).fetchall()
-            return [dict(r) for r in rows]
-        finally:
-            conn.close()
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            "SELECT ts,event,detail,ip FROM audit ORDER BY id DESC LIMIT ?", (n,)
+        ).fetchall()
+        conn.close()
+        return [dict(r) for r in rows]
 
 
 # ---------------------------------------------------------------------------
@@ -1122,78 +1115,65 @@ class CertificateAuthority:
     """Self-signed CA with certificate issuance and revocation."""
 
     def __init__(self, ca_dir: str = "./ca", config: Optional["ServerConfig"] = None,
-                 ocsp_url: str = "", crl_url: str = "",
-                 ca_key_passphrase: Optional[bytes] = None):
+                 ocsp_url: str = "", crl_url: str = ""):
         self.ca_dir = Path(ca_dir)
         self.ca_dir.mkdir(parents=True, exist_ok=True)
         self.db_path = self.ca_dir / "certificates.db"
         self.config  = config  # may be None (uses hardcoded defaults as fallback)
         self._ocsp_url = ocsp_url   # embedded in every issued cert AIA extension
         self._crl_url  = crl_url    # embedded in every issued cert CDP extension
-        self._ca_key_passphrase = ca_key_passphrase
         self._init_db()
         self._load_or_create_ca()
 
     def _init_db(self):
         conn = sqlite3.connect(str(self.db_path))
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS certificates (
+                serial      INTEGER PRIMARY KEY,
+                subject     TEXT NOT NULL,
+                not_before  TEXT NOT NULL,
+                not_after   TEXT NOT NULL,
+                der         BLOB NOT NULL,
+                revoked     INTEGER DEFAULT 0,
+                revoked_at  TEXT,
+                reason      INTEGER,
+                profile     TEXT DEFAULT 'default'
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS serial_counter (
+                id    INTEGER PRIMARY KEY,
+                value INTEGER NOT NULL
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS crl_base (
+                id          INTEGER PRIMARY KEY,
+                issued_at   TEXT NOT NULL,
+                this_update TEXT NOT NULL,
+                next_update TEXT NOT NULL,
+                der         BLOB NOT NULL
+            )
+        """)
+        conn.execute("INSERT OR IGNORE INTO serial_counter VALUES (1, 1000)")
+        # Migrate: add profile column if missing (for existing DBs)
         try:
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS certificates (
-                    serial      INTEGER PRIMARY KEY,
-                    subject     TEXT NOT NULL,
-                    not_before  TEXT NOT NULL,
-                    not_after   TEXT NOT NULL,
-                    der         BLOB NOT NULL,
-                    revoked     INTEGER DEFAULT 0,
-                    revoked_at  TEXT,
-                    reason      INTEGER,
-                    profile     TEXT DEFAULT 'default'
-                )
-            """)
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS serial_counter (
-                    id    INTEGER PRIMARY KEY,
-                    value INTEGER NOT NULL
-                )
-            """)
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS crl_base (
-                    id          INTEGER PRIMARY KEY,
-                    issued_at   TEXT NOT NULL,
-                    this_update TEXT NOT NULL,
-                    next_update TEXT NOT NULL,
-                    der         BLOB NOT NULL
-                )
-            """)
-            conn.execute("INSERT OR IGNORE INTO serial_counter VALUES (1, 1000)")
-            # Migrate: add profile column if missing (for existing DBs)
-            try:
-                conn.execute("ALTER TABLE certificates ADD COLUMN profile TEXT DEFAULT 'default'")
-            except Exception:
-                pass
-            conn.commit()
-        finally:
-            conn.close()
-        # Create key_archive table (also idempotent)
-        self._init_key_archive_table()
-
-    _serial_lock = threading.Lock()
+            conn.execute("ALTER TABLE certificates ADD COLUMN profile TEXT DEFAULT 'default'")
+        except Exception:
+            pass
+        conn.commit()
+        conn.close()
 
     def _next_serial(self) -> int:
-        with self._serial_lock:
-            conn = sqlite3.connect(str(self.db_path))
-            try:
-                conn.execute("BEGIN EXCLUSIVE")
-                row = conn.execute("SELECT value FROM serial_counter WHERE id=1").fetchone()
-                serial = row[0]
-                conn.execute("UPDATE serial_counter SET value=? WHERE id=1", (serial + 1,))
-                conn.commit()
-                return serial
-            except Exception:
-                conn.rollback()
-                raise
-            finally:
-                conn.close()
+        conn = sqlite3.connect(str(self.db_path))
+        try:
+            row = conn.execute("SELECT value FROM serial_counter WHERE id=1").fetchone()
+            serial = row[0]
+            conn.execute("UPDATE serial_counter SET value=? WHERE id=1", (serial + 1,))
+            conn.commit()
+            return serial
+        finally:
+            conn.close()
 
     def _cfg(self, attr: str, default: int) -> int:
         """Read a validity value from config, falling back to default."""
@@ -1208,9 +1188,7 @@ class CertificateAuthority:
         if ca_key_path.exists() and ca_cert_path.exists():
             logger.info("Loading existing CA key and certificate.")
             with open(ca_key_path, "rb") as f:
-                self.ca_key = serialization.load_pem_private_key(
-                    f.read(), password=self._ca_key_passphrase
-                )
+                self.ca_key = serialization.load_pem_private_key(f.read(), password=None)
             with open(ca_cert_path, "rb") as f:
                 self.ca_cert = x509.load_pem_x509_certificate(f.read())
         else:
@@ -1250,23 +1228,8 @@ class CertificateAuthority:
                 .sign(self.ca_key, SHA256())
             )
 
-            # Encrypt CA key if passphrase provided, otherwise store unencrypted
-            if self._ca_key_passphrase:
-                key_enc = serialization.BestAvailableEncryption(self._ca_key_passphrase)
-                logger.info("CA private key will be encrypted on disk.")
-            else:
-                key_enc = NoEncryption()
-                logger.warning(
-                    "CA private key stored WITHOUT encryption. "
-                    "Use --ca-key-passphrase for production deployments."
-                )
             with open(ca_key_path, "wb") as f:
-                f.write(self.ca_key.private_bytes(Encoding.PEM, PrivateFormat.TraditionalOpenSSL, key_enc))
-            # Restrict file permissions (best-effort on platforms that support it)
-            try:
-                os.chmod(ca_key_path, 0o600)
-            except OSError:
-                pass
+                f.write(self.ca_key.private_bytes(Encoding.PEM, PrivateFormat.TraditionalOpenSSL, NoEncryption()))
             with open(ca_cert_path, "wb") as f:
                 f.write(self.ca_cert.public_bytes(Encoding.PEM))
 
@@ -1584,34 +1547,29 @@ class CertificateAuthority:
         with _t.start_as_current_span("ca.revoke_certificate") as _span:
             _span.set_attribute("cert.serial", serial)
             _span.set_attribute("cert.revocation_reason", reason)
-            conn = sqlite3.connect(str(self.db_path))
-            try:
-                row = conn.execute("SELECT serial FROM certificates WHERE serial=? AND revoked=0", (serial,)).fetchone()
-                if not row:
-                    return False
-                now = datetime.datetime.now(datetime.timezone.utc).isoformat()
-                conn.execute(
-                    "UPDATE certificates SET revoked=1, revoked_at=?, reason=? WHERE serial=?",
-                    (now, reason, serial),
-                )
-                conn.commit()
-                logger.info(f"Revoked certificate serial={serial} reason={reason}")
-                return True
-            except Exception as e:
-                _span.record_exception(e)
-                raise
-            finally:
-                conn.close()
+        conn = sqlite3.connect(str(self.db_path))
+        try:
+            row = conn.execute("SELECT serial FROM certificates WHERE serial=? AND revoked=0", (serial,)).fetchone()
+            if not row:
+                return False
+            now = datetime.datetime.now(datetime.timezone.utc).isoformat()
+            conn.execute(
+                "UPDATE certificates SET revoked=1, revoked_at=?, reason=? WHERE serial=?",
+                (now, reason, serial),
+            )
+            conn.commit()
+            logger.info(f"Revoked certificate serial={serial} reason={reason}")
+            return True
+        finally:
+            conn.close()
 
     def generate_crl(self) -> bytes:
         """Generate a DER-encoded CRL."""
         conn = sqlite3.connect(str(self.db_path))
-        try:
-            revoked = conn.execute(
-                "SELECT serial, revoked_at, reason FROM certificates WHERE revoked=1"
-            ).fetchall()
-        finally:
-            conn.close()
+        revoked = conn.execute(
+            "SELECT serial, revoked_at, reason FROM certificates WHERE revoked=1"
+        ).fetchall()
+        conn.close()
 
         builder = (
             x509.CertificateRevocationListBuilder()
@@ -1638,24 +1596,20 @@ class CertificateAuthority:
 
     def get_cert_by_serial(self, serial: int) -> Optional[bytes]:
         conn = sqlite3.connect(str(self.db_path))
-        try:
-            row = conn.execute("SELECT der FROM certificates WHERE serial=?", (serial,)).fetchone()
-            return row[0] if row else None
-        finally:
-            conn.close()
+        row = conn.execute("SELECT der FROM certificates WHERE serial=?", (serial,)).fetchone()
+        conn.close()
+        return row[0] if row else None
 
     def list_certificates(self) -> list:
         conn = sqlite3.connect(str(self.db_path))
-        try:
-            rows = conn.execute(
-                "SELECT serial, subject, not_before, not_after, revoked, profile FROM certificates"
-            ).fetchall()
-            return [
-                {"serial": r[0], "subject": r[1], "not_before": r[2], "not_after": r[3], "revoked": bool(r[4]), "profile": r[5] or "default"}
-                for r in rows
-            ]
-        finally:
-            conn.close()
+        rows = conn.execute(
+            "SELECT serial, subject, not_before, not_after, revoked, profile FROM certificates"
+        ).fetchall()
+        conn.close()
+        return [
+            {"serial": r[0], "subject": r[1], "not_before": r[2], "not_after": r[3], "revoked": bool(r[4]), "profile": r[5] or "default"}
+            for r in rows
+        ]
 
     def provision_tls_server_cert(self, hostname: str = "localhost") -> Tuple[Path, Path]:
         """
@@ -1893,6 +1847,7 @@ class CertificateAuthority:
         )
 
         # Write to temp files (SSLContext.load_cert_chain needs file paths)
+        import tempfile, os
         with tempfile.NamedTemporaryFile(delete=False, suffix=".pem") as cf:
             cf.write(cert.public_bytes(Encoding.PEM))
             cert_tmp = cf.name
@@ -1938,20 +1893,43 @@ class CertificateAuthority:
         conn.row_factory = sqlite3.Row
         try:
             row = conn.execute(
-                "SELECT der FROM certificates WHERE serial=?", (serial,)
+                "SELECT cert_pem FROM certificates WHERE serial=?", (serial,)
             ).fetchone()
-            if not row:
-                return None
-            cert = x509.load_der_x509_certificate(row["der"])
-            return cert.public_bytes(Encoding.PEM).decode()
+            return row["cert_pem"] if row else None
         finally:
             conn.close()
 
     def generate_crl_der(self) -> bytes:
-        """Generate and return the current CRL in DER format.
-        Delegates to generate_crl() to avoid duplicated logic.
-        """
-        return self.generate_crl()
+        """Generate and return the current CRL in DER format."""
+        # Build a real CRL from the revoked serials in the DB
+        builder = (
+            x509.CertificateRevocationListBuilder()
+            .issuer_name(self.ca_cert.subject)
+            .last_update(datetime.datetime.now(datetime.timezone.utc))
+            .next_update(datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(days=7))
+        )
+        conn = sqlite3.connect(str(self.db_path))
+        conn.row_factory = sqlite3.Row
+        try:
+            rows = conn.execute(
+                "SELECT serial, revoked_at FROM certificates WHERE revoked=1"
+            ).fetchall()
+            for row in rows:
+                revoked_cert = (
+                    x509.RevokedCertificateBuilder()
+                    .serial_number(row["serial"])
+                    .revocation_date(
+                        datetime.datetime.fromtimestamp(row["revoked_at"], tz=datetime.timezone.utc)
+                        if row["revoked_at"]
+                        else datetime.datetime.now(datetime.timezone.utc)
+                    )
+                    .build()
+                )
+                builder = builder.add_revoked_certificate(revoked_cert)
+        finally:
+            conn.close()
+        crl = builder.sign(private_key=self.ca_key, algorithm=SHA256())
+        return crl.public_bytes(Encoding.DER)
 
     # ------------------------------------------------------------------
     # Sub-CA issuance
@@ -2135,20 +2113,18 @@ class CertificateAuthority:
     # ------------------------------------------------------------------
 
     def _init_key_archive_table(self):
-        """Create key_archive table if it does not exist."""
+        """Create key_archive table if it does not exist (called from _init_db)."""
         conn = sqlite3.connect(str(self.db_path))
-        try:
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS key_archive (
-                    serial      INTEGER PRIMARY KEY,
-                    archived_at TEXT NOT NULL,
-                    encrypted   BLOB NOT NULL,
-                    subject     TEXT NOT NULL
-                )
-            """)
-            conn.commit()
-        finally:
-            conn.close()
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS key_archive (
+                serial      INTEGER PRIMARY KEY,
+                archived_at TEXT NOT NULL,
+                encrypted   BLOB NOT NULL,
+                subject     TEXT NOT NULL
+            )
+        """)
+        conn.commit()
+        conn.close()
 
     def archive_private_key(self, serial: int, private_key_pem: bytes) -> bool:
         """
@@ -2294,19 +2270,7 @@ class CertificateAuthority:
         for ext in cert.extensions:
             nc_cert = nc_cert.add_extension(ext.value, critical=ext.critical)
         nc_cert = nc_cert.add_extension(nc_ext, critical=True)
-        final_cert = nc_cert.sign(self.ca_key, SHA256())
-
-        # Update the DB record so the stored DER matches the returned certificate
-        conn = sqlite3.connect(str(self.db_path))
-        try:
-            conn.execute(
-                "UPDATE certificates SET der=? WHERE serial=?",
-                (final_cert.public_bytes(Encoding.DER), cert.serial_number),
-            )
-            conn.commit()
-        finally:
-            conn.close()
-        return final_cert
+        return nc_cert.sign(self.ca_key, SHA256())
 
     # ------------------------------------------------------------------
     # Feature 8 — Expiry monitoring
@@ -2572,7 +2536,7 @@ class CertificateAuthority:
             "# TYPE pypki_certs_by_profile gauge",
         ]
         for profile, count in m["pypki_certs_by_profile"].items():
-            safe = profile.replace('"', '\\"')
+            safe = profile.replace('"', '\"')
             lines.append(f'pypki_certs_by_profile{{profile="{safe}"}} {count}')
         lines.append("")  # trailing newline
         return "\n".join(lines) + "\n"
@@ -2963,8 +2927,7 @@ class CMPv2Handler:
 
     def __init__(self, ca: CertificateAuthority):
         self.ca = ca
-        self._pending_confirmations: Dict[bytes, Tuple[bytes, float]] = {}  # txid -> (cert_der, timestamp)
-        self._pending_ttl = 300  # 5 minutes TTL for unconfirmed certs
+        self._pending_confirmations: Dict[bytes, bytes] = {}  # txid -> cert_der
         self._lock = threading.Lock()
 
     def handle(self, der_data: bytes) -> bytes:
@@ -3036,8 +2999,7 @@ class CMPv2Handler:
 
             # Store pending for certConf
             with self._lock:
-                self._evict_stale_confirmations()
-                self._pending_confirmations[txid] = (cert_der, time.time())
+                self._pending_confirmations[txid] = cert_der
 
             body = CMPv2ASN1.build_ip_cp_body(cert_der, status=0, request_id=0)
             resp = CMPv2ASN1.build_pki_message(resp_body_type, body, txid, os.urandom(16), snonce)
@@ -3062,8 +3024,7 @@ class CMPv2Handler:
             cert_der = cert.public_bytes(Encoding.DER)
 
             with self._lock:
-                self._evict_stale_confirmations()
-                self._pending_confirmations[txid] = (cert_der, time.time())
+                self._pending_confirmations[txid] = cert_der
 
             body = CMPv2ASN1.build_ip_cp_body(cert_der, status=0, request_id=0)
             return CMPv2ASN1.build_pki_message(3, body, txid, os.urandom(16), snonce)
@@ -3081,36 +3042,27 @@ class CMPv2Handler:
         """Handle Revocation Request (rr -> rp)."""
         body_raw = msg.get("body_raw", b"")
 
-        # Extract serial from RevDetails (RFC 4210 §5.3.9)
-        # RevDetails ::= SEQUENCE { certDetails CertTemplate, ... }
-        # CertTemplate has [1] serialNumber (context tag 1, INTEGER)
+        # Try to extract serial from RevDetails (very simplified)
         serial = None
         try:
-            # RevReqContent ::= SEQUENCE OF RevDetails
-            # Each RevDetails: SEQUENCE { certDetails CertTemplate, ... }
+            # Walk the body looking for an INTEGER that could be a serial
             pos = 0
-            if body_raw and body_raw[0] == 0x30:
-                # Unwrap outer SEQUENCE (RevReqContent)
-                _, outer_val, _ = CMPv2ASN1._decode_tlv(body_raw, 0)
-                # First RevDetails SEQUENCE
-                if outer_val and outer_val[0] == 0x30:
-                    _, rd_val, _ = CMPv2ASN1._decode_tlv(outer_val, 0)
-                    # certDetails (CertTemplate SEQUENCE)
-                    if rd_val and rd_val[0] == 0x30:
-                        _, tmpl_val, _ = CMPv2ASN1._decode_tlv(rd_val, 0)
-                        # Walk CertTemplate context-tagged fields
-                        tpos = 0
-                        while tpos < len(tmpl_val):
-                            ftag = tmpl_val[tpos]
-                            flen, fnext = CMPv2ASN1._decode_length(tmpl_val, tpos + 1)
-                            fval = tmpl_val[fnext:fnext + flen]
-                            field_num = ftag & 0x1F
-                            if field_num == 1:  # [1] serialNumber
-                                serial = int.from_bytes(fval, "big")
-                                break
-                            tpos = fnext + flen
-        except Exception as e:
-            logger.debug(f"RevDetails parse error: {e}")
+            depth = 0
+            while pos < len(body_raw) and depth < 20:
+                if pos + 2 > len(body_raw):
+                    break
+                tag = body_raw[pos]
+                length, next_pos = CMPv2ASN1._decode_length(body_raw, pos + 1)
+                val = body_raw[next_pos:next_pos + length]
+                if tag == 0x02 and 1 <= length <= 20:  # INTEGER
+                    candidate = int.from_bytes(val, "big")
+                    if candidate > 1000:  # likely a serial
+                        serial = candidate
+                        break
+                pos = next_pos + length
+                depth += 1
+        except Exception:
+            pass
 
         if serial and self.ca.revoke_certificate(serial):
             body = CMPv2ASN1.build_rp_body(0)
@@ -3120,21 +3072,10 @@ class CMPv2Handler:
 
         return CMPv2ASN1.build_pki_message(12, body, txid, os.urandom(16), snonce)
 
-    def _evict_stale_confirmations(self):
-        """Remove pending confirmations older than _pending_ttl seconds (called under lock)."""
-        now = time.time()
-        stale = [k for k, (_, ts) in self._pending_confirmations.items()
-                 if now - ts > self._pending_ttl]
-        for k in stale:
-            self._pending_confirmations.pop(k, None)
-        if stale:
-            logger.debug(f"Evicted {len(stale)} stale pending confirmation(s)")
-
     def _handle_cert_confirm(self, msg: dict, txid: bytes, snonce: bytes) -> bytes:
         """Handle Certificate Confirmation (certConf -> pkiconf)."""
         with self._lock:
-            entry = self._pending_confirmations.pop(txid, None)
-            cert_der = entry[0] if entry else None
+            cert_der = self._pending_confirmations.pop(txid, None)
 
         if cert_der:
             logger.info(f"Certificate confirmed for txid={txid.hex()}")
@@ -3495,52 +3436,6 @@ class CMPv2HTTPHandler(http.server.BaseHTTPRequestHandler):
     ca: CertificateAuthority = None
     audit_log: "AuditLog" = None
     rate_limiter: "RateLimiter" = None
-    admin_api_key: Optional[str] = None  # If set, required for sensitive endpoints
-    admin_allowed_cns: Optional[List[str]] = None  # mTLS CN allowlist for admin ops
-
-    # Endpoints that require admin authentication
-    _ADMIN_ENDPOINTS = {
-        "/api/revoke", "/api/sub-ca", "/api/name-constrained-ca",
-    }
-    _ADMIN_ENDPOINT_PATTERNS = [
-        r"^/api/certs/\d+/archive$",
-        r"^/api/certs/\d+/recover$",
-        r"^/api/certs/\d+/renew$",
-    ]
-
-    def _require_admin(self, path: str) -> bool:
-        """Check if this path requires admin auth, and if so, verify credentials.
-        Returns True if access is allowed, False if denied (and sends 403)."""
-        # Determine if this is an admin endpoint
-        is_admin = path in self._ADMIN_ENDPOINTS or path == "/config"
-        if not is_admin:
-            for pattern in self._ADMIN_ENDPOINT_PATTERNS:
-                if re.match(pattern, path):
-                    is_admin = True
-                    break
-        if not is_admin:
-            return True  # Not an admin endpoint — allow
-
-        # If no admin key is configured, allow (backward compat)
-        if not self.admin_api_key and not self.admin_allowed_cns:
-            return True
-
-        # Check API key header
-        if self.admin_api_key:
-            provided = self.headers.get("X-Admin-Key", "")
-            if hmac.compare_digest(provided, self.admin_api_key):
-                return True
-
-        # Check mTLS client CN allowlist
-        if self.admin_allowed_cns:
-            client_cn = self._get_client_cn()
-            if client_cn and client_cn in self.admin_allowed_cns:
-                return True
-
-        self._send_json({"error": "admin authentication required"}, 403)
-        if self.audit_log:
-            self.audit_log.record("auth_denied", f"path={path}", self.client_address[0])
-        return False
 
     def log_message(self, format, *args):
         client_cn = self._get_client_cn()
@@ -3562,8 +3457,6 @@ class CMPv2HTTPHandler(http.server.BaseHTTPRequestHandler):
 
     def do_POST_api(self, path: str, body: bytes):
         """Handle POST requests to /api/* management endpoints."""
-        if not self._require_admin(path):
-            return
         try:
             data = json.loads(body) if body else {}
         except json.JSONDecodeError:
@@ -3687,6 +3580,68 @@ class CMPv2HTTPHandler(http.server.BaseHTTPRequestHandler):
             except Exception as e:
                 self._send_json({"error": str(e)}, 500)
 
+        elif path == "/api/issue":
+            # POST /api/issue — issue an end-entity certificate via REST
+            # Body: {subject, public_key_pem?, validity_days?, san_dns?, san_emails?,
+            #        san_ips?, profile?, ocsp_url?, crl_url?, no_rev_avail?}
+            try:
+                subject_str = data.get("subject", "").strip()
+                if not subject_str:
+                    self._send_json({"error": "subject is required"}, 400)
+                    return
+                # Resolve public key — generate RSA-2048 if not supplied
+                priv_key_pem = None
+                pubkey_pem = data.get("public_key_pem", "").strip()
+                if pubkey_pem:
+                    from cryptography.hazmat.primitives.serialization import load_pem_public_key
+                    pub_key = load_pem_public_key(pubkey_pem.encode())
+                else:
+                    priv = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+                    pub_key = priv.public_key()
+                    priv_key_pem = priv.private_bytes(
+                        Encoding.PEM, PrivateFormat.TraditionalOpenSSL, NoEncryption()
+                    ).decode()
+
+                kwargs = {
+                    "subject_str":   subject_str,
+                    "public_key":    pub_key,
+                    "profile":       data.get("profile", "default"),
+                    "audit":         self.audit_log,
+                    "requester_ip":  self.client_address[0],
+                }
+                if data.get("validity_days"):
+                    kwargs["validity_days"] = int(data["validity_days"])
+                if data.get("san_dns"):
+                    kwargs["san_dns"] = data["san_dns"]
+                if data.get("san_emails"):
+                    kwargs["san_emails"] = data["san_emails"]
+                if data.get("san_ips"):
+                    kwargs["san_ips"] = data["san_ips"]
+                if data.get("ocsp_url"):
+                    kwargs["ocsp_url"] = data["ocsp_url"]
+                if data.get("crl_url"):
+                    kwargs["crl_url"] = data["crl_url"]
+                if "no_rev_avail" in data:
+                    kwargs["no_rev_avail"] = bool(data["no_rev_avail"])
+                if data.get("certificate_policies"):
+                    kwargs["certificate_policies"] = data["certificate_policies"]
+
+                cert = self.ca.issue_certificate(**kwargs)
+                resp = {
+                    "ok":       True,
+                    "serial":   cert.serial_number,
+                    "subject":  cert.subject.rfc4514_string(),
+                    "not_after": cert.not_valid_after_utc.isoformat(),
+                    "profile":  data.get("profile", "default"),
+                    "cert_pem": cert.public_bytes(Encoding.PEM).decode(),
+                }
+                if priv_key_pem:
+                    resp["key_pem"] = priv_key_pem
+                self._send_json(resp, 201)
+            except Exception as e:
+                logger.exception("POST /api/issue failed")
+                self._send_json({"error": str(e)}, 500)
+
         else:
             self._send_json({"error": "unknown API endpoint"}, 404)
 
@@ -3761,9 +3716,6 @@ class CMPv2HTTPHandler(http.server.BaseHTTPRequestHandler):
         if self.path.rstrip("/") != "/config":
             self.send_response(404)
             self.end_headers()
-            return
-
-        if not self._require_admin("/config"):
             return
 
         content_length = int(self.headers.get("Content-Length", 0))
@@ -3867,29 +3819,12 @@ class CMPv2HTTPHandler(http.server.BaseHTTPRequestHandler):
 
         elif path == "/bootstrap":
             # Plain-HTTP endpoint: issues a fresh client cert (use only on bootstrap port)
-            # Security: enforce rate limiting and optional bootstrap token
-            if self.rate_limiter and not self.rate_limiter.allow(self.client_address[0]):
-                self._send_json({"error": "rate limit exceeded"}, 429)
-                return
-            # Check optional bootstrap token
-            bootstrap_token = getattr(self, "bootstrap_token", None)
-            if bootstrap_token:
-                provided_token = self.headers.get("X-Bootstrap-Token", "")
-                if "?" in self.path:
-                    for param in self.path.split("?")[1].split("&"):
-                        if param.startswith("token="):
-                            provided_token = param[6:]
-                if not hmac.compare_digest(provided_token, bootstrap_token):
-                    self._send_json({"error": "invalid or missing bootstrap token"}, 403)
-                    return
-            cn = self.headers.get("X-Client-CN") or "bootstrap-client"
+            cn = self.headers.get("X-Client-CN") or self.path.split("?cn=")[-1] or "bootstrap-client"
             # Also accept ?cn= query param
             if "?" in self.path:
                 for param in self.path.split("?")[1].split("&"):
                     if param.startswith("cn="):
                         cn = param[3:]
-            # Sanitize CN — only allow safe characters
-            cn = re.sub(r'[^a-zA-Z0-9._\-]', '_', cn)[:64]
             try:
                 cert_pem, key_pem = self.ca.issue_client_cert(cn)
                 bundle = cert_pem + key_pem + self.ca.ca_cert_pem
@@ -3928,10 +3863,17 @@ class CMPv2HTTPHandler(http.server.BaseHTTPRequestHandler):
                 if "=" in kv:
                     k, _, v = kv.partition("=")
                     params[k] = v
+            raw_days = params.get("days", "30")
             try:
-                days = int(params.get("days", 30))
+                days = int(raw_days)
+                if days < 0:
+                    raise ValueError("negative")
             except ValueError:
-                days = 30
+                self._send_json(
+                    {"error": f"Invalid 'days' parameter: {raw_days!r} — must be a non-negative integer"},
+                    400,
+                )
+                return
             expiring = self.ca.expiring_certificates(days_ahead=days)
             self._send_json({"expiring": expiring, "days_ahead": days, "count": len(expiring)})
 
@@ -4022,6 +3964,7 @@ class CMPv2HTTPHandler(http.server.BaseHTTPRequestHandler):
                     "GET /api/certs": "List issued certificates (JSON)",
                     "GET /api/certs/<serial>/pem": "Download certificate as PEM",
                     "GET /api/certs/<serial>/p12": "Download certificate as PKCS#12 bundle",
+                    "POST /api/issue": "Issue end-entity certificate {subject, public_key_pem?, validity_days?, san_dns?, profile?, ...}",
                     "POST /api/sub-ca": "Issue subordinate CA certificate",
                     "POST /api/revoke": "Revoke certificate {serial, reason}",
                     "GET /api/audit": "Structured audit log (last 200 events)",
@@ -4081,34 +4024,29 @@ MTLSServer = TLSServer
 # CLI / Main
 # ---------------------------------------------------------------------------
 
-def make_handler(ca: CertificateAuthority, cmp_handler,
+def make_handler(ca: CertificateAuthority, cmp_handler: CMPv2Handler,
                  audit_log: Optional[AuditLog] = None,
-                 rate_limiter: Optional[RateLimiter] = None,
-                 admin_api_key: Optional[str] = None,
-                 admin_allowed_cns: Optional[List[str]] = None,
-                 bootstrap_token: Optional[str] = None):
-    """Create a bound HTTP handler class with CA and CMP handler attached."""
+                 rate_limiter: Optional[RateLimiter] = None):
     class BoundHandler(CMPv2HTTPHandler):
         pass
     BoundHandler.ca = ca
     BoundHandler.cmp_handler = cmp_handler
     BoundHandler.audit_log = audit_log
     BoundHandler.rate_limiter = rate_limiter
-    BoundHandler.admin_api_key = admin_api_key
-    BoundHandler.admin_allowed_cns = admin_allowed_cns
-    BoundHandler.bootstrap_token = bootstrap_token
     return BoundHandler
 
 
-def make_cmpv3_handler(ca: CertificateAuthority, cmp_handler,
+def make_cmpv3_handler(ca: CertificateAuthority, cmp_handler: CMPv3Handler,
                        audit_log: Optional[AuditLog] = None,
-                       rate_limiter: Optional[RateLimiter] = None,
-                       admin_api_key: Optional[str] = None,
-                       admin_allowed_cns: Optional[List[str]] = None,
-                       bootstrap_token: Optional[str] = None):
-    """Alias for make_handler (kept for backward compatibility)."""
-    return make_handler(ca, cmp_handler, audit_log, rate_limiter,
-                        admin_api_key, admin_allowed_cns, bootstrap_token)
+                       rate_limiter: Optional[RateLimiter] = None):
+    """Make an HTTP handler that uses CMPv3Handler (with well-known URI support)."""
+    class BoundHandler(CMPv2HTTPHandler):
+        pass
+    BoundHandler.ca = ca
+    BoundHandler.cmp_handler = cmp_handler
+    BoundHandler.audit_log = audit_log
+    BoundHandler.rate_limiter = rate_limiter
+    return BoundHandler
 
 
 def start_bootstrap_server(host: str, port: int, ca: CertificateAuthority, cmp_handler: CMPv2Handler):
@@ -4360,30 +4298,6 @@ def main():
     validity_group.add_argument("--ca-days", type=int, default=None,
                                 metavar="DAYS", help="CA cert lifetime on first creation (default: 3650)")
 
-    security_group = parser.add_argument_group(
-        "Security options",
-        "Authentication and key protection settings."
-    )
-    security_group.add_argument(
-        "--ca-key-passphrase", default=None, metavar="PASS",
-        help="Passphrase for CA private key encryption on disk. "
-             "Can also be set via PYPKI_CA_KEY_PASSPHRASE env var."
-    )
-    security_group.add_argument(
-        "--admin-api-key", default=None, metavar="KEY",
-        help="API key required for admin endpoints (revoke, sub-ca, key recovery, config). "
-             "Clients must send X-Admin-Key header. Can also be set via PYPKI_ADMIN_API_KEY env var."
-    )
-    security_group.add_argument(
-        "--admin-allowed-cns", default=None, metavar="CN1,CN2",
-        help="Comma-separated list of mTLS client CNs allowed to call admin endpoints"
-    )
-    security_group.add_argument(
-        "--bootstrap-token", default=None, metavar="TOKEN",
-        help="Shared secret required for bootstrap endpoint. "
-             "Clients must send X-Bootstrap-Token header or ?token= query param."
-    )
-
     args = parser.parse_args()
 
     logging.getLogger().setLevel(args.log_level)
@@ -4418,28 +4332,8 @@ def main():
     ocsp_url = getattr(args, "ocsp_url", "")
     crl_url  = getattr(args, "crl_url", "")
 
-    # CA key passphrase — CLI arg or env var
-    ca_key_passphrase = getattr(args, "ca_key_passphrase", None)
-    if ca_key_passphrase is None:
-        ca_key_passphrase = os.environ.get("PYPKI_CA_KEY_PASSPHRASE")
-    ca_key_passphrase_bytes = ca_key_passphrase.encode() if ca_key_passphrase else None
-
     ca = CertificateAuthority(ca_dir=args.ca_dir, config=config,
-                               ocsp_url=ocsp_url, crl_url=crl_url,
-                               ca_key_passphrase=ca_key_passphrase_bytes)
-
-    # Admin API key — CLI arg or env var
-    admin_api_key = getattr(args, "admin_api_key", None)
-    if admin_api_key is None:
-        admin_api_key = os.environ.get("PYPKI_ADMIN_API_KEY")
-
-    # Admin allowed CNs for mTLS
-    admin_allowed_cns = None
-    if getattr(args, "admin_allowed_cns", None):
-        admin_allowed_cns = [cn.strip() for cn in args.admin_allowed_cns.split(",")]
-
-    # Bootstrap token
-    bootstrap_token = getattr(args, "bootstrap_token", None)
+                               ocsp_url=ocsp_url, crl_url=crl_url)
 
     # Feature 8: expiry monitor thread
     _expiry_days = getattr(args, "expiry_warn_days", 30)
@@ -4473,17 +4367,11 @@ def main():
     # Use CMPv3Handler (RFC 9480) by default; fall back to CMPv2Handler if --no-cmpv3
     if getattr(args, "cmpv3", True):
         cmp_handler = CMPv3Handler(ca)
-        handler_class = make_cmpv3_handler(ca, cmp_handler, audit_log, rate_limiter,
-                                            admin_api_key=admin_api_key,
-                                            admin_allowed_cns=admin_allowed_cns,
-                                            bootstrap_token=bootstrap_token)
+        handler_class = make_cmpv3_handler(ca, cmp_handler, audit_log, rate_limiter)
         logger.info("CMPv3 handler active (RFC 9480 — pvno auto-negotiation, well-known URI)")
     else:
         cmp_handler = CMPv2Handler(ca)
-        handler_class = make_handler(ca, cmp_handler, audit_log, rate_limiter,
-                                      admin_api_key=admin_api_key,
-                                      admin_allowed_cns=admin_allowed_cns,
-                                      bootstrap_token=bootstrap_token)
+        handler_class = make_handler(ca, cmp_handler, audit_log, rate_limiter)
         logger.info("CMPv2 handler active (--no-cmpv3 specified)")
 
     scheme = "http"
@@ -4546,7 +4434,16 @@ def main():
             print("WARNING: acme_server.py not found — ACME support disabled.")
             print("         Place acme_server.py in the same directory as pki_server.py.")
         else:
-            acme_base = args.acme_base_url or f"http://{args.host}:{args.acme_port}"
+            # Use tls_hostname (or localhost) instead of 127.0.0.1 for the ACME base URL
+            # so directory URLs are reachable by clients (127.0.0.1 is a bind addr, not a hostname)
+            _acme_hostname = (
+                args.acme_base_url.split("://")[1].split(":")[0]
+                if args.acme_base_url
+                else (getattr(args, "tls_hostname", None) or "localhost")
+                if args.host in ("127.0.0.1", "::")
+                else args.host
+            )
+            acme_base = args.acme_base_url or f"http://{_acme_hostname}:{args.acme_port}"
             acme_srv = _acme_module.start_acme_server(
                 host=args.host,
                 port=args.acme_port,
@@ -4630,8 +4527,6 @@ def main():
                 scep_base_url=_scep_base,
                 est_base_url=_est_base,
                 ocsp_base_url=_ocsp_base,
-                admin_api_key=admin_api_key,
-                admin_allowed_cns=admin_allowed_cns,
             )
 
     acme_line = f"http://{args.host}:{args.acme_port}/acme/directory" if (args.acme_port and HAS_ACME) else "disabled"
@@ -4643,55 +4538,55 @@ def main():
     rl_info   = f"{args.rate_limit}/min per IP" if getattr(args,"rate_limit",0) > 0 else "disabled"
     audit_info = "ca/audit.db" if getattr(args,"audit",True) else "disabled"
     boot_line = f"http://{args.host}:{args.bootstrap_port}/bootstrap?cn=<n>" if args.bootstrap_port else "disabled"
-    space = " "
+
     print(f"""
 ╔══════════════════════════════════════════════════════════════════╗
-║         PyPKI CMPv2 + ACME Server (RFC 4210 / RFC 8555 + TLS)    ║
+║         PyPKI CMPv2 + ACME Server (RFC 4210 / RFC 8555 + TLS)  ║
 ╠══════════════════════════════════════════════════════════════════╣
-║  Listening (CMPv2): {scheme}://{args.host}:{args.port:<28}║
-║  Listening (ACME) : {acme_line:<45}║
-║  CA Dir           : {args.ca_dir:<45}║
-║  TLS Mode         : {tls_mode_label:<45}║
-║  Bootstrap        : {boot_line:<45}║
-║  Listening (SCEP) : {scep_line:<45}║
-║  Listening (EST)  : {est_line:<45}║
-║  Listening (OCSP) : {ocsp_line:<45}║
-║  Web Dashboard    : {web_line:<45}║
-║  CMP Well-Known   : {cmp_wk:<45}║
-║  Rate Limiting    : {rl_info:<45}║
-║  Audit Log        : {audit_info:<45}║
-║  Metrics          : {scheme}://{args.host}:{args.port}/metrics                ║
-║  Expiry Monitor   : {str(_expiry_days)+"d" if _expiry_days else "disabled":<45}║
+║  Listening (CMPv2): {scheme}://{args.host}:{args.port:<32}║
+║  Listening (ACME) : {acme_line:<47}║
+║  CA Dir           : {args.ca_dir:<47}║
+║  TLS Mode         : {tls_mode_label:<47}║
+║  Bootstrap        : {boot_line:<47}║
+║  Listening (SCEP) : {scep_line:<47}║
+║  Listening (EST)  : {est_line:<47}║
+║  Listening (OCSP) : {ocsp_line:<47}║
+║  Web Dashboard    : {web_line:<47}║
+║  CMP Well-Known   : {cmp_wk:<47}║
+║  Rate Limiting    : {rl_info:<47}║
+║  Audit Log        : {audit_info:<47}║
+║  Metrics          : {scheme}://{args.host}:{args.port}/metrics                      ║
+║  Expiry Monitor   : {str(_expiry_days)+"d" if _expiry_days else "disabled":<47}║
 ╠══════════════════════════════════════════════════════════════════╣
-║  Validity periods (change live: PATCH /config)                   ║
+║  Validity periods (change live: PATCH /config)                  ║
 ║    End-entity   : {config.end_entity_days:<3} days                                       ║
 ║    Client cert  : {config.client_cert_days:<3} days                                       ║
 ║    TLS server   : {config.tls_server_days:<3} days                                       ║
 ║    CA cert      : {config.ca_days:<4} days                                      ║
 ╠══════════════════════════════════════════════════════════════════╣
-║  CMPv2 Endpoint  : POST {scheme}://{args.host}:{args.port}/{space:<8}           ║
-║  ACME Directory  : GET  {acme_line:<41}║
-║  SCEP Endpoint   : {scep_line:<46}║
-║  Config          : GET/PATCH {scheme}://{args.host}:{args.port}/config{space:<8}║
-║  CA Certificate  : GET  {scheme}://{args.host}:{args.port}/ca/cert.pem{space:<7} ║
-║  CRL             : GET  {scheme}://{args.host}:{args.port}/ca/crl{space:<13}║
-║  Health Check    : GET  {scheme}://{args.host}:{args.port}/health{space:<13}║
+║  CMPv2 Endpoint  : POST {scheme}://{args.host}:{args.port}/           ║
+║  ACME Directory  : GET  {acme_line:<40}║
+║  SCEP Endpoint   : {scep_line:<48}║
+║  Config          : GET/PATCH {scheme}://{args.host}:{args.port}/config ║
+║  CA Certificate  : GET  {scheme}://{args.host}:{args.port}/ca/cert.pem ║
+║  CRL             : GET  {scheme}://{args.host}:{args.port}/ca/crl      ║
+║  Health Check    : GET  {scheme}://{args.host}:{args.port}/health      ║
 ╠══════════════════════════════════════════════════════════════════╣
-║  Supported CMPv2/CMPv3 operations:                               ║
-║    ir, cr, kur, rr, certConf, genm, p10cr (CMPv2 / RFC 4210)     ║
-║    pollReq/pollRep - extended polling (CMPv3 / RFC 9480)         ║
-║    genm GetCACerts, GetRootCACertUpdate, GetCertReqTemplate      ║
-║    Well-known URI: POST/GET /.well-known/cmp[/p/<label>]         ║
+║  Supported CMPv2/CMPv3 operations:                              ║
+║    ir, cr, kur, rr, certConf, genm, p10cr (CMPv2 / RFC 4210)   ║
+║    pollReq/pollRep - extended polling (CMPv3 / RFC 9480)        ║
+║    genm GetCACerts, GetRootCACertUpdate, GetCertReqTemplate     ║
+║    Well-known URI: POST/GET /.well-known/cmp[/p/<label>]        ║
 ╠══════════════════════════════════════════════════════════════════╣
-║  Supported ACME operations (RFC 8555 + RFC 9608):                ║
-║    new-account, new-order, http-01, dns-01, finalize, revoke     ║
-║    noRevAvail (RFC 9608) auto-applied to short-lived certs       ║
+║  Supported ACME operations (RFC 8555 + RFC 9608):              ║
+║    new-account, new-order, http-01, dns-01, finalize, revoke   ║
+║    noRevAvail (RFC 9608) auto-applied to short-lived certs     ║
 ╠══════════════════════════════════════════════════════════════════╣
-║  Supported SCEP operations (RFC 8894):                           ║
-║    GetCACaps, GetCACert, PKCSReq, CertPoll, GetCert, GetCRL      ║
+║  Supported SCEP operations (RFC 8894):                          ║
+║    GetCACaps, GetCACert, PKCSReq, CertPoll, GetCert, GetCRL    ║
 ╠══════════════════════════════════════════════════════════════════╣
-║  Supported EST operations (RFC 7030):                            ║
-║    cacerts, simpleenroll, simplereenroll, csrattrs, serverkeygen ║
+║  Supported EST operations (RFC 7030):                           ║
+║    cacerts, simpleenroll, simplereenroll, csrattrs, serverkeygen║
 ╚══════════════════════════════════════════════════════════════════╝
 """)
 
@@ -4743,6 +4638,13 @@ def main():
         if args.acme_auto_approve_dns:
             print(f"  ⚠ dns-01 auto-approval is ON — do not use in production!")
         print()
+
+    if 'est_srv' not in dir():
+        est_srv = None
+    if 'ocsp_srv' not in dir():
+        ocsp_srv = None
+    if 'web_srv' not in dir():
+        web_srv = None
 
     try:
         server.serve_forever()

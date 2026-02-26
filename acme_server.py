@@ -23,7 +23,7 @@
 ACME Server — RFC 8555 (Automatic Certificate Management Environment)
 ======================================================================
 Implements the ACME protocol for automated certificate issuance and renewal.
-Designed to share the CertificateAuthority from pki_cmpv2_server.py.
+Designed to share the CertificateAuthority from pki_server.py.
 
 Supported challenge types:
   - http-01  : Client places a token at /.well-known/acme-challenge/<token>
@@ -49,15 +49,15 @@ ACME flow (RFC 8555 §7):
 All POST bodies are JWS (JSON Web Signature) with JWK or KID headers.
 Nonces are single-use and tracked server-side.
 
-Dependencies (already required by pki_cmpv2_server.py):
+Dependencies (already required by pki_server.py):
     pip install cryptography
 
 Usage:
     Standalone:
         python acme_server.py [--host 0.0.0.0] [--port 8888] [--ca-dir ./ca]
 
-    Integrated (imported by pki_cmpv2_server.py via --acme-port):
-        python pki_cmpv2_server.py --acme-port 8888
+    Integrated (imported by pki_server.py via --acme-port):
+        python pki_server.py --acme-port 8888
 """
 
 import base64
@@ -243,99 +243,92 @@ class ACMEDatabase:
 
     def _init(self):
         conn = self._conn()
-        try:
-            conn.executescript("""
-                CREATE TABLE IF NOT EXISTS nonces (
-                    value TEXT PRIMARY KEY,
-                    created_at REAL NOT NULL
-                );
+        conn.executescript("""
+            CREATE TABLE IF NOT EXISTS nonces (
+                value TEXT PRIMARY KEY,
+                created_at REAL NOT NULL
+            );
 
-                CREATE TABLE IF NOT EXISTS accounts (
-                    kid         TEXT PRIMARY KEY,
-                    jwk_json    TEXT NOT NULL,
-                    thumbprint  TEXT NOT NULL,
-                    status      TEXT NOT NULL DEFAULT 'valid',
-                    contact     TEXT,
-                    created_at  REAL NOT NULL
-                );
+            CREATE TABLE IF NOT EXISTS accounts (
+                kid         TEXT PRIMARY KEY,
+                jwk_json    TEXT NOT NULL,
+                thumbprint  TEXT NOT NULL,
+                status      TEXT NOT NULL DEFAULT 'valid',
+                contact     TEXT,
+                created_at  REAL NOT NULL
+            );
 
-                CREATE TABLE IF NOT EXISTS orders (
-                    id          TEXT PRIMARY KEY,
-                    account_kid TEXT NOT NULL,
-                    status      TEXT NOT NULL DEFAULT 'pending',
-                    identifiers TEXT NOT NULL,
-                    not_before  TEXT,
-                    not_after   TEXT,
-                    cert_id     TEXT,
-                    created_at  REAL NOT NULL,
-                    expires_at  REAL NOT NULL
-                );
+            CREATE TABLE IF NOT EXISTS orders (
+                id          TEXT PRIMARY KEY,
+                account_kid TEXT NOT NULL,
+                status      TEXT NOT NULL DEFAULT 'pending',
+                identifiers TEXT NOT NULL,
+                not_before  TEXT,
+                not_after   TEXT,
+                cert_id     TEXT,
+                created_at  REAL NOT NULL,
+                expires_at  REAL NOT NULL
+            );
 
-                CREATE TABLE IF NOT EXISTS authorizations (
-                    id          TEXT PRIMARY KEY,
-                    order_id    TEXT NOT NULL,
-                    identifier  TEXT NOT NULL,
-                    status      TEXT NOT NULL DEFAULT 'pending',
-                    created_at  REAL NOT NULL,
-                    expires_at  REAL NOT NULL
-                );
+            CREATE TABLE IF NOT EXISTS authorizations (
+                id          TEXT PRIMARY KEY,
+                order_id    TEXT NOT NULL,
+                identifier  TEXT NOT NULL,
+                status      TEXT NOT NULL DEFAULT 'pending',
+                created_at  REAL NOT NULL,
+                expires_at  REAL NOT NULL
+            );
 
-                CREATE TABLE IF NOT EXISTS challenges (
-                    id          TEXT PRIMARY KEY,
-                    auth_id     TEXT NOT NULL,
-                    type        TEXT NOT NULL,
-                    token       TEXT NOT NULL,
-                    status      TEXT NOT NULL DEFAULT 'pending',
-                    validated_at REAL,
-                    error       TEXT
-                );
+            CREATE TABLE IF NOT EXISTS challenges (
+                id          TEXT PRIMARY KEY,
+                auth_id     TEXT NOT NULL,
+                type        TEXT NOT NULL,
+                token       TEXT NOT NULL,
+                status      TEXT NOT NULL DEFAULT 'pending',
+                validated_at REAL,
+                error       TEXT
+            );
 
-                CREATE TABLE IF NOT EXISTS certificates (
-                    id          TEXT PRIMARY KEY,
-                    order_id    TEXT NOT NULL,
-                    pem_chain   TEXT NOT NULL,
-                    serial      INTEGER,
-                    created_at  REAL NOT NULL
-                );
-            """)
-            conn.commit()
-        finally:
-            conn.close()
+            CREATE TABLE IF NOT EXISTS certificates (
+                id          TEXT PRIMARY KEY,
+                order_id    TEXT NOT NULL,
+                pem_chain   TEXT NOT NULL,
+                serial      INTEGER,
+                created_at  REAL NOT NULL
+            );
+        """)
+        conn.commit()
+        conn.close()
 
     # -- Nonces --
 
     def create_nonce(self) -> str:
         nonce = b64url_encode(os.urandom(16))
         conn = self._conn()
-        try:
-            conn.execute("INSERT INTO nonces VALUES (?, ?)", (nonce, time.time()))
-            conn.commit()
-        finally:
-            conn.close()
+        conn.execute("INSERT INTO nonces VALUES (?, ?)", (nonce, time.time()))
+        conn.commit()
+        conn.close()
         return nonce
 
     def consume_nonce(self, nonce: str) -> bool:
         """Returns True if nonce was valid and is now consumed."""
         with self._lock:
             conn = self._conn()
-            try:
-                row = conn.execute("SELECT value FROM nonces WHERE value=?", (nonce,)).fetchone()
-                if not row:
-                    return False
-                conn.execute("DELETE FROM nonces WHERE value=?", (nonce,))
-                conn.commit()
-            finally:
+            row = conn.execute("SELECT value FROM nonces WHERE value=?", (nonce,)).fetchone()
+            if not row:
                 conn.close()
+                return False
+            conn.execute("DELETE FROM nonces WHERE value=?", (nonce,))
+            conn.commit()
+            conn.close()
             return True
 
     def purge_old_nonces(self, max_age_secs: int = 3600):
         cutoff = time.time() - max_age_secs
         conn = self._conn()
-        try:
-            conn.execute("DELETE FROM nonces WHERE created_at < ?", (cutoff,))
-            conn.commit()
-        finally:
-            conn.close()
+        conn.execute("DELETE FROM nonces WHERE created_at < ?", (cutoff,))
+        conn.commit()
+        conn.close()
 
     # -- Accounts --
 
@@ -344,48 +337,41 @@ class ACMEDatabase:
         thumb = jwk_thumbprint(jwk)
         kid = f"acct-{thumb[:16]}"
         conn = self._conn()
-        try:
-            row = conn.execute("SELECT * FROM accounts WHERE kid=?", (kid,)).fetchone()
-            if row:
-                return False, dict(row)
-            conn.execute(
-                "INSERT INTO accounts VALUES (?,?,?,?,?,?)",
-                (kid, json.dumps(jwk), thumb, "valid",
-                 json.dumps(contact) if contact else None, time.time())
-            )
-            conn.commit()
-            account = dict(conn.execute("SELECT * FROM accounts WHERE kid=?", (kid,)).fetchone())
-        finally:
+        row = conn.execute("SELECT * FROM accounts WHERE kid=?", (kid,)).fetchone()
+        if row:
             conn.close()
+            return False, dict(row)
+        conn.execute(
+            "INSERT INTO accounts VALUES (?,?,?,?,?,?)",
+            (kid, json.dumps(jwk), thumb, "valid",
+             json.dumps(contact) if contact else None, time.time())
+        )
+        conn.commit()
+        account = dict(conn.execute("SELECT * FROM accounts WHERE kid=?", (kid,)).fetchone())
+        conn.close()
         return True, account
 
     def get_account(self, kid: str) -> Optional[dict]:
         conn = self._conn()
-        try:
-            row = conn.execute("SELECT * FROM accounts WHERE kid=?", (kid,)).fetchone()
-        finally:
-            conn.close()
+        row = conn.execute("SELECT * FROM accounts WHERE kid=?", (kid,)).fetchone()
+        conn.close()
         return dict(row) if row else None
 
     def get_account_by_thumbprint(self, thumb: str) -> Optional[dict]:
         conn = self._conn()
-        try:
-            row = conn.execute("SELECT * FROM accounts WHERE thumbprint=?", (thumb,)).fetchone()
-        finally:
-            conn.close()
+        row = conn.execute("SELECT * FROM accounts WHERE thumbprint=?", (thumb,)).fetchone()
+        conn.close()
         return dict(row) if row else None
 
     def update_account_key(self, kid: str, new_jwk: dict, new_thumbprint: str):
         """Replace the JWK and thumbprint for an existing account (key rollover)."""
         conn = self._conn()
-        try:
-            conn.execute(
-                "UPDATE accounts SET jwk_json=?, thumbprint=? WHERE kid=?",
-                (json.dumps(new_jwk), new_thumbprint, kid)
-            )
-            conn.commit()
-        finally:
-            conn.close()
+        conn.execute(
+            "UPDATE accounts SET jwk_json=?, thumbprint=? WHERE kid=?",
+            (json.dumps(new_jwk), new_thumbprint, kid)
+        )
+        conn.commit()
+        conn.close()
 
     # -- Orders --
 
@@ -394,45 +380,41 @@ class ACMEDatabase:
         now = time.time()
         expires = now + 86400  # 24 hours
         conn = self._conn()
-        try:
+        conn.execute(
+            "INSERT INTO orders VALUES (?,?,?,?,?,?,?,?,?)",
+            (order_id, account_kid, "pending",
+             json.dumps(identifiers), None, None, None, now, expires)
+        )
+        conn.commit()
+
+        # Create authorizations for each identifier
+        auth_ids = []
+        for ident in identifiers:
+            auth_id = b64url_encode(os.urandom(12))
             conn.execute(
-                "INSERT INTO orders VALUES (?,?,?,?,?,?,?,?,?)",
-                (order_id, account_kid, "pending",
-                 json.dumps(identifiers), None, None, None, now, expires)
+                "INSERT INTO authorizations VALUES (?,?,?,?,?,?)",
+                (auth_id, order_id, json.dumps(ident), "pending", now, expires)
             )
-            conn.commit()
-
-            # Create authorizations for each identifier
-            auth_ids = []
-            for ident in identifiers:
-                auth_id = b64url_encode(os.urandom(12))
+            # Create http-01, dns-01, and tls-alpn-01 challenges for each authorization
+            for ctype in ("http-01", "dns-01", "tls-alpn-01"):
+                chall_id = b64url_encode(os.urandom(12))
+                token = b64url_encode(os.urandom(32))
                 conn.execute(
-                    "INSERT INTO authorizations VALUES (?,?,?,?,?,?)",
-                    (auth_id, order_id, json.dumps(ident), "pending", now, expires)
+                    "INSERT INTO challenges VALUES (?,?,?,?,?,?,?)",
+                    (chall_id, auth_id, ctype, token, "pending", None, None)
                 )
-                # Create http-01, dns-01, and tls-alpn-01 challenges for each authorization
-                for ctype in ("http-01", "dns-01", "tls-alpn-01"):
-                    chall_id = b64url_encode(os.urandom(12))
-                    token = b64url_encode(os.urandom(32))
-                    conn.execute(
-                        "INSERT INTO challenges VALUES (?,?,?,?,?,?,?)",
-                        (chall_id, auth_id, ctype, token, "pending", None, None)
-                    )
-                auth_ids.append(auth_id)
+            auth_ids.append(auth_id)
 
-            conn.commit()
-            order = dict(conn.execute("SELECT * FROM orders WHERE id=?", (order_id,)).fetchone())
-        finally:
-            conn.close()
+        conn.commit()
+        order = dict(conn.execute("SELECT * FROM orders WHERE id=?", (order_id,)).fetchone())
+        conn.close()
         order["auth_ids"] = auth_ids
         return order
 
     def get_order(self, order_id: str) -> Optional[dict]:
         conn = self._conn()
-        try:
-            row = conn.execute("SELECT * FROM orders WHERE id=?", (order_id,)).fetchone()
-        finally:
-            conn.close()
+        row = conn.execute("SELECT * FROM orders WHERE id=?", (order_id,)).fetchone()
+        conn.close()
         return dict(row) if row else None
 
     def update_order(self, order_id: str, **kwargs):
@@ -441,30 +423,24 @@ class ACMEDatabase:
         sets = ", ".join(f"{k}=?" for k in kwargs)
         vals = list(kwargs.values()) + [order_id]
         conn = self._conn()
-        try:
-            conn.execute(f"UPDATE orders SET {sets} WHERE id=?", vals)
-            conn.commit()
-        finally:
-            conn.close()
+        conn.execute(f"UPDATE orders SET {sets} WHERE id=?", vals)
+        conn.commit()
+        conn.close()
 
     def get_order_authorizations(self, order_id: str) -> list:
         conn = self._conn()
-        try:
-            rows = conn.execute(
-                "SELECT * FROM authorizations WHERE order_id=?", (order_id,)
-            ).fetchall()
-        finally:
-            conn.close()
+        rows = conn.execute(
+            "SELECT * FROM authorizations WHERE order_id=?", (order_id,)
+        ).fetchall()
+        conn.close()
         return [dict(r) for r in rows]
 
     # -- Authorizations --
 
     def get_authorization(self, auth_id: str) -> Optional[dict]:
         conn = self._conn()
-        try:
-            row = conn.execute("SELECT * FROM authorizations WHERE id=?", (auth_id,)).fetchone()
-        finally:
-            conn.close()
+        row = conn.execute("SELECT * FROM authorizations WHERE id=?", (auth_id,)).fetchone()
+        conn.close()
         return dict(row) if row else None
 
     def update_authorization(self, auth_id: str, **kwargs):
@@ -473,30 +449,24 @@ class ACMEDatabase:
         sets = ", ".join(f"{k}=?" for k in kwargs)
         vals = list(kwargs.values()) + [auth_id]
         conn = self._conn()
-        try:
-            conn.execute(f"UPDATE authorizations SET {sets} WHERE id=?", vals)
-            conn.commit()
-        finally:
-            conn.close()
+        conn.execute(f"UPDATE authorizations SET {sets} WHERE id=?", vals)
+        conn.commit()
+        conn.close()
 
     # -- Challenges --
 
     def get_challenge(self, chall_id: str) -> Optional[dict]:
         conn = self._conn()
-        try:
-            row = conn.execute("SELECT * FROM challenges WHERE id=?", (chall_id,)).fetchone()
-        finally:
-            conn.close()
+        row = conn.execute("SELECT * FROM challenges WHERE id=?", (chall_id,)).fetchone()
+        conn.close()
         return dict(row) if row else None
 
     def get_auth_challenges(self, auth_id: str) -> list:
         conn = self._conn()
-        try:
-            rows = conn.execute(
-                "SELECT * FROM challenges WHERE auth_id=?", (auth_id,)
-            ).fetchall()
-        finally:
-            conn.close()
+        rows = conn.execute(
+            "SELECT * FROM challenges WHERE auth_id=?", (auth_id,)
+        ).fetchall()
+        conn.close()
         return [dict(r) for r in rows]
 
     def update_challenge(self, chall_id: str, **kwargs):
@@ -505,33 +475,27 @@ class ACMEDatabase:
         sets = ", ".join(f"{k}=?" for k in kwargs)
         vals = list(kwargs.values()) + [chall_id]
         conn = self._conn()
-        try:
-            conn.execute(f"UPDATE challenges SET {sets} WHERE id=?", vals)
-            conn.commit()
-        finally:
-            conn.close()
+        conn.execute(f"UPDATE challenges SET {sets} WHERE id=?", vals)
+        conn.commit()
+        conn.close()
 
     # -- Certificates --
 
     def store_certificate(self, order_id: str, pem_chain: str, serial: int) -> str:
         cert_id = b64url_encode(os.urandom(12))
         conn = self._conn()
-        try:
-            conn.execute(
-                "INSERT INTO certificates VALUES (?,?,?,?,?)",
-                (cert_id, order_id, pem_chain, serial, time.time())
-            )
-            conn.commit()
-        finally:
-            conn.close()
+        conn.execute(
+            "INSERT INTO certificates VALUES (?,?,?,?,?)",
+            (cert_id, order_id, pem_chain, serial, time.time())
+        )
+        conn.commit()
+        conn.close()
         return cert_id
 
     def get_certificate(self, cert_id: str) -> Optional[dict]:
         conn = self._conn()
-        try:
-            row = conn.execute("SELECT * FROM certificates WHERE id=?", (cert_id,)).fetchone()
-        finally:
-            conn.close()
+        row = conn.execute("SELECT * FROM certificates WHERE id=?", (cert_id,)).fetchone()
+        conn.close()
         return dict(row) if row else None
 
 
@@ -556,10 +520,12 @@ class ChallengeValidator:
         auto_approve_dns: bool = False,
         http_timeout: int = 10,
         tls_alpn01_enabled: bool = False,
+        dns01_hook=None,
     ):
         self.auto_approve_dns = auto_approve_dns
         self.http_timeout = http_timeout
         self.tls_alpn01_enabled = tls_alpn01_enabled
+        self.dns01_hook = dns01_hook  # callable(domain, token, key_auth) -> (bool, str)
 
     def key_authorization(self, token: str, jwk_thumbprint_str: str) -> str:
         return f"{token}.{jwk_thumbprint_str}"
@@ -645,7 +611,16 @@ class ChallengeValidator:
         """
         Validate DNS-01 challenge.
         Expected TXT record: _acme-challenge.<domain> = base64url(sha256(key_auth))
+
+        If a dns01_hook callable was provided at construction time it is called first
+        and its result is used directly (production webhook / RFC 2136 mode).
         """
+        if self.dns01_hook is not None:
+            try:
+                return self.dns01_hook(domain, token, key_auth)
+            except Exception as e:
+                return False, f"dns01_hook raised: {e}"
+
         if self.auto_approve_dns:
             logger.info(f"dns-01 auto-approved for {domain} (test mode)")
             return True, "auto-approved"
@@ -768,6 +743,16 @@ class ACMEHandler(http.server.BaseHTTPRequestHandler):
 
     def do_GET(self):
         path = self.path.split("?")[0].rstrip("/")
+        try:
+            self._do_GET_inner(path)
+        except Exception as e:
+            logger.error(f"ACME GET error on {path}: {e}\n{traceback.format_exc()}")
+            try:
+                self._send_error(500, "urn:ietf:params:acme:error:serverInternal", str(e))
+            except Exception:
+                pass
+
+    def _do_GET_inner(self, path: str):
         if path in ("/acme/directory", ""):
             self._handle_directory()
         elif path == "/acme/new-nonce":
@@ -1601,6 +1586,7 @@ def start_acme_server(
     enable_tls_alpn01: bool = False,
     cert_validity_days: int = 90,
     short_lived_threshold_days: int = 7,
+    dns01_hook=None,
 ) -> ThreadedACMEServer:
     """
     Start the ACME server in a background thread.
@@ -1614,6 +1600,11 @@ def start_acme_server(
         short_lived_threshold_days: Certs with validity <= this value automatically
                            receive the RFC 9608 id-ce-noRevAvail extension and have
                            CDP / AIA-OCSP suppressed (default: 7 days).
+        dns01_hook: Optional callable for dns-01 challenge validation.
+                    Signature: (domain: str, token: str, key_auth: str) -> (bool, str)
+                    When provided, this hook is called instead of the built-in DNS
+                    TXT lookup. Use make_dns01_webhook_hook() or
+                    make_dns01_rfc2136_hook() from pki_server.py to build one.
     """
     if base_url is None:
         base_url = f"http://{host}:{port}"
@@ -1623,6 +1614,7 @@ def start_acme_server(
     validator = ChallengeValidator(
         auto_approve_dns=auto_approve_dns,
         tls_alpn01_enabled=enable_tls_alpn01,
+        dns01_hook=dns01_hook,
     )
     handler = make_acme_handler(
         db, ca, validator, base_url,
@@ -1663,16 +1655,16 @@ if __name__ == "__main__":
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s"
     )
 
-    # Import CertificateAuthority from pki_cmpv2_server if available
+    # Import CertificateAuthority from pki_server if available
     spec = importlib.util.spec_from_file_location(
-        "pki_cmpv2_server", Path(__file__).parent / "pki_cmpv2_server.py"
+        "pki_server", Path(__file__).parent / "pki_server.py"
     )
     if spec and spec.loader:
         pki_mod = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(pki_mod)
         ca = pki_mod.CertificateAuthority(ca_dir=args.ca_dir)
     else:
-        print("ERROR: pki_cmpv2_server.py not found. Run from the same directory.")
+        print("ERROR: pki_server.py not found. Run from the same directory.")
         sys.exit(1)
 
     base_url = args.base_url or f"http://{args.host}:{args.port}"
