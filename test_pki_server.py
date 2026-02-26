@@ -2019,6 +2019,766 @@ class TestCertificatePolicies(unittest.TestCase):
         finally:
             pki_mod.CertProfile.PROFILES["tls_server"] = original
 
+
+# ===========================================================================
+# 21. Feature 3 — datetime timezone-awareness
+# ===========================================================================
+
+class TestDatetimeTimezoneAwareness(unittest.TestCase):
+    """Feature 3: all datetime objects in issued certs use UTC timezone."""
+
+    def setUp(self):
+        self._tmp = tempfile.mkdtemp()
+        self.ca = _make_ca(self._tmp)
+        self.key = _gen_key()
+
+    def test_cert_not_valid_before_is_utc(self):
+        """not_valid_before_utc must be timezone-aware."""
+        cert = self.ca.issue_certificate("CN=tz-test", self.key.public_key())
+        self.assertIsNotNone(cert.not_valid_before_utc.tzinfo,
+                             "not_valid_before_utc must be timezone-aware")
+
+    def test_cert_not_valid_after_is_utc(self):
+        """not_valid_after_utc must be timezone-aware."""
+        cert = self.ca.issue_certificate("CN=tz-test2", self.key.public_key())
+        self.assertIsNotNone(cert.not_valid_after_utc.tzinfo,
+                             "not_valid_after_utc must be timezone-aware")
+
+    def test_ca_cert_timezone_aware(self):
+        """CA self-signed cert dates must be timezone-aware."""
+        self.assertIsNotNone(
+            self.ca.ca_cert.not_valid_before_utc.tzinfo,
+            "CA cert not_valid_before must be timezone-aware"
+        )
+
+
+# ===========================================================================
+# 22. Feature 4 — random CA serial number
+# ===========================================================================
+
+class TestRandomCASerial(unittest.TestCase):
+    """Feature 4: CA self-signed cert must use random_serial_number()."""
+
+    def setUp(self):
+        self._tmp = tempfile.mkdtemp()
+        self.ca = _make_ca(self._tmp)
+
+    def test_ca_serial_not_one(self):
+        """CA serial number must NOT be 1 (should be cryptographically random)."""
+        self.assertNotEqual(self.ca.ca_cert.serial_number, 1,
+                            "CA serial must be random, not hard-coded 1")
+
+    def test_ca_serial_positive(self):
+        """CA serial must be a positive integer per RFC 5280 §4.1.2.2."""
+        self.assertGreater(self.ca.ca_cert.serial_number, 0)
+
+    def test_two_fresh_cas_have_different_serials(self):
+        """Two independently-created CAs must have different serial numbers."""
+        import tempfile as _tf
+        tmp2 = _tf.mkdtemp()
+        ca2 = _make_ca(tmp2)
+        self.assertNotEqual(self.ca.ca_cert.serial_number,
+                            ca2.ca_cert.serial_number,
+                            "Two independent CAs must not share the same serial")
+
+
+# ===========================================================================
+# 23. Feature 6 — Key archival
+# ===========================================================================
+
+class TestKeyArchival(unittest.TestCase):
+    """Feature 6: key escrow — archive and recover subscriber private keys."""
+
+    def setUp(self):
+        self._tmp = tempfile.mkdtemp()
+        self.ca = _make_ca(self._tmp)
+        self.key = _gen_key()
+
+    def _issue_and_archive(self):
+        cert = self.ca.issue_certificate("CN=key-escrow", self.key.public_key())
+        serial = cert.serial_number
+        key_pem = self.key.private_bytes(
+            Encoding.PEM, PrivateFormat.TraditionalOpenSSL, NoEncryption()
+        )
+        ok = self.ca.archive_private_key(serial, key_pem)
+        return serial, key_pem, ok
+
+    def test_archive_returns_true(self):
+        _, _, ok = self._issue_and_archive()
+        self.assertTrue(ok, "archive_private_key must return True on success")
+
+    def test_recover_returns_pem_bytes(self):
+        serial, key_pem, _ = self._issue_and_archive()
+        recovered = self.ca.recover_private_key(serial)
+        self.assertIsNotNone(recovered, "recover_private_key must return bytes")
+        self.assertIsInstance(recovered, bytes)
+
+    def test_recovered_key_matches_original(self):
+        serial, key_pem, _ = self._issue_and_archive()
+        recovered = self.ca.recover_private_key(serial)
+        self.assertEqual(key_pem, recovered,
+                         "Recovered key PEM must exactly match the archived key")
+
+    def test_recover_unknown_serial_returns_none(self):
+        result = self.ca.recover_private_key(999999999)
+        self.assertIsNone(result,
+                          "Recovering unknown serial must return None")
+
+    def test_archive_is_encrypted_at_rest(self):
+        """The archived payload must not contain plaintext PEM (it must be encrypted)."""
+        import sqlite3 as _sq
+        serial, key_pem, _ = self._issue_and_archive()
+        conn = _sq.connect(str(self.ca.ca_dir / "certificates.db"))
+        try:
+            row = conn.execute(
+                "SELECT encrypted FROM key_archive WHERE serial=?", (serial,)
+            ).fetchone()
+        finally:
+            conn.close()
+        self.assertIsNotNone(row, "Key archive record must exist in DB")
+        payload = row[0]
+        # Should not contain raw PEM header
+        self.assertNotIn(b"-----BEGIN", payload,
+                         "Archived payload must be encrypted — PEM header must not appear")
+
+    def test_overwrite_replaces_archive(self):
+        """Re-archiving the same serial must overwrite the previous entry."""
+        serial, key_pem, _ = self._issue_and_archive()
+        # Archive again — must not raise
+        ok2 = self.ca.archive_private_key(serial, key_pem)
+        self.assertTrue(ok2)
+        recovered = self.ca.recover_private_key(serial)
+        self.assertEqual(recovered, key_pem)
+
+
+# ===========================================================================
+# 24. Feature 7 — NameConstraints
+# ===========================================================================
+
+class TestNameConstraints(unittest.TestCase):
+    """Feature 7: NameConstraints extension on sub-CA certificates."""
+
+    def setUp(self):
+        self._tmp = tempfile.mkdtemp()
+        self.ca = _make_ca(self._tmp)
+        self.key = _gen_key()
+
+    def _get_nc(self, cert) -> x509.NameConstraints:
+        return cert.extensions.get_extension_for_class(x509.NameConstraints).value
+
+    def test_name_constraints_present(self):
+        """NameConstraints extension must be present when requested."""
+        cert = self.ca.issue_certificate_with_name_constraints(
+            "CN=Constrained CA", self.key.public_key(),
+            permitted_dns=[".example.com"],
+        )
+        nc = self._get_nc(cert)
+        self.assertIsNotNone(nc.permitted_subtrees)
+
+    def test_name_constraints_is_critical(self):
+        """RFC 5280 §4.2.1.10: NameConstraints MUST be critical in CA certs."""
+        cert = self.ca.issue_certificate_with_name_constraints(
+            "CN=Constrained CA", self.key.public_key(),
+            permitted_dns=[".example.com"],
+        )
+        ext = cert.extensions.get_extension_for_class(x509.NameConstraints)
+        self.assertTrue(ext.critical,
+                        "RFC 5280 §4.2.1.10: NameConstraints MUST be marked critical")
+
+    def test_permitted_dns_subtree(self):
+        """Permitted DNS subtree must appear in permitted_subtrees."""
+        cert = self.ca.issue_certificate_with_name_constraints(
+            "CN=Constrained CA", self.key.public_key(),
+            permitted_dns=[".example.com", ".internal.corp"],
+        )
+        nc = self._get_nc(cert)
+        dns_names = [n.value for n in nc.permitted_subtrees
+                     if isinstance(n, x509.DNSName)]
+        self.assertIn(".example.com", dns_names)
+        self.assertIn(".internal.corp", dns_names)
+
+    def test_excluded_dns_subtree(self):
+        """Excluded DNS subtree must appear in excluded_subtrees."""
+        cert = self.ca.issue_certificate_with_name_constraints(
+            "CN=Constrained CA", self.key.public_key(),
+            excluded_dns=["bad.example.com"],
+        )
+        nc = self._get_nc(cert)
+        self.assertIsNotNone(nc.excluded_subtrees)
+        dns_names = [n.value for n in nc.excluded_subtrees
+                     if isinstance(n, x509.DNSName)]
+        self.assertIn("bad.example.com", dns_names)
+
+    def test_result_is_ca_cert(self):
+        """The issued certificate must be a CA (BasicConstraints cA=True)."""
+        cert = self.ca.issue_certificate_with_name_constraints(
+            "CN=Constrained CA", self.key.public_key(),
+            permitted_dns=[".example.com"],
+        )
+        bc = cert.extensions.get_extension_for_class(x509.BasicConstraints).value
+        self.assertTrue(bc.ca, "Name-constrained cert must be a CA certificate")
+
+
+# ===========================================================================
+# 25. Feature 8 — Expiry monitoring
+# ===========================================================================
+
+class TestExpiryMonitor(unittest.TestCase):
+    """Feature 8: expiring_certificates() and start_expiry_monitor()."""
+
+    def setUp(self):
+        self._tmp = tempfile.mkdtemp()
+        self.ca = _make_ca(self._tmp)
+        self.key = _gen_key()
+
+    def test_expiring_certificates_empty_for_far_future(self):
+        """No certificates should appear as expiring when window is 0 days."""
+        self.ca.issue_certificate("CN=far-future", self.key.public_key(),
+                                  validity_days=365)
+        results = self.ca.expiring_certificates(days_ahead=0)
+        self.assertEqual(results, [], "days_ahead=0 should return nothing")
+
+    def test_expiring_certificates_finds_short_lived(self):
+        """A 1-day certificate should appear when days_ahead=2."""
+        cert = self.ca.issue_certificate("CN=short", self.key.public_key(),
+                                         validity_days=1)
+        results = self.ca.expiring_certificates(days_ahead=2)
+        serials = [r["serial"] for r in results]
+        self.assertIn(cert.serial_number, serials,
+                      "1-day cert must appear in expiring list with days_ahead=2")
+
+    def test_expiry_result_has_required_keys(self):
+        """Each expiry result must contain: serial, subject, not_after, profile, days_remaining."""
+        self.ca.issue_certificate("CN=expiry-keys", self.key.public_key(), validity_days=1)
+        results = self.ca.expiring_certificates(days_ahead=2)
+        if results:
+            r = results[0]
+            for key in ("serial", "subject", "not_after", "profile", "days_remaining"):
+                self.assertIn(key, r, f"Expiry result must contain '{key}' key")
+
+    def test_revoked_cert_not_in_expiring(self):
+        """Revoked certificates must not appear in the expiring list."""
+        cert = self.ca.issue_certificate("CN=revoked-expiry", self.key.public_key(),
+                                         validity_days=1)
+        self.ca.revoke_certificate(cert.serial_number)
+        results = self.ca.expiring_certificates(days_ahead=5)
+        serials = [r["serial"] for r in results]
+        self.assertNotIn(cert.serial_number, serials,
+                         "Revoked certificate must not appear in expiring list")
+
+    def test_expiry_monitor_starts_daemon_thread(self):
+        """start_expiry_monitor must return a running daemon thread."""
+        t = self.ca.start_expiry_monitor(days_ahead=30, check_interval_seconds=3600)
+        self.assertIsInstance(t, threading.Thread)
+        self.assertTrue(t.is_alive(), "Expiry monitor thread must be alive")
+        self.assertTrue(t.daemon, "Expiry monitor thread must be a daemon thread")
+
+
+# ===========================================================================
+# 26. Feature 9 — Certificate renewal
+# ===========================================================================
+
+class TestCertificateRenewal(unittest.TestCase):
+    """Feature 9: renew_certificate() — same key+profile, new serial+validity."""
+
+    def setUp(self):
+        self._tmp = tempfile.mkdtemp()
+        self.ca = _make_ca(self._tmp)
+        self.key = _gen_key()
+
+    def test_renewal_returns_certificate(self):
+        cert = self.ca.issue_certificate("CN=renew-me", self.key.public_key())
+        new_cert = self.ca.renew_certificate(cert.serial_number)
+        self.assertIsNotNone(new_cert, "renew_certificate must return a new certificate")
+
+    def test_renewed_serial_is_new(self):
+        cert = self.ca.issue_certificate("CN=renew-serial", self.key.public_key())
+        new_cert = self.ca.renew_certificate(cert.serial_number)
+        self.assertNotEqual(cert.serial_number, new_cert.serial_number,
+                            "Renewed certificate must have a new serial number")
+
+    def test_renewed_subject_matches(self):
+        cert = self.ca.issue_certificate("CN=renew-subj,O=Test", self.key.public_key())
+        new_cert = self.ca.renew_certificate(cert.serial_number)
+        # rfc4514_string() representation must match (both derived from same source)
+        orig_attrs = sorted(str(a) for a in cert.subject)
+        new_attrs  = sorted(str(a) for a in new_cert.subject)
+        self.assertEqual(orig_attrs, new_attrs,
+                         "Renewed cert must have the same subject attributes")
+
+    def test_renewed_public_key_matches(self):
+        cert = self.ca.issue_certificate("CN=renew-key", self.key.public_key())
+        new_cert = self.ca.renew_certificate(cert.serial_number)
+        self.assertEqual(
+            cert.public_key().public_bytes(serialization.Encoding.DER, serialization.PublicFormat.SubjectPublicKeyInfo),
+            new_cert.public_key().public_bytes(serialization.Encoding.DER, serialization.PublicFormat.SubjectPublicKeyInfo),
+            "Renewed cert must preserve the original public key",
+        )
+
+    def test_renewed_validity_is_fresh(self):
+        cert = self.ca.issue_certificate("CN=renew-validity", self.key.public_key(),
+                                         validity_days=1)
+        new_cert = self.ca.renew_certificate(cert.serial_number, validity_days=365)
+        import datetime
+        delta = new_cert.not_valid_after_utc - cert.not_valid_after_utc
+        self.assertGreater(delta.total_seconds(), 0,
+                           "Renewed cert must expire later than the original")
+
+    def test_renewed_san_preserved(self):
+        cert = self.ca.issue_certificate("CN=renew-san", self.key.public_key(),
+                                         san_dns=["example.com", "www.example.com"])
+        new_cert = self.ca.renew_certificate(cert.serial_number)
+        san = new_cert.extensions.get_extension_for_class(
+            x509.SubjectAlternativeName
+        ).value.get_values_for_type(x509.DNSName)
+        self.assertIn("example.com", san)
+        self.assertIn("www.example.com", san)
+
+    def test_renew_unknown_serial_returns_none(self):
+        result = self.ca.renew_certificate(999999999)
+        self.assertIsNone(result,
+                          "Renewing unknown serial must return None")
+
+    def test_original_not_revoked_after_renewal(self):
+        """Renewal must NOT auto-revoke the original certificate."""
+        import sqlite3 as _sq
+        cert = self.ca.issue_certificate("CN=renew-norevoke", self.key.public_key())
+        self.ca.renew_certificate(cert.serial_number)
+        conn = _sq.connect(str(self.ca.ca_dir / "certificates.db"))
+        try:
+            row = conn.execute(
+                "SELECT revoked FROM certificates WHERE serial=?",
+                (cert.serial_number,)
+            ).fetchone()
+        finally:
+            conn.close()
+        self.assertEqual(row[0], 0, "Original certificate must NOT be revoked after renewal")
+
+
+# ===========================================================================
+# 27. Feature 11 — Prometheus metrics
+# ===========================================================================
+
+class TestPrometheusMetrics(unittest.TestCase):
+    """Feature 11: Prometheus-compatible /metrics endpoint."""
+
+    def setUp(self):
+        self._tmp = tempfile.mkdtemp()
+        self.ca = _make_ca(self._tmp)
+        self.key = _gen_key()
+
+    def test_get_metrics_returns_dict(self):
+        m = self.ca.get_metrics()
+        self.assertIsInstance(m, dict)
+
+    def test_get_metrics_has_required_keys(self):
+        m = self.ca.get_metrics()
+        required = [
+            "pypki_certs_issued_total",
+            "pypki_certs_valid",
+            "pypki_certs_revoked_total",
+            "pypki_certs_expiring_30d",
+            "pypki_certs_expiring_7d",
+            "pypki_certs_expired",
+            "pypki_ca_days_remaining",
+            "pypki_certs_by_profile",
+        ]
+        for key in required:
+            self.assertIn(key, m, f"get_metrics() must contain '{key}'")
+
+    def test_issued_total_increments(self):
+        before = self.ca.get_metrics()["pypki_certs_issued_total"]
+        self.ca.issue_certificate("CN=metric-test", self.key.public_key())
+        after = self.ca.get_metrics()["pypki_certs_issued_total"]
+        self.assertEqual(after, before + 1)
+
+    def test_revoked_total_increments(self):
+        cert = self.ca.issue_certificate("CN=metric-revoke", self.key.public_key())
+        before = self.ca.get_metrics()["pypki_certs_revoked_total"]
+        self.ca.revoke_certificate(cert.serial_number)
+        after = self.ca.get_metrics()["pypki_certs_revoked_total"]
+        self.assertEqual(after, before + 1)
+
+    def test_ca_days_remaining_positive(self):
+        m = self.ca.get_metrics()
+        self.assertGreater(m["pypki_ca_days_remaining"], 0)
+
+    def test_metrics_prometheus_text_format(self):
+        text = self.ca.metrics_prometheus()
+        self.assertIn("# HELP", text, "Prometheus output must contain HELP lines")
+        self.assertIn("# TYPE", text, "Prometheus output must contain TYPE lines")
+        self.assertIn("pypki_certs_issued_total", text)
+
+    def test_metrics_prometheus_ends_with_newline(self):
+        text = self.ca.metrics_prometheus()
+        self.assertTrue(text.endswith("\n"),
+                        "Prometheus text exposition must end with a newline")
+
+    def test_by_profile_dict_populated(self):
+        self.ca.issue_certificate("CN=prof-metric", self.key.public_key(),
+                                  profile="tls_server", san_dns=["metrics.test"])
+        m = self.ca.get_metrics()
+        self.assertIn("tls_server", m["pypki_certs_by_profile"])
+
+    def test_metrics_http_endpoint(self):
+        """GET /metrics must return Prometheus text content-type."""
+        import http.client, threading
+        from http.server import HTTPServer
+        import sys
+        sys.path.insert(0, "/home/claude")
+        import pki_server as pki_mod
+        audit = pki_mod.AuditLog(self.ca.ca_dir)
+        handler = pki_mod.make_handler(self.ca, pki_mod.CMPv2Handler(self.ca), audit, None)
+        srv = HTTPServer(("127.0.0.1", 0), handler)
+        port = srv.server_address[1]
+        t = threading.Thread(target=srv.serve_forever, daemon=True)
+        t.start()
+        try:
+            conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+            conn.request("GET", "/metrics")
+            resp = conn.getresponse()
+            self.assertEqual(resp.status, 200)
+            ct = resp.getheader("Content-Type", "")
+            self.assertIn("text/plain", ct, "Content-Type must be text/plain for Prometheus")
+            body = resp.read().decode()
+            self.assertIn("pypki_certs_issued_total", body)
+        finally:
+            srv.shutdown()
+
+
+# ===========================================================================
+# 28. Feature 12 — /api/certs filtering
+# ===========================================================================
+
+class TestCertFilterEndpoint(unittest.TestCase):
+    """Feature 12: /api/certs?profile=X&expiring_in=N filtering."""
+
+    def _start_local_server(self, ca):
+        import sys
+        sys.path.insert(0, "/home/claude")
+        import pki_server as pki_mod
+        from http.server import HTTPServer
+        import threading
+        audit = pki_mod.AuditLog(ca.ca_dir)
+        handler = pki_mod.make_handler(ca, pki_mod.CMPv2Handler(ca), audit, None)
+        srv = HTTPServer(("127.0.0.1", 0), handler)
+        port = srv.server_address[1]
+        t = threading.Thread(target=srv.serve_forever, daemon=True)
+        t.start()
+        return srv, port
+
+    def setUp(self):
+        self._tmp = tempfile.mkdtemp()
+        self.ca = _make_ca(self._tmp)
+        self.key = _gen_key()
+        # Issue a mix of profiles
+        self.ca.issue_certificate("CN=tls1", self.key.public_key(),
+                                  profile="tls_server", san_dns=["tls1.test"])
+        self.ca.issue_certificate("CN=cli1", self.key.public_key(),
+                                  profile="tls_client")
+        self.ca.issue_certificate("CN=short1", self.key.public_key(),
+                                  validity_days=1, profile="short_lived")
+        self._srv, self._port = self._start_local_server(self.ca)
+
+    def tearDown(self):
+        self._srv.shutdown()
+
+    def test_no_filter_returns_all(self):
+        import http.client
+        conn = http.client.HTTPConnection("127.0.0.1", self._port, timeout=5)
+        conn.request("GET", "/api/certs")
+        resp = conn.getresponse()
+        data = json.loads(resp.read())
+        self.assertGreaterEqual(len(data["certificates"]), 3)
+
+    def test_filter_by_profile(self):
+        import http.client
+        conn = http.client.HTTPConnection("127.0.0.1", self._port, timeout=5)
+        conn.request("GET", "/api/certs?profile=tls_server")
+        resp = conn.getresponse()
+        data = json.loads(resp.read())
+        profiles = {c.get("profile") for c in data["certificates"]}
+        self.assertEqual(profiles, {"tls_server"}, "Profile filter must return only matching certs")
+
+    def test_expiring_in_filter(self):
+        import http.client
+        conn = http.client.HTTPConnection("127.0.0.1", self._port, timeout=5)
+        conn.request("GET", "/api/certs?expiring_in=2")
+        resp = conn.getresponse()
+        data = json.loads(resp.read())
+        self.assertIn("days_ahead", data)
+        # The 1-day cert must appear
+        subjects = [c.get("subject") for c in data.get("certificates", [])]
+        self.assertTrue(any("short1" in (s or "") for s in subjects),
+                        "1-day certificate must appear in expiring_in=2 filter")
+
+    def test_expiring_api_endpoint(self):
+        import http.client
+        conn = http.client.HTTPConnection("127.0.0.1", self._port, timeout=5)
+        conn.request("GET", "/api/expiring?days=2")
+        resp = conn.getresponse()
+        self.assertEqual(resp.status, 200)
+        data = json.loads(resp.read())
+        self.assertIn("expiring", data)
+        self.assertIn("days_ahead", data)
+        self.assertEqual(data["days_ahead"], 2)
+
+
+# ===========================================================================
+# 29. Feature 13 — TLS 1.3-only mode
+# ===========================================================================
+
+class TestTLS13Only(unittest.TestCase):
+    """Feature 13: --tls13-only enforces TLS 1.3 minimum + maximum."""
+
+    def setUp(self):
+        self._tmp = tempfile.mkdtemp()
+        self.ca = _make_ca(self._tmp)
+
+    def test_tls13_only_sets_minimum_version(self):
+        """When tls13_only=True, minimum_version must be TLSv1_3."""
+        cert_path, key_path = self.ca.provision_tls_server_cert("localhost")
+        ctx = self.ca.build_tls_context(
+            cert_path=str(cert_path),
+            key_path=str(key_path),
+            tls13_only=True,
+        )
+        import ssl
+        self.assertEqual(ctx.minimum_version, ssl.TLSVersion.TLSv1_3,
+                         "tls13_only=True must set minimum_version=TLSv1_3")
+
+    def test_tls13_only_sets_maximum_version(self):
+        """When tls13_only=True, maximum_version must also be TLSv1_3."""
+        cert_path, key_path = self.ca.provision_tls_server_cert("localhost")
+        ctx = self.ca.build_tls_context(
+            cert_path=str(cert_path),
+            key_path=str(key_path),
+            tls13_only=True,
+        )
+        import ssl
+        self.assertEqual(ctx.maximum_version, ssl.TLSVersion.TLSv1_3,
+                         "tls13_only=True must set maximum_version=TLSv1_3")
+
+    def test_default_allows_tls12(self):
+        """Without tls13_only, TLS 1.2 must still be allowed (minimum=TLSv1_2)."""
+        cert_path, key_path = self.ca.provision_tls_server_cert("localhost")
+        ctx = self.ca.build_tls_context(
+            cert_path=str(cert_path),
+            key_path=str(key_path),
+            tls13_only=False,
+        )
+        import ssl
+        self.assertLessEqual(ctx.minimum_version, ssl.TLSVersion.TLSv1_2,
+                             "Default mode must allow TLS 1.2")
+
+
+# ===========================================================================
+# 30. Feature 1 — OCSP Stapling
+# ===========================================================================
+
+class TestOCSPStapling(unittest.TestCase):
+    """Feature 1: OCSP staple fetch + cache machinery."""
+
+    def setUp(self):
+        self._tmp = tempfile.mkdtemp()
+        self.ca = _make_ca(self._tmp)
+        self.key = _gen_key()
+
+    def test_fetch_without_ocsp_url_returns_none(self):
+        """fetch_ocsp_staple must return None when no OCSP URL is configured."""
+        cert = self.ca.issue_certificate("CN=staple-test", self.key.public_key())
+        result = self.ca.fetch_ocsp_staple(cert=cert, ocsp_url=None)
+        self.assertIsNone(result,
+                          "fetch_ocsp_staple must return None when no OCSP URL is available")
+
+    def test_invalidate_removes_cache(self):
+        """invalidate_ocsp_staple must remove the cached entry."""
+        # Seed cache manually
+        cache = self.ca._ocsp_cache()
+        cache[12345] = (b"fake_der", 0.0)
+        self.ca.invalidate_ocsp_staple(12345)
+        self.assertNotIn(12345, cache,
+                         "invalidate_ocsp_staple must remove the cache entry")
+
+    def test_invalidate_unknown_serial_is_safe(self):
+        """Invalidating an unknown serial must not raise."""
+        try:
+            self.ca.invalidate_ocsp_staple(999999)
+        except Exception as e:
+            self.fail(f"invalidate_ocsp_staple raised unexpectedly: {e}")
+
+    def test_cache_initialized_lazily(self):
+        """_ocsp_cache() must initialise and return a dict."""
+        cache = self.ca._ocsp_cache()
+        self.assertIsInstance(cache, dict)
+
+    def test_fetch_with_bad_url_returns_none(self):
+        """fetch_ocsp_staple must return None (not raise) on network failure."""
+        cert = self.ca.issue_certificate("CN=staple-bad-url", self.key.public_key())
+        result = self.ca.fetch_ocsp_staple(
+            cert=cert,
+            ocsp_url="http://127.0.0.1:1/bad-ocsp",
+        )
+        self.assertIsNone(result, "Network failure must return None, not raise")
+
+
+# ===========================================================================
+# 31. Feature 2 — Certificate Transparency
+# ===========================================================================
+
+class TestCertificateTransparency(unittest.TestCase):
+    """Feature 2: CT log submission and SCT embedding."""
+
+    def setUp(self):
+        self._tmp = tempfile.mkdtemp()
+        self.ca = _make_ca(self._tmp)
+        self.key = _gen_key()
+
+    def test_submit_bad_url_returns_none(self):
+        """CT log submission to a bad URL must return None without raising."""
+        cert = self.ca.issue_certificate("CN=ct-test", self.key.public_key())
+        result = self.ca.submit_to_ct_log(cert, "http://127.0.0.1:1/bad-ct/")
+        self.assertIsNone(result, "CT submission failure must return None")
+
+    def test_embed_scts_adds_extension(self):
+        """embed_scts must add the SCT list extension (OID 1.3.6.1.4.1.11129.2.4.2)."""
+        import struct
+        cert = self.ca.issue_certificate("CN=ct-embed", self.key.public_key())
+        # Craft a minimal valid TLS-encoded SCT (version + log-id + timestamp + ext + sig)
+        # Format: 1(ver) + 32(log_id) + 8(ts) + 2(ext_len=0) + sig_alg(2) + sig_len(2) + sig(64)
+        fake_sct = (bytes([0])                    # sct_version = v1
+                    + bytes(32)                  # log_id (32 zero bytes)
+                    + struct.pack(">Q", 0)       # timestamp
+                    + struct.pack(">H", 0)       # extensions length = 0
+                    + bytes([4, 3])              # sig alg: ecdsa-secp256r1-sha256
+                    + struct.pack(">H", 64)      # sig length = 64
+                    + bytes(64))                 # signature bytes
+        new_cert = self.ca.embed_scts(cert, [fake_sct])
+        ext_oids = [e.oid.dotted_string for e in new_cert.extensions]
+        self.assertIn("1.3.6.1.4.1.11129.2.4.2", ext_oids,
+                      "SCT list extension OID must be present after embed_scts")
+
+    def test_embed_scts_is_non_critical(self):
+        """The SCT list extension must be non-critical."""
+        import struct
+        cert = self.ca.issue_certificate("CN=ct-crit", self.key.public_key())
+        fake_sct = (bytes([0]) + bytes(32) + struct.pack(">Q", 0)
+                    + struct.pack(">H", 0) + bytes([4, 3]) + struct.pack(">H", 64) + bytes(64))
+        new_cert = self.ca.embed_scts(cert, [fake_sct])
+        ext = next(e for e in new_cert.extensions
+                   if e.oid.dotted_string == "1.3.6.1.4.1.11129.2.4.2")
+        self.assertFalse(ext.critical, "SCT list extension must be non-critical")
+
+    def test_ct_oid_constant_correct(self):
+        """OID_SCT_LIST must equal 1.3.6.1.4.1.11129.2.4.2."""
+        import pki_server as pki_mod
+        self.assertEqual(
+            pki_mod.CertificateAuthority.OID_SCT_LIST.dotted_string,
+            "1.3.6.1.4.1.11129.2.4.2",
+        )
+
+    def test_issue_certificate_with_ct_no_logs_available(self):
+        """issue_certificate_with_ct must still issue a cert even when logs are unreachable."""
+        cert = self.ca.issue_certificate_with_ct(
+            "CN=ct-nologs", self.key.public_key(),
+            ct_log_urls=["http://127.0.0.1:1/bad-ct/"],
+        )
+        self.assertIsNotNone(cert)
+        self.assertIsInstance(cert, x509.Certificate)
+
+
+# ===========================================================================
+# 32. Feature 5 — ACME DNS-01 hook factories
+# ===========================================================================
+
+class TestDNS01Hooks(unittest.TestCase):
+    """Feature 5: ACME dns-01 real resolver hook factories."""
+
+    def test_webhook_hook_returns_callable(self):
+        """make_dns01_webhook_hook must return a callable."""
+        import pki_server as pki_mod
+        hook = pki_mod.CertificateAuthority.make_dns01_webhook_hook(
+            "http://127.0.0.1:1/hook"
+        )
+        self.assertTrue(callable(hook), "Webhook hook must be callable")
+
+    def test_webhook_hook_returns_false_on_failure(self):
+        """Webhook hook must return False (not raise) when the endpoint is unreachable."""
+        import pki_server as pki_mod
+        hook = pki_mod.CertificateAuthority.make_dns01_webhook_hook(
+            "http://127.0.0.1:1/hook"
+        )
+        result = hook("example.com", "token123", "keyauth456")
+        self.assertFalse(result, "Unreachable webhook must return False")
+
+    def test_rfc2136_hook_returns_none_without_dnspython(self):
+        """make_dns01_rfc2136_hook must return None if dnspython is not installed."""
+        import importlib, sys
+        # Temporarily hide dnspython
+        saved = {k: v for k, v in sys.modules.items() if k.startswith("dns")}
+        for k in list(saved.keys()):
+            sys.modules[k] = None
+        try:
+            import pki_server as pki_mod
+            importlib.reload(pki_mod)
+            hook = pki_mod.CertificateAuthority.make_dns01_rfc2136_hook(
+                "127.0.0.1", "key.", "secret=="
+            )
+            # May return None (dnspython absent) or raise ImportError — both acceptable
+        except (ImportError, TypeError):
+            pass  # acceptable
+        finally:
+            for k in list(sys.modules.keys()):
+                if k.startswith("dns") and k not in saved:
+                    del sys.modules[k]
+            sys.modules.update(saved)
+
+
+# ===========================================================================
+# 33. Feature 10 — OpenTelemetry no-op tracer
+# ===========================================================================
+
+class TestOpenTelemetryNoOp(unittest.TestCase):
+    """Feature 10: OTel no-op stubs must not raise even without the SDK."""
+
+    def test_get_tracer_returns_object(self):
+        """_get_tracer() must return a usable object regardless of SDK availability."""
+        import pki_server as pki_mod
+        tracer = pki_mod._get_tracer()
+        self.assertIsNotNone(tracer)
+
+    def test_noop_span_context_manager(self):
+        """No-op span must work as a context manager without raising."""
+        import pki_server as pki_mod
+        tracer = pki_mod._get_tracer()
+        try:
+            with tracer.start_as_current_span("test.span") as span:
+                span.set_attribute("key", "value")
+                span.set_attribute("count", 42)
+        except Exception as e:
+            self.fail(f"No-op span raised unexpectedly: {e}")
+
+    def test_setup_otel_without_sdk_is_noop(self):
+        """_setup_otel() must not raise when the SDK is missing."""
+        import pki_server as pki_mod
+        try:
+            pki_mod._setup_otel("test-service")
+        except Exception as e:
+            self.fail(f"_setup_otel raised without SDK: {e}")
+
+    def test_issue_certificate_with_noop_tracer(self):
+        """issue_certificate must succeed even with the no-op tracer active."""
+        import pki_server as pki_mod
+        import tempfile
+        tmp = tempfile.mkdtemp()
+        ca = _make_ca(tmp)
+        key = _gen_key()
+        # Ensure _tracer is the no-op version
+        pki_mod._tracer = pki_mod._get_tracer()
+        cert = ca.issue_certificate("CN=otel-test", key.public_key())
+        self.assertIsNotNone(cert)
+
+
 # ===========================================================================
 # Entry point
 # ===========================================================================

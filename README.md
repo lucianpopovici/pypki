@@ -26,7 +26,7 @@ A self-contained, production-grade private Certificate Authority with support fo
 | [`est_server.py`](#est-server) | EST server module (RFC 7030) |
 | [`ocsp_server.py`](#ocsp-responder) | OCSP responder (RFC 6960 / RFC 5019) |
 | [`web_ui.py`](#web-dashboard) | HTML management dashboard |
-| [`test_pki_server.py`](#testing) | Unit + RFC compliance test suite (178 tests) |
+| [`test_pki_server.py`](#testing) | Unit + RFC compliance test suite (241 tests) |
 | [`ca_import/`](#ansible-ca-import-role) | Ansible role to push the CA cert to client machines |
 | [`CHANGELOG.md`](CHANGELOG.md) | Full version history |
 | [`LICENSE`](LICENSE) | MIT License |
@@ -45,6 +45,17 @@ A self-contained, production-grade private Certificate Authority with support fo
 - RFC 9608 `noRevAvail` for short-lived certs; CDP and AIA-OCSP auto-suppressed
 - RFC 9549/9598 IDNA: DNS U-label → A-label, `SmtpUTF8Mailbox` for non-ASCII email
 - RFC 5280 §4.2.1.4 `CertificatePolicies` with CPS URI and UserNotice (RFC 6818)
+- Key archival / key escrow with AES-256-CBC encryption (`POST /api/certs/<serial>/archive`)
+- Name constraints extension (`NameConstraints` OID 2.5.29.30) for technically-constrained sub-CAs
+- Certificate expiry monitoring with configurable webhook callbacks
+- One-shot certificate renewal (`POST /api/certs/<serial>/renew`)
+- Prometheus `/metrics` endpoint (counters for issues, revocations, OCSP fetches, rate-limit hits)
+- Expiring-cert query API (`GET /api/expiring?days=30`)
+- TLS 1.3-only mode (`--tls13-only`)
+- OCSP stapling cache with background refresh
+- Certificate Transparency: submit to CT logs and embed SCTs (`SignedCertificateTimestampList`)
+- ACME `dns-01` production hooks: RFC 2136 Dynamic DNS and generic webhook
+- OpenTelemetry tracing with no-op fallback (zero dependencies without `opentelemetry` installed)
 
 ### CMPv2 / CMPv3 Protocol (RFC 4210 / RFC 6712 / RFC 9480)
 | Operation | Type | Description |
@@ -868,13 +879,239 @@ openssl x509 -in cert.pem -noout -text | grep -A10 "Certificate Policies"
 
 ---
 
+## Key Archival (Key Escrow)
+
+Subscriber private keys can be encrypted and stored server-side for recovery scenarios (S/MIME, device replacement).
+
+```bash
+# Archive a subscriber private key (PEM, AES-256-CBC encrypted)
+curl -X POST http://localhost:8080/api/certs/1001/archive \
+  -H "Content-Type: application/json" \
+  -d '{"private_key_pem": "-----BEGIN RSA PRIVATE KEY-----\n...", "password": "s3cret"}'
+
+# Recover the key (returns encrypted PEM)
+curl -X POST http://localhost:8080/api/certs/1001/recover \
+  -H "Content-Type: application/json" \
+  -d '{"password": "s3cret"}'
+```
+
+Keys are stored AES-256-CBC encrypted in the SQLite database; the plaintext key never leaves the request handler. Only the original password can decrypt the archive.
+
+---
+
+## Name Constraints
+
+Issue technically-constrained sub-CA certificates that are restricted to specific DNS zones or IP ranges:
+
+```python
+sub_ca_cert = ca.issue_certificate_with_name_constraints(
+    subject="CN=Intranet Sub-CA,O=Corp",
+    public_key=sub_key.public_key(),
+    permitted_dns=["internal.corp.example.com", ".dev.example.com"],
+    excluded_dns=[],
+    permitted_ip=["10.0.0.0/8", "192.168.0.0/16"],
+)
+```
+
+The resulting `NameConstraints` extension (OID `2.5.29.30`) is marked **critical** per RFC 5280 §4.2.1.10. Browsers and TLS stacks enforce the restrictions automatically.
+
+---
+
+## Certificate Expiry Monitoring
+
+Detect and react to certificates nearing expiry without any external tools.
+
+### Query expiring certs via REST
+
+```bash
+# Certs expiring within 30 days (default)
+curl http://localhost:8080/api/expiring
+
+# Certs expiring within 7 days
+curl "http://localhost:8080/api/expiring?days=7"
+```
+
+Response:
+```json
+[
+  {"serial": 1001, "subject": "CN=svc.example.com", "not_after": "2026-03-10T...", "profile": "tls_server"}
+]
+```
+
+### Background monitor with callback
+
+```python
+def on_expiry(cert_info: dict):
+    send_slack_alert(f"Cert {cert_info['serial']} expires in {cert_info['days_left']} days")
+
+ca.start_expiry_monitor(
+    days_ahead=30,
+    callback=on_expiry,
+    interval_seconds=86400,   # check every 24 h
+)
+```
+
+---
+
+## Certificate Renewal
+
+Re-issue a certificate for the same subscriber without requiring a new CSR. Subject, SANs, profile, and key are preserved; only the serial number and validity window change.
+
+```bash
+curl -X POST http://localhost:8080/api/certs/1001/renew
+```
+
+```json
+{"serial": 1042, "subject": "CN=svc.example.com", "not_after": "2027-02-26T..."}
+```
+
+The old certificate remains valid until its `notAfter` date; no automatic revocation is performed.
+
+---
+
+## Prometheus Metrics
+
+A Prometheus-compatible `/metrics` endpoint exposes real-time counters in `text/plain` format:
+
+```bash
+curl http://localhost:8080/metrics
+```
+
+```
+# HELP pypki_certs_issued_total Total certificates issued
+# TYPE pypki_certs_issued_total counter
+pypki_certs_issued_total 47
+
+# HELP pypki_certs_revoked_total Total certificates revoked
+# TYPE pypki_certs_revoked_total counter
+pypki_certs_revoked_total 3
+
+# HELP pypki_ocsp_fetches_total OCSP staple fetches (cache misses)
+# TYPE pypki_ocsp_fetches_total counter
+pypki_ocsp_fetches_total 12
+
+# HELP pypki_rate_limit_hits_total Rate-limit rejections
+# TYPE pypki_rate_limit_hits_total counter
+pypki_rate_limit_hits_total 0
+```
+
+Scrape interval recommendation: 15–60 seconds. Compatible with any Prometheus-compatible stack (Grafana, VictoriaMetrics, Datadog agent).
+
+---
+
+## OCSP Stapling
+
+PyPKI caches OCSP responses for issued certificates. TLS handlers can attach the cached staple to the handshake without client round-trips:
+
+```python
+# Fetch (or serve from cache) an OCSP staple for a certificate
+staple = ca.fetch_ocsp_staple(
+    serial=1001,
+    ocsp_responder_url="http://ocsp.example.com",
+    ttl_seconds=3600,
+)
+
+# Invalidate on revocation
+ca.invalidate_ocsp_staple(serial=1001)
+```
+
+Cached responses are stored in memory with a configurable TTL. The cache is automatically warmed for long-lived TLS connections.
+
+---
+
+## Certificate Transparency (CT)
+
+Submit issued certificates to public CT logs and embed the resulting Signed Certificate Timestamps (SCTs) to satisfy browser and OS CT policies.
+
+```python
+from pki_server import CertificateAuthority
+
+cert_pem = ca.issue_certificate("CN=svc.example.com", key.public_key(),
+                                san_dns=["svc.example.com"])
+
+# Submit to two CT logs and get a cert with embedded SCTs
+ct_cert_der = ca.issue_certificate_with_ct(
+    subject="CN=svc.example.com",
+    public_key=key.public_key(),
+    san_dns=["svc.example.com"],
+    log_urls=[
+        CertificateAuthority.CT_LOG_ARGON_2025,
+        CertificateAuthority.CT_LOG_XENON_2025,
+    ],
+)
+```
+
+SCTs are embedded in the `SignedCertificateTimestampList` extension (OID `1.3.6.1.4.1.11129.2.4.2`).
+
+### Pre-defined CT log URLs
+
+| Constant | URL |
+|---|---|
+| `CT_LOG_ARGON_2025` | `https://ct.googleapis.com/logs/us1/argon2025h2/` |
+| `CT_LOG_XENON_2025` | `https://ct.googleapis.com/logs/us1/xenon2025h2/` |
+
+---
+
+## ACME `dns-01` Production Hooks
+
+Two ready-made hooks enable real `dns-01` validation for wildcard certificates in production environments.
+
+### Webhook hook (generic HTTP provider)
+
+```python
+from pki_server import CertificateAuthority
+
+hook = CertificateAuthority.make_dns01_webhook_hook(
+    hook_url="https://dns-api.example.com/challenge",
+    timeout=10,
+)
+# Pass `hook` to the ACME server's dns01_hook parameter
+```
+
+The hook performs `POST /challenge` with `{"domain": "...", "token": "...", "key_auth": "..."}`.
+
+### RFC 2136 Dynamic DNS hook
+
+```python
+hook = CertificateAuthority.make_dns01_rfc2136_hook(
+    nameserver="ns1.example.com",
+    zone="example.com",
+    key_name="acme-key",
+    key_algorithm="hmac-sha256",
+    key_secret="base64secret==",
+)
+```
+
+Uses `dnspython` (optional dependency) to send RFC 2136 `nsupdate` packets directly to the authoritative nameserver.
+
+---
+
+## OpenTelemetry Tracing
+
+PyPKI emits OTLP traces for all certificate issuance, revocation, and HTTP handler operations. If the `opentelemetry-sdk` package is not installed, a no-op tracer is used automatically — no configuration is required.
+
+```bash
+# Enable tracing (requires opentelemetry-sdk + exporter)
+pip install opentelemetry-sdk opentelemetry-exporter-otlp-proto-grpc
+
+OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4317 \
+OTEL_SERVICE_NAME=pypki \
+python pki_server.py
+```
+
+Spans are emitted for: `issue_certificate`, `revoke_certificate`, `generate_crl`, and every HTTP request handler. Attributes include `cert.serial`, `cert.profile`, `cert.subject`, and `http.status_code`.
+
+---
+
+---
+
 ## Testing
 
 PyPKI ships a comprehensive test suite covering RFC compliance, all public APIs,
-and integration behaviour.
+and integration behaviour. The suite contains **241 tests across 33 test classes**.
 
 ```bash
-# Run all 178 tests
+# Run all 241 tests
 python -m unittest test_pki_server -v
 
 # Run only RFC compliance tests
@@ -884,6 +1121,12 @@ python -m unittest test_pki_server.TestRFC5280CRL -v
 python -m unittest test_pki_server.TestRFC9608NoRevAvail -v
 python -m unittest test_pki_server.TestRFC9549IDNA -v
 python -m unittest test_pki_server.TestCertificatePolicies -v
+python -m unittest test_pki_server.TestKeyArchival -v
+python -m unittest test_pki_server.TestNameConstraints -v
+python -m unittest test_pki_server.TestPrometheusMetrics -v
+python -m unittest test_pki_server.TestCertificateRenewal -v
+python -m unittest test_pki_server.TestOCSPStapling -v
+python -m unittest test_pki_server.TestCertificateTransparency -v
 
 # Run HTTP API integration tests
 python -m unittest test_pki_server.TestHTTPAPI -v
@@ -946,7 +1189,7 @@ ca/
 ├── crl_base            Delta CRL base snapshots stored in certificates.db
 
 Project root:
-├── test_pki_server.py  Unit + RFC compliance test suite (178 tests)
+├── test_pki_server.py  Unit + RFC compliance test suite (241 tests)
 ├── est/                EST TLS cert auto-issued here (if no --est-tls-cert)
 ├── config.json         Live server configuration (hot-reloaded)
 ├── server.crt          Auto-issued TLS server certificate

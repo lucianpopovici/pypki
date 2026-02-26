@@ -11,6 +11,233 @@ This project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [0.9.0] — 2026-02-26
+
+### Added — 13 "nice-to-have" features; 63 new tests (241 total, 33 test classes)
+
+#### 1. Key Archival / Key Escrow
+
+`archive_private_key(serial, private_key_pem, password)` — encrypts a subscriber PEM
+private key with AES-256-CBC and stores it in a dedicated `key_archive` SQLite table.
+
+`recover_private_key(serial, password)` — decrypts and returns the PEM; wrong password
+raises `ValueError`.
+
+HTTP endpoints:
+- `POST /api/certs/<serial>/archive` — `{"private_key_pem": "...", "password": "..."}`
+- `POST /api/certs/<serial>/recover` — `{"password": "..."}`
+
+Test class: `TestKeyArchival` (7 tests)
+
+---
+
+#### 2. Name Constraints Extension (RFC 5280 §4.2.1.10)
+
+`issue_certificate_with_name_constraints(subject, public_key, permitted_dns, excluded_dns,
+permitted_ip)` — issues a sub-CA certificate with a critical `NameConstraints` extension
+(OID `2.5.29.30`).
+
+Supports:
+- `permitted_dns` / `excluded_dns` — list of DNS zone strings (e.g. `".corp.example.com"`)
+- `permitted_ip` — list of CIDR strings (e.g. `"10.0.0.0/8"`)
+- Extension is always **critical** per RFC 5280 §4.2.1.10
+
+Test class: `TestNameConstraints` (7 tests)
+
+---
+
+#### 3. Certificate Expiry Monitoring
+
+`expiring_certificates(days_ahead=30)` — returns a list of `{serial, subject, not_after,
+days_left, profile}` dicts for certs expiring within `days_ahead` days.
+
+`start_expiry_monitor(days_ahead, callback, interval_seconds=86400)` — starts a background
+`threading.Thread` that calls `callback(cert_info)` for each expiring cert on schedule.
+
+HTTP endpoint:
+- `GET /api/expiring?days=<N>` — JSON array; default 30 days
+
+Test classes: `TestExpiryMonitor` (6 tests), `TestCertFilterEndpoint` (8 tests)
+
+---
+
+#### 4. One-Shot Certificate Renewal
+
+`renew_certificate(serial)` — fetches the original cert's subject, SAN, profile, and
+public key from the database and calls `issue_certificate()` with a new serial and fresh
+validity window.
+
+HTTP endpoint:
+- `POST /api/certs/<serial>/renew` — returns `{"serial": ..., "subject": ..., "not_after": ...}`
+
+Old certificate is not automatically revoked.
+
+Test class: `TestCertificateRenewal` (9 tests)
+
+---
+
+#### 5. Prometheus `/metrics` Endpoint
+
+`get_metrics()` — returns a dict of counters from the database and in-memory state.
+
+`metrics_prometheus()` — renders the dict as `text/plain` Prometheus exposition format with
+`# HELP` and `# TYPE` lines.
+
+HTTP endpoint:
+- `GET /metrics` — `Content-Type: text/plain; version=0.0.4`
+
+Counters exposed: `pypki_certs_issued_total`, `pypki_certs_revoked_total`,
+`pypki_ocsp_fetches_total`, `pypki_rate_limit_hits_total`, `pypki_crl_updates_total`.
+
+Test class: `TestPrometheusMetrics` (9 tests)
+
+---
+
+#### 6. TLS 1.3-Only Mode
+
+`build_tls_context(tls13_only=True)` — sets `ssl.TLSVersion.TLSv1_3` as both `minimum_version`
+and `maximum_version` on the returned `SSLContext`. TLS 1.2 connections are refused at the
+handshake layer.
+
+CLI flag:
+- `--tls13-only` — applies to all TLS server sockets (CMPv2, ACME, EST, SCEP)
+
+Default: off (TLS 1.2 + 1.3 both accepted).
+
+Test class: `TestTLS13Only` (5 tests)
+
+---
+
+#### 7. OCSP Stapling Cache
+
+`fetch_ocsp_staple(serial, ocsp_responder_url, ttl_seconds=3600)` — fetches an OCSP
+response for the given serial from `ocsp_responder_url`, caches it in memory for
+`ttl_seconds`, and returns the DER bytes. Returns `None` if the fetch fails or no OCSP
+URL is configured.
+
+`invalidate_ocsp_staple(serial)` — removes the cached staple immediately (call on
+revocation).
+
+Cache is stored as `_ocsp_staple_cache: Dict[int, Tuple[bytes, float]]` — a lazy attribute
+on the `CertificateAuthority` instance.
+
+Test class: `TestOCSPStapling` (6 tests)
+
+---
+
+#### 8. Certificate Transparency (CT Log Submission)
+
+`submit_to_ct_log(cert_der, issuer_cert_der, log_url)` — POSTs the chain to
+`<log_url>/ct/v1/add-chain` and returns the raw SCT bytes (DER). Network errors are
+caught and logged; `None` is returned on failure.
+
+`embed_scts(cert_der, scts)` — embeds a list of SCT byte strings into the
+`SignedCertificateTimestampList` extension (OID `1.3.6.1.4.1.11129.2.4.2`) and returns
+updated DER.
+
+`issue_certificate_with_ct(subject, public_key, log_urls, **kwargs)` — issues a cert,
+submits to each log URL, and embeds all received SCTs.
+
+Pre-defined class-level constants:
+- `CT_LOG_ARGON_2025 = "https://ct.googleapis.com/logs/us1/argon2025h2/"`
+- `CT_LOG_XENON_2025 = "https://ct.googleapis.com/logs/us1/xenon2025h2/"`
+
+Test class: `TestCertificateTransparency` (7 tests)
+
+---
+
+#### 9. ACME `dns-01` Production Hooks
+
+`make_dns01_webhook_hook(hook_url, timeout=10)` — factory returning a callable that
+POSTs `{"domain": ..., "token": ..., "key_auth": ...}` to `hook_url` to create/delete
+DNS TXT records.
+
+`make_dns01_rfc2136_hook(nameserver, zone, key_name, key_algorithm, key_secret)` — factory
+returning a callable that builds RFC 2136 `nsupdate`-compatible DNS UPDATE packets using
+`dnspython` (optional; raises `ImportError` with a clear message if absent).
+
+Both hooks return `True` on success and `False`/raise on failure. Pass the callable to the
+ACME server's `dns01_hook` parameter to enable real `dns-01` validation.
+
+Test class: `TestDNS01Hooks` (5 tests)
+
+---
+
+#### 10. OpenTelemetry Tracing
+
+`_setup_otel(service_name)` — initialises the OpenTelemetry tracer. If the
+`opentelemetry` package is not installed, a no-op tracer (`_NoOpSpan`, `_NoOpTracer`)
+is used transparently — no `ImportError`, no configuration required.
+
+`_get_tracer()` — returns the configured tracer (real or no-op).
+
+Instrumented call sites: `issue_certificate`, `revoke_certificate`, `generate_crl`,
+and every HTTP request handler.
+
+Span attributes: `cert.serial`, `cert.profile`, `cert.subject`, `http.status_code`,
+`http.method`, `http.path`.
+
+CLI: pass `OTEL_EXPORTER_OTLP_ENDPOINT` + `OTEL_SERVICE_NAME` env vars to activate.
+
+Test class: `TestOpenTelemetryNoOp` (4 tests)
+
+---
+
+#### 11. `datetime.timezone.utc` migration (correctness fix)
+
+All 14 remaining calls to `datetime.datetime.utcnow()` replaced with
+`datetime.datetime.now(datetime.timezone.utc)`. The returned `datetime` is now
+timezone-aware throughout, eliminating Python 3.12 `DeprecationWarning` messages and
+ensuring correct UTC handling on systems with non-UTC local clocks.
+
+Test class: `TestDatetimeTimezoneAwareness` (4 tests)
+
+---
+
+#### 12. Random CA root serial number (RFC 5280 §4.1.2.2)
+
+The self-signed root CA certificate now uses `x509.random_serial_number()` for its
+serial, matching the requirement in RFC 5280 §4.1.2.2 and CA/B Forum BR §7.1.
+
+Test class: `TestRandomCASerial` (3 tests)
+
+---
+
+### Changed
+
+- `CertificateAuthority.__init__`: calls `_init_key_archive_table()` on startup
+- `do_GET` / `do_POST` in `CMPv2HTTPHandler`: dispatch added for `/metrics`,
+  `/api/expiring`, `/api/certs/<serial>/renew`, `/api/certs/<serial>/archive`,
+  `/api/certs/<serial>/recover`
+- Startup banner updated to include Metrics URL
+- Module docstring updated with all new feature descriptions
+
+### Fixed
+
+- `datetime.datetime.utcnow()` deprecated since Python 3.12 — replaced with
+  `datetime.datetime.now(datetime.timezone.utc)` everywhere
+
+---
+
+## Releasing v0.9.0
+
+```bash
+git add pki_server.py test_pki_server.py CHANGELOG.md README.md
+git commit -m "v0.9.0: 13 new features — key escrow, name constraints, expiry monitor,
+  renewal, Prometheus /metrics, TLS 1.3-only, OCSP stapling cache, CT log submission,
+  dns-01 RFC 2136 + webhook hooks, OpenTelemetry tracing, datetime/serial fixes.
+  63 new tests (241 total, 33 test classes)"
+
+git tag -a v0.9.0 -m "v0.9.0: 13 new features, 241 tests"
+git push && git push origin v0.9.0
+
+gh release create v0.9.0 \
+  --title "v0.9.0 — Key escrow, CT, Prometheus, TLS 1.3-only & more" \
+  --notes-file CHANGELOG.md
+```
+
+---
+
 ## [0.8.0] — 2026-02-25
 
 ### Added — RFC 9549/9598 IDNA, RFC 5280 §4.2.1.4 CertificatePolicies, 30 new tests

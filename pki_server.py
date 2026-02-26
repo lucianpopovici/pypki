@@ -75,6 +75,7 @@ import http.server
 import json
 import logging
 import os
+import re
 import socket
 import sqlite3
 import ssl
@@ -167,6 +168,79 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s"
 )
 logger = logging.getLogger("pki-cmpv2")
+
+# ---------------------------------------------------------------------------
+# Feature 10 — OpenTelemetry tracing (optional)
+# ---------------------------------------------------------------------------
+# If the opentelemetry-sdk package is installed, PyPKI creates spans for every
+# certificate issuance, revocation, CRL generation, and HTTP request.
+# Without the package, all tracing calls are no-ops (zero overhead).
+#
+# Install:  pip install opentelemetry-sdk opentelemetry-exporter-otlp-proto-grpc
+# Configure: set OTEL_EXPORTER_OTLP_ENDPOINT env var (e.g. http://localhost:4317)
+# ---------------------------------------------------------------------------
+
+try:
+    from opentelemetry import trace as _otel_trace
+    from opentelemetry.sdk.trace import TracerProvider as _OtelTracerProvider
+    from opentelemetry.sdk.trace.export import BatchSpanProcessor as _BatchSpanProcessor
+    try:
+        from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import (
+            OTLPSpanExporter as _OTLPExporter,
+        )
+        _HAS_OTLP = True
+    except ImportError:
+        _HAS_OTLP = False
+    _HAS_OTEL = True
+except ImportError:
+    _HAS_OTEL = False
+    _HAS_OTLP = False
+
+
+def _setup_otel(service_name: str = "pypki") -> None:
+    """
+    Configure the OpenTelemetry SDK.  Called once at startup if --otel-endpoint
+    is provided.  Without the SDK this is a no-op.
+    """
+    if not _HAS_OTEL:
+        logger.debug("opentelemetry-sdk not installed — tracing disabled")
+        return
+
+    provider = _OtelTracerProvider()
+    if _HAS_OTLP:
+        endpoint = os.environ.get("OTEL_EXPORTER_OTLP_ENDPOINT", "http://localhost:4317")
+        exporter = _OTLPExporter(endpoint=endpoint, insecure=True)
+        provider.add_span_processor(_BatchSpanProcessor(exporter))
+        logger.info(f"OpenTelemetry tracing → {endpoint}")
+    else:
+        # Fallback: log spans to stderr
+        from opentelemetry.sdk.trace.export import SimpleSpanProcessor, ConsoleSpanExporter
+        provider.add_span_processor(SimpleSpanProcessor(ConsoleSpanExporter()))
+        logger.info("OpenTelemetry tracing → console (OTLP exporter not installed)")
+
+    _otel_trace.set_tracer_provider(provider)
+
+
+def _get_tracer():
+    """Return an OpenTelemetry Tracer, or a no-op stub if OTEL is unavailable."""
+    if _HAS_OTEL:
+        return _otel_trace.get_tracer("pypki")
+    # No-op stub
+    class _NoopSpan:
+        def __enter__(self): return self
+        def __exit__(self, *a): pass
+        def set_attribute(self, *a): pass
+        def record_exception(self, *a): pass
+        def set_status(self, *a): pass
+    class _NoopTracer:
+        def start_as_current_span(self, name, **kw):
+            return _NoopSpan()
+    return _NoopTracer()
+
+
+_tracer = None  # Set to _get_tracer() after _setup_otel() is called in main()
+
+
 
 
 # ---------------------------------------------------------------------------
@@ -646,7 +720,7 @@ class CMPv2ASN1:
         sender = ctx(4, seq(b""), constructed=True)   # GeneralName [4] directoryName
         recipient = ctx(4, seq(b""), constructed=True)
 
-        msg_time = ctx(0, generalizedtime(datetime.datetime.utcnow()), constructed=False)
+        msg_time = ctx(0, generalizedtime(datetime.datetime.now(datetime.timezone.utc)), constructed=False)
 
         # sha256WithRSAEncryption OID for protection alg hint
         prot_alg = ctx(1, seq(oid("1.2.840.113549.1.1.11") + null()), constructed=False)
@@ -874,7 +948,7 @@ class AuditLog:
         conn.close()
 
     def record(self, event: str, detail: str = "", ip: str = ""):
-        ts = datetime.datetime.utcnow().isoformat()
+        ts = datetime.datetime.now(datetime.timezone.utc).isoformat()
         conn = sqlite3.connect(str(self._db))
         conn.execute("INSERT INTO audit(ts,event,detail,ip) VALUES(?,?,?,?)",
                      (ts, event, detail, ip))
@@ -1127,14 +1201,14 @@ class CertificateAuthority:
                 x509.NameAttribute(NameOID.COMMON_NAME, "PyPKI Root CA"),
             ])
 
-            now = datetime.datetime.utcnow()
+            now = datetime.datetime.now(datetime.timezone.utc)
             ca_days = self._cfg("ca_days", 3650)
             self.ca_cert = (
                 x509.CertificateBuilder()
                 .subject_name(subject)
                 .issuer_name(issuer)
                 .public_key(self.ca_key.public_key())
-                .serial_number(1)
+                .serial_number(x509.random_serial_number())
                 .not_valid_before(now)
                 .not_valid_after(now + datetime.timedelta(days=ca_days))
                 .add_extension(x509.BasicConstraints(ca=True, path_length=None), critical=True)
@@ -1261,7 +1335,7 @@ class CertificateAuthority:
 
         subject = x509.Name(attrs)
         serial = self._next_serial()
-        now = datetime.datetime.utcnow()
+        now = datetime.datetime.now(datetime.timezone.utc)
         path_len = prof.get("path_length", 0) if is_ca else None
 
         ku = prof["key_usage"].copy()
@@ -1426,7 +1500,14 @@ class CertificateAuthority:
                     critical=False,
                 )
 
-        cert = builder.sign(self.ca_key, SHA256())
+        # Feature 10: OpenTelemetry span for certificate issuance
+        _t = _tracer or _get_tracer()
+        with _t.start_as_current_span("ca.issue_certificate") as _span:
+            _span.set_attribute("cert.serial", serial)
+            _span.set_attribute("cert.subject", subject_str)
+            _span.set_attribute("cert.profile", profile)
+            _span.set_attribute("cert.validity_days", validity_days or 0)
+            cert = builder.sign(self.ca_key, SHA256())
 
         # Store in DB (including profile)
         conn = sqlite3.connect(str(self.db_path))
@@ -1461,12 +1542,17 @@ class CertificateAuthority:
         return priv_key, cert
 
     def revoke_certificate(self, serial: int, reason: int = 0) -> bool:
+        # Feature 10: tracing
+        _t = _tracer or _get_tracer()
+        with _t.start_as_current_span("ca.revoke_certificate") as _span:
+            _span.set_attribute("cert.serial", serial)
+            _span.set_attribute("cert.revocation_reason", reason)
         conn = sqlite3.connect(str(self.db_path))
         try:
             row = conn.execute("SELECT serial FROM certificates WHERE serial=? AND revoked=0", (serial,)).fetchone()
             if not row:
                 return False
-            now = datetime.datetime.utcnow().isoformat()
+            now = datetime.datetime.now(datetime.timezone.utc).isoformat()
             conn.execute(
                 "UPDATE certificates SET revoked=1, revoked_at=?, reason=? WHERE serial=?",
                 (now, reason, serial),
@@ -1488,8 +1574,8 @@ class CertificateAuthority:
         builder = (
             x509.CertificateRevocationListBuilder()
             .issuer_name(self.ca_cert.subject)
-            .last_update(datetime.datetime.utcnow())
-            .next_update(datetime.datetime.utcnow() + datetime.timedelta(days=1))
+            .last_update(datetime.datetime.now(datetime.timezone.utc))
+            .next_update(datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(days=1))
         )
 
         for serial, revoked_at, reason in revoked:
@@ -1499,7 +1585,7 @@ class CertificateAuthority:
                 .revocation_date(
                     datetime.datetime.fromisoformat(revoked_at)
                     if revoked_at
-                    else datetime.datetime.utcnow()
+                    else datetime.datetime.now(datetime.timezone.utc)
                 )
                 .build()
             )
@@ -1517,11 +1603,11 @@ class CertificateAuthority:
     def list_certificates(self) -> list:
         conn = sqlite3.connect(str(self.db_path))
         rows = conn.execute(
-            "SELECT serial, subject, not_before, not_after, revoked FROM certificates"
+            "SELECT serial, subject, not_before, not_after, revoked, profile FROM certificates"
         ).fetchall()
         conn.close()
         return [
-            {"serial": r[0], "subject": r[1], "not_before": r[2], "not_after": r[3], "revoked": bool(r[4])}
+            {"serial": r[0], "subject": r[1], "not_before": r[2], "not_after": r[3], "revoked": bool(r[4]), "profile": r[5] or "default"}
             for r in rows
         ]
 
@@ -1580,7 +1666,7 @@ class CertificateAuthority:
         priv_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
         subject_str = f"CN={common_name},O={org}"
 
-        now = datetime.datetime.utcnow()
+        now = datetime.datetime.now(datetime.timezone.utc)
         serial = self._next_serial()
         subject = x509.Name([
             x509.NameAttribute(NameOID.COMMON_NAME, common_name),
@@ -1650,6 +1736,7 @@ class CertificateAuthority:
         key_path: str,
         require_client_cert: bool = False,
         alpn_protocols: Optional[List[str]] = None,
+        tls13_only: bool = False,
     ) -> ssl.SSLContext:
         """
         Build a server-side SSLContext with ALPN support.
@@ -1673,6 +1760,11 @@ class CertificateAuthority:
         """
         ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+        # TLS 1.3-only mode (--tls13-only) — refuse TLS 1.2 connections
+        if tls13_only:
+            ctx.minimum_version = ssl.TLSVersion.TLSv1_3
+            ctx.maximum_version = ssl.TLSVersion.TLSv1_3
+            logger.info("TLS 1.3-only mode active — TLS 1.2 connections will be refused")
 
         # Harden: disable weak ciphers and compression
         ctx.options |= ssl.OP_NO_COMPRESSION
@@ -1724,7 +1816,7 @@ class CertificateAuthority:
 
         # Generate a throwaway key for this challenge cert
         throwaway_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
-        now = datetime.datetime.utcnow()
+        now = datetime.datetime.now(datetime.timezone.utc)
 
         # Build the challenge certificate
         cert = (
@@ -1813,8 +1905,8 @@ class CertificateAuthority:
         builder = (
             x509.CertificateRevocationListBuilder()
             .issuer_name(self.ca_cert.subject)
-            .last_update(datetime.datetime.utcnow())
-            .next_update(datetime.datetime.utcnow() + datetime.timedelta(days=7))
+            .last_update(datetime.datetime.now(datetime.timezone.utc))
+            .next_update(datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(days=7))
         )
         conn = sqlite3.connect(str(self.db_path))
         conn.row_factory = sqlite3.Row
@@ -1827,9 +1919,9 @@ class CertificateAuthority:
                     x509.RevokedCertificateBuilder()
                     .serial_number(row["serial"])
                     .revocation_date(
-                        datetime.datetime.utcfromtimestamp(row["revoked_at"])
+                        datetime.datetime.fromtimestamp(row["revoked_at"], tz=datetime.timezone.utc)
                         if row["revoked_at"]
-                        else datetime.datetime.utcnow()
+                        else datetime.datetime.now(datetime.timezone.utc)
                     )
                     .build()
                 )
@@ -1917,7 +2009,7 @@ class CertificateAuthority:
         ).fetchall()
         conn.close()
 
-        now = datetime.datetime.utcnow()
+        now = datetime.datetime.now(datetime.timezone.utc)
         next_update = now + datetime.timedelta(hours=6)
 
         builder = (
@@ -2012,6 +2104,816 @@ class CertificateAuthority:
     @property
     def ca_cert_pem(self) -> bytes:
         return self.ca_cert.public_bytes(Encoding.PEM)
+
+
+    # ------------------------------------------------------------------
+    # Feature 6 — Key archival / key escrow (RFC 4210 §5.3.4)
+    # Encrypts subscriber private key to the CA public key using RSA-OAEP
+    # and stores the ciphertext in a dedicated DB table.
+    # ------------------------------------------------------------------
+
+    def _init_key_archive_table(self):
+        """Create key_archive table if it does not exist (called from _init_db)."""
+        conn = sqlite3.connect(str(self.db_path))
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS key_archive (
+                serial      INTEGER PRIMARY KEY,
+                archived_at TEXT NOT NULL,
+                encrypted   BLOB NOT NULL,
+                subject     TEXT NOT NULL
+            )
+        """)
+        conn.commit()
+        conn.close()
+
+    def archive_private_key(self, serial: int, private_key_pem: bytes) -> bool:
+        """
+        Encrypt and archive a subscriber private key using RSA-OAEP with the CA public key.
+        The plaintext never touches disk.  Returns True on success.
+
+        The CA private key is needed to decrypt — use recover_private_key().
+        """
+        self._init_key_archive_table()
+        from cryptography.hazmat.primitives.asymmetric.padding import OAEP, MGF1
+        # Chunk-encrypt the PEM with RSA-OAEP + AES-256-GCM (hybrid encryption)
+        # Step 1 — generate a random 32-byte AES key
+        aes_key = os.urandom(32)
+        nonce    = os.urandom(12)
+        # Step 2 — encrypt plaintext with AES-256-GCM
+        from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+        aesgcm = AESGCM(aes_key)
+        ciphertext = aesgcm.encrypt(nonce, private_key_pem, None)
+        # Step 3 — encrypt AES key with RSA-OAEP (CA public key)
+        wrapped_key = self.ca_cert.public_key().encrypt(
+            aes_key,
+            OAEP(mgf=MGF1(algorithm=hashes.SHA256()), algorithm=hashes.SHA256(), label=None)
+        )
+        # Step 4 — pack: 2-byte wrapped_key_len | wrapped_key | 12-byte nonce | ciphertext
+        payload = (
+            len(wrapped_key).to_bytes(2, "big")
+            + wrapped_key
+            + nonce
+            + ciphertext
+        )
+        now = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        conn = sqlite3.connect(str(self.db_path))
+        try:
+            # Fetch subject from certificates table
+            row = conn.execute(
+                "SELECT subject FROM certificates WHERE serial=?", (serial,)
+            ).fetchone()
+            subject = row[0] if row else "unknown"
+            conn.execute(
+                "INSERT OR REPLACE INTO key_archive(serial,archived_at,encrypted,subject) VALUES(?,?,?,?)",
+                (serial, now, payload, subject)
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        logger.info(f"Key archived for serial={serial}")
+        return True
+
+    def recover_private_key(self, serial: int) -> Optional[bytes]:
+        """
+        Decrypt and return the archived private key PEM for the given serial.
+        Returns None if no archive entry exists.
+        Requires the CA private key (held in memory, never written in plaintext outside ca.key).
+        """
+        self._init_key_archive_table()
+        from cryptography.hazmat.primitives.asymmetric.padding import OAEP, MGF1
+        conn = sqlite3.connect(str(self.db_path))
+        try:
+            row = conn.execute(
+                "SELECT encrypted FROM key_archive WHERE serial=?", (serial,)
+            ).fetchone()
+            if not row:
+                return None
+            payload = row[0]
+        finally:
+            conn.close()
+        # Unpack
+        wk_len = int.from_bytes(payload[:2], "big")
+        wrapped_key = payload[2:2 + wk_len]
+        nonce = payload[2 + wk_len: 2 + wk_len + 12]
+        ciphertext = payload[2 + wk_len + 12:]
+        # Decrypt AES key
+        from cryptography.hazmat.primitives.asymmetric.padding import OAEP, MGF1
+        from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+        aes_key = self.ca_key.decrypt(
+            wrapped_key,
+            OAEP(mgf=MGF1(algorithm=hashes.SHA256()), algorithm=hashes.SHA256(), label=None)
+        )
+        aesgcm = AESGCM(aes_key)
+        plaintext = aesgcm.decrypt(nonce, ciphertext, None)
+        logger.info(f"Key recovery performed for serial={serial}")
+        return plaintext
+
+    # ------------------------------------------------------------------
+    # Feature 7 — Name Constraints extension (RFC 5280 §4.2.1.10)
+    # ------------------------------------------------------------------
+
+    def issue_certificate_with_name_constraints(
+        self,
+        subject_str: str,
+        public_key,
+        permitted_dns: Optional[List[str]] = None,
+        excluded_dns: Optional[List[str]] = None,
+        permitted_emails: Optional[List[str]] = None,
+        excluded_ips: Optional[List[str]] = None,
+        **kwargs,
+    ) -> x509.Certificate:
+        """
+        Issue a CA certificate (is_ca=True, profile='sub_ca') with a NameConstraints
+        extension per RFC 5280 §4.2.1.10.  NameConstraints MUST only appear in CA certs.
+
+        permitted_dns  : e.g. [".example.com"] — subtree of permitted DNS names
+        excluded_dns   : e.g. [".evil.example.com"]
+        permitted_emails: e.g. ["@example.com"]
+        excluded_ips   : e.g. ["10.0.0.0/8"]
+        """
+        import ipaddress as _ip
+        permitted: List[x509.GeneralName] = []
+        excluded:  List[x509.GeneralName] = []
+
+        for dns in (permitted_dns or []):
+            permitted.append(x509.DNSName(dns))
+        for dns in (excluded_dns or []):
+            excluded.append(x509.DNSName(dns))
+        for email in (permitted_emails or []):
+            permitted.append(x509.RFC822Name(email))
+        for cidr in (excluded_ips or []):
+            net = _ip.ip_network(cidr, strict=False)
+            excluded.append(x509.IPAddress(net))
+
+        nc_ext = x509.NameConstraints(
+            permitted_subtrees=permitted if permitted else None,
+            excluded_subtrees=excluded  if excluded  else None,
+        )
+
+        kwargs.setdefault("is_ca", True)
+        kwargs.setdefault("profile", "sub_ca")
+        cert = self.issue_certificate(subject_str=subject_str, public_key=public_key, **kwargs)
+
+        # Re-sign with NameConstraints added; we need to rebuild because issue_certificate
+        # doesn't expose arbitrary extension injection via keyword args.
+        # Build a new cert based on the just-issued cert's fields.
+        now = datetime.datetime.now(datetime.timezone.utc)
+        nc_cert = (
+            x509.CertificateBuilder()
+            .subject_name(cert.subject)
+            .issuer_name(cert.issuer)
+            .public_key(cert.public_key())
+            .serial_number(cert.serial_number)
+            .not_valid_before(cert.not_valid_before_utc)
+            .not_valid_after(cert.not_valid_after_utc)
+        )
+        for ext in cert.extensions:
+            nc_cert = nc_cert.add_extension(ext.value, critical=ext.critical)
+        nc_cert = nc_cert.add_extension(nc_ext, critical=True)
+        return nc_cert.sign(self.ca_key, SHA256())
+
+    # ------------------------------------------------------------------
+    # Feature 8 — Expiry monitoring
+    # ------------------------------------------------------------------
+
+    def expiring_certificates(self, days_ahead: int = 30) -> List[dict]:
+        """
+        Return a list of non-revoked certificates expiring within the next
+        ``days_ahead`` days.  Each entry has keys: serial, subject, not_after,
+        profile, days_remaining.
+        """
+        cutoff = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(days=days_ahead)
+        conn = sqlite3.connect(str(self.db_path))
+        try:
+            rows = conn.execute(
+                "SELECT serial, subject, not_after, profile FROM certificates "
+                "WHERE revoked=0 ORDER BY not_after ASC"
+            ).fetchall()
+        finally:
+            conn.close()
+
+        result = []
+        for serial, subject, not_after_str, profile in rows:
+            try:
+                not_after = datetime.datetime.fromisoformat(not_after_str)
+                # Make timezone-aware if naive
+                if not_after.tzinfo is None:
+                    not_after = not_after.replace(tzinfo=datetime.timezone.utc)
+            except ValueError:
+                continue
+            now = datetime.datetime.now(datetime.timezone.utc)
+            if now < not_after <= cutoff:
+                days_remaining = (not_after - now).days
+                result.append({
+                    "serial": serial,
+                    "subject": subject,
+                    "not_after": not_after.isoformat(),
+                    "profile": profile or "default",
+                    "days_remaining": days_remaining,
+                })
+        return result
+
+    def start_expiry_monitor(
+        self,
+        days_ahead: int = 30,
+        check_interval_seconds: int = 86400,
+        on_expiring: Optional[callable] = None,
+        audit: Optional["AuditLog"] = None,
+    ) -> threading.Thread:
+        """
+        Start a background thread that periodically logs (and optionally calls a
+        callback for) certificates approaching expiry.
+
+        on_expiring(cert_info: dict) is called once per certificate per check cycle
+        when it enters the warning window.  Use it to send emails, fire webhooks, etc.
+        """
+        def _monitor():
+            logger.info(f"Expiry monitor started: window={days_ahead}d, interval={check_interval_seconds}s")
+            while True:
+                try:
+                    expiring = self.expiring_certificates(days_ahead=days_ahead)
+                    if expiring:
+                        logger.warning(
+                            f"Expiry monitor: {len(expiring)} certificate(s) expiring "
+                            f"within {days_ahead} days"
+                        )
+                        for info in expiring:
+                            logger.warning(
+                                f"  EXPIRING serial={info['serial']} "
+                                f"subject='{info['subject']}' "
+                                f"days_remaining={info['days_remaining']} "
+                                f"not_after={info['not_after']}"
+                            )
+                            if on_expiring:
+                                try:
+                                    on_expiring(info)
+                                except Exception as cb_err:
+                                    logger.error(f"Expiry callback error: {cb_err}")
+                        if audit:
+                            audit.record(
+                                "expiry_monitor",
+                                f"found={len(expiring)} expiring_within={days_ahead}d",
+                            )
+                    else:
+                        logger.debug(f"Expiry monitor: no certificates expiring in {days_ahead} days")
+                except Exception as err:
+                    logger.error(f"Expiry monitor error: {err}")
+                time.sleep(check_interval_seconds)
+
+        t = threading.Thread(target=_monitor, daemon=True, name="expiry-monitor")
+        t.start()
+        return t
+
+    # ------------------------------------------------------------------
+    # Feature 9 — Certificate renewal
+    # ------------------------------------------------------------------
+
+    def renew_certificate(
+        self,
+        serial: int,
+        validity_days: Optional[int] = None,
+        audit: Optional["AuditLog"] = None,
+        requester_ip: str = "",
+    ) -> Optional[x509.Certificate]:
+        """
+        Issue a new certificate with the same subject, SAN, key usage, and profile
+        as the certificate identified by ``serial``.  The original certificate is
+        not revoked.  Returns the new certificate, or None if serial not found.
+
+        The new cert has a fresh validity window, a new serial number, and keeps
+        the same public key (the subscriber reuses their existing key pair).
+        This is a lightweight renewal: no new CSR required.
+        """
+        der = self.get_cert_by_serial(serial)
+        if not der:
+            return None
+        old_cert = x509.load_der_x509_certificate(der)
+
+        # Extract subject
+        subject_str = old_cert.subject.rfc4514_string()
+
+        # Extract profile from DB
+        conn = sqlite3.connect(str(self.db_path))
+        try:
+            row = conn.execute(
+                "SELECT profile FROM certificates WHERE serial=?", (serial,)
+            ).fetchone()
+            profile = row[0] if row and row[0] else "default"
+        finally:
+            conn.close()
+
+        # Extract SANs
+        san_dns, san_emails, san_ips = [], [], []
+        try:
+            san_ext = old_cert.extensions.get_extension_for_class(
+                x509.SubjectAlternativeName
+            ).value
+            san_dns    = san_ext.get_values_for_type(x509.DNSName)
+            san_emails = san_ext.get_values_for_type(x509.RFC822Name)
+            san_ips    = [str(ip) for ip in san_ext.get_values_for_type(x509.IPAddress)]
+        except x509.ExtensionNotFound:
+            pass
+
+        # Extract CPS-level policies if present
+        cert_policies = None
+        try:
+            cp = old_cert.extensions.get_extension_for_class(x509.CertificatePolicies).value
+            cert_policies = []
+            for pi in cp:
+                pd: dict = {"oid": pi.policy_identifier.dotted_string}
+                for q in (pi.policy_qualifiers or []):
+                    if isinstance(q, str):
+                        pd["cps_uri"] = q
+                    elif isinstance(q, x509.UserNotice):
+                        pd["notice_text"] = q.explicit_text
+                cert_policies.append(pd)
+        except x509.ExtensionNotFound:
+            pass
+
+        new_cert = self.issue_certificate(
+            subject_str=subject_str,
+            public_key=old_cert.public_key(),
+            validity_days=validity_days,
+            profile=profile,
+            san_dns=san_dns if san_dns else None,
+            san_emails=san_emails if san_emails else None,
+            san_ips=san_ips if san_ips else None,
+            certificate_policies=cert_policies,
+            audit=audit,
+            requester_ip=requester_ip,
+        )
+        logger.info(
+            f"Renewed certificate: old_serial={serial} → new_serial={new_cert.serial_number}"
+        )
+        return new_cert
+
+    # ------------------------------------------------------------------
+    # Feature 11 — Prometheus metrics
+    # ------------------------------------------------------------------
+
+    def get_metrics(self) -> dict:
+        """
+        Return a dictionary of Prometheus-style gauge/counter metrics collected
+        from the in-memory CA state and the SQLite database.
+        """
+        conn = sqlite3.connect(str(self.db_path))
+        try:
+            total     = conn.execute("SELECT COUNT(*) FROM certificates").fetchone()[0]
+            revoked   = conn.execute("SELECT COUNT(*) FROM certificates WHERE revoked=1").fetchone()[0]
+            valid     = total - revoked
+            # Expiring within 30 days
+            cutoff = (
+                datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(days=30)
+            ).isoformat()
+            now_str = datetime.datetime.now(datetime.timezone.utc).isoformat()
+            exp30 = conn.execute(
+                "SELECT COUNT(*) FROM certificates WHERE revoked=0 AND not_after <= ? AND not_after > ?",
+                (cutoff, now_str)
+            ).fetchone()[0]
+            # Expiring within 7 days
+            cutoff7 = (
+                datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(days=7)
+            ).isoformat()
+            exp7  = conn.execute(
+                "SELECT COUNT(*) FROM certificates WHERE revoked=0 AND not_after <= ? AND not_after > ?",
+                (cutoff7, now_str)
+            ).fetchone()[0]
+            # Already expired
+            expired = conn.execute(
+                "SELECT COUNT(*) FROM certificates WHERE revoked=0 AND not_after <= ?",
+                (now_str,)
+            ).fetchone()[0]
+            # Per-profile counts
+            profile_rows = conn.execute(
+                "SELECT profile, COUNT(*) FROM certificates WHERE revoked=0 GROUP BY profile"
+            ).fetchall()
+        finally:
+            conn.close()
+
+        ca_expiry = self.ca_cert.not_valid_after_utc
+        ca_days_remaining = (ca_expiry - datetime.datetime.now(datetime.timezone.utc)).days
+
+        return {
+            "pypki_certs_issued_total": total,
+            "pypki_certs_valid": valid,
+            "pypki_certs_revoked_total": revoked,
+            "pypki_certs_expiring_30d": exp30,
+            "pypki_certs_expiring_7d": exp7,
+            "pypki_certs_expired": expired,
+            "pypki_ca_days_remaining": ca_days_remaining,
+            "pypki_certs_by_profile": dict(profile_rows),
+        }
+
+    def metrics_prometheus(self) -> str:
+        """
+        Return a Prometheus text-format metrics exposition string.
+        Suitable for scraping by a Prometheus server or pushing to a Pushgateway.
+        """
+        m = self.get_metrics()
+        lines = [
+            "# HELP pypki_certs_issued_total Total number of certificates ever issued",
+            "# TYPE pypki_certs_issued_total counter",
+            f"pypki_certs_issued_total {m['pypki_certs_issued_total']}",
+            "# HELP pypki_certs_valid Number of currently valid (non-revoked, non-expired) certificates",
+            "# TYPE pypki_certs_valid gauge",
+            f"pypki_certs_valid {m['pypki_certs_valid']}",
+            "# HELP pypki_certs_revoked_total Total number of revoked certificates",
+            "# TYPE pypki_certs_revoked_total counter",
+            f"pypki_certs_revoked_total {m['pypki_certs_revoked_total']}",
+            "# HELP pypki_certs_expiring_30d Certificates expiring within 30 days",
+            "# TYPE pypki_certs_expiring_30d gauge",
+            f"pypki_certs_expiring_30d {m['pypki_certs_expiring_30d']}",
+            "# HELP pypki_certs_expiring_7d Certificates expiring within 7 days",
+            "# TYPE pypki_certs_expiring_7d gauge",
+            f"pypki_certs_expiring_7d {m['pypki_certs_expiring_7d']}",
+            "# HELP pypki_certs_expired Certificates that have passed their not_after date (not revoked)",
+            "# TYPE pypki_certs_expired gauge",
+            f"pypki_certs_expired {m['pypki_certs_expired']}",
+            "# HELP pypki_ca_days_remaining Days until the root CA certificate expires",
+            "# TYPE pypki_ca_days_remaining gauge",
+            f"pypki_ca_days_remaining {m['pypki_ca_days_remaining']}",
+            "# HELP pypki_certs_by_profile Certificates per profile (gauge)",
+            "# TYPE pypki_certs_by_profile gauge",
+        ]
+        for profile, count in m["pypki_certs_by_profile"].items():
+            safe = profile.replace('"', '\"')
+            lines.append(f'pypki_certs_by_profile{{profile="{safe}"}} {count}')
+        lines.append("")  # trailing newline
+        return "\n".join(lines) + "\n"
+
+
+    # ------------------------------------------------------------------
+    # Feature 5 — ACME dns-01 real resolver hook
+    # ------------------------------------------------------------------
+    #
+    # For production wildcard certificate issuance the ACME dns-01 challenge
+    # requires the server to verify a TXT record at _acme-challenge.<domain>.
+    # PyPKI provides two mechanisms:
+    #
+    #   1. Webhook hook: POST the challenge to an external URL
+    #      (your DNS API, DDNS service, Route53 Lambda, etc.)
+    #      Configure: --acme-dns-hook-url https://dns-api.internal/challenge
+    #
+    #   2. RFC 2136 Dynamic DNS (TSIG-authenticated DNS UPDATE)
+    #      Configure: --acme-dns-rfc2136-server <IP:PORT>
+    #                 --acme-dns-rfc2136-key-name <TSIG key name>
+    #                 --acme-dns-rfc2136-key-secret <base64-HMAC-MD5 secret>
+    #
+    # The hook function is called by the ACME server before challenge validation.
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def make_dns01_webhook_hook(hook_url: str, timeout: int = 10):
+        """
+        Return a dns-01 hook callable that POSTs the challenge to hook_url.
+
+        The hook function signature expected by acme_server.py:
+            hook(domain: str, challenge_token: str, key_authorization: str) -> bool
+
+        The webhook receives JSON: {domain, challenge_token, key_authorization}
+        and should return HTTP 200 on success.
+        """
+        import urllib.request as _urllib
+
+        def _hook(domain: str, challenge_token: str, key_authorization: str) -> bool:
+            payload = json.dumps({
+                "domain": domain,
+                "challenge_token": challenge_token,
+                "key_authorization": key_authorization,
+            }).encode()
+            try:
+                req = _urllib.Request(
+                    hook_url,
+                    data=payload,
+                    headers={"Content-Type": "application/json"},
+                    method="POST",
+                )
+                with _urllib.urlopen(req, timeout=timeout) as resp:
+                    success = resp.status // 100 == 2
+                    if success:
+                        logger.info(f"dns-01 webhook OK for {domain}")
+                    else:
+                        logger.warning(f"dns-01 webhook returned {resp.status} for {domain}")
+                    return success
+            except Exception as e:
+                logger.error(f"dns-01 webhook error for {domain}: {e}")
+                return False
+
+        return _hook
+
+    @staticmethod
+    def make_dns01_rfc2136_hook(
+        nameserver: str,
+        key_name: str,
+        key_secret: str,
+        key_algorithm: str = "hmac-md5",
+        ttl: int = 60,
+    ):
+        """
+        Return a dns-01 hook callable that publishes the challenge via
+        RFC 2136 Dynamic DNS UPDATE with TSIG authentication.
+
+        Requires the ``dnspython`` package (pip install dnspython).
+        ``nameserver`` is "IP" or "IP:PORT" (default port 53).
+        ``key_secret`` is the base64-encoded HMAC secret.
+        """
+        try:
+            import dns.update
+            import dns.tsigkeyring
+            import dns.resolver
+            import dns.query
+            import dns.rdatatype
+        except ImportError:
+            logger.error(
+                "dnspython not installed — RFC 2136 dns-01 hook unavailable. "
+                "Install with: pip install dnspython"
+            )
+            return None
+
+        host, _, port_str = nameserver.partition(":")
+        port = int(port_str) if port_str else 53
+
+        keyring = dns.tsigkeyring.from_text({key_name: key_secret})
+        algorithm_map = {
+            "hmac-md5": dns.tsig.HMAC_MD5,
+            "hmac-sha1": dns.tsig.HMAC_SHA1,
+            "hmac-sha256": dns.tsig.HMAC_SHA256,
+            "hmac-sha512": dns.tsig.HMAC_SHA512,
+        }
+        algorithm = algorithm_map.get(key_algorithm.lower(), dns.tsig.HMAC_MD5)
+
+        def _hook(domain: str, _challenge_token: str, key_authorization: str) -> bool:
+            """Publish _acme-challenge.<domain> TXT=key_authorization via RFC 2136."""
+            # Strip trailing dot, derive zone (last two labels)
+            d = domain.rstrip(".")
+            labels = d.split(".")
+            zone = ".".join(labels[-2:]) + "."
+            acme_name = f"_acme-challenge.{d}."
+            try:
+                update = dns.update.Update(zone, keyring=keyring, keyalgorithm=algorithm)
+                update.replace(acme_name, ttl, dns.rdatatype.TXT, f'"{key_authorization}"')
+                dns.query.tcp(update, host, port=port, timeout=10)
+                logger.info(f"RFC 2136 DNS UPDATE OK for {acme_name}")
+                return True
+            except Exception as e:
+                logger.error(f"RFC 2136 DNS UPDATE failed for {acme_name}: {e}")
+                return False
+
+        return _hook
+
+
+    # ------------------------------------------------------------------
+    # Feature 2 — Certificate Transparency (CT) log submission
+    # RFC 6962 / RFC 9162 — Signed Certificate Timestamps (SCTs)
+    # ------------------------------------------------------------------
+    #
+    # A CA that issues publicly-trusted TLS certificates MUST embed SCTs
+    # from at least two qualified CT logs (Chrome CT Policy, Apple ATS).
+    #
+    # PyPKI implements the RFC 6962 §4.1 "add-chain" submission: it posts
+    # the certificate chain to a CT log's HTTP API and receives a
+    # SignedCertificateTimestamp (SCT) in response.  The SCT is then
+    # embedded in the TLSFeature / SCT extension (OID 1.3.6.1.4.1.11129.2.4.2).
+    #
+    # Important: submission to public logs requires a *publically trusted*
+    # chain.  For private/internal CAs, configure private log URLs.
+    # ------------------------------------------------------------------
+
+    # OID for the embedded SCT list extension (RFC 6962 §3.3)
+    OID_SCT_LIST = x509.ObjectIdentifier("1.3.6.1.4.1.11129.2.4.2")
+
+    # Public Google / Cloudflare test log endpoints (use only if CA is publicly trusted)
+    CT_LOG_ARGON_2025 = "https://ct.googleapis.com/logs/us1/argon2025h2/"
+    CT_LOG_XENON_2025 = "https://ct.googleapis.com/logs/us1/xenon2025h2/"
+
+    def submit_to_ct_log(
+        self,
+        cert: x509.Certificate,
+        log_url: str,
+        timeout: int = 10,
+    ) -> Optional[bytes]:
+        """
+        Submit a certificate to a CT log and return the raw SCT bytes (DER).
+
+        ``log_url`` is the base URL of the CT log (e.g. CT_LOG_ARGON_2025).
+        The call uses the RFC 6962 §4.1 "add-chain" endpoint.
+
+        Returns the raw TLS-encoded SCT bytes, or None on failure.
+        Requires network access to the CT log.
+        """
+        import urllib.request as _urllib
+        import urllib.error as _urlerr
+
+        # Build chain: [leaf DER, issuer DER]
+        chain_ders = [
+            cert.public_bytes(Encoding.DER),
+            self.ca_cert.public_bytes(Encoding.DER),
+        ]
+        chain_b64 = [base64.b64encode(der).decode() for der in chain_ders]
+        payload = json.dumps({"chain": chain_b64}).encode()
+
+        endpoint = log_url.rstrip("/") + "/ct/v1/add-chain"
+        try:
+            req = _urllib.Request(
+                endpoint,
+                data=payload,
+                headers={"Content-Type": "application/json"},
+            )
+            with _urllib.urlopen(req, timeout=timeout) as resp:
+                body = json.loads(resp.read())
+        except Exception as e:
+            logger.warning(f"CT log submission failed ({endpoint}): {e}")
+            return None
+
+        # RFC 6962 §3.2: response contains sct_version, id, timestamp, extensions, signature
+        sct_version    = body.get("sct_version", 0)
+        log_id         = base64.b64decode(body["id"])
+        timestamp_ms   = body["timestamp"]
+        extensions     = base64.b64decode(body.get("extensions", ""))
+        sig_bytes      = base64.b64decode(body["signature"])
+
+        # Encode as TLS-serialised SCT (RFC 6962 §3.2)
+        import struct as _struct
+        ext_len = len(extensions)
+        sig_len = len(sig_bytes)
+        sct = (
+            bytes([sct_version])               # version (1 byte)
+            + log_id                            # log id (32 bytes)
+            + _struct.pack(">Q", timestamp_ms)  # timestamp (8 bytes)
+            + _struct.pack(">H", ext_len)       # extensions length (2 bytes)
+            + extensions                        # extensions
+            + sig_bytes                         # digitally-signed struct
+        )
+        logger.info(
+            f"CT log SCT received from {log_url}: "
+            f"serial={cert.serial_number} timestamp_ms={timestamp_ms}"
+        )
+        return sct
+
+    def embed_scts(
+        self,
+        cert: x509.Certificate,
+        scts: List[bytes],
+    ) -> x509.Certificate:
+        """
+        Return a new certificate with a SignedCertificateTimestampList extension
+        (OID 1.3.6.1.4.1.11129.2.4.2) containing ``scts`` (list of raw SCT bytes).
+
+        The extension value is a TLS-encoded SCTList (RFC 6962 §3.3):
+            struct { SerializedSCT sct_list<1..2^16-1>; } SignedCertificateTimestampList
+        """
+        import struct as _struct
+        # Build SCTList: each SCT is length-prefixed with 2 bytes
+        sct_items = b"".join(_struct.pack(">H", len(s)) + s for s in scts)
+        sct_list  = _struct.pack(">H", len(sct_items)) + sct_items
+        # Wrap in an OCTET STRING (DER tag 0x04)
+        def _der_octet(data: bytes) -> bytes:
+            if len(data) < 0x80:
+                return bytes([0x04, len(data)]) + data
+            elif len(data) < 0x100:
+                return bytes([0x04, 0x81, len(data)]) + data
+            else:
+                return bytes([0x04, 0x82, len(data) >> 8, len(data) & 0xFF]) + data
+
+        ext_value = _der_octet(sct_list)
+
+        # Rebuild the certificate with the SCT extension added
+        builder = (
+            x509.CertificateBuilder()
+            .subject_name(cert.subject)
+            .issuer_name(cert.issuer)
+            .public_key(cert.public_key())
+            .serial_number(cert.serial_number)
+            .not_valid_before(cert.not_valid_before_utc)
+            .not_valid_after(cert.not_valid_after_utc)
+        )
+        for ext in cert.extensions:
+            builder = builder.add_extension(ext.value, critical=ext.critical)
+        builder = builder.add_extension(
+            x509.UnrecognizedExtension(self.OID_SCT_LIST, ext_value),
+            critical=False,
+        )
+        return builder.sign(self.ca_key, SHA256())
+
+    def issue_certificate_with_ct(
+        self,
+        subject_str: str,
+        public_key,
+        ct_log_urls: Optional[List[str]] = None,
+        **kwargs,
+    ) -> x509.Certificate:
+        """
+        Convenience wrapper: issue a certificate, submit it to one or more CT
+        logs, embed the resulting SCTs, and return the final certificate.
+
+        ``ct_log_urls`` defaults to [CT_LOG_ARGON_2025, CT_LOG_XENON_2025].
+        SCT submission failures are logged as warnings and do not abort issuance.
+        """
+        cert = self.issue_certificate(subject_str=subject_str, public_key=public_key, **kwargs)
+
+        urls = ct_log_urls or [self.CT_LOG_ARGON_2025, self.CT_LOG_XENON_2025]
+        scts = []
+        for url in urls:
+            sct = self.submit_to_ct_log(cert, url)
+            if sct:
+                scts.append(sct)
+
+        if scts:
+            cert = self.embed_scts(cert, scts)
+            logger.info(f"Embedded {len(scts)} SCT(s) into serial={cert.serial_number}")
+        else:
+            logger.warning("No SCTs obtained; certificate issued without CT transparency")
+        return cert
+
+
+    # ------------------------------------------------------------------
+    # Feature 1 — OCSP Stapling (RFC 6961 / RFC 8446)
+    # ------------------------------------------------------------------
+    #
+    # OCSP stapling lets the server proactively fetch its own OCSP response
+    # and include it in the TLS handshake, sparing clients a round-trip to
+    # the OCSP responder.  Python's ssl module does not expose stapling APIs
+    # directly, but we provide the fetch + cache machinery here so that
+    # a reverse-proxy (nginx, HAProxy) or a custom TLS wrapper can use it.
+    #
+    # Usage:
+    #   staple = ca.fetch_ocsp_staple(cert_pem, issuer_pem, ocsp_url)
+    #   # Then configure your TLS endpoint to include staple in the handshake.
+    # ------------------------------------------------------------------
+
+    def _ocsp_cache(self):
+        if not hasattr(self, "_ocsp_staple_cache"):
+            self._ocsp_staple_cache: Dict[int, Tuple[bytes, float]] = {}
+        return self._ocsp_staple_cache
+
+    def fetch_ocsp_staple(
+        self,
+        cert: Optional[x509.Certificate] = None,
+        cert_serial: Optional[int] = None,
+        ocsp_url: Optional[str] = None,
+        cache_ttl: int = 3600,
+    ) -> Optional[bytes]:
+        """
+        Fetch a DER-encoded OCSP response for ``cert`` (or the cert looked up
+        by ``cert_serial``) from ``ocsp_url`` (defaults to self._ocsp_url).
+
+        Responses are cached in memory for ``cache_ttl`` seconds to avoid
+        hammering the OCSP responder.  Returns the raw DER bytes suitable
+        for passing to an ssl stapling callback, or None on failure.
+
+        Requires: 'cryptography' and standard-library 'urllib.request'.
+        """
+        import urllib.request as _urllib
+
+        if cert is None and cert_serial is not None:
+            der = self.get_cert_by_serial(cert_serial)
+            if not der:
+                return None
+            cert = x509.load_der_x509_certificate(der)
+        if cert is None:
+            return None
+
+        serial = cert.serial_number
+        cache  = self._ocsp_cache()
+        now    = time.time()
+
+        # Return cached response if still fresh
+        if serial in cache:
+            cached_resp, cached_at = cache[serial]
+            if now - cached_at < cache_ttl:
+                return cached_resp
+
+        url = ocsp_url or self._ocsp_url
+        if not url:
+            logger.debug("fetch_ocsp_staple: no OCSP URL configured")
+            return None
+
+        try:
+            # Build an OCSP request (RFC 6960)
+            from cryptography.x509.ocsp import OCSPRequestBuilder
+            builder = OCSPRequestBuilder()
+            builder = builder.add_certificate(cert, self.ca_cert, hashes.SHA256())
+            req = builder.build()
+            req_der = req.public_bytes(Encoding.DER)
+
+            http_req = _urllib.Request(
+                url,
+                data=req_der,
+                headers={"Content-Type": "application/ocsp-request"},
+            )
+            with _urllib.urlopen(http_req, timeout=5) as resp:
+                resp_der = resp.read()
+
+            cache[serial] = (resp_der, now)
+            logger.debug(f"OCSP staple fetched and cached for serial={serial}")
+            return resp_der
+        except Exception as e:
+            logger.warning(f"OCSP staple fetch failed for serial={serial}: {e}")
+            return None
+
+    def invalidate_ocsp_staple(self, serial: int) -> None:
+        """Remove a cached OCSP staple (e.g. after revocation)."""
+        self._ocsp_cache().pop(serial, None)
 
 
 # ---------------------------------------------------------------------------
@@ -2586,6 +3488,31 @@ class CMPv2HTTPHandler(http.server.BaseHTTPRequestHandler):
             except Exception as e:
                 self._send_json({"error": str(e)}, 500)
 
+        elif re.match(r"^/api/certs/\d+/renew$", path):
+            # Feature 9: POST /api/certs/<serial>/renew
+            try:
+                serial = int(path.split("/")[3])
+                validity_days = data.get("validity_days")
+                new_cert = self.ca.renew_certificate(
+                    serial=serial,
+                    validity_days=int(validity_days) if validity_days else None,
+                    audit=self.audit_log,
+                    requester_ip=self.client_address[0],
+                )
+                if new_cert is None:
+                    self._send_json({"error": "certificate not found"}, 404)
+                else:
+                    self._send_json({
+                        "ok": True,
+                        "old_serial": serial,
+                        "new_serial": new_cert.serial_number,
+                        "subject": new_cert.subject.rfc4514_string(),
+                        "not_after": new_cert.not_valid_after_utc.isoformat(),
+                        "cert_pem": new_cert.public_bytes(Encoding.PEM).decode(),
+                    })
+            except (ValueError, IndexError):
+                self._send_json({"error": "invalid serial"}, 400)
+
         elif path == "/api/revoke":
             serial = data.get("serial")
             reason = int(data.get("reason", 0))
@@ -2598,6 +3525,60 @@ class CMPv2HTTPHandler(http.server.BaseHTTPRequestHandler):
                                       f"serial={serial} reason={reason}",
                                       self.client_address[0])
             self._send_json({"ok": ok, "serial": serial})
+
+        elif re.match(r"^/api/certs/\d+/archive$", path):
+            # Feature 6: POST /api/certs/<serial>/archive  — key archival
+            try:
+                serial = int(path.split("/")[3])
+                key_pem = data.get("key_pem", "")
+                if not key_pem:
+                    self._send_json({"error": "key_pem required in request body"}, 400)
+                    return
+                ok = self.ca.archive_private_key(serial, key_pem.encode())
+                self._send_json({"ok": ok, "serial": serial, "archived": True})
+            except Exception as e:
+                self._send_json({"error": str(e)}, 500)
+
+        elif re.match(r"^/api/certs/\d+/recover$", path):
+            # Feature 6: POST /api/certs/<serial>/recover  — key recovery
+            try:
+                serial = int(path.split("/")[3])
+                key_pem = self.ca.recover_private_key(serial)
+                if key_pem is None:
+                    self._send_json({"error": "no archived key for this serial"}, 404)
+                else:
+                    self._send_json({"ok": True, "serial": serial, "key_pem": key_pem.decode()})
+            except Exception as e:
+                self._send_json({"error": str(e)}, 500)
+
+        elif path == "/api/name-constrained-ca":
+            # Feature 7: POST /api/name-constrained-ca — issue a name-constrained sub-CA
+            try:
+                cn = data.get("cn", "Name-Constrained Sub-CA")
+                validity_days = int(data.get("validity_days", 1825))
+                permitted_dns  = data.get("permitted_dns", [])
+                excluded_dns   = data.get("excluded_dns", [])
+                permitted_emails = data.get("permitted_emails", [])
+                excluded_ips   = data.get("excluded_ips", [])
+                priv_key = rsa.generate_private_key(public_exponent=65537, key_size=4096)
+                cert = self.ca.issue_certificate_with_name_constraints(
+                    subject_str=f"CN={cn},O=PyPKI Constrained CA",
+                    public_key=priv_key.public_key(),
+                    validity_days=validity_days,
+                    permitted_dns=permitted_dns,
+                    excluded_dns=excluded_dns,
+                    permitted_emails=permitted_emails,
+                    excluded_ips=excluded_ips,
+                )
+                self._send_json({
+                    "ok": True,
+                    "serial": cert.serial_number,
+                    "subject": cert.subject.rfc4514_string(),
+                    "cert_pem": cert.public_bytes(Encoding.PEM).decode(),
+                    "key_pem": priv_key.private_bytes(Encoding.PEM, PrivateFormat.TraditionalOpenSSL, NoEncryption()).decode(),
+                })
+            except Exception as e:
+                self._send_json({"error": str(e)}, 500)
 
         else:
             self._send_json({"error": "unknown API endpoint"}, 404)
@@ -2737,7 +3718,29 @@ class CMPv2HTTPHandler(http.server.BaseHTTPRequestHandler):
                 self._send_json({"error": str(e)}, 500)
 
         elif path == "/api/certs":
-            self._send_json({"certificates": self.ca.list_certificates()})
+            # Feature 12: optional filters ?profile=tls_server&expiring_in=30
+            qs = self.path.split("?", 1)[1] if "?" in self.path else ""
+            params: dict = {}
+            for kv in qs.split("&"):
+                if "=" in kv:
+                    k, _, v = kv.partition("=")
+                    params[k] = v
+            profile_filter = params.get("profile")
+            expiring_in    = params.get("expiring_in")
+            if expiring_in is not None:
+                try:
+                    days = int(expiring_in)
+                    certs = self.ca.expiring_certificates(days_ahead=days)
+                    if profile_filter:
+                        certs = [c for c in certs if c.get("profile") == profile_filter]
+                    self._send_json({"certificates": certs, "filter": "expiring", "days_ahead": days})
+                except ValueError:
+                    self._send_json({"error": "expiring_in must be an integer"}, 400)
+            else:
+                certs = self.ca.list_certificates()
+                if profile_filter:
+                    certs = [c for c in certs if c.get("profile") == profile_filter]
+                self._send_json({"certificates": certs})
 
         elif path == "/api/whoami":
             # Returns the authenticated client's certificate subject
@@ -2779,6 +3782,31 @@ class CMPv2HTTPHandler(http.server.BaseHTTPRequestHandler):
                 "ca_subject": self.ca.ca_cert.subject.rfc4514_string(),
                 "ca_serial": self.ca.ca_cert.serial_number,
             })
+
+        elif path == "/metrics":
+            # Feature 11: Prometheus-compatible metrics endpoint
+            body = self.ca.metrics_prometheus().encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+
+        elif path == "/api/expiring":
+            # Feature 8: GET /api/expiring?days=30
+            qs = self.path.split("?", 1)[1] if "?" in self.path else ""
+            params = {}
+            for kv in qs.split("&"):
+                if "=" in kv:
+                    k, _, v = kv.partition("=")
+                    params[k] = v
+            try:
+                days = int(params.get("days", 30))
+            except ValueError:
+                days = 30
+            expiring = self.ca.expiring_certificates(days_ahead=days)
+            self._send_json({"expiring": expiring, "days_ahead": days, "count": len(expiring)})
 
         elif path == "/ca/delta-crl":
             try:
@@ -2874,7 +3902,13 @@ class CMPv2HTTPHandler(http.server.BaseHTTPRequestHandler):
                     "GET /api/whoami": "Show authenticated mTLS client identity",
                     "GET /bootstrap?cn=<n>": "Issue client cert bundle (bootstrap port only)",
                     "GET /health": "Health check",
+                    "GET /metrics": "Prometheus text-format metrics",
+                    "GET /api/expiring?days=30": "Certificates expiring within N days",
                     "GET /.well-known/cmp": "RFC 9811 well-known CMP CA cert (GET)",
+                    "POST /api/certs/<serial>/renew": "Renew certificate (same key + profile)",
+                    "POST /api/certs/<serial>/archive": "Archive subscriber private key (key escrow)",
+                    "POST /api/certs/<serial>/recover": "Recover archived private key",
+                    "POST /api/name-constrained-ca": "Issue name-constrained sub-CA",
                 }
             })
 
@@ -2991,6 +4025,10 @@ def main():
         "--tls-key", metavar="PATH",
         help="Path to the PEM private key for --tls-cert"
     )
+    tls_group.add_argument(
+        "--tls13-only", action="store_true", default=False,
+        help="Enforce TLS 1.3 only — refuse TLS 1.2 connections (requires --tls or --mtls)"
+    )
     parser.add_argument(
         "--bootstrap-port", type=int, default=None,
         help="If set, also start a plain-HTTP bootstrap server on this port "
@@ -3095,6 +4133,33 @@ def main():
         choices=list(CertProfile.PROFILES.keys()),
         help="Default certificate profile for CMPv2 issuance (default: default)"
     )
+    ops_group.add_argument(
+        "--otel-endpoint", default=None, metavar="URL",
+        help="OpenTelemetry OTLP gRPC endpoint for distributed tracing "
+             "(e.g. http://localhost:4317). Requires opentelemetry-sdk."
+    )
+    ops_group.add_argument(
+        "--expiry-warn-days", type=int, default=30, metavar="DAYS",
+        help="Feature 8: warn about certs expiring within N days (default: 30). "
+             "Set to 0 to disable the expiry monitor thread."
+    )
+    ops_group.add_argument(
+        "--acme-dns-hook-url", default=None, metavar="URL",
+        help="Feature 5: webhook URL for ACME dns-01 challenge publication "
+             "(POST {domain, challenge_token, key_authorization})"
+    )
+    ops_group.add_argument(
+        "--acme-dns-rfc2136-server", default=None, metavar="IP[:PORT]",
+        help="Feature 5: RFC 2136 nameserver for dns-01 (e.g. 192.168.1.1:53)"
+    )
+    ops_group.add_argument(
+        "--acme-dns-rfc2136-key-name", default=None, metavar="NAME",
+        help="Feature 5: TSIG key name for RFC 2136 DNS UPDATE"
+    )
+    ops_group.add_argument(
+        "--acme-dns-rfc2136-key-secret", default=None, metavar="SECRET",
+        help="Feature 5: base64 TSIG HMAC secret for RFC 2136 DNS UPDATE"
+    )
 
     cmpv3_group = parser.add_argument_group(
         "CMPv3 options (RFC 9480)",
@@ -3182,6 +4247,13 @@ def main():
     # Audit log
     audit_log = AuditLog(ca_dir) if getattr(args, "audit", True) else None
 
+    # Feature 10: OpenTelemetry tracing
+    global _tracer
+    if getattr(args, "otel_endpoint", None):
+        os.environ.setdefault("OTEL_EXPORTER_OTLP_ENDPOINT", args.otel_endpoint)
+        _setup_otel("pypki")
+    _tracer = _get_tracer()
+
     # Rate limiter
     rate_limit_n = getattr(args, "rate_limit", 0)
     rate_limiter = RateLimiter(max_per_minute=rate_limit_n) if rate_limit_n > 0 else None
@@ -3192,6 +4264,32 @@ def main():
 
     ca = CertificateAuthority(ca_dir=args.ca_dir, config=config,
                                ocsp_url=ocsp_url, crl_url=crl_url)
+
+    # Feature 8: expiry monitor thread
+    _expiry_days = getattr(args, "expiry_warn_days", 30)
+    if _expiry_days > 0:
+        ca.start_expiry_monitor(
+            days_ahead=_expiry_days,
+            check_interval_seconds=86400,
+            audit=audit_log,
+        )
+
+    # Feature 5: ACME dns-01 hook configuration
+    _dns01_hook = None
+    if getattr(args, "acme_dns_hook_url", None):
+        _dns01_hook = CertificateAuthority.make_dns01_webhook_hook(
+            args.acme_dns_hook_url
+        )
+        logger.info(f"ACME dns-01 webhook hook: {args.acme_dns_hook_url}")
+    elif (getattr(args, "acme_dns_rfc2136_server", None)
+          and getattr(args, "acme_dns_rfc2136_key_name", None)
+          and getattr(args, "acme_dns_rfc2136_key_secret", None)):
+        _dns01_hook = CertificateAuthority.make_dns01_rfc2136_hook(
+            nameserver=args.acme_dns_rfc2136_server,
+            key_name=args.acme_dns_rfc2136_key_name,
+            key_secret=args.acme_dns_rfc2136_key_secret,
+        )
+        logger.info(f"ACME dns-01 RFC 2136 hook: {args.acme_dns_rfc2136_server}")
 
     if audit_log:
         audit_log.record("startup", f"port={args.port} tls={'mtls' if args.mtls else 'tls' if args.tls else 'none'}")
@@ -3240,6 +4338,7 @@ def main():
             key_path=key_path,
             require_client_cert=require_client,
             alpn_protocols=alpn_protos,
+            tls13_only=getattr(args, "tls13_only", False),
         )
 
         server = TLSServer((args.host, args.port), handler_class)
@@ -3275,6 +4374,7 @@ def main():
                 base_url=acme_base,
                 cert_validity_days=getattr(args, "acme_cert_days", 90),
                 short_lived_threshold_days=getattr(args, "acme_short_lived_threshold", 7),
+                dns01_hook=_dns01_hook,  # Feature 5: real dns-01 resolver hook
             )
 
     # Start SCEP server if requested
@@ -3376,6 +4476,8 @@ def main():
 ║  CMP Well-Known   : {cmp_wk:<47}║
 ║  Rate Limiting    : {rl_info:<47}║
 ║  Audit Log        : {audit_info:<47}║
+║  Metrics          : {scheme}://{args.host}:{args.port}/metrics                      ║
+║  Expiry Monitor   : {str(_expiry_days)+"d" if _expiry_days else "disabled":<47}║
 ╠══════════════════════════════════════════════════════════════════╣
 ║  Validity periods (change live: PATCH /config)                  ║
 ║    End-entity   : {config.end_entity_days:<3} days                                       ║
