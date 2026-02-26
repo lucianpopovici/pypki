@@ -215,17 +215,45 @@ Test class: `TestRandomCASerial` (3 tests)
 ### Fixed
 
 - `datetime.datetime.utcnow()` deprecated since Python 3.12 — replaced with
-  `datetime.datetime.now(datetime.timezone.utc)` everywhere
+  `datetime.datetime.now(datetime.timezone.utc)` everywhere in both `pki_server.py`
+  and `web_ui.py`
+
+#### Web Dashboard (`web_ui.py`) — v0.9.0 update
+
+`web_ui.py` was previously present in the working directory but had never been committed
+to the repository. This release adds it to version control and updates it to match the
+v0.9.0 feature set.
+
+Changes from the v0.6.0 baseline:
+
+- **Version badge** updated from `v0.6.0` to `v0.9.0`
+- **New page — Expiring Certificates** (`/expiring`): lists all non-revoked certificates
+  expiring within 30 days, sorted by days remaining; colour-coded rows (red ≤7d, amber ≤30d);
+  per-row **Renew** button calls `POST /api/renew`
+- **New page — Prometheus Metrics** (`/metrics-ui`): renders the full Prometheus text output
+  from `ca.metrics_prometheus()` in a `<pre>` block; link to the raw `/api/metrics` scrape
+  endpoint
+- **`POST /api/renew`** — new REST endpoint; body `{"serial": N}`; calls
+  `ca.renew_certificate(serial)`; returns `{"ok": true, "serial": <new>, "not_after": "..."}`
+- **`GET /api/metrics`** — new REST endpoint; returns `ca.metrics_prometheus()` with
+  content-type `text/plain; version=0.0.4` (Prometheus scrape-compatible)
+- **Navigation bar**: two new links — `Expiring` and `Metrics` — inserted between
+  `Certificates` and `Revocation`
+- **API Docs page** updated with the two new endpoints
+- **`datetime.utcnow()` → `datetime.now(timezone.utc)`** in `_dashboard()` and
+  `_certs_page()` (Python 3.12 deprecation fix)
+- `fromisoformat()` comparisons made timezone-aware throughout
 
 ---
 
 ## Releasing v0.9.0
 
 ```bash
-git add pki_server.py test_pki_server.py CHANGELOG.md README.md
+git add pki_server.py test_pki_server.py web_ui.py CHANGELOG.md README.md
 git commit -m "v0.9.0: 13 new features — key escrow, name constraints, expiry monitor,
   renewal, Prometheus /metrics, TLS 1.3-only, OCSP stapling cache, CT log submission,
   dns-01 RFC 2136 + webhook hooks, OpenTelemetry tracing, datetime/serial fixes.
+  web_ui.py: add Expiring and Metrics pages, /api/renew, /api/metrics, Python 3.12 fixes.
   63 new tests (241 total, 33 test classes)"
 
 git tag -a v0.9.0 -m "v0.9.0: 13 new features, 241 tests"

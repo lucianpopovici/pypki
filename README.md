@@ -687,11 +687,30 @@ Pages:
 |---|---|---|
 | Dashboard | `/` | Stats (total/active/revoked/expired), CA info, endpoint URLs |
 | Certificates | `/certs` | Searchable inventory, PEM/P12 download, one-click revoke |
+| Expiring | `/expiring` | Certs expiring within 30 days, one-click renew button |
 | Revocation | `/revocation` | CRL/OCSP URLs, revoke-by-serial form with reason |
 | Sub-CA | `/sub-ca` | Issue intermediate CA certificates |
+| Metrics | `/metrics-ui` | Rendered Prometheus metrics; link to raw `/api/metrics` scrape endpoint |
 | Config | `/config-ui` | Live config viewer + validity period editor |
 | Audit Log | `/audit` | Last 100 audit events |
 | API Docs | `/api-docs` | Quick-reference endpoint table |
+
+REST API exposed by the dashboard (also consumable directly):
+
+| Method | Path | Description |
+|---|---|---|
+| `GET` | `/api/certs` | List all certificates (JSON) |
+| `GET` | `/api/certs/<serial>/pem` | Download certificate as PEM |
+| `GET` | `/api/certs/<serial>/p12` | Download certificate + CA chain as PKCS#12 |
+| `POST` | `/api/revoke` | Revoke a certificate — body: `{"serial": N, "reason": 0}` |
+| `POST` | `/api/renew` | Renew a certificate — body: `{"serial": N}` |
+| `GET` | `/api/metrics` | Prometheus metrics (`text/plain`, scrape-compatible) |
+| `GET` | `/api/config` | View live configuration (JSON) |
+| `PATCH` | `/api/config` | Update validity periods — body: `{"validity": {...}}` |
+| `POST` | `/api/issue-sub-ca` | Issue sub-CA cert — body: `{"cn": "...", "validity_days": N}` |
+| `GET` | `/api/audit` | Audit log — last 200 events (JSON) |
+| `GET` | `/ca/cert.pem` | CA certificate (PEM, for trust store import) |
+| `GET` | `/ca/crl` | Certificate Revocation List (DER) |
 
 ---
 
