@@ -4,12 +4,13 @@ test_endpoints.py — PyPKI Endpoint Integration Tests
 =====================================================
 Black-box HTTP tests against a live PyPKI server stack.
 
-Tests every endpoint across all six servers:
+Tests every endpoint across all seven servers:
   • pki_server.py   (CMP/REST)   — default https://localhost:8443
   • acme_server.py  (ACME)       — default http://localhost:8888
   • scep_server.py  (SCEP)       — default http://localhost:8889
   • est_server.py   (EST)        — default https://localhost:8444
   • ocsp_server.py  (OCSP)       — default http://localhost:8082
+  • ipsec_server.py (IPsec PKI)  — default https://localhost:8445
   • web_ui.py       (Web UI)     — default http://localhost:8090
 
 Usage
@@ -36,6 +37,7 @@ Usage
   python test_endpoints.py --only scep
   python test_endpoints.py --only est
   python test_endpoints.py --only ocsp
+  python test_endpoints.py --only ipsec
   python test_endpoints.py --only webui
 
   # Verbose (show request/response details):
@@ -490,6 +492,41 @@ def test_pki(cfg: argparse.Namespace, c: Client) -> Suite:
         return expect_status(r, 200, 400, 500)  # any response but 404
     check(s, "POST / (CMP endpoint reachable)", _cmp_post)
 
+    # ── Bootstrap endpoint ───────────────────────────────────────
+    check(s, "GET /bootstrap (client cert bundle)", lambda: (
+        (r := c.get(f"{base}/bootstrap?cn=endpoint-test-client")).status_code == 200
+        and b"BEGIN CERTIFICATE" in r.content,
+        f"HTTP {r.status_code} len={len(r.content)}"
+    ))
+
+    # ── Key recovery ─────────────────────────────────────────────
+    if serial:
+        def _recover(sn=serial):
+            r = c.post(f"{base}/api/certs/{sn}/recover",
+                       json={}, headers={"Content-Type": "application/json"})
+            # 200 = key was archived; 404 = no archived key (expected if archive skipped)
+            return expect_status(r, 200, 404)
+        check(s, f"POST /api/certs/{serial}/recover (key recovery)", _recover)
+
+    # ── TLS reload ───────────────────────────────────────────────
+    check(s, "POST /api/reload-tls → 200 or 409", lambda: (
+        (r := c.post(f"{base}/api/reload-tls",
+                     data=b"", headers={"Content-Type": "application/json"})).status_code in (200, 409),
+        f"HTTP {r.status_code}"  # 409 = TLS not active (plain HTTP server), 200 = reloaded
+    ))
+
+    # ── Expiring filter alias (/api/certs?expiring_in=N) ─────────
+    check(s, "GET /api/certs?expiring_in=30", lambda: expect_status(
+        c.get(f"{base}/api/certs?expiring_in=30"), 200
+    ))
+
+    # ── CMP well-known labelled URI ───────────────────────────────
+    check(s, "GET /.well-known/cmp/p/test-ca (labelled)", lambda: (
+        (r := c.get(f"{base}/.well-known/cmp/p/test-ca")).status_code == 200
+        and len(r.content) > 0,
+        f"HTTP {r.status_code} len={len(r.content)}"
+    ))
+
     # ── Unknown path → endpoint listing ─────────────────────────
     check(s, "GET /unknown → JSON endpoint listing", lambda: (
         (r := c.get(f"{base}/unknown-path-xyz")).status_code in (200, 404)
@@ -680,6 +717,55 @@ def test_acme(cfg: argparse.Namespace, c: Client) -> Suite:
             return expect_status(resp, 200, 400)
         check(s, "POST /acme/challenge/<authz>/<id> (respond)", _respond_challenge)
 
+    # ── POST /acme/order/<id>/finalize (with CSR) ────────────────
+    if order_location:
+        def _finalize():
+            nonlocal nonce
+            r = c.get(nonce_url)
+            nonce = r.headers.get("Replay-Nonce", nonce)
+            finalize_url = f"{order_location}/finalize"
+            fin_key = gen_rsa_key()
+            fin_csr = gen_csr(fin_key, "test-acme.example.com",
+                              dns_names=["test-acme.example.com"])
+            csr_der = fin_csr.public_bytes(Encoding.DER)
+            jws = make_jws(account_key,
+                           {"csr": b64url(csr_der)},
+                           finalize_url, nonce, kid=kid)
+            resp = c.post(finalize_url, json=jws,
+                          headers={"Content-Type": "application/jose+json"})
+            nonce = resp.headers.get("Replay-Nonce", nonce)
+            # 200 = finalized; 400/403 = order not ready (auth not validated without real DNS)
+            return expect_status(resp, 200, 400, 403)
+        check(s, "POST /acme/order/<id>/finalize (CSR submission)", _finalize)
+
+    # ── GET /acme/cert/<id> ───────────────────────────────────────
+    # Try to fetch a cert URL from the order if one is available
+    if order_location:
+        order_r = c.get(order_location)
+        if order_r.ok:
+            cert_url = order_r.json().get("certificate")
+            if cert_url:
+                def _get_cert(cu=cert_url):
+                    r = c.get(cu)
+                    return (
+                        r.status_code == 200
+                        and b"BEGIN CERTIFICATE" in r.content,
+                        f"HTTP {r.status_code} len={len(r.content)}"
+                    )
+                check(s, "GET /acme/cert/<id> (certificate download)", _get_cert)
+
+                # POST-as-GET cert fetch
+                def _post_cert(cu=cert_url):
+                    nonlocal nonce
+                    r = c.get(nonce_url)
+                    nonce = r.headers.get("Replay-Nonce", nonce)
+                    jws = make_jws(account_key, None, cu, nonce, kid=kid)
+                    resp = c.post(cu, json=jws,
+                                  headers={"Content-Type": "application/jose+json"})
+                    nonce = resp.headers.get("Replay-Nonce", nonce)
+                    return expect_status(resp, 200, 404)
+                check(s, "POST /acme/cert/<id> (POST-as-GET)", _post_cert)
+
     # ── POST /acme/key-change ─────────────────────────────────────
     def _key_change():
         nonlocal nonce
@@ -775,6 +861,34 @@ def test_scep(cfg: argparse.Namespace, c: Client) -> Suite:
         return expect_status(r, 200, 400, 500)
     check(s, "POST /scep?operation=PKCSReq (reachable)", _pkcsreq)
 
+    # ── CertPoll / GetCertInitial ─────────────────────────────────
+    check(s, "GET /scep?operation=CertPoll (reachable)", lambda: expect_status(
+        c.get(f"{base}/scep?operation=CertPoll&message=dGVzdA"),  # base64 "test"
+        200, 400, 404
+    ))
+    check(s, "GET /scep?operation=GetCertInitial (alias for CertPoll)", lambda: expect_status(
+        c.get(f"{base}/scep?operation=GetCertInitial&message=dGVzdA"),
+        200, 400, 404
+    ))
+
+    # ── GetCert ──────────────────────────────────────────────────
+    check(s, "GET /scep?operation=GetCert (reachable)", lambda: expect_status(
+        c.get(f"{base}/scep?operation=GetCert&message=dGVzdA"),
+        200, 400, 404
+    ))
+
+    # ── GetCRL ───────────────────────────────────────────────────
+    check(s, "GET /scep?operation=GetCRL (reachable)", lambda: expect_status(
+        c.get(f"{base}/scep?operation=GetCRL"),
+        200, 400
+    ))
+
+    # ── GetNextCACert ─────────────────────────────────────────────
+    check(s, "GET /scep?operation=GetNextCACert (reachable)", lambda: expect_status(
+        c.get(f"{base}/scep?operation=GetNextCACert"),
+        200, 404  # 404 acceptable if next CA cert not configured
+    ))
+
     return s
 
 
@@ -849,6 +963,45 @@ def test_est(cfg: argparse.Namespace, c: Client) -> Suite:
     check(s, "GET /.well-known/est/default/cacerts (labelled)", lambda: expect_status(
         c.get(f"{base}{est_base}/default/cacerts"), 200, 404
     ))
+
+    # ── Labelled EST: GET /.well-known/est/<label>/csrattrs ───────
+    check(s, "GET /.well-known/est/default/csrattrs (labelled)", lambda: expect_status(
+        c.get(f"{base}{est_base}/default/csrattrs"), 200, 404
+    ))
+
+    # ── Labelled EST POST operations ──────────────────────────────
+    def _labelled_simpleenroll():
+        r = c.post(
+            f"{base}{est_base}/default/simpleenroll",
+            data=csr_b64,
+            headers={
+                "Content-Type": "application/pkcs10",
+                "Content-Transfer-Encoding": "base64",
+            },
+        )
+        return expect_status(r, 200, 201, 400, 401, 404)
+    check(s, "POST /.well-known/est/default/simpleenroll (labelled)", _labelled_simpleenroll)
+
+    def _labelled_simplereenroll():
+        r = c.post(
+            f"{base}{est_base}/default/simplereenroll",
+            data=csr_b64,
+            headers={
+                "Content-Type": "application/pkcs10",
+                "Content-Transfer-Encoding": "base64",
+            },
+        )
+        return expect_status(r, 200, 201, 400, 401, 403, 404)
+    check(s, "POST /.well-known/est/default/simplereenroll (labelled)", _labelled_simplereenroll)
+
+    def _labelled_serverkeygen():
+        r = c.post(
+            f"{base}{est_base}/default/serverkeygen",
+            data=b"",
+            headers={"Content-Type": "application/pkcs10"},
+        )
+        return expect_status(r, 200, 201, 400, 401, 403, 501, 404)
+    check(s, "POST /.well-known/est/default/serverkeygen (labelled)", _labelled_serverkeygen)
 
     # ── Invalid path → 404 ───────────────────────────────────────
     check(s, "GET /.well-known/est/nonexistent → 404", lambda: expect_status(
@@ -944,7 +1097,173 @@ def test_ocsp(cfg: argparse.Namespace, c: Client) -> Suite:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# ⑥ Web UI
+# ⑥ IPsec PKI Server (RFC 4809 / RFC 4945)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_ipsec(cfg: argparse.Namespace, c: Client) -> Suite:
+    s = suite("IPsec PKI Server (RFC 4809)")
+    base = cfg.ipsec_url
+    print(f"\n{'─'*60}")
+    print(f"  IPsec Server  →  {base}")
+    print(f"{'─'*60}")
+
+    # ── Health ────────────────────────────────────────────────────
+    check(s, "GET /ipsec/health", lambda: (
+        (r := c.get(f"{base}/ipsec/health")).status_code == 200
+        and "json" in r.headers.get("Content-Type", ""),
+        f"HTTP {r.status_code}"
+    ))
+
+    # ── CA certificate ────────────────────────────────────────────
+    check(s, "GET /ipsec/ca-cert", lambda: (
+        (r := c.get(f"{base}/ipsec/ca-cert")).status_code == 200
+        and b"BEGIN CERTIFICATE" in r.content,
+        f"HTTP {r.status_code} len={len(r.content)}"
+    ))
+
+    # ── Profiles ──────────────────────────────────────────────────
+    check(s, "GET /ipsec/profiles", lambda: (
+        (r := c.get(f"{base}/ipsec/profiles")).status_code == 200
+        and "json" in r.headers.get("Content-Type", ""),
+        f"HTTP {r.status_code}"
+    ))
+
+    # ── Pending approval queue ────────────────────────────────────
+    check(s, "GET /ipsec/pending", lambda: expect_json(
+        c.get(f"{base}/ipsec/pending"), 200
+    ))
+
+    # ── Issue certificate ─────────────────────────────────────────
+    ipsec_key = gen_rsa_key()
+    ipsec_pub_pem = ipsec_key.public_key().public_bytes(
+        Encoding.PEM, PublicFormat.SubjectPublicKeyInfo
+    ).decode()
+    ipsec_serial = None
+
+    def _issue():
+        nonlocal ipsec_serial
+        r = c.post(f"{base}/ipsec/issue",
+                   json={
+                       "subject": "CN=ipsec-test.example.com,O=TestOrg",
+                       "public_key_pem": ipsec_pub_pem,
+                       "profile": "ipsec_end",
+                       "validity_days": 30,
+                   },
+                   headers={"Content-Type": "application/json"})
+        if r.status_code in (200, 201):
+            data = r.json()
+            ipsec_serial = data.get("serial")
+        return expect_status(r, 200, 201)
+    check(s, "POST /ipsec/issue", _issue)
+
+    # ── Fetch cert by serial ──────────────────────────────────────
+    if ipsec_serial:
+        check(s, f"GET /ipsec/cert/{ipsec_serial}", lambda sn=ipsec_serial: (
+            (r := c.get(f"{base}/ipsec/cert/{sn}")).status_code == 200
+            and b"BEGIN CERTIFICATE" in r.content,
+            f"HTTP {r.status_code}"
+        ))
+
+    # ── Batch issue ───────────────────────────────────────────────
+    def _batch_issue():
+        key2 = gen_rsa_key()
+        pub2 = key2.public_key().public_bytes(
+            Encoding.PEM, PublicFormat.SubjectPublicKeyInfo
+        ).decode()
+        r = c.post(f"{base}/ipsec/batch-issue",
+                   json={"requests": [
+                       {"subject": "CN=ipsec-batch-1.example.com", "public_key_pem": pub2,
+                        "profile": "ipsec_end", "validity_days": 30},
+                   ]},
+                   headers={"Content-Type": "application/json"})
+        return expect_status(r, 200, 201)
+    check(s, "POST /ipsec/batch-issue", _batch_issue)
+
+    # ── CSR-based enroll ──────────────────────────────────────────
+    enroll_key = gen_rsa_key()
+    enroll_csr = gen_csr(enroll_key, "ipsec-enroll.example.com")
+    enroll_csr_pem = enroll_csr.public_bytes(Encoding.PEM).decode()
+    def _enroll():
+        r = c.post(f"{base}/ipsec/enroll",
+                   json={"csr_pem": enroll_csr_pem, "profile": "ipsec_end"},
+                   headers={"Content-Type": "application/json"})
+        return expect_status(r, 200, 201, 400)
+    check(s, "POST /ipsec/enroll (CSR-based)", _enroll)
+
+    # ── Update (new key, same subject) ────────────────────────────
+    if ipsec_serial:
+        update_key = gen_rsa_key()
+        update_pub = update_key.public_key().public_bytes(
+            Encoding.PEM, PublicFormat.SubjectPublicKeyInfo
+        ).decode()
+        def _update(sn=ipsec_serial, pub=update_pub):
+            r = c.post(f"{base}/ipsec/update",
+                       json={"serial": sn, "public_key_pem": pub},
+                       headers={"Content-Type": "application/json"})
+            return expect_status(r, 200, 201, 400, 404)
+        check(s, f"POST /ipsec/update serial={ipsec_serial}", _update)
+
+    # ── Renew (same key, new validity) ────────────────────────────
+    if ipsec_serial:
+        def _renew(sn=ipsec_serial):
+            r = c.post(f"{base}/ipsec/renew",
+                       json={"serial": sn},
+                       headers={"Content-Type": "application/json"})
+            return expect_status(r, 200, 201, 400, 404)
+        check(s, f"POST /ipsec/renew serial={ipsec_serial}", _renew)
+
+    # ── Enrollment confirmation ────────────────────────────────────
+    check(s, "POST /ipsec/confirm (reachable)", lambda: expect_status(
+        c.post(f"{base}/ipsec/confirm",
+               json={"serial": ipsec_serial or 1},
+               headers={"Content-Type": "application/json"}),
+        200, 400, 404
+    ))
+
+    # ── Pending request by ID → 404 (no pending requests) ─────────
+    check(s, "GET /ipsec/pending/nonexistent → 404", lambda: expect_status(
+        c.get(f"{base}/ipsec/pending/nonexistent-id-xyz"), 404
+    ))
+
+    # ── Approve / reject unknown request → 404 ───────────────────
+    check(s, "POST /ipsec/approve/<id> (unknown) → 404", lambda: expect_status(
+        c.post(f"{base}/ipsec/approve/nonexistent-id-xyz",
+               json={}, headers={"Content-Type": "application/json"}),
+        404
+    ))
+    check(s, "POST /ipsec/reject/<id> (unknown) → 404", lambda: expect_status(
+        c.post(f"{base}/ipsec/reject/nonexistent-id-xyz",
+               json={}, headers={"Content-Type": "application/json"}),
+        404
+    ))
+
+    # ── OCSP hash lookup (GET) ────────────────────────────────────
+    check(s, "GET /ipsec/ocsp-hash/<issuer>/<serial> (reachable)", lambda: expect_status(
+        c.get(f"{base}/ipsec/ocsp-hash/deadbeef/0001"), 200, 400, 404
+    ))
+
+    # ── OCSP hash lookup (POST) ───────────────────────────────────
+    check(s, "POST /ipsec/ocsp-hash (reachable)", lambda: expect_status(
+        c.post(f"{base}/ipsec/ocsp-hash",
+               json={"issuer_hash": "deadbeef", "serial": "0001"},
+               headers={"Content-Type": "application/json"}),
+        200, 400, 404
+    ))
+
+    # ── Revoke ────────────────────────────────────────────────────
+    if ipsec_serial:
+        def _revoke(sn=ipsec_serial):
+            r = c.post(f"{base}/ipsec/revoke",
+                       json={"serial": sn, "reason": 0},
+                       headers={"Content-Type": "application/json"})
+            return expect_status(r, 200, 400, 404)
+        check(s, f"POST /ipsec/revoke serial={ipsec_serial}", _revoke)
+
+    return s
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ⑦ Web UI
 # ─────────────────────────────────────────────────────────────────────────────
 
 def test_webui(cfg: argparse.Namespace, c: Client) -> Suite:
@@ -1059,6 +1378,46 @@ def test_webui(cfg: argparse.Namespace, c: Client) -> Suite:
         200, 201
     ))
 
+    # ── /ca/cert alias ────────────────────────────────────────────
+    check(s, "GET /ca/cert (alias for /ca/cert.pem)", lambda: (
+        (r := c.get(f"{base}/ca/cert")).status_code == 200
+        and b"BEGIN CERTIFICATE" in r.content,
+        f"HTTP {r.status_code}"
+    ))
+
+    # ── POST /api/config (same handler as PATCH via do_PATCH=do_POST) ──
+    check(s, "POST /api/config (same as PATCH)", lambda: (
+        (r := c.post(f"{base}/api/config",
+                     json={"validity": {"end_entity_days": 365}},
+                     headers={"Content-Type": "application/json"})).status_code in (200, 500),
+        f"HTTP {r.status_code}"
+    ))
+
+    # ── POST /api/renew ───────────────────────────────────────────
+    check(s, "POST /api/renew (missing serial → 400)", lambda: (
+        (r := c.post(f"{base}/api/renew",
+                     json={},
+                     headers={"Content-Type": "application/json"})).status_code == 400
+        and "error" in r.json(),
+        f"HTTP {r.status_code}"
+    ))
+
+    # ── Service stop ──────────────────────────────────────────────
+    services_r = c.get(f"{base}/api/services")
+    if services_r.ok and services_r.json():
+        svc_name = next(iter(services_r.json()))
+        check(s, f"POST /api/services/{svc_name}/stop → ok", lambda n=svc_name: (
+            (r := c.post(f"{base}/api/services/{n}/stop",
+                         json={}, headers={"Content-Type": "application/json"})).status_code == 200
+            and r.json().get("ok") is True,
+            f"HTTP {r.status_code}"
+        ))
+        check(s, f"POST /api/services/{svc_name}/unknownaction → 400", lambda n=svc_name: (
+            (r := c.post(f"{base}/api/services/{n}/unknownaction",
+                         json={}, headers={"Content-Type": "application/json"})).status_code == 400,
+            f"HTTP {r.status_code}"
+        ))
+
     # ── Unknown page → 404 ───────────────────────────────────────
     check(s, "GET /unknown → 404", lambda: expect_status(
         c.get(f"{base}/nonexistent-xyz"), 404
@@ -1131,15 +1490,17 @@ def parse_args() -> argparse.Namespace:
                    help="EST server base URL (default: https://localhost:8444)")
     p.add_argument("--ocsp-url", default="http://localhost:8082",
                    help="OCSP server base URL (default: http://localhost:8082)")
-    p.add_argument("--web-url",  default="http://localhost:8090",
+    p.add_argument("--web-url",   default="http://localhost:8090",
                    help="Web UI base URL (default: http://localhost:8090)")
+    p.add_argument("--ipsec-url", default="https://localhost:8445",
+                   help="IPsec PKI server base URL (default: https://localhost:8445)")
     p.add_argument("--ca-cert",  default=None, metavar="PATH",
                    help="CA certificate PEM for TLS verification (default: system bundle)")
     p.add_argument("--no-verify", action="store_true",
                    help="Disable TLS certificate verification")
     p.add_argument("--timeout", type=int, default=10,
                    help="Request timeout in seconds (default: 10)")
-    p.add_argument("--only", choices=["pki", "acme", "scep", "est", "ocsp", "webui"],
+    p.add_argument("--only", choices=["pki", "acme", "scep", "est", "ocsp", "ipsec", "webui"],
                    help="Run only one test group")
     p.add_argument("-v", "--verbose", action="store_true",
                    help="Show request/response details for all tests")
@@ -1169,6 +1530,7 @@ def main():
     print(f"║  SCEP  : {cfg.scep_url:<49}║")
     print(f"║  EST   : {cfg.est_url:<49}║")
     print(f"║  OCSP  : {cfg.ocsp_url:<49}║")
+    print(f"║  IPsec : {cfg.ipsec_url:<49}║")
     print(f"║  WebUI : {cfg.web_url:<49}║")
     print(f"║  TLS   : {'disabled (--no-verify)' if cfg.no_verify else cfg.ca_cert or 'system bundle':<49}║")
     print("╚══════════════════════════════════════════════════════════╝")
@@ -1179,6 +1541,7 @@ def main():
         "scep":  lambda: test_scep(cfg, c),
         "est":   lambda: test_est(cfg, c),
         "ocsp":  lambda: test_ocsp(cfg, c),
+        "ipsec": lambda: test_ipsec(cfg, c),
         "webui": lambda: test_webui(cfg, c),
     }
 
