@@ -11,167 +11,189 @@ This project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
-## [0.10.0] — 2026-02-27
+## [0.10.0] — 2026-03-01
 
-### Added
+### Added — Intermediate CA support + zero-downtime TLS certificate reload; 35 new tests (260 total, 35 test classes)
 
-#### Service Management — Live Start / Stop / Restart from the Web UI
+#### 1. Intermediate CA support (`pki_server.py`)
 
-A new `service_manager.py` module and matching Web UI page give operators
-full control over every PKI sub-service without restarting the whole process
-or touching the command line.
+PyPKI can now operate as an **intermediate (subordinate) CA** — signed by an
+external root CA — while still issuing leaf certificates, generating CRLs,
+responding to OCSP requests, and serving all five certificate management
+protocols (CMP, ACME, SCEP, EST, IPsec).
 
-##### `service_manager.py` — new module
+**Core infrastructure**
 
-**`ServiceDef`** — per-service descriptor and lifecycle controller:
+`CertificateAuthority.__init__` gains an optional `parent_chain_path: str`
+parameter pointing to a PEM file containing one or more parent CA certificates
+(immediate issuer first, root last).
 
-- `start()` — calls the registered factory, stores the live server object,
-  transitions state to `running`
-- `stop()` — calls `server.shutdown()`, transitions state to `stopped`
-- `restart()` — `stop()` + `start()` in sequence
-- `patch_config(updates)` — deep-merges `updates` into the service's startup
-  kwargs dict and restarts the service
-- Thread-safe (internal `threading.Lock` on every state transition)
-- States: `stopped`, `starting`, `running`, `error`
-- `status_dict()` — returns a snapshot dict with `name`, `label`, `state`,
-  `enabled`, `error`, `config`, `unmanaged`
+`_load_parent_chain(path)` — validates that the first certificate in the file
+actually signed the CA's own certificate (raises `ValueError` otherwise),
+then validates chain continuity upward to the root.  The chain is stored in
+`self._parent_chain` as a list of `x509.Certificate` objects.
 
-**`ServiceManager`** — registry and bulk lifecycle controller:
+Auto-discovery: if `parent_chain_path` is `None`, the server automatically
+looks for `<ca_dir>/ca-chain.pem` and loads it silently if present.  Place the
+chain file there and no CLI flag is needed.
 
-- `register(name, label, factory, config, enabled)` — add a service;
-  `factory=None` marks the service *unmanaged* (visible in the UI but cannot
-  be stopped/restarted — used for the CMP main server)
-- `start(name)` / `stop(name)` / `restart(name)` → `(ok: bool, error: str)`
-- `start_all_enabled()` — start every service whose `enabled` flag is `True`
-- `stop_all()` — stop every running managed service
-- `restart_all()` — restart every running or enabled managed service
-- `patch_service_config(name, updates)` → `(ok, error)` — updates config
-  **and restarts only that service** (no other service is affected)
-- `update_global_config(updates, source)`:
-  - `source="webui"` — restarts only the services whose config key appears in
-    `_KEY_TO_SERVICES` (e.g. `{"acme": ...}` restarts only the ACME service;
-    `{"validity": ...}` restarts nothing)
-  - `source="file"` — triggered by the config-file watcher; restarts **all**
-    managed services so the new config takes effect everywhere
-- `start_config_watcher(poll_interval=2.0)` — background daemon thread that
-  polls `ca/config.json` every `poll_interval` seconds; if the file mtime
-  changes since startup it triggers `update_global_config({}, source="file")`
-- `stop_config_watcher()` — signals the watcher thread to exit cleanly
-- `status_all()` / `status_one(name)` — snapshot status dicts (used by the
-  Web UI auto-refresh)
-- `SERVICE_CONFIG_SCHEMA` — per-service field metadata (key, label, type,
-  min/max/options) used to auto-generate configuration forms in the UI
+New properties:
+- `is_intermediate: bool` — `True` when at least one parent cert is loaded
+- `ca_chain_ders: List[bytes]` — DER bytes `[own_cert, parent, …, root]`
+- `ca_chain_pem: bytes` — concatenated PEM in the same order
 
-**Unmanaged CMP registration** — the CMP main server socket is registered with
-`factory=None` so it appears in the UI as `Running` but the Stop/Restart
-buttons are correctly disabled.
+New CLI flag:
+- `--parent-cert PATH` — path to the parent chain PEM file
 
-##### `web_ui.py` — new Services page and REST API
+Startup banner: new **CA Mode** line shows `intermediate (N parent cert(s))`
+or `root (self-signed)`.
 
-**New page: `/services`**
+**TLS chain presentation**
 
-- One card per service showing: animated status pulse dot (green / grey / red /
-  amber per state), state badge, Start / Stop / Restart buttons
-- Start/Stop/Restart buttons are disabled when the action is not applicable
-  (e.g. Stop is disabled when already stopped)
-- Per-service collapsible **⚙ Configuration** section with type-aware form
-  inputs (number, text, password, checkbox, select) auto-generated from
-  `ServiceManager.SERVICE_CONFIG_SCHEMA`
-- **Save & Restart** button — sends `PATCH /api/services/<n>/config`;
-  restarts only the affected service
-- Status auto-refreshes every 5 seconds via JavaScript polling
-  `GET /api/services`
-- Page is gracefully degraded when no `ServiceManager` is attached (shows an
-  informational message rather than an error)
+`provision_tls_server_cert()` appends parent chain PEM blocks to `server.crt`
+so that `ssl.SSLContext.load_cert_chain()` sends the complete intermediate
+chain to TLS clients.  Browsers and TLS stacks that don't already have the
+intermediate in their trust cache will receive it during the handshake.
 
-**New REST endpoints (Web UI server):**
+`build_tls_context()` and `build_ssl_context()` updated to load the full chain
+for mTLS client verification.
 
-| Method | Path | Description |
-|---|---|---|
-| `GET`   | `/api/services` | Status dict for all registered services |
-| `POST`  | `/api/services/<n>/start` | Start a service |
-| `POST`  | `/api/services/<n>/stop` | Stop a service |
-| `POST`  | `/api/services/<n>/restart` | Restart a service |
-| `PATCH` | `/api/services/<n>/config` | Update service config and restart it |
+**PKCS#12 export**
 
-All service control actions are recorded in the audit log
-(`service_start`, `service_stop`, `service_restart`, `service_config_patch`).
+`export_pkcs12()` includes all parent certificates in the PKCS#12 CA bag so
+that importing applications (browsers, OS key stores) can build the complete
+path to the root.
 
-**Navigation bar** — "Services" tab added between "Sub-CA" and "Metrics".
+**Protocol chain serving** — all five protocols now serve the full chain:
 
-##### `pki_server.py` — ServiceManager integration
+| Module | Change |
+|---|---|
+| `cmp_server.py` | `GET /ca/cert.pem`, `GET /.well-known/cmp`, `GetCACerts` genm, bootstrap bundle — all serve `ca_chain_pem` |
+| `est_server.py` | `/cacerts`, `simpleenroll`, `simplereenroll`, `serverkeygen` — PKCS#7 bags include full chain via new `ESTCMSBuilder.certs_only_chain(chain_ders)` |
+| `scep_server.py` | `GetCACert` — returns plain DER for root CAs; returns PKCS#7 p7c containing full chain for intermediate CAs (RFC 8894 §4.2) |
+| `ipsec_server.py` | `GET /ipsec/ca-cert` serves `ca_chain_pem` |
+| `web_ui.py` | `GET /ca/cert.pem` serves full chain; dashboard shows **CA Mode** and **Chain Depth** |
 
-- `ServiceManager` is instantiated in `main()` before any sub-service is started
-- Each optional service (ACME, SCEP, EST, OCSP) is registered with its exact
-  CLI-derived startup kwargs
-- The CMP main server is registered as unmanaged (`factory=None`, `enabled=True`)
-- Every service that has a registered `ServiceDef` is started **through** the
-  `ServiceManager` (`sm.start("acme")` etc.) so state is tracked from the very
-  first boot, not just after a UI-initiated restart
-- `start_config_watcher()` is called after all services are up
-- `service_manager=_sm` is passed to `start_web_ui()`; if `service_manager.py`
-  is not present in the directory, startup continues normally with a
-  `WARNING` log and all service management features gracefully absent
+**Using PyPKI as a Let's Encrypt-chained intermediate**
 
-#### Test Suite — 41 new tests (282 total, 35 test classes)
+Let's Encrypt does not operate a subordinate CA program for third parties.
+This feature is designed for **private PKI hierarchies** — your own root signs
+your intermediate, which runs this server.  For publicly-trusted leaf
+certificates, combine with option 1 (Let's Encrypt TLS on the server endpoints
+via `--tls-cert` / `--tls-key`; zero intersection between the two chains).
 
-`TestServiceManager` (26 tests):
-- `test_start_changes_state_to_running` — state transitions from stopped to running
-- `test_stop_changes_state_to_stopped` — stop transitions to stopped
-- `test_restart_returns_service_to_running` — restart ends in running state
-- `test_restart_calls_stop_then_start` — ordering: stop precedes start
-- `test_start_all_enabled_starts_only_enabled` — disabled services not started
-- `test_stop_all_stops_running_services` — all running services stopped
-- `test_unknown_service_returns_error` — meaningful error for unknown name
-- `test_unmanaged_service_state_running_on_register` — CMP-like state on register
-- `test_unmanaged_service_stop_refused` — stop returns `ok=False` + message
-- `test_unmanaged_service_restart_refused` — restart returns `ok=False`
-- `test_unmanaged_flag_in_status_dict` — `unmanaged=True` in status
-- `test_managed_flag_false_for_normal_service` — `unmanaged=False` for managed
-- `test_patch_service_config_updates_value` — config dict patched in-place
-- `test_patch_service_config_triggers_restart` — new config used in restart factory call
-- `test_patch_config_unknown_service_returns_error` — error on unknown name
-- `test_update_global_config_file_restarts_all` — `source="file"` restarts all
-- `test_update_global_config_webui_restarts_only_affected` — selective restart
-- `test_update_global_config_known_key_no_restart` — `validity` key → 0 restarts
-- `test_status_all_keys_match_registered_names` — all names in status dict
-- `test_status_dict_has_required_fields` — all required fields present
-- `test_status_none_for_unknown_service` — `None` for unknown name
-- `test_config_watcher_detects_file_change` — mtime change triggers restart
-- `test_config_watcher_does_not_restart_on_no_change` — no spurious restarts
-- `test_schema_present_for_all_standard_services` — schema covers acme/scep/est/ocsp
-- `test_schema_fields_have_required_keys` — every field has key/label/type
-- `test_schema_types_are_valid` — type is one of the allowed set
+Test class: `TestIntermediateCA` (21 tests) — chain loading, validation
+rejection, `ca_chain_ders`/`ca_chain_pem` properties, `is_intermediate` flag,
+issued-cert issuer, PKCS#12 CA bag, `server.crt` chain content, auto-discovery
+of `ca-chain.pem`.
 
-`TestWebUIServicesPage` (15 tests — live HTTP over a real `WebUIHandler`):
-- `test_services_page_returns_200` — GET /services HTTP 200
-- `test_services_page_contains_service_names` — page body contains service labels
-- `test_services_page_shows_running_badge_for_cmp` — running state rendered
-- `test_api_services_returns_json` — GET /api/services returns valid JSON
-- `test_api_services_cmp_is_running` — CMP state = running
-- `test_api_services_acme_is_stopped` — ACME state = stopped initially
-- `test_api_service_start_changes_state` — POST start → state running
-- `test_api_service_stop_changes_state` — POST stop → state stopped
-- `test_api_service_restart_works` — POST restart → state running
-- `test_api_service_config_patch_updates_and_restarts` — PATCH config applied + restart
-- `test_api_cmp_stop_refused` — unmanaged CMP stop rejected
-- `test_api_unknown_service_returns_error` — unknown service handled gracefully
-- `test_services_page_has_start_stop_buttons` — HTML contains button labels
-- `test_services_page_has_config_form` — config form rendered for ACME
-- `test_services_nav_link_present` — nav bar includes /services link
+---
+
+#### 2. Zero-downtime TLS certificate reload (`cmp_server.py`, `est_server.py`, `ipsec_server.py`, `pki_server.py`)
+
+All three TLS-capable servers (CMP, EST, IPsec) can now reload their TLS
+certificate from disk **without restarting and without dropping in-flight
+connections**.  This is the key integration point for Let's Encrypt: point
+`--tls-cert` at certbot's `fullchain.pem` and the server picks up every
+90-day renewal automatically.
+
+**`TLSContextHolder`** (`cmp_server.py`)
+
+Thread-safe, atomically-swappable wrapper around `ssl.SSLContext`.
+
+- `get()` — returns the current context (lock-free, GIL-safe fast path)
+- `swap(new_ctx)` — atomically replaces the context; all new connections
+  immediately use the new certificate; in-flight TLS handshakes are
+  unaffected
+- `ssl_context` property shim — existing code that sets `srv.ssl_context`
+  directly continues to work without modification
+
+**`TlsCertWatcher`** (`cmp_server.py`)
+
+Background daemon thread that polls a cert file's mtime every N seconds.
+
+- When mtime advances (certbot wrote a new cert), calls `build_ctx()` to
+  construct a fresh `SSLContext` and calls `holder.swap()`
+- If the build fails (malformed cert, mismatched key), logs the error and
+  **keeps the old context** — the server stays up and retries on the next
+  poll cycle
+- `reload_now()` — forces an immediate reload regardless of mtime; used
+  by the API endpoint and by the `start()` / `stop()` lifecycle
+
+**`TLSServer`** (`cmp_server.py`)
+
+Refactored to read from `ctx_holder.get()` on every `get_request()` call
+instead of holding a single context at startup.  The `ssl_context` attribute
+shim preserves backward compatibility.
+
+**EST and IPsec servers refactored to per-connection wrapping**
+
+Both previously wrapped the listening socket once at startup
+(`srv.socket = ctx.wrap_socket(...)`), making in-process reload impossible.
+Both are now converted to the same per-connection pattern as `TLSServer`,
+with their own `_TLSThreadedServer` inner class and a shared
+`TLSContextHolder`.
+
+**`POST /api/reload-tls`** (`cmp_server.py`)
+
+New management endpoint — forces an immediate TLS certificate reload from
+disk.  Returns `{"ok": true}` on success or HTTP 500 on failure.
+
+Designed as a certbot deploy-hook target:
+
+```
+/etc/letsencrypt/renewal-hooks/deploy/pypki-reload.sh
+---
+#!/bin/sh
+curl -sf -X POST https://pki.example.com:8080/api/reload-tls
+```
+
+**New CLI flag** (`pki_server.py`)
+
+`--tls-reload-interval SECS` — seconds between cert-file mtime polls
+(default: 60).  Set `0` to disable the automatic watcher and rely solely on
+`POST /api/reload-tls`.
+
+**Startup banner** — new **TLS Cert Reload** row shows the poll interval and
+the API endpoint, or `n/a (no TLS)` for plain-HTTP mode.
+
+**Graceful shutdown** — `KeyboardInterrupt` handler stops all watcher threads
+before shutting down the HTTP servers.
+
+**Let's Encrypt quick-start:**
+
+```bash
+# Obtain cert once
+certbot certonly --standalone -d pki.example.com
+
+# Start PyPKI — watcher picks up every renewal within 60 s
+python pki_server.py \
+  --tls \
+  --tls-cert /etc/letsencrypt/live/pki.example.com/fullchain.pem \
+  --tls-key  /etc/letsencrypt/live/pki.example.com/privkey.pem \
+  --tls-reload-interval 60
+```
+
+Test class: `TestTlsCertWatcher` (14 tests) — `TLSContextHolder` get/swap/
+property/thread-safety, `TlsCertWatcher.reload_now()` success/swap/failure/
+auto-poll/stop, CMP server ctx_holder attachment, `reload_tls()` callable,
+returns-True on success, swaps context, plain-HTTP returns False.
+
+---
 
 ### Changed
 
-- `start_web_ui()` signature extended: new optional `service_manager` parameter
-  (default `None` — backward-compatible; existing callers unaffected)
-- Navigation bar in `web_ui.py` gains a "Services" entry between "Sub-CA" and
-  "Metrics"; all pages updated accordingly
-- `pki_server.py` service startup block refactored: when `ServiceManager` is
-  available, each service is started through it; when not available, the
-  original direct-call path is used unchanged
-- `test_pki_server.py`: `import socket` added to the standard import block
-  (was already used in `TestHTTPAPI` via `http.client`; now also needed by
-  `TestWebUIServicesPage.setUpClass`)
+- `CertificateAuthority.__init__`: new `parent_chain_path` parameter
+- `provision_tls_server_cert()`: appends parent chain blocks to `server.crt`
+- `build_tls_context()` / `build_ssl_context()`: full chain for mTLS trust store
+- `export_pkcs12()`: parent certs included in CA bag
+- `start_cmp_server()`: new `tls_reload_interval` parameter; returns server with `reload_tls()` and `_tls_watcher`
+- `start_est_server()`: new `tls_reload_interval` parameter; per-connection TLS wrapping
+- `start_ipsec_server()`: per-connection TLS wrapping; reads `ca._tls_reload_interval`
+- `CMPv2HTTPHandler.do_POST_api()`: new `POST /api/reload-tls` branch
+- `CMPv2HTTPHandler` GET docs: `POST /api/reload-tls` listed
+- Startup banner: `CA Mode` row, `TLS Cert Reload` row
+- `main()` shutdown: stops TLS watchers before shutting down servers
 
 ### Fixed
 
@@ -182,206 +204,41 @@ All service control actions are recorded in the audit log
 ## Releasing v0.10.0
 
 ```bash
-git add service_manager.py web_ui.py pki_server.py test_pki_server.py CHANGELOG.md README.md
-git commit -m "v0.10.0: Service management — start/stop/restart from Web UI
+git add pki_server.py cmp_server.py est_server.py ipsec_server.py \
+        scep_server.py web_ui.py test_pki_server.py CHANGELOG.md README.md
+git commit -m "v0.10.0: intermediate CA support + zero-downtime TLS cert reload
 
-New module: service_manager.py
-- ServiceDef: per-service lifecycle controller (start/stop/restart/patch_config)
-- ServiceManager: registry with bulk ops and selective config-driven restarts
-- Config-file watcher: detects ca/config.json mtime changes, restarts all services
-- SERVICE_CONFIG_SCHEMA: field metadata for UI form generation
+Intermediate CA:
+- --parent-cert PATH / auto-discover ca-chain.pem
+- _load_parent_chain(): validates issuer signature + chain continuity
+- ca_chain_pem / ca_chain_ders / is_intermediate properties
+- provision_tls_server_cert(): appends parent chain to server.crt
+- export_pkcs12(): parent certs in PKCS#12 CA bag
+- cmp_server: /ca/cert.pem, GetCACerts, well-known, bootstrap serve full chain
+- est_server: /cacerts, simpleenroll, serverkeygen PKCS#7 include full chain
+- scep_server: GetCACert returns p7c for intermediate CAs (RFC 8894 §4.2)
+- ipsec_server: /ipsec/ca-cert serves ca_chain_pem
+- web_ui: CA Mode + Chain Depth in dashboard, chain PEM endpoint
+- TestIntermediateCA: 21 tests
 
-web_ui.py:
-- New /services page: per-service cards with action buttons + config forms
-- Status auto-refresh every 5s via GET /api/services
-- New REST API: GET /api/services, POST /api/services/<n>/start|stop|restart,
-  PATCH /api/services/<n>/config
-- All service actions recorded in the audit log
-- 'Services' nav tab added
+Zero-downtime TLS reload:
+- TLSContextHolder: atomic ssl.SSLContext swap, ssl_context shim
+- TlsCertWatcher: mtime-polling daemon thread, keeps old ctx on failure
+- TLSServer: per-connection wrapping from ctx_holder.get()
+- EST, IPsec: converted from socket-wrap to per-connection TLS
+- POST /api/reload-tls: certbot deploy-hook target
+- --tls-reload-interval SECS (default 60; 0 = watcher disabled)
+- TestTlsCertWatcher: 14 tests
 
-pki_server.py:
-- ServiceManager instantiated in main() before service startup
-- Each service started through SM so state is tracked from first boot
-- Config-file watcher started after all services are up
-- Graceful fallback when service_manager.py is absent
+260 tests total (35 test classes)"
 
-Tests: 41 new tests (282 total, 35 test classes)
-- TestServiceManager: 26 unit tests covering all lifecycle paths
-- TestWebUIServicesPage: 15 live-HTTP integration tests"
-
-git tag -a v0.10.0 -m "v0.10.0: Service management from Web UI"
+git tag -a v0.10.0 -m "v0.10.0: intermediate CA + zero-downtime TLS reload, 260 tests"
 git push && git push origin v0.10.0
 
 gh release create v0.10.0 \
-  --title "v0.10.0 — Service Management from Web UI" \
+  --title "v0.10.0 — Intermediate CA + Zero-Downtime TLS Cert Reload" \
   --notes-file CHANGELOG.md
 ```
-
----
-
-
-
-#### Admin API Authentication
-
-All sensitive management endpoints (`/api/revoke`, `/api/sub-ca`, `/api/certs/<serial>/archive`,
-`/api/certs/<serial>/recover`, `/api/certs/<serial>/renew`, `PATCH /config`) now support
-token-based and mTLS CN-based authentication.
-
-CLI flags:
-- `--admin-api-key KEY` — require `X-Admin-Key` header on admin endpoints (also `PYPKI_ADMIN_API_KEY` env var)
-- `--admin-allowed-cns CN1,CN2` — comma-separated mTLS client CN allowlist for admin operations
-- `--bootstrap-token TOKEN` — shared secret required for `/bootstrap` endpoint (`X-Bootstrap-Token` header or `?token=` query param)
-
-When no admin key or CN allowlist is configured, all endpoints remain open for backward compatibility.
-
-#### CA Private Key Encryption
-
-The root CA private key can now be encrypted at rest with a passphrase.
-
-CLI flag:
-- `--ca-key-passphrase PASS` — encrypts `ca.key` with `BestAvailableEncryption` (also `PYPKI_CA_KEY_PASSPHRASE` env var)
-
-The key file permissions are set to `0600` on creation. If no passphrase is provided, a warning is logged.
-
-#### Web Dashboard Security
-
-- **Authentication** — web UI mutating endpoints (`/api/revoke`, `/api/renew`, `/api/config`,
-  `/api/issue-sub-ca`) now enforce the same `--admin-api-key` / `--admin-allowed-cns` checks
-  as the main PKI server
-- **XSS prevention** — all user-sourced data (certificate subjects, audit log fields, config JSON,
-  Prometheus metrics) is HTML-escaped before rendering via `html.escape()`
-- **Security headers** — all responses include `X-Frame-Options: DENY`,
-  `X-Content-Type-Options: nosniff`, and `Cache-Control: no-store`
-- **CSRF protection** — write endpoints check the `Origin` header to prevent cross-site request forgery
-- **CN sanitization** — sub-CA common names are sanitized with the same regex filter as bootstrap
-  (`[a-zA-Z0-9._\- ]`, max 64 chars)
-
-#### Web Dashboard `PATCH /config` Support
-
-The config editor on the web dashboard now works correctly. Added `do_PATCH` handler to
-`WebUIHandler` to match the JavaScript `fetch()` call that sends `method: 'PATCH'`.
-
----
-
-### Fixed
-
-#### Critical — Runtime Crashes
-
-- **`NameError` in CMP message parser** — `parse_pki_message()` referenced undefined variable
-  `data` instead of `der_data` (line 586). All CMPv2/v3 message processing was broken.
-
-- **`NameError` in web UI** — `do_GET_api_cert()` and `_api_issue_sub_ca()` referenced
-  `Encoding` and `serialization` without importing them. PEM download, P12 download, and
-  sub-CA issuance via the web dashboard all crashed with `NameError`.
-
-- **`sqlite3.OperationalError` in `get_certificate_by_serial()`** — queried non-existent
-  `cert_pem` column; the table stores `der`. Fixed to query `der` and convert to PEM.
-
-- **`TypeError` in CRL generation** — `generate_crl_der()` called `fromtimestamp()` on ISO 8601
-  date strings instead of `fromisoformat()`. Every CRL containing revoked certificates crashed.
-
-#### High — Security
-
-- **Unencrypted CA private key** — `ca.key` was written to disk with `NoEncryption()`. Now
-  supports passphrase encryption via `--ca-key-passphrase` with `BestAvailableEncryption`.
-
-- **No API authentication** — management endpoints (revoke, sub-CA, key recovery, config) had
-  zero authentication. Added `--admin-api-key` and `--admin-allowed-cns` with `hmac.compare_digest`.
-
-- **Web UI bypassed admin auth** — the web dashboard ran on a separate port and called CA methods
-  directly, bypassing all admin authentication on the main server. Fixed by enforcing the same
-  auth checks in `WebUIHandler`.
-
-- **Sub-CA private key exposed without auth** — `/api/issue-sub-ca` returned a CA-grade private
-  key in cleartext JSON to any caller. Now gated by admin authentication.
-
-- **Stored XSS in web dashboard** — certificate subjects, audit log details, and other
-  DB-sourced fields were interpolated into HTML without escaping. An attacker enrolling a
-  certificate with `CN=<script>...` achieved persistent XSS on the dashboard.
-
-- **Bootstrap endpoint unrestricted** — issued client certificates over plain HTTP to any
-  caller with no rate limiting, no challenge, and no CN sanitization. Added rate limiting,
-  optional `--bootstrap-token`, and CN regex filter (64-char limit).
-
-- **Serial number race condition** — `_next_serial()` had a read-then-write race under
-  concurrent requests. Fixed with `threading.Lock` + `BEGIN EXCLUSIVE` transaction.
-
-#### High — Reliability
-
-- **SQLite connection leaks** — 7 methods in `pki_server.py`, 19 in `acme_server.py`, and
-  6 in `scep_server.py` lacked `try/finally` guards around `conn.close()`. Under load, leaked
-  connections accumulated until the process hit the file descriptor limit. All sites now wrapped.
-
-- **Tracing span closed prematurely** — `revoke_certificate()` closed the OpenTelemetry span
-  before the DB work executed. Timing data was meaningless and exceptions were not captured.
-  Moved DB work inside the `with` block.
-
-- **Duplicate CRL generators** — `generate_crl()` (1-day validity) and `generate_crl_der()`
-  (7-day validity, different date parsing) had divergent behavior. Consolidated
-  `generate_crl_der()` to delegate to `generate_crl()`.
-
-#### Medium
-
-- **Fragile revocation serial extraction** — used a heuristic ("first INTEGER > 1000") to find
-  the serial in CMP revocation requests. Replaced with proper CertTemplate `[1] serialNumber`
-  field parsing per RFC 4210 §5.3.9.
-
-- **Name constraints DB mismatch** — `issue_certificate_with_name_constraints()` stored one cert
-  in the DB but returned a different re-signed cert with the same serial. Fixed to update the DB
-  with the re-signed certificate.
-
-- **Pending confirmations memory leak** — `_pending_confirmations` dict grew without bound for
-  unconfirmed enrollments. Added timestamps and 5-minute TTL eviction.
-
-- **`_init_db()` connection leak** — the database initialization method had no `try/finally`
-  guard. Fixed.
-
-- **`_init_key_archive_table()` called per-operation** — ran `CREATE TABLE IF NOT EXISTS` on
-  every archive/recover call. Now called once during `_init_db()`.
-
-- **Web UI config editor broken** — JavaScript sent `method: 'PATCH'` but `WebUIHandler` only
-  had `do_POST`. Added `do_PATCH` handler.
-
-- **Web UI silent JSON error** — malformed POST bodies were silently swallowed and set to `{}`.
-  Now returns 400 Bad Request.
-
-- **Web UI monkey-patch fragility** — `/api/certs/<serial>/<fmt>` routes were added via
-  monkey-patching `do_GET` at module level. Moved into `do_GET` directly.
-
-#### Low
-
-- **Prometheus label escaping** — `profile.replace('"', '\"')` was a no-op in Python. Fixed
-  to `replace('"', '\\"')`.
-
-- **Redundant inline imports** — three `import copy` statements inside methods and one
-  `import tempfile, os` removed; all already imported at module level.
-
-- **Fragile `dir()` checks** — `if 'est_srv' not in dir()` replaced with proper `None`
-  initialization (already present earlier in the code).
-
-- **Duplicate handler factories** — `make_handler()` and `make_cmpv3_handler()` were identical
-  copies. `make_cmpv3_handler()` now delegates to `make_handler()`.
-
-- **Missing security headers** — web UI responses had no `X-Frame-Options`, `X-Content-Type-Options`,
-  or `Cache-Control` headers. Added to prevent clickjacking and caching of sensitive pages.
-
-- **No CSRF protection** — web UI POST endpoints had no Origin/Referer checks. Added Origin
-  header validation on write requests.
-
-- **API docs mismatch** — web UI API docs page listed `POST` for config update; actual method
-  is `PATCH`. Fixed to show `PATCH`.
-
-- **Version badge hardcoded** — web UI showed `v0.9.0` as a string literal. Replaced with
-  `__version__` module variable.
-
----
-
-### Changed
-
-- `CertificateAuthority.__init__()` now accepts `ca_key_passphrase: Optional[bytes]` parameter
-- `make_handler()` / `make_cmpv3_handler()` accept `admin_api_key`, `admin_allowed_cns`, `bootstrap_token` parameters
-- `start_web_ui()` accepts `admin_api_key` and `admin_allowed_cns` parameters
-- Web UI `_send_html()` parameter renamed from `html` to `html_content` to avoid shadowing the `html` module import
 
 ---
 

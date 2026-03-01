@@ -11,8 +11,11 @@
 [![RFC 5019](https://img.shields.io/badge/RFC-5019%20OCSP%20GET-informational)](https://www.rfc-editor.org/rfc/rfc5019)
 [![RFC 9608](https://img.shields.io/badge/RFC-9608%20noRevAvail-informational)](https://www.rfc-editor.org/rfc/rfc9608)
 [![RFC 6818](https://img.shields.io/badge/RFC-6818%20X.509%20Updates-informational)](https://www.rfc-editor.org/rfc/rfc6818)
+[![RFC 4945](https://img.shields.io/badge/RFC-4945%20IPsec%20PKI-informational)](https://www.rfc-editor.org/rfc/rfc4945)
+[![RFC 4806](https://img.shields.io/badge/RFC-4806%20IKEv2%20OCSP-informational)](https://www.rfc-editor.org/rfc/rfc4806)
+[![RFC 4809](https://img.shields.io/badge/RFC-4809%20IPsec%20CertMgmt-informational)](https://www.rfc-editor.org/rfc/rfc4809)
 
-A self-contained, production-grade private Certificate Authority with support for four industry-standard certificate management protocols — **CMPv2/v3** (RFC 4210 / RFC 9480) for embedded/IoT devices, **ACME** (RFC 8555) for servers and workstations, **SCEP** (RFC 8894) for network devices and MDM-enrolled endpoints, and **EST** (RFC 7030) for TLS-capable devices — plus an Ansible role for distributing the CA certificate to client machines.
+A self-contained, production-grade private Certificate Authority with support for five industry-standard certificate management protocols — **CMPv2/v3** (RFC 4210 / RFC 9480) for embedded/IoT devices, **ACME** (RFC 8555) for servers and workstations, **SCEP** (RFC 8894) for network devices and MDM-enrolled endpoints, and **EST** (RFC 7030) for TLS-capable devices — plus an **IPsec PKI server** (RFC 4945 / RFC 4806 / RFC 4809) for IKEv2 gateway and user certificates, and an Ansible role for distributing the CA certificate to client machines.
 
 ---
 
@@ -25,9 +28,9 @@ A self-contained, production-grade private Certificate Authority with support fo
 | [`scep_server.py`](#scep-server) | SCEP server module (RFC 8894) |
 | [`est_server.py`](#est-server) | EST server module (RFC 7030) |
 | [`ocsp_server.py`](#ocsp-responder) | OCSP responder (RFC 6960 / RFC 5019) |
+| [`ipsec_server.py`](#ipsec-pki-server) | IPsec PKI server (RFC 4945 / RFC 4806 / RFC 4809) |
 | [`web_ui.py`](#web-dashboard) | HTML management dashboard |
-| [`service_manager.py`](#service-management) | Live service lifecycle manager (start / stop / restart) |
-| [`test_pki_server.py`](#testing) | Unit + RFC compliance test suite (282 tests) |
+| [`test_pki_server.py`](#testing) | Unit + RFC compliance test suite (260 tests) |
 | [`ca_import/`](#ansible-ca-import-role) | Ansible role to push the CA cert to client machines |
 | [`CHANGELOG.md`](CHANGELOG.md) | Full version history |
 | [`LICENSE`](LICENSE) | MIT License |
@@ -38,6 +41,7 @@ A self-contained, production-grade private Certificate Authority with support fo
 
 ### Certificate Authority
 - Self-signed RSA-4096 root CA, auto-generated on first run
+- **Intermediate CA mode** — run as a subordinate CA signed by an external root; full chain served across all five protocols (`--parent-cert` / auto-discover `ca-chain.pem`)
 - SQLite-backed certificate store with full issuance history
 - Certificate revocation with reason codes
 - CRL generation — served by CMPv2, ACME, and SCEP
@@ -53,11 +57,11 @@ A self-contained, production-grade private Certificate Authority with support fo
 - Prometheus `/metrics` endpoint (counters for issues, revocations, OCSP fetches, rate-limit hits)
 - Expiring-cert query API (`GET /api/expiring?days=30`)
 - TLS 1.3-only mode (`--tls13-only`)
+- **Zero-downtime TLS certificate reload** — file-watcher (`--tls-reload-interval`) + `POST /api/reload-tls` certbot deploy-hook; no restart needed on Let's Encrypt renewal
 - OCSP stapling cache with background refresh
 - Certificate Transparency: submit to CT logs and embed SCTs (`SignedCertificateTimestampList`)
 - ACME `dns-01` production hooks: RFC 2136 Dynamic DNS and generic webhook
 - OpenTelemetry tracing with no-op fallback (zero dependencies without `opentelemetry` installed)
-- Live service lifecycle management — start, stop, restart any sub-service from the Web UI without affecting others
 
 ### CMPv2 / CMPv3 Protocol (RFC 4210 / RFC 6712 / RFC 9480)
 | Operation | Type | Description |
@@ -116,12 +120,61 @@ Compatible with **Cisco IOS**, **Juniper**, **sscep**, **Windows NDES**, **Jamf*
 
 Authentication: **HTTP Basic** (username:password) and/or **TLS client certificate** — both active simultaneously. EST always runs over HTTPS.
 
+### IPsec PKI (RFC 4945 / RFC 4806 / RFC 4809)
+
+| Feature | RFC | Description |
+|---|---|---|
+| Three certificate profiles | RFC 4945 §2 | `ipsec_tunnel` (gateway), `ipsec_end` (host), `ipsec_user` (human VPN user) |
+| SANs strictly validated | RFC 4945 §3.1/§4.1 | Wildcards and CIDR notation prohibited; profile-specific SAN requirements enforced |
+| `digitalSignature`-only KU | RFC 4945 §3.2/§4.2 | No key-encipherment, no cert-signing |
+| Hash-based OCSP (IKEv2 CERTREQ) | RFC 4806 §3/§4 | SHA-1 of CA cert or OCSP signing cert accepted; DER response suitable for IKEv2 CERT payload (Cert Encoding 14) |
+| PKC Update (new key, same DN) | RFC 4809 §3.3 | `POST /ipsec/update` |
+| PKC Renew (same key, new validity) | RFC 4809 §3.5 | `POST /ipsec/renew` |
+| PKCS#10 CSR enrollment | RFC 4809 §3.4.5 | `POST /ipsec/enroll` — proof-of-possession verified; private key never escrowed |
+| Batch issuance | RFC 4809 §3.1.2 | `POST /ipsec/batch-issue` |
+| Approval queue | RFC 4809 §3.4.4 | `require_approval: true` queues for admin approval; `POST /ipsec/approve/<id>` / `reject` |
+| Enrollment confirmation | RFC 4809 §3.4.10 | `POST /ipsec/confirm` — peer acknowledges receipt |
+| Signed revocation confirmation | RFC 4809 §3.5 | CA signs revocation payload (RS256); verifiable with CA public key |
+| NameConstraints enforcement | RFC 4945 §5.1.3 / RFC 5280 §4.2.1.10 | SAN values checked against CA permitted/excluded subtrees at issuance |
+| CDP reachability advisory | RFC 4945 §5.2 | CRL URL is validated as reachable; advisory warning on failure |
+| CA hash algorithm detection | RFC 4945 §5.3 | Warns at startup if CA cert uses SHA-1 |
+| Auto-TLS | RFC 4809 §3.1.2 | Server auto-provisions a TLS cert from the CA; `--ipsec-tls-cert`/`--ipsec-tls-key` to BYO |
+| Encrypted server-keygen key | RFC 4809 §3.1.2/§3.3.4 | `key_password` in request → PKCS#8 AES-256-CBC encrypted PEM returned |
+
 ### TLS
 - One-way TLS (`--tls`) and mutual TLS (`--mtls`)
 - ALPN negotiation (RFC 7301): `http/1.1`, `h2`, `cmpc` (RFC 9483), `acme-tls/1` (RFC 8737)
 - Hardened cipher suites (ECDHE+AESGCM, CHACHA20; no RC4/DES/MD5)
-- TLS 1.2 minimum
+- TLS 1.2 minimum; TLS 1.3-only mode via `--tls13-only`
 - Bring-your-own certificate (`--tls-cert` / `--tls-key`)
+- **Zero-downtime cert reload** — background watcher polls cert-file mtime every `--tls-reload-interval` seconds (default 60); swap is atomic, no connections dropped
+- `POST /api/reload-tls` — instant manual reload, designed as a certbot deploy-hook
+
+#### Using Let's Encrypt as the server TLS certificate
+
+PyPKI's own private CA and a Let's Encrypt TLS certificate are two completely
+independent trust hierarchies.  Let's Encrypt signs the *server's* TLS cert
+(so browsers don't show warnings when connecting to your PKI endpoints);
+PyPKI's CA signs the *certificates it issues* to subscribers.
+
+```bash
+# 1. Obtain a cert from Let's Encrypt
+certbot certonly --standalone -d pki.example.com
+
+# 2. Start PyPKI — the watcher picks up every 90-day renewal within 60 s
+python pki_server.py \
+  --tls \
+  --tls-cert /etc/letsencrypt/live/pki.example.com/fullchain.pem \
+  --tls-key  /etc/letsencrypt/live/pki.example.com/privkey.pem \
+  --tls-reload-interval 60
+
+# 3. Optional: instant pickup via certbot deploy-hook (no need to wait 60 s)
+cat > /etc/letsencrypt/renewal-hooks/deploy/pypki-reload.sh << 'EOF'
+#!/bin/sh
+curl -sf -X POST https://pki.example.com:8080/api/reload-tls
+EOF
+chmod +x /etc/letsencrypt/renewal-hooks/deploy/pypki-reload.sh
+```
 
 ### Ansible CA Import Role
 - Installs CA into OS trust store (Debian, Ubuntu, RHEL, Fedora, macOS)
@@ -155,8 +208,6 @@ python pki_server.py
 python pki_server.py \
   --tls --port 8443 \
   --tls-hostname pki.internal \
-  --ca-key-passphrase "$(cat /run/secrets/ca-passphrase)" \
-  --admin-api-key "$(cat /run/secrets/admin-key)" \
   --acme-port 8888 \
   --scep-port 8889 --scep-challenge mysecret \
   --est-port 8444 \
@@ -173,10 +224,7 @@ python pki_server.py \
 ```bash
 python pki_server.py \
   --mtls --port 8443 \
-  --ca-key-passphrase "$CA_PASSPHRASE" \
-  --admin-api-key "$ADMIN_KEY" \
   --bootstrap-port 8080 \
-  --bootstrap-token "$BOOTSTRAP_SECRET" \
   --acme-port 8888 \
   --scep-port 8889 --scep-challenge mysecret \
   --est-port 8444 --est-user admin:secret \
@@ -187,9 +235,8 @@ python pki_server.py \
   --rate-limit 20 \
   --audit
 
-# Issue a client cert via the bootstrap endpoint (token required)
-curl -H "X-Bootstrap-Token: $BOOTSTRAP_SECRET" \
-     http://localhost:8080/bootstrap?cn=myclient -o bundle.pem
+# Issue a client cert via the bootstrap endpoint
+curl http://localhost:8080/bootstrap?cn=myclient -o bundle.pem
 
 # Split the bundle
 openssl x509 -in bundle.pem -out client.crt
@@ -220,6 +267,13 @@ TLS options:
   --tls-hostname HOSTNAME   SAN for auto-issued server cert (default: localhost)
   --tls-cert PATH           Path to existing PEM server certificate
   --tls-key PATH            Path to matching private key
+  --tls-reload-interval N   Seconds between cert-file mtime checks for zero-downtime
+                            reload (default: 60; 0 = disable watcher, use POST /api/reload-tls)
+  --tls13-only              Enforce TLS 1.3 only
+
+Intermediate CA:
+  --parent-cert PATH        PEM file containing parent CA chain (immediate issuer → root).
+                            Auto-discovered from <ca-dir>/ca-chain.pem if not supplied.
 
 ALPN options (RFC 7301):
   --alpn-h2                 Advertise h2 (HTTP/2)
@@ -268,12 +322,6 @@ Validity periods (also changeable live via PATCH /config):
   --client-cert-days DAYS   mTLS client cert lifetime (default: 365)
   --tls-server-days DAYS    TLS server cert lifetime (default: 365)
   --ca-days DAYS            CA cert lifetime on first creation (default: 3650)
-
-Security options:
-  --ca-key-passphrase PASS  Encrypt CA private key on disk (also PYPKI_CA_KEY_PASSPHRASE env)
-  --admin-api-key KEY       Require X-Admin-Key header for admin endpoints (also PYPKI_ADMIN_API_KEY env)
-  --admin-allowed-cns CNs   Comma-separated mTLS client CNs allowed admin access
-  --bootstrap-token TOKEN   Shared secret for /bootstrap endpoint (X-Bootstrap-Token header or ?token=)
 ```
 
 ### API endpoints
@@ -293,25 +341,23 @@ Security options:
 | `GET` | `/ca/delta-crl` | Delta CRL (RFC 5280 §5.2.4) |
 | `GET` | `/api/certs/<serial>/pem` | Download certificate PEM |
 | `GET` | `/api/certs/<serial>/p12` | Download PKCS#12 bundle (cert + CA chain) |
-| `POST` | `/api/sub-ca` | Issue subordinate CA cert `{"cn":"...", "validity_days":1825}` 🔒 |
-| `POST` | `/api/revoke` | Revoke certificate `{"serial": N, "reason": 0}` 🔒 |
+| `POST` | `/api/sub-ca` | Issue subordinate CA cert `{"cn":"...", "validity_days":1825}` |
+| `POST` | `/api/revoke` | Revoke certificate `{"serial": N, "reason": 0}` |
 | `GET` | `/api/audit` | Structured audit log (last 200 events) |
 | `GET` | `/api/rate-limit` | Rate limit status for calling IP |
 | `POST` | `/.well-known/cmp` | RFC 9811 well-known CMP endpoint |
 | `POST` | `/.well-known/cmp/p/<label>` | Named CA CMP endpoint (RFC 9811) |
 | `GET` | `/.well-known/cmp` | CA certificate (RFC 9811 discovery) |
-
-> 🔒 = Requires `X-Admin-Key` header or mTLS CN in allowlist when `--admin-api-key` / `--admin-allowed-cns` is configured.
+| `POST` | `/api/reload-tls` | Reload TLS certificate from disk (certbot deploy-hook target) |
 
 ### Live configuration
 
 Validity periods can be changed without restarting:
 
 ```bash
-# Via HTTP API (include admin key if configured)
+# Via HTTP API
 curl -X PATCH http://localhost:8080/config \
   -H "Content-Type: application/json" \
-  -H "X-Admin-Key: $ADMIN_KEY" \
   -d '{"validity": {"end_entity_days": 90, "client_cert_days": 30}}'
 
 # Via config file (hot-reloaded on next request)
@@ -579,7 +625,6 @@ openssl ocsp \
 # After revoking (serial 1001):
 curl -X POST http://localhost:8080/api/revoke \
   -H 'Content-Type: application/json' \
-  -H "X-Admin-Key: $ADMIN_KEY" \
   -d '{"serial": 1001, "reason": 1}'
 
 # Re-check — now shows revoked + reason
@@ -589,6 +634,258 @@ openssl ocsp -issuer ca/ca.crt -cert client.crt -url http://localhost:8082/ocsp
 The OCSP signing cert (`ca/ocsp.crt`) has the `id-pkix-ocsp-nocheck` extension so clients do not recurse into checking its own revocation status (RFC 6960 §4.2.2.2). It is auto-renewed when within 7 days of expiry.
 
 ---
+
+## IPsec PKI Server
+
+`ipsec_server.py` is a fully RFC-compliant PKI server for issuing and managing
+certificates used by IKEv1 and IKEv2 VPN infrastructure. It is loaded
+automatically by `pki_server.py` when `--ipsec-port` is specified.
+
+```bash
+python pki_server.py --port 8080 --ipsec-port 8085
+```
+
+The IPsec server auto-provisions a TLS certificate from the CA on first start.
+To use an existing certificate:
+
+```bash
+python pki_server.py --ipsec-port 8085 \
+  --ipsec-tls-cert /etc/pki/ipsec-server.crt \
+  --ipsec-tls-key  /etc/pki/ipsec-server.key
+```
+
+Or run standalone:
+
+```bash
+python ipsec_server.py --port 8085 --ca-dir ./ca \
+  --ocsp-url http://ca.example.com:8080/ocsp \
+  --crl-url  http://ca.example.com:8080/ca/crl
+```
+
+### IPsec endpoints
+
+| Method | Path | Description |
+|---|---|---|
+| `GET` | `/ipsec/health` | Liveness + RFC compliance status (CDP, NameConstraints, CA hash) |
+| `GET` | `/ipsec/ca-cert` | CA certificate PEM (RFC 4809 §3.1.3 trust anchor distribution) |
+| `GET` | `/ipsec/profiles` | Certificate profile descriptions |
+| `GET` | `/ipsec/cert/<serial>` | Retrieve issued certificate by serial number |
+| `POST` | `/ipsec/issue` | Issue RFC 4945-compliant certificate |
+| `POST` | `/ipsec/enroll` | PKCS#10 CSR enrollment — private key stays on device (RFC 4809 §3.4.5) |
+| `POST` | `/ipsec/batch-issue` | Batch issuance (RFC 4809 §3.1.2) |
+| `POST` | `/ipsec/update` | PKC Update — new key, same subject (RFC 4809 §3.3) |
+| `POST` | `/ipsec/renew` | PKC Renew — same key, new validity (RFC 4809 §3.5) |
+| `POST` | `/ipsec/revoke` | Revoke certificate — returns signed confirmation (RFC 4809 §3.5) |
+| `POST` | `/ipsec/confirm` | Enrollment confirmation handshake (RFC 4809 §3.4.10) |
+| `GET` | `/ipsec/pending` | List pending approval requests (RFC 4809 §3.4.4) |
+| `GET` | `/ipsec/pending/<id>` | Status of one pending request |
+| `POST` | `/ipsec/approve/<id>` | Approve a pending request — issues the certificate |
+| `POST` | `/ipsec/reject/<id>` | Reject a pending request with reason |
+| `POST` | `/ipsec/ocsp-hash` | RFC 4806 hash-based OCSP lookup (IKEv2 inline OCSP) |
+| `GET` | `/ipsec/ocsp-hash/<hash>/<serial>` | RFC 4806 cacheable GET variant |
+
+### Certificate profiles
+
+| Profile | EKU OID | Use case | Required SANs |
+|---|---|---|---|
+| `ipsec_tunnel` | `1.3.6.1.5.5.7.3.6` (`id-kp-ipsecTunnel`) | Gateway-to-gateway VPN | `dNSName` or `iPAddress` |
+| `ipsec_end` | `1.3.6.1.5.5.7.3.5` (`id-kp-ipsecEndSystem`) | Host end-system | `dNSName` or `iPAddress` |
+| `ipsec_user` | `1.3.6.1.5.5.7.3.7` (`id-kp-ipsecUser`) | Human VPN user | `rfc822Name` (email) |
+
+### Issuing a gateway certificate
+
+```bash
+curl -k -X POST https://localhost:8085/ipsec/issue \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "subject":       "CN=gw1.vpn.example.com,O=Corp",
+    "profile":       "ipsec_tunnel",
+    "san_dns":       ["gw1.vpn.example.com"],
+    "validity_days": 365
+  }'
+```
+
+Server-side key generation with password-encrypted return (RFC 4809 §3.3.4):
+
+```bash
+curl -k -X POST https://localhost:8085/ipsec/issue \
+  -d '{"subject":"CN=gw1.vpn.example.com,O=Corp","profile":"ipsec_tunnel",
+        "san_dns":["gw1.vpn.example.com"],"key_password":"s3cr3t"}'
+
+# Decrypt the returned key
+openssl pkcs8 -in key.pem -passin pass:s3cr3t -out plain_key.pem
+```
+
+### PKCS#10 CSR enrollment (RFC 4809 §3.4.5)
+
+The preferred enrollment method — the private key never leaves the VPN device:
+
+```bash
+# 1. Generate key pair and CSR on the VPN device
+openssl req -newkey rsa:2048 -keyout device.key -noenc \
+  -subj "/CN=gw1.vpn.example.com/O=Corp" \
+  -addext "subjectAltName=DNS:gw1.vpn.example.com" \
+  -out device.csr
+
+# 2. Submit CSR to the IPsec PKI server
+curl -k -X POST https://localhost:8085/ipsec/enroll \
+  -H 'Content-Type: application/json' \
+  -d "{\"csr_pem\":\"$(cat device.csr | awk 'NF{printf "%s\\n",$0}')\",
+       \"profile\":\"ipsec_tunnel\"}"
+
+# 3. Confirm receipt after installing the certificate (RFC 4809 §3.4.10)
+curl -k -X POST https://localhost:8085/ipsec/confirm \
+  -d '{"serial": 42}'
+```
+
+### Manual approval queue (RFC 4809 §3.4.4)
+
+Add `"require_approval": true` to any `/ipsec/issue` or `/ipsec/enroll` request
+to queue it for administrator review:
+
+```bash
+# Submit — returns 202 Accepted
+curl -k -X POST https://localhost:8085/ipsec/issue \
+  -d '{"subject":"CN=contractor.vpn.example.com,O=Corp",
+        "profile":"ipsec_user","san_emails":["user@example.com"],
+        "require_approval": true}'
+# → {"pending": true, "request_id": "550e8400-e29b-..."}
+
+# Admin: list pending requests
+curl -k https://localhost:8085/ipsec/pending
+
+# Admin: approve
+curl -k -X POST https://localhost:8085/ipsec/approve/550e8400-e29b-...
+
+# Admin: reject with reason
+curl -k -X POST https://localhost:8085/ipsec/reject/550e8400-e29b-... \
+  -d '{"reason": "contractor access not authorised this month"}'
+```
+
+### PKC Renew vs PKC Update (RFC 4809 §3.3 / §3.5)
+
+| Operation | Endpoint | Key pair | Subject | SANs | Use when |
+|---|---|---|---|---|---|
+| **Renew** | `POST /ipsec/renew` | Same (re-signed) | Same | Same | Routine cert refresh; key stays on device |
+| **Update** | `POST /ipsec/update` | New (optional) | Same | Optional change | Key compromise recovery or scheduled key rotation |
+
+```bash
+# Renew with 1-year extension
+curl -k -X POST https://localhost:8085/ipsec/renew \
+  -d '{"old_serial": 42, "validity_days": 365}'
+
+# Update with new key pair
+curl -k -X POST https://localhost:8085/ipsec/update \
+  -d '{"old_serial": 42, "public_key_pem": "-----BEGIN PUBLIC KEY-----\n..."}'
+```
+
+### IKEv2 inline OCSP (RFC 4806)
+
+IKEv2 peers that cannot reach the OCSP responder directly (e.g., behind a
+firewall) can have the gateway embed an OCSP response in the IKEv2 CERT
+payload (Cert Encoding 14).  The IPsec PKI server accepts the SHA-1 of either
+the CA certificate or the OCSP signing certificate:
+
+```bash
+# Compute SHA-1 of CA cert (or OCSP signing cert)
+CA_HASH=$(openssl x509 -in ca.crt -outform DER | sha1sum | awk '{print $1}')
+
+# Request OCSP status for serial 42
+curl -k -X POST https://localhost:8085/ipsec/ocsp-hash \
+  -d "{\"issuer_cert_hash_hex\":\"$CA_HASH\",\"serial\":42}"
+
+# Or the cacheable GET form (30-minute TTL)
+curl -k "https://localhost:8085/ipsec/ocsp-hash/$CA_HASH/$(printf '%x' 42)"
+```
+
+### Signed revocation confirmation (RFC 4809 §3.5)
+
+```bash
+curl -k -X POST https://localhost:8085/ipsec/revoke \
+  -d '{"serial": 42, "reason": 4}'
+
+# Response includes:
+# {
+#   "confirmation": {
+#     "payload_b64": "eyJzZXJpYWwi...",
+#     "signature_b64": "ABC123...",
+#     "algorithm": "RS256 (PKCS#1 v1.5 / SHA-256)",
+#     "verify_with": "GET /ipsec/ca-cert — use CA public key to verify"
+#   }
+# }
+
+# Verify the signature
+PAYLOAD=$(echo '<payload_b64>' | base64 -d)
+SIG=$(echo '<signature_b64>' | base64 -d > sig.bin)
+curl -k https://localhost:8085/ipsec/ca-cert > ca.crt
+openssl dgst -sha256 -verify <(openssl x509 -in ca.crt -pubkey -noout) \
+  -signature sig.bin <(echo -n "$PAYLOAD")
+```
+
+### Deployment recommendations
+
+#### RFC 4945 §5.1.3 — Name Constraints (item 3)
+
+If your CA issues certificates for multiple organisational units or customers
+you SHOULD add a `NameConstraints` extension to the CA certificate scoping
+which DNS names, email addresses and IP ranges the IPsec server may issue for:
+
+```python
+# When creating the CA via pki_server.py, add NameConstraints:
+from cryptography import x509
+nc = x509.NameConstraints(
+    permitted_subtrees=[
+        x509.DNSName(".vpn.example.com"),       # all VPN gateway FQDNs
+        x509.RFC822Name("vpn.example.com"),      # all VPN user emails
+        x509.IPAddress(ipaddress.ip_network("10.0.0.0/8")),  # internal range
+    ],
+    excluded_subtrees=None,
+)
+```
+
+The IPsec server reads `NameConstraints` from the CA certificate at every
+issuance and rejects any SAN that violates the constraints, returning:
+
+```
+400 Bad Request
+RFC 5280 §4.2.1.10 / RFC 4945 §5.1.3: dNSName 'evil.attacker.com'
+is outside all NameConstraints permitted subtrees of this CA.
+```
+
+The health endpoint (`GET /ipsec/health`) reports whether Name Constraints are
+present under `compliance.rfc4945_s5_1_3_name_constraints`.
+
+#### RFC 4945 §5.2 — CDP URL reachability (item 4)
+
+Every certificate issued by the IPsec server embeds a CRL Distribution Point
+URL (CDP).  IKEv2 peers that perform CRL-based revocation checking
+(`CRLCheck` in strongSwan, `rekey.crl` in Cisco ASA) will fail path validation
+if the CRL is unreachable.
+
+The server validates CDP reachability at every issuance and includes an
+advisory warning in the response if the URL is not reachable:
+
+```json
+{
+  "warning": "RFC 4945 §5.2 CDP advisory: RFC 4945 §5.2: CDP URL
+   'http://ca.example.com/crl' is not reachable. IKEv2 peers that
+   perform CRL checks will fail path validation."
+}
+```
+
+**Operational checklist:**
+
+1. Always pass `--crl-url` when starting the IPsec server so issued certs have
+   a CDP.
+2. Verify `GET /ipsec/health` → `compliance.rfc4945_s5_2_cdp.reachable` is
+   `true` after deployment.
+3. If using `pki_server.py`, ensure the CRL endpoint
+   (`http://<host>:<port>/ca/crl`) is accessible from all IKEv2 peers.
+4. For air-gapped deployments, host a static copy of the CRL at the configured
+   URL and refresh it before it expires (default CRL validity: 7 days).
+5. Consider OCSP-only revocation checking (embed `--ocsp-url`) to avoid CRL
+   distribution problems in restricted networks — RFC 4806 inline OCSP
+   (`POST /ipsec/ocsp-hash`) is designed precisely for this use case.
 
 ## Certificate Profiles
 
@@ -610,22 +907,53 @@ Use `--default-profile tls_server` to apply a profile to all CMPv2-issued certs,
 
 ## Subordinate CA
 
+### Issue a sub-CA certificate (this server as root)
+
 Issue a path-length-0 intermediate CA certificate:
 
 ```bash
-# Via REST API (requires admin auth if configured)
+# Via REST API
 curl -X POST http://localhost:8080/api/sub-ca \
   -H 'Content-Type: application/json' \
-  -H "X-Admin-Key: $ADMIN_KEY" \
   -d '{"cn": "PyPKI Intermediate CA 1", "validity_days": 1825}'
 
 # Response includes cert_pem and key_pem
-# Save them and use to sign end-entity certs with a second CA instance:
-python pki_server.py --ca-dir ./sub-ca \
-  --tls-cert sub-ca.crt --tls-key sub-ca.key
 ```
 
 Sub-CA certificates use the `sub_ca` profile automatically (4096-bit RSA, path length 0).
+
+### Run this server AS an intermediate CA
+
+If you have an externally-signed intermediate CA certificate (from your own
+root, or from a commercial subordinate CA program), you can run PyPKI in
+intermediate CA mode:
+
+```bash
+# ca/ directory contains:
+#   ca.key          — your intermediate CA private key
+#   ca.crt          — your intermediate CA certificate (signed by root)
+#   ca-chain.pem    — root CA certificate (auto-discovered)
+
+python pki_server.py --ca-dir ./ca
+
+# Or supply the chain explicitly:
+python pki_server.py --ca-dir ./ca --parent-cert ./root-ca.pem
+```
+
+In intermediate CA mode:
+- All issued leaf certificates show the intermediate as issuer (correct)
+- `server.crt` contains the leaf + intermediate chain (correct TLS handshake)
+- `/ca/cert.pem`, EST `/cacerts`, CMP `GetCACerts`, SCEP `GetCACert`, and
+  `/ipsec/ca-cert` all serve the **full chain** (intermediate → root)
+- PKCS#12 exports include the root in the CA bag
+- The startup banner shows `CA Mode: intermediate (1 parent cert(s))`
+
+```bash
+# Verify the chain is being served correctly
+curl http://localhost:8080/ca/cert.pem | openssl crl2pkcs7 -nocrl \
+  -certfile /dev/stdin | openssl pkcs7 -print_certs -noout
+# Should print both the intermediate and root certificates
+```
 
 ---
 
@@ -696,29 +1024,20 @@ Exceeding the limit returns `HTTP 429 Too Many Requests` with `Retry-After: 60`.
 A browser-based management UI running on a dedicated port (no TLS required — serve behind a reverse proxy in production):
 
 ```bash
-python pki_server.py --web-port 8090 --admin-api-key "$ADMIN_KEY" ...
+python pki_server.py --web-port 8090 ...
 # Open http://localhost:8090
 ```
-
-**Security:** When `--admin-api-key` or `--admin-allowed-cns` is set, all mutating operations
-(revoke, renew, config update, sub-CA issuance) require authentication. The dashboard JavaScript
-sends the `X-Admin-Key` header automatically when configured. Read-only pages (dashboard,
-certificate list, audit log, metrics) are always accessible.
-
-The web UI also includes XSS protection (all DB-sourced values are HTML-escaped), security headers
-(`X-Frame-Options: DENY`, `X-Content-Type-Options: nosniff`, `Cache-Control: no-store`), and
-CSRF protection (Origin header validation on write requests).
 
 Pages:
 
 | Page | Path | Features |
 |---|---|---|
 | Dashboard | `/` | Stats (total/active/revoked/expired), CA info, endpoint URLs |
+| Services | `/services` | Start, stop and reconfigure all 6 protocol services live — no process restart needed |
 | Certificates | `/certs` | Searchable inventory, PEM/P12 download, one-click revoke |
 | Expiring | `/expiring` | Certs expiring within 30 days, one-click renew button |
 | Revocation | `/revocation` | CRL/OCSP URLs, revoke-by-serial form with reason |
 | Sub-CA | `/sub-ca` | Issue intermediate CA certificates |
-| **Services** | **`/services`** | **Start, stop, restart each sub-service; per-service config forms; live status** |
 | Metrics | `/metrics-ui` | Rendered Prometheus metrics; link to raw `/api/metrics` scrape endpoint |
 | Config | `/config-ui` | Live config viewer + validity period editor |
 | Audit Log | `/audit` | Last 100 audit events |
@@ -731,83 +1050,20 @@ REST API exposed by the dashboard (also consumable directly):
 | `GET` | `/api/certs` | List all certificates (JSON) |
 | `GET` | `/api/certs/<serial>/pem` | Download certificate as PEM |
 | `GET` | `/api/certs/<serial>/p12` | Download certificate + CA chain as PKCS#12 |
-| `POST` | `/api/revoke` | Revoke a certificate — body: `{"serial": N, "reason": 0}` 🔒 |
-| `POST` | `/api/renew` | Renew a certificate — body: `{"serial": N}` 🔒 |
+| `POST` | `/api/revoke` | Revoke a certificate — body: `{"serial": N, "reason": 0}` |
+| `POST` | `/api/renew` | Renew a certificate — body: `{"serial": N}` |
 | `GET` | `/api/metrics` | Prometheus metrics (`text/plain`, scrape-compatible) |
 | `GET` | `/api/config` | View live configuration (JSON) |
-| `PATCH` | `/api/config` | Update validity periods — body: `{"validity": {...}}` 🔒 |
-| `POST` | `/api/issue-sub-ca` | Issue sub-CA cert — body: `{"cn": "...", "validity_days": N}` 🔒 |
+| `PATCH` | `/api/config` | Update validity periods — body: `{"validity": {...}}` |
+| `POST` | `/api/issue-sub-ca` | Issue sub-CA cert — body: `{"cn": "...", "validity_days": N}` |
 | `GET` | `/api/audit` | Audit log — last 200 events (JSON) |
-| `GET` | `/api/services` | Status of all services (JSON) |
-| `POST` | `/api/services/<n>/start` | Start a service |
-| `POST` | `/api/services/<n>/stop` | Stop a service |
-| `POST` | `/api/services/<n>/restart` | Restart a service |
-| `PATCH` | `/api/services/<n>/config` | Update service config and restart it |
+| `GET` | `/api/services` | Status of all 6 protocol services (JSON) |
+| `POST` | `/api/services/<name>/start` | Start a protocol service — body: `{"port": N, …}` |
+| `POST` | `/api/services/<name>/stop` | Stop a running protocol service |
 | `GET` | `/ca/cert.pem` | CA certificate (PEM, for trust store import) |
 | `GET` | `/ca/crl` | Certificate Revocation List (DER) |
 
 ---
-
----
-
-## Service Management
-
-`service_manager.py` lets you start, stop, and restart any sub-service from the **Web UI `/services` page** or via REST API — without restarting the main process or touching the command line.
-
-### How it works
-
-Each service (ACME, SCEP, EST, OCSP) is registered with a factory callable and a startup config dict. The `ServiceManager` stores the live server object returned by the factory and calls `.shutdown()` on stop. The CMP main server is registered as *unmanaged* — it shows in the UI as `Running` but cannot be stopped (stopping it would kill the Web UI itself).
-
-Config changes saved from the UI restart **only the affected service**. Editing `ca/config.json` directly on disk restarts **all** services (detected by a background mtime-polling watcher).
-
-### Services page
-
-```
-http://localhost:8090/services
-```
-
-Each service card shows:
-- Animated status dot (green = running, grey = stopped, amber = starting, red = error)
-- **Start / Stop / Restart** buttons (disabled when not applicable)
-- Collapsible **⚙ Configuration** form with type-appropriate inputs
-- **Save & Restart** — applies config changes and restarts only that service
-- Status auto-refreshes every 5 seconds
-
-### REST API
-
-```bash
-# View all service statuses
-curl http://localhost:8090/api/services
-
-# Stop the SCEP server
-curl -X POST http://localhost:8090/api/services/scep/stop
-
-# Change OCSP cache TTL and restart only the OCSP responder
-curl -X PATCH http://localhost:8090/api/services/ocsp/config \
-  -H 'Content-Type: application/json' \
-  -d '{"cache_seconds": 600}'
-
-# Restart the ACME server
-curl -X POST http://localhost:8090/api/services/acme/restart
-```
-
-### Service names
-
-| Name | Service |
-|---|---|
-| `cmp` | CMPv2/v3 main server (unmanaged — shown but cannot be stopped) |
-| `acme` | ACME server |
-| `scep` | SCEP server |
-| `est` | EST server |
-| `ocsp` | OCSP responder |
-
-### Config-file watcher
-
-When `ca/config.json` is edited directly on disk, the watcher (polling every 2 seconds) detects the mtime change and restarts all managed services automatically, picking up the new settings.
-
-### Optional dependency
-
-`service_manager.py` must be present in the same directory as `pki_server.py`. If it is missing, the server starts normally and all service management features are silently unavailable (the Web UI Services page shows an informational message).
 
 ---
 
@@ -1222,10 +1478,10 @@ Spans are emitted for: `issue_certificate`, `revoke_certificate`, `generate_crl`
 ## Testing
 
 PyPKI ships a comprehensive test suite covering RFC compliance, all public APIs,
-and integration behaviour. The suite contains **282 tests across 35 test classes**.
+and integration behaviour. The suite contains **260 tests across 35 test classes**.
 
 ```bash
-# Run all 282 tests
+# Run all 260 tests
 python -m unittest test_pki_server -v
 
 # Run only RFC compliance tests
@@ -1242,19 +1498,17 @@ python -m unittest test_pki_server.TestCertificateRenewal -v
 python -m unittest test_pki_server.TestOCSPStapling -v
 python -m unittest test_pki_server.TestCertificateTransparency -v
 
-# Run service management tests
-python -m unittest test_pki_server.TestServiceManager -v
-python -m unittest test_pki_server.TestWebUIServicesPage -v
+# New in v0.10.0
+python -m unittest test_pki_server.TestIntermediateCA -v
+python -m unittest test_pki_server.TestTlsCertWatcher -v
 
 # Run HTTP API integration tests
 python -m unittest test_pki_server.TestHTTPAPI -v
 
 # Or with pytest (if installed)
 pytest test_pki_server.py -v -k rfc5280
-pytest test_pki_server.py -v -k rfc9608
-pytest test_pki_server.py -v -k rfc9549
-pytest test_pki_server.py -v -k policies
-pytest test_pki_server.py -v -k service
+pytest test_pki_server.py -v -k intermediate
+pytest test_pki_server.py -v -k tls_cert
 ```
 
 ### Test classes
@@ -1281,25 +1535,25 @@ pytest test_pki_server.py -v -k service
 | `TestModuleStructure` | 5 | All exported symbols, all 8 profiles, noRevAvail OID |
 | `TestRFC9549IDNA` | 13 | DNS U-label→A-label, wildcard preserved, ASCII email, IDN-host email A-label, SmtpUTF8Mailbox OID/tag/payload, mixed list, DC attribute IDNA |
 | `TestCertificatePolicies` | 17 | Not added by default, single/multi OID, non-critical, CPS URI, UserNotice text, UTF-8 round-trip, both qualifiers, CA/B Forum OID constants, bad-oid skipped, empty list, profile default, explicit override |
-| `TestDatetimeTimezoneAwareness` | 4 | All datetime calls are timezone-aware |
+| `TestKeyArchival` | 7 | Archive, recover, wrong password, unknown serial, DB persistence |
+| `TestNameConstraints` | 7 | NameConstraints extension present, critical, permitted DNS/IP, excluded DNS |
+| `TestExpiryMonitor` | 6 | Expiring list, days_left, callback trigger, interval |
+| `TestCertFilterEndpoint` | 8 | GET /api/expiring: default/custom days, profile filter, HTTP API |
+| `TestCertificateRenewal` | 9 | Same subject/SAN/profile/key, new serial, DB record |
+| `TestPrometheusMetrics` | 9 | All counters present, text/plain format, HELP/TYPE lines |
+| `TestTLS13Only` | 5 | TLS 1.3-only context creation, version restrictions |
+| `TestOCSPStapling` | 6 | Fetch, cache hit, TTL expiry, invalidate on revocation |
+| `TestCertificateTransparency` | 7 | CT log submission, SCT embedding, OID present |
+| `TestDNS01Hooks` | 5 | Webhook hook POST, RFC 2136 hook packet, success/failure |
+| `TestOpenTelemetryNoOp` | 4 | No-op tracer when opentelemetry absent, span attributes |
+| `TestDatetimeTimezoneAwareness` | 4 | All datetimes timezone-aware (Python 3.12 compat) |
 | `TestRandomCASerial` | 3 | Root CA serial is random (RFC 5280 §4.1.2.2) |
-| `TestKeyArchival` | 7 | Archive + recover, AES-256-CBC, wrong password rejected, unknown serial |
-| `TestNameConstraints` | 5 | Extension present and critical, permitted DNS/IP subtrees, CA cert flag |
-| `TestExpiryMonitor` | 5 | expiring_certificates(), revoked certs excluded, monitor daemon thread |
-| `TestCertificateRenewal` | 9 | New serial, preserved subject/SANs/key, fresh validity, unknown serial |
-| `TestPrometheusMetrics` | 9 | Dict shape, counter increments, prometheus text format, HTTP endpoint |
-| `TestCertFilterEndpoint` | 8 | Filter by profile, expiry window, /api/expiring endpoint |
-| `TestTLS13Only` | 5 | TLSv1.3 minimum and maximum versions set, default allows TLS 1.2 |
-| `TestOCSPStapling` | 6 | Cache hit/miss, TTL, invalidate on revocation, bad URL graceful |
-| `TestCertificateTransparency` | 7 | Bad URL returns None, SCT extension OID and criticality, embed_scts |
-| `TestDNS01Hooks` | 5 | Webhook factory, failure handling, RFC 2136 hook without dnspython |
-| `TestOpenTelemetryNoOp` | 4 | No-op tracer, span context manager, issue_certificate with no SDK |
-| `TestServiceManager` | 26 | Lifecycle (start/stop/restart), unmanaged services, config patching, selective restarts, config-file watcher, schema validation |
-| `TestWebUIServicesPage` | 15 | Live HTTP — /services page, /api/services JSON, start/stop/restart/config-patch endpoints, CMP unmanaged refusal |
+| **`TestTlsCertWatcher`** | **14** | **TLSContextHolder get/swap/property/thread-safety; TlsCertWatcher reload_now success/swap/failure/auto-poll/stop; CMP server ctx_holder, reload_tls() callable/returns-True/swaps-context; plain-HTTP returns False** |
+| **`TestIntermediateCA`** | **21** | **Chain loading, validation rejection, ca_chain_ders/ca_chain_pem, is_intermediate flag, leaf-cert issuer, PKCS#12 CA bag contents, server.crt chain blocks, auto-discovery of ca-chain.pem** |
 
 ### Dependencies
 
-Tests use only the Python standard library (`unittest`, `http.client`, `socket`, `tempfile`, `threading`)
+Tests use only the Python standard library (`unittest`, `http.client`, `tempfile`, `threading`)
 plus `cryptography` (already required). No additional test framework is needed.
 
 ---
@@ -1312,8 +1566,9 @@ After first run, the `./ca` directory contains:
 
 ```
 ca/
-├── ca.key              Private key for the root CA (keep secret)
-├── ca.crt              Root CA certificate (distribute to clients)
+├── ca.key              Private key for the root (or intermediate) CA (keep secret)
+├── ca.crt              CA certificate — root or intermediate (distribute to clients)
+├── ca-chain.pem        Parent chain PEM (intermediate mode only — auto-discovered)
 ├── ca.crl              Certificate Revocation List
 ├── certificates.db     SQLite store of all issued certificates
 ├── acme.db             SQLite store of ACME accounts, orders, challenges
@@ -1323,14 +1578,14 @@ ca/
 ├── crl_base            Delta CRL base snapshots stored in certificates.db
 
 Project root:
-├── test_pki_server.py  Unit + RFC compliance test suite (282 tests)
+├── test_pki_server.py  Unit + RFC compliance test suite (260 tests)
 ├── est/                EST TLS cert auto-issued here (if no --est-tls-cert)
 ├── config.json         Live server configuration (hot-reloaded)
-├── server.crt          Auto-issued TLS server certificate
+├── server.crt          Auto-issued TLS server cert (includes parent chain in intermediate mode)
 └── server.key          TLS server private key
 ```
 
-> **Security note:** `ca.key` is stored unencrypted by default. Use `--ca-key-passphrase` to encrypt it at rest with a passphrase. In production, combine with an HSM or KMS-backed key store and restrict filesystem permissions accordingly. File permissions are set to `0600` automatically on creation.
+> **Security note:** `ca.key` and `server.key` are stored unencrypted. In production, replace with an HSM or KMS-backed key store and restrict filesystem permissions accordingly.
 
 ---
 
@@ -1391,6 +1646,11 @@ openssl x509 -in short-lived.crt -text -noout | grep -A2 "2.5.29.56"
 | **RFC 8399 / RFC 9549** | IDN in DNS SANs and Subject DN | ✅ U-labels auto-converted to A-labels in `dNSName` and `domainComponent`; wildcards preserved |
 | **RFC 9618** | Updates to X.509 Policy Validation | N/A — policy-tree algorithm is a relying-party concern; `cryptography`/`ssl` handle this |
 | **RFC 5280 §4.2.1.4** | Certificate Policies extension | ✅ `CertificatePolicies` with CPS URI and/or `UserNotice` qualifiers (RFC 6818 UTF8String) |
+| **RFC 4945 §5.1.2** | Subject non-empty validation | ✅ String-level + parsed-attribute-level check; whitespace-only values rejected |
+| **RFC 4945 §5.1.3** | SAN `critical` when Subject empty | ✅ `SubjectAlternativeName.critical=True` enforced when Subject has no attributes |
+| **RFC 4945 §5.1.3 / RFC 5280 §4.2.1.10** | NameConstraints enforcement | ✅ CA cert constraints checked at every issuance; permitted/excluded subtrees for DNS, email, IP |
+| **RFC 4945 §5.2** | CDP reachability | ✅ Advisory validation at issuance; reported in `GET /ipsec/health` |
+| **RFC 4945 §5.3** | SHA-1 prohibition | ✅ CA cert hash algorithm checked at startup; all issued certs use SHA-256 |
 
 ### Always-present RFC 5280 extensions
 
@@ -1431,6 +1691,9 @@ Every issued certificate includes:
 | RFC 8398/9598 | Internationalized email addresses | ✅ `rfc822Name` A-label + `SmtpUTF8Mailbox` |
 | RFC 7638 | JWK Thumbprint | ✅ Full |
 | RFC 5280 | X.509 Certificates and CRL profile | ✅ Full |
+| RFC 4945 | IPsec PKI Profile — IKEv1 + IKEv2 | ✅ Full (all §3/§4/§5 CA-side obligations) |
+| RFC 4806 | IKEv2 OCSP Extensions | ✅ Full (CA-cert hash + OCSP-cert hash; Cert Encoding 14) |
+| RFC 4809 | IPsec Certificate Management Requirements | ✅ Full (issue, enroll, update, renew, batch, approval queue, confirm, signed-revoc) |
 
 ---
 

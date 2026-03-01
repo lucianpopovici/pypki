@@ -744,3 +744,77 @@ class TestAPIEndpoints:
     def test_api_unknown_post_path_returns_404(self, api):
         resp = api.post(f"{BASE_URL}/api/this-does-not-exist", json={})
         assert resp.status_code == 404
+
+@pytest.mark.auth
+class TestAdminSecurity:
+    """Verify that administrative endpoints are properly protected."""
+
+    def test_unauthorized_config_patch_fails(self, api):
+        # Create a session without the admin key
+        plain_api = requests.Session()
+        plain_api.verify = api.verify
+        
+        resp = plain_api.patch(f"{BASE_URL}/api/config", json={"validity": {"end_entity_days": 10}})
+        assert resp.status_code == 403
+        assert "admin authentication required" in resp.json()["error"]
+
+    def test_invalid_config_patch_returns_400(self, api):
+        # validity_days must be an integer; sending a string should fail validation
+        resp = api.patch(f"{BASE_URL}/api/config", json={"validity": {"end_entity_days": "invalid"}})
+        assert resp.status_code == 400
+
+    def test_issue_subca_requires_admin(self, api):
+        plain_api = requests.Session()
+        resp = plain_api.post(f"{BASE_URL}/api/issue-sub-ca", json={"cn": "Test Sub-CA"})
+        assert resp.status_code == 403
+
+@pytest.mark.api
+class TestServiceManagement:
+    """Test the integration with ServiceManager for controlling sub-servers."""
+
+    def test_list_services(self, api):
+        resp = api.get(f"{BASE_URL}/api/services")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert "acme" in data or "scep" in data # At least one service should exist
+        assert "state" in data[list(data.keys())[0]]
+
+    def test_service_lifecycle_actions(self, api):
+        # Attempt to stop and restart the ACME service
+        # Note: This might be disruptive; consider using a dedicated test service if available
+        stop_resp = api.post(f"{BASE_URL}/api/services/acme/stop", json={})
+        assert stop_resp.status_code == 200
+        assert stop_resp.json()["state"] == "stopped"
+
+        start_resp = api.post(f"{BASE_URL}/api/services/acme/start", json={})
+        assert start_resp.status_code == 200
+        assert start_resp.json()["state"] == "running"
+        
+        
+@pytest.mark.api
+class TestExtendedCerts:
+    """Test specialized certificate operations and binary downloads."""
+
+    def test_download_crl(self, api):
+        resp = api.get(f"{BASE_URL}/ca/crl.der")
+        assert resp.status_code == 200
+        assert resp.headers["Content-Type"] == "application/pkix-crl"
+        assert len(resp.content) > 0
+
+    def test_download_p12_bundle(self, api):
+        # Get a valid serial first
+        certs = api.get(f"{BASE_URL}/api/certs").json().get("certificates", [])
+        if not certs:
+            pytest.skip("No certificates to test P12 download")
+        
+        serial = certs[0]["serial"]
+        resp = api.get(f"{BASE_URL}/api/certs/{serial}/p12")
+        assert resp.status_code == 200
+        # P12 is a binary format
+        assert resp.headers["Content-Type"] == "application/x-pkcs12"
+
+    def test_issue_subca_success(self, api):
+        payload = {"cn": "Integration Test Sub-CA", "validity_days": 365}
+        resp = api.post(f"{BASE_URL}/api/issue-sub-ca", json=payload)
+        assert resp.status_code == 200
+        assert "serial" in resp.json()

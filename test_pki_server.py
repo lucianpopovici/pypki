@@ -32,7 +32,6 @@ import http.client
 import http.server
 import json
 import os
-import socket
 import sqlite3
 import sys
 import tempfile
@@ -40,7 +39,7 @@ import threading
 import time
 import unittest
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Tuple
 
 # ---------------------------------------------------------------------------
 # Ensure the module under test is importable
@@ -1086,21 +1085,12 @@ class TestHTTPAPI(unittest.TestCase):
         handler_class = pki.make_cmpv3_handler(cls.ca, cmp_handler,
                                                 cls.audit, cls.rate)
 
-        # Bind to port 0 and let the OS assign a free port, keeping the socket
-        # open until the server is ready to avoid the TOCTOU race where another
-        # process (e.g. a live TLS server) grabs the port between our probe and
-        # our bind.  ThreadedHTTPServer uses SO_REUSEADDR which on Windows also
-        # allows re-use of TIME_WAIT ports, so we must not release the socket
-        # before the server has bound.
+        # Find a free port
         import socket
-        probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        # On Windows SO_EXCLUSIVEADDRUSE prevents another socket from stealing
-        # our port even after we close the probe.
-        if hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
-            probe.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
-        probe.bind(("127.0.0.1", 0))
-        cls.port = probe.getsockname()[1]
-        probe.close()
+        s = socket.socket()
+        s.bind(("127.0.0.1", 0))
+        cls.port = s.getsockname()[1]
+        s.close()
 
         cls.server = pki.ThreadedHTTPServer(("127.0.0.1", cls.port), handler_class)
         cls._thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
@@ -1260,12 +1250,10 @@ class TestHTTPAPI(unittest.TestCase):
         handler2 = pki.make_handler(ca2, cmp2, rate_limiter=rate2)
 
         import socket as _sock
-        probe2 = _sock.socket(_sock.AF_INET, _sock.SOCK_STREAM)
-        if hasattr(_sock, "SO_EXCLUSIVEADDRUSE"):
-            probe2.setsockopt(_sock.SOL_SOCKET, _sock.SO_EXCLUSIVEADDRUSE, 1)
-        probe2.bind(("127.0.0.1", 0))
-        port2 = probe2.getsockname()[1]
-        probe2.close()
+        s = _sock.socket()
+        s.bind(("127.0.0.1", 0))
+        port2 = s.getsockname()[1]
+        s.close()
 
         srv2 = pki.ThreadedHTTPServer(("127.0.0.1", port2), handler2)
         t2 = threading.Thread(target=srv2.serve_forever, daemon=True)
@@ -1331,12 +1319,10 @@ class TestOCSPParsing(unittest.TestCase):
         ca = _make_ca(tmp)
 
         import socket as _sock
-        probe_o = _sock.socket(_sock.AF_INET, _sock.SOCK_STREAM)
-        if hasattr(_sock, "SO_EXCLUSIVEADDRUSE"):
-            probe_o.setsockopt(_sock.SOL_SOCKET, _sock.SO_EXCLUSIVEADDRUSE, 1)
-        probe_o.bind(("127.0.0.1", 0))
-        port = probe_o.getsockname()[1]
-        probe_o.close()
+        s = _sock.socket()
+        s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]
+        s.close()
 
         srv = ocsp_server.start_ocsp_server("127.0.0.1", port, ca, cache_seconds=10)
         time.sleep(0.1)
@@ -2793,571 +2779,581 @@ class TestOpenTelemetryNoOp(unittest.TestCase):
         self.assertIsNotNone(cert)
 
 
-
-
 # ===========================================================================
-# Service Manager tests (service_manager.py)
+# TLS Certificate Hot-Reload
 # ===========================================================================
 
-class TestServiceManager(unittest.TestCase):
-    """Tests for service_manager.ServiceManager and ServiceDef."""
-
-    def _make_factory(self, call_log: list):
-        """Return a factory callable and a tracker list for lifecycle events."""
-        def factory(**kwargs):
-            call_log.append(("start", dict(kwargs)))
-
-            class _FakeSrv:
-                def shutdown(self):
-                    call_log.append(("stop",))
-
-            return _FakeSrv()
-
-        return factory
-
-    def _make_sm(self):
-        """Return a fresh ServiceManager with no config-file path."""
-        try:
-            from service_manager import ServiceManager
-        except ImportError:
-            self.skipTest("service_manager.py not present")
-        return ServiceManager()
-
-    # ---- ServiceDef lifecycle ----
-
-    def test_start_changes_state_to_running(self):
-        sm = self._make_sm()
-        log = []
-        sm.register("svc", "Test", self._make_factory(log), {"port": 9000}, enabled=True)
-        ok, err = sm.start("svc")
-        self.assertTrue(ok, err)
-        self.assertEqual(sm.get("svc").state, "running")
-
-    def test_stop_changes_state_to_stopped(self):
-        sm = self._make_sm()
-        log = []
-        sm.register("svc", "Test", self._make_factory(log), {"port": 9000}, enabled=True)
-        sm.start("svc")
-        ok, err = sm.stop("svc")
-        self.assertTrue(ok, err)
-        self.assertEqual(sm.get("svc").state, "stopped")
-
-    def test_restart_returns_service_to_running(self):
-        sm = self._make_sm()
-        log = []
-        sm.register("svc", "Test", self._make_factory(log), {"port": 9000}, enabled=True)
-        sm.start("svc")
-        ok, err = sm.restart("svc")
-        self.assertTrue(ok, err)
-        self.assertEqual(sm.get("svc").state, "running")
-
-    def test_restart_calls_stop_then_start(self):
-        sm = self._make_sm()
-        log = []
-        sm.register("svc", "Test", self._make_factory(log), {"port": 9000}, enabled=True)
-        sm.start("svc")
-        log.clear()
-        sm.restart("svc")
-        events = [e[0] for e in log]
-        self.assertIn("stop", events)
-        self.assertIn("start", events)
-        self.assertLess(events.index("stop"), events.index("start"))
-
-    def test_start_all_enabled_starts_only_enabled(self):
-        sm = self._make_sm()
-        log = []
-        factory = self._make_factory(log)
-        sm.register("svc1", "S1", factory, {"port": 9001}, enabled=True)
-        sm.register("svc2", "S2", factory, {"port": 9002}, enabled=False)
-        sm.start_all_enabled()
-        self.assertEqual(sm.get("svc1").state, "running")
-        self.assertEqual(sm.get("svc2").state, "stopped")
-
-    def test_stop_all_stops_running_services(self):
-        sm = self._make_sm()
-        log = []
-        factory = self._make_factory(log)
-        sm.register("svc1", "S1", factory, {"port": 9001}, enabled=True)
-        sm.register("svc2", "S2", factory, {"port": 9002}, enabled=True)
-        sm.start("svc1")
-        sm.start("svc2")
-        sm.stop_all()
-        self.assertEqual(sm.get("svc1").state, "stopped")
-        self.assertEqual(sm.get("svc2").state, "stopped")
-
-    def test_unknown_service_returns_error(self):
-        sm = self._make_sm()
-        ok, err = sm.start("nonexistent")
-        self.assertFalse(ok)
-        self.assertIn("Unknown", err)
-
-    # ---- Unmanaged (factory=None) services ----
-
-    def test_unmanaged_service_state_running_on_register(self):
-        sm = self._make_sm()
-        sm.register("cmp", "CMP", None, {"port": 8080}, enabled=True)
-        self.assertEqual(sm.get("cmp").state, "running")
-
-    def test_unmanaged_service_stop_refused(self):
-        sm = self._make_sm()
-        sm.register("cmp", "CMP", None, {"port": 8080}, enabled=True)
-        ok, err = sm.stop("cmp")
-        self.assertFalse(ok)
-        self.assertIn("cannot", err.lower())
-
-    def test_unmanaged_service_restart_refused(self):
-        sm = self._make_sm()
-        sm.register("cmp", "CMP", None, {"port": 8080}, enabled=True)
-        ok, err = sm.restart("cmp")
-        self.assertFalse(ok)
-
-    def test_unmanaged_flag_in_status_dict(self):
-        sm = self._make_sm()
-        sm.register("cmp", "CMP", None, {"port": 8080}, enabled=True)
-        status = sm.status_one("cmp")
-        self.assertTrue(status["unmanaged"])
-
-    def test_managed_flag_false_for_normal_service(self):
-        sm = self._make_sm()
-        log = []
-        sm.register("acme", "ACME", self._make_factory(log), {"port": 8888}, enabled=False)
-        status = sm.status_one("acme")
-        self.assertFalse(status["unmanaged"])
-
-    # ---- Config patching ----
-
-    def test_patch_service_config_updates_value(self):
-        sm = self._make_sm()
-        log = []
-        sm.register("acme", "ACME", self._make_factory(log),
-                    {"port": 8888, "cert_validity_days": 90}, enabled=True)
-        sm.start("acme")
-        sm.patch_service_config("acme", {"cert_validity_days": 30})
-        self.assertEqual(sm.get("acme").config["cert_validity_days"], 30)
-
-    def test_patch_service_config_triggers_restart(self):
-        sm = self._make_sm()
-        log = []
-        sm.register("acme", "ACME", self._make_factory(log), {"port": 8888}, enabled=True)
-        sm.start("acme")
-        sm.patch_service_config("acme", {"port": 9999})
-        self.assertEqual(sm.get("acme").state, "running")
-        # Verify new config was used in the restart
-        last_start = next(e for e in reversed(log) if e[0] == "start")
-        self.assertEqual(last_start[1]["port"], 9999)
-
-    def test_patch_config_unknown_service_returns_error(self):
-        sm = self._make_sm()
-        ok, err = sm.patch_service_config("nope", {"port": 1})
-        self.assertFalse(ok)
-        self.assertIn("Unknown", err)
-
-    # ---- Global config updates ----
-
-    def test_update_global_config_file_restarts_all(self):
-        sm = self._make_sm()
-        log = []
-        factory = self._make_factory(log)
-        sm.register("acme", "ACME", factory, {"port": 8888}, enabled=True)
-        sm.register("scep", "SCEP", factory, {"port": 8889}, enabled=True)
-        sm.start("acme")
-        sm.start("scep")
-        restarted = sm.update_global_config({}, source="file")
-        self.assertIn("acme", restarted)
-        self.assertIn("scep", restarted)
-
-    def test_update_global_config_webui_restarts_only_affected(self):
-        sm = self._make_sm()
-        log = []
-        factory = self._make_factory(log)
-        sm.register("acme", "ACME", factory, {"port": 8888}, enabled=True)
-        sm.register("scep", "SCEP", factory, {"port": 8889}, enabled=True)
-        sm.start("acme")
-        sm.start("scep")
-        restarted = sm.update_global_config({"acme": {}}, source="webui")
-        self.assertIn("acme", restarted)
-        self.assertNotIn("scep", restarted)
-
-    def test_update_global_config_known_key_no_restart(self):
-        """'validity' key does not need to restart any service."""
-        sm = self._make_sm()
-        log = []
-        sm.register("acme", "ACME", self._make_factory(log), {"port": 8888}, enabled=True)
-        sm.start("acme")
-        log.clear()
-        sm.update_global_config({"validity": {"end_entity_days": 90}}, source="webui")
-        # No restarts should have happened
-        self.assertEqual(len(log), 0)
-
-    # ---- Status API ----
-
-    def test_status_all_keys_match_registered_names(self):
-        sm = self._make_sm()
-        log = []
-        sm.register("acme", "ACME", self._make_factory(log), {"port": 8888})
-        sm.register("cmp",  "CMP",  None,                    {"port": 8080}, enabled=True)
-        status = sm.status_all()
-        self.assertIn("acme", status)
-        self.assertIn("cmp",  status)
-
-    def test_status_dict_has_required_fields(self):
-        sm = self._make_sm()
-        log = []
-        sm.register("acme", "ACME", self._make_factory(log), {"port": 8888}, enabled=True)
-        sm.start("acme")
-        s = sm.status_one("acme")
-        for field in ("name", "label", "state", "enabled", "error", "config", "unmanaged"):
-            self.assertIn(field, s, f"Missing field: {field}")
-
-    def test_status_none_for_unknown_service(self):
-        sm = self._make_sm()
-        self.assertIsNone(sm.status_one("ghost"))
-
-    # ---- Config-file watcher ----
-
-    def test_config_watcher_detects_file_change(self):
-        try:
-            from service_manager import ServiceManager
-        except ImportError:
-            self.skipTest("service_manager.py not present")
-        import tempfile
-        import time
-
-        tmp = tempfile.mkdtemp()
-        cfg = Path(tmp) / "config.json"
-        cfg.write_text('{"validity": {"end_entity_days": 365}}')
-
-        restart_count = [0]
-        log = []
-        def factory(**kw):
-            restart_count[0] += 1
-            log.append(kw)
-
-            class S:
-                def shutdown(self): pass
-
-            return S()
-
-        sm = ServiceManager(config_path=cfg)
-        sm.register("acme", "ACME", factory, {"port": 8888}, enabled=True)
-        sm.start("acme")
-        before = restart_count[0]
-
-        sm.start_config_watcher(poll_interval=0.15)
-        time.sleep(0.05)
-
-        # Modify the config file
-        cfg.write_text('{"validity": {"end_entity_days": 90}}')
-        time.sleep(0.5)  # let watcher detect and act
-
-        sm.stop_config_watcher()
-
-        self.assertGreater(restart_count[0], before,
-                           "Expected at least one restart after config file change")
-        self.assertEqual(sm.get("acme").state, "running")
-
-    def test_config_watcher_does_not_restart_on_no_change(self):
-        try:
-            from service_manager import ServiceManager
-        except ImportError:
-            self.skipTest("service_manager.py not present")
-        import tempfile
-        import time
-
-        tmp = tempfile.mkdtemp()
-        cfg = Path(tmp) / "config.json"
-        cfg.write_text('{"validity": {"end_entity_days": 365}}')
-
-        restart_count = [0]
-
-        def factory(**kw):
-            restart_count[0] += 1
-
-            class S:
-                def shutdown(self): pass
-
-            return S()
-
-        sm = ServiceManager(config_path=cfg)
-        sm.register("acme", "ACME", factory, {"port": 8888}, enabled=True)
-        sm.start("acme")
-        before = restart_count[0]
-
-        sm.start_config_watcher(poll_interval=0.15)
-        time.sleep(0.5)  # wait through several poll cycles without touching the file
-        sm.stop_config_watcher()
-
-        self.assertEqual(restart_count[0], before,
-                         "No restart expected when config file is unchanged")
-
-    # ---- SERVICE_CONFIG_SCHEMA ----
-
-    def test_schema_present_for_all_standard_services(self):
-        try:
-            from service_manager import ServiceManager
-        except ImportError:
-            self.skipTest("service_manager.py not present")
-        for svc in ("acme", "scep", "est", "ocsp"):
-            self.assertIn(svc, ServiceManager.SERVICE_CONFIG_SCHEMA,
-                          f"Schema missing for service: {svc}")
-
-    def test_schema_fields_have_required_keys(self):
-        try:
-            from service_manager import ServiceManager
-        except ImportError:
-            self.skipTest("service_manager.py not present")
-        for svc, fields in ServiceManager.SERVICE_CONFIG_SCHEMA.items():
-            for field in fields:
-                self.assertIn("key",   field, f"{svc}: field missing 'key'")
-                self.assertIn("label", field, f"{svc}: field missing 'label'")
-                self.assertIn("type",  field, f"{svc}: field missing 'type'")
-
-    def test_schema_types_are_valid(self):
-        try:
-            from service_manager import ServiceManager
-        except ImportError:
-            self.skipTest("service_manager.py not present")
-        valid_types = {"number", "text", "password", "checkbox", "select"}
-        for svc, fields in ServiceManager.SERVICE_CONFIG_SCHEMA.items():
-            for field in fields:
-                self.assertIn(field["type"], valid_types,
-                              f"{svc}.{field['key']}: invalid type '{field['type']}'")
-
-
-class TestWebUIServicesPage(unittest.TestCase):
-    """
-    Integration tests for the /services page and /api/services/* endpoints
-    in web_ui.py (requires a running WebUIHandler + a ServiceManager).
-    """
-
-    @classmethod
-    def setUpClass(cls):
-        import tempfile
-        import http.client
-        try:
-            import web_ui as _web_ui_mod
-            from service_manager import ServiceManager
-        except ImportError:
-            cls._skip = True
-            return
-        cls._skip = False
-
-        tmp = tempfile.mkdtemp()
-        cls.ca = _make_ca(tmp)
-        cls.ca.config = None  # web_ui handles missing config gracefully
-
-        # Build a ServiceManager with two fake services
-        cls.sm = ServiceManager()
-        cls.call_log = []
-
-        def _factory(**kw):
-            cls.call_log.append(("start", dict(kw)))
-
-            class _S:
-                def shutdown(self):
-                    cls.call_log.append(("stop",))
-
-            return _S()
-
-        cls.sm.register("cmp",  "CMP Server",  None,     {"port": 8080}, enabled=True)
-        cls.sm.register("acme", "ACME Server", _factory, {"port": 8888}, enabled=False)
-
-        # Find a free port
-        probe = socket.socket()
-        probe.bind(("127.0.0.1", 0))
-        cls.port = probe.getsockname()[1]
-        probe.close()
-
-        cls.web_srv = _web_ui_mod.start_web_ui(
-            host="127.0.0.1",
-            port=cls.port,
-            ca=cls.ca,
-            service_manager=cls.sm,
+class TestTlsCertWatcher(unittest.TestCase):
+    """TLSContextHolder and TlsCertWatcher — zero-downtime cert reload."""
+
+    def setUp(self):
+        self._tmp = tempfile.mkdtemp()
+        self.ca   = _make_ca(self._tmp)
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self._tmp, ignore_errors=True)
+
+    # ── TLSContextHolder ────────────────────────────────────────────────────
+
+    def test_holder_get_returns_initial_context(self):
+        """TLSContextHolder.get() must return the context passed at construction."""
+        import ssl as _ssl
+        from cmp_server import TLSContextHolder
+        ctx = _ssl.SSLContext(_ssl.PROTOCOL_TLS_SERVER)
+        holder = TLSContextHolder(ctx)
+        self.assertIs(holder.get(), ctx)
+
+    def test_holder_swap_replaces_context(self):
+        """TLSContextHolder.swap() must make get() return the new context."""
+        import ssl as _ssl
+        from cmp_server import TLSContextHolder
+        ctx1 = _ssl.SSLContext(_ssl.PROTOCOL_TLS_SERVER)
+        ctx2 = _ssl.SSLContext(_ssl.PROTOCOL_TLS_SERVER)
+        holder = TLSContextHolder(ctx1)
+        holder.swap(ctx2)
+        self.assertIs(holder.get(), ctx2)
+
+    def test_holder_ssl_context_property(self):
+        """The ssl_context property shim must expose and accept the context."""
+        import ssl as _ssl
+        from cmp_server import TLSContextHolder
+        ctx1 = _ssl.SSLContext(_ssl.PROTOCOL_TLS_SERVER)
+        ctx2 = _ssl.SSLContext(_ssl.PROTOCOL_TLS_SERVER)
+        holder = TLSContextHolder(ctx1)
+        self.assertIs(holder.ssl_context, ctx1)
+        holder.ssl_context = ctx2
+        self.assertIs(holder.ssl_context, ctx2)
+
+    def test_holder_thread_safety(self):
+        """Concurrent swaps must never leave the holder in an inconsistent state."""
+        import ssl as _ssl
+        from cmp_server import TLSContextHolder
+        ctx = _ssl.SSLContext(_ssl.PROTOCOL_TLS_SERVER)
+        holder = TLSContextHolder(ctx)
+        errors = []
+
+        def _swapper():
+            for _ in range(200):
+                c = _ssl.SSLContext(_ssl.PROTOCOL_TLS_SERVER)
+                try:
+                    holder.swap(c)
+                    _ = holder.get()    # must not raise
+                except Exception as e:
+                    errors.append(e)
+
+        threads = [threading.Thread(target=_swapper) for _ in range(8)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        self.assertEqual(errors, [], f"Thread-safety errors: {errors}")
+
+    # ── TlsCertWatcher ──────────────────────────────────────────────────────
+
+    def _write_self_signed_pem(self, name: str) -> Tuple[Path, Path]:
+        """Write a fresh self-signed cert+key pair into self._tmp. Returns (cert_path, key_path)."""
+        key  = _gen_key(2048)
+        now  = datetime.datetime.now(datetime.timezone.utc)
+        cert = (
+            x509.CertificateBuilder()
+            .subject_name(x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, name)]))
+            .issuer_name (x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, name)]))
+            .public_key(key.public_key())
+            .serial_number(x509.random_serial_number())
+            .not_valid_before(now)
+            .not_valid_after(now + datetime.timedelta(days=1))
+            .add_extension(x509.BasicConstraints(ca=False, path_length=None), critical=True)
+            .sign(key, SHA256())
         )
-        import time; time.sleep(0.15)
+        cert_path = Path(self._tmp) / f"{name}.crt"
+        key_path  = Path(self._tmp) / f"{name}.key"
+        cert_path.write_bytes(cert.public_bytes(Encoding.PEM))
+        key_path.write_bytes(
+            key.private_bytes(Encoding.PEM, serialization.PrivateFormat.TraditionalOpenSSL, serialization.NoEncryption())
+        )
+        return cert_path, key_path
 
-    @classmethod
-    def tearDownClass(cls):
-        if not cls._skip and cls.web_srv:
-            cls.web_srv.shutdown()
+    def test_watcher_reload_now_returns_true_on_success(self):
+        """TlsCertWatcher.reload_now() must return True when the new cert loads cleanly."""
+        import ssl as _ssl
+        from cmp_server import TLSContextHolder, TlsCertWatcher
 
-    def _conn(self):
-        import http.client
-        return http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
+        cert_path, key_path = self._write_self_signed_pem("watcher-test")
 
-    def _skip_if_needed(self):
-        if self._skip:
-            self.skipTest("web_ui.py or service_manager.py not available")
+        def _build(cp, kp):
+            ctx = _ssl.SSLContext(_ssl.PROTOCOL_TLS_SERVER)
+            ctx.load_cert_chain(certfile=cp, keyfile=kp)
+            return ctx
 
-    def test_services_page_returns_200(self):
-        self._skip_if_needed()
-        conn = self._conn()
-        conn.request("GET", "/services")
-        r = conn.getresponse(); r.read()
-        self.assertEqual(r.status, 200)
+        initial_ctx = _build(str(cert_path), str(key_path))
+        holder  = TLSContextHolder(initial_ctx)
+        watcher = TlsCertWatcher(holder, str(cert_path), str(key_path), _build, poll_interval=9999)
 
-    def test_services_page_contains_service_names(self):
-        self._skip_if_needed()
-        conn = self._conn()
-        conn.request("GET", "/services")
-        r = conn.getresponse()
-        body = r.read().decode()
-        self.assertIn("CMP Server", body)
-        self.assertIn("ACME Server", body)
+        result = watcher.reload_now()
+        self.assertTrue(result, "reload_now() must return True on success")
 
-    def test_services_page_shows_running_badge_for_cmp(self):
-        self._skip_if_needed()
-        conn = self._conn()
-        conn.request("GET", "/services")
-        r = conn.getresponse()
-        body = r.read().decode()
-        self.assertIn("running", body.lower())
+    def test_watcher_reload_now_updates_holder(self):
+        """reload_now() must swap in a new SSLContext object."""
+        import ssl as _ssl
+        from cmp_server import TLSContextHolder, TlsCertWatcher
 
-    def test_api_services_returns_json(self):
-        self._skip_if_needed()
-        import json
-        conn = self._conn()
-        conn.request("GET", "/api/services")
-        r = conn.getresponse()
-        body = r.read()
-        self.assertEqual(r.status, 200)
-        data = json.loads(body)
-        self.assertIn("cmp",  data)
-        self.assertIn("acme", data)
+        cert_path, key_path = self._write_self_signed_pem("watcher-swap")
 
-    def test_api_services_cmp_is_running(self):
-        self._skip_if_needed()
-        import json
-        conn = self._conn()
-        conn.request("GET", "/api/services")
-        r = conn.getresponse()
-        data = json.loads(r.read())
-        self.assertEqual(data["cmp"]["state"], "running")
+        def _build(cp, kp):
+            ctx = _ssl.SSLContext(_ssl.PROTOCOL_TLS_SERVER)
+            ctx.load_cert_chain(certfile=cp, keyfile=kp)
+            return ctx
 
-    def test_api_services_acme_is_stopped(self):
-        self._skip_if_needed()
-        import json
-        conn = self._conn()
-        conn.request("GET", "/api/services")
-        r = conn.getresponse()
-        data = json.loads(r.read())
-        self.assertEqual(data["acme"]["state"], "stopped")
+        initial_ctx = _build(str(cert_path), str(key_path))
+        holder  = TLSContextHolder(initial_ctx)
+        watcher = TlsCertWatcher(holder, str(cert_path), str(key_path), _build, poll_interval=9999)
 
-    def test_api_service_start_changes_state(self):
-        self._skip_if_needed()
-        import json
-        conn = self._conn()
-        body = b'{}'
-        conn.request("POST", "/api/services/acme/start", body=body,
-                     headers={"Content-Type": "application/json",
-                               "Content-Length": str(len(body))})
-        r = conn.getresponse()
-        data = json.loads(r.read())
-        self.assertEqual(r.status, 200)
-        self.assertEqual(data["state"], "running")
-        # Verify the factory was called
-        self.assertTrue(any(e[0] == "start" for e in self.call_log))
+        watcher.reload_now()
+        # The holder must now contain a *different* SSLContext object
+        self.assertIsNot(holder.get(), initial_ctx,
+                         "reload_now() must replace the SSLContext in the holder")
 
-    def test_api_service_stop_changes_state(self):
-        self._skip_if_needed()
-        import json
-        # Ensure it's running first
-        self.sm.start("acme")
-        conn = self._conn()
-        body = b'{}'
-        conn.request("POST", "/api/services/acme/stop", body=body,
-                     headers={"Content-Type": "application/json",
-                               "Content-Length": str(len(body))})
-        r = conn.getresponse()
-        data = json.loads(r.read())
-        self.assertEqual(r.status, 200)
-        self.assertEqual(data["state"], "stopped")
+    def test_watcher_reload_now_returns_false_on_bad_cert(self):
+        """reload_now() must return False and keep the old context if the cert is broken."""
+        import ssl as _ssl
+        from cmp_server import TLSContextHolder, TlsCertWatcher
 
-    def test_api_service_restart_works(self):
-        self._skip_if_needed()
-        import json
-        self.sm.start("acme")
-        conn = self._conn()
-        body = b'{}'
-        conn.request("POST", "/api/services/acme/restart", body=body,
-                     headers={"Content-Type": "application/json",
-                               "Content-Length": str(len(body))})
-        r = conn.getresponse()
-        data = json.loads(r.read())
-        self.assertEqual(r.status, 200)
-        self.assertEqual(data["state"], "running")
+        cert_path, key_path = self._write_self_signed_pem("watcher-bad")
 
-    def test_api_service_config_patch_updates_and_restarts(self):
-        self._skip_if_needed()
-        import json
-        self.sm.start("acme")
-        payload = json.dumps({"port": 9999}).encode()
-        conn = self._conn()
-        conn.request("PATCH", "/api/services/acme/config", body=payload,
-                     headers={"Content-Type": "application/json",
-                               "Content-Length": str(len(payload))})
-        r = conn.getresponse()
-        data = json.loads(r.read())
-        self.assertEqual(r.status, 200)
-        self.assertTrue(data.get("ok"), data)
-        self.assertEqual(self.sm.get("acme").config["port"], 9999)
+        build_calls = []
+        def _build_bad(cp, kp):
+            build_calls.append((cp, kp))
+            raise ssl.SSLError("simulated bad cert")
 
-    def test_api_cmp_stop_refused(self):
-        """CMP is unmanaged — stop must be refused."""
-        self._skip_if_needed()
-        import json
-        body = b'{}'
-        conn = self._conn()
-        conn.request("POST", "/api/services/cmp/stop", body=body,
-                     headers={"Content-Type": "application/json",
-                               "Content-Length": str(len(body))})
-        r = conn.getresponse()
-        data = json.loads(r.read())
-        # The response should indicate failure
-        self.assertFalse(data.get("ok", True) and data.get("state") == "stopped")
+        initial_ctx = _ssl.SSLContext(_ssl.PROTOCOL_TLS_SERVER)
+        holder  = TLSContextHolder(initial_ctx)
+        watcher = TlsCertWatcher(holder, str(cert_path), str(key_path), _build_bad, poll_interval=9999)
 
-    def test_api_unknown_service_returns_error(self):
-        self._skip_if_needed()
-        import json
-        body = b'{}'
-        conn = self._conn()
-        conn.request("POST", "/api/services/ghost/start", body=body,
-                     headers={"Content-Type": "application/json",
-                               "Content-Length": str(len(body))})
-        r = conn.getresponse()
-        r.read()
-        # Either 404 or a JSON error is acceptable
-        self.assertIn(r.status, (200, 404, 400, 500))
+        result = watcher.reload_now()
+        self.assertFalse(result, "reload_now() must return False when build_ctx raises")
+        self.assertIs(holder.get(), initial_ctx,
+                      "Holder context must be unchanged after a failed reload")
 
-    def test_services_page_has_start_stop_buttons(self):
-        """The HTML page must include action buttons."""
-        self._skip_if_needed()
-        conn = self._conn()
-        conn.request("GET", "/services")
-        r = conn.getresponse()
-        body = r.read().decode()
-        self.assertIn("Start", body)
-        self.assertIn("Stop",  body)
-        self.assertIn("Restart", body)
+    def test_watcher_polls_and_auto_reloads(self):
+        """Watcher background thread must auto-reload when cert file mtime changes."""
+        import ssl as _ssl
+        from cmp_server import TLSContextHolder, TlsCertWatcher
 
-    def test_services_page_has_config_form(self):
-        """ACME service must have a config form with at least one field."""
-        self._skip_if_needed()
-        conn = self._conn()
-        conn.request("GET", "/services")
-        r = conn.getresponse()
-        body = r.read().decode()
-        # The ACME config schema includes a "port" field
-        self.assertIn("data-field", body)
+        cert_path, key_path = self._write_self_signed_pem("watcher-poll")
 
-    def test_services_nav_link_present(self):
-        """The main nav bar must include a link to /services."""
-        self._skip_if_needed()
-        conn = self._conn()
-        conn.request("GET", "/")
-        r = conn.getresponse()
-        body = r.read().decode()
-        self.assertIn("/services", body)
+        reloaded = threading.Event()
+        contexts = []
+
+        def _build(cp, kp):
+            ctx = _ssl.SSLContext(_ssl.PROTOCOL_TLS_SERVER)
+            ctx.load_cert_chain(certfile=cp, keyfile=kp)
+            contexts.append(ctx)
+            if len(contexts) >= 2:      # second build = auto-reload fired
+                reloaded.set()
+            return ctx
+
+        initial_ctx = _build(str(cert_path), str(key_path))
+        holder  = TLSContextHolder(initial_ctx)
+        watcher = TlsCertWatcher(
+            holder, str(cert_path), str(key_path), _build, poll_interval=1
+        ).start()
+
+        try:
+            # Simulate certbot: write a new cert with a later mtime
+            time.sleep(0.1)
+            new_cert_path, new_key_path = self._write_self_signed_pem("watcher-poll-new")
+            import shutil
+            shutil.copy(str(new_cert_path), str(cert_path))
+            shutil.copy(str(new_key_path),  str(key_path))
+            # bump mtime explicitly to ensure it changes
+            import os
+            os.utime(str(cert_path), None)
+
+            triggered = reloaded.wait(timeout=5)
+            self.assertTrue(triggered, "Watcher must auto-reload within 5 seconds of mtime change")
+            self.assertIsNot(holder.get(), initial_ctx,
+                             "Holder must contain a new SSLContext after auto-reload")
+        finally:
+            watcher.stop()
+
+    def test_watcher_stop_terminates_thread(self):
+        """TlsCertWatcher.stop() must cause the background thread to exit."""
+        import ssl as _ssl
+        from cmp_server import TLSContextHolder, TlsCertWatcher
+
+        cert_path, key_path = self._write_self_signed_pem("watcher-stop")
+
+        def _build(cp, kp):
+            ctx = _ssl.SSLContext(_ssl.PROTOCOL_TLS_SERVER)
+            ctx.load_cert_chain(certfile=cp, keyfile=kp)
+            return ctx
+
+        holder  = TLSContextHolder(_build(str(cert_path), str(key_path)))
+        watcher = TlsCertWatcher(holder, str(cert_path), str(key_path), _build, poll_interval=1).start()
+        watcher.stop()
+        self.assertFalse(watcher._thread.is_alive(),
+                         "Watcher thread must be dead after stop()")
+
+    # ── TLSServer ctx_holder integration ───────────────────────────────────
+
+    def test_tls_server_has_ctx_holder_after_start(self):
+        """start_cmp_server() must attach a TLSContextHolder to the returned server."""
+        from cmp_server import start_cmp_server, TLSContextHolder
+
+        cert_path, key_path = self._write_self_signed_pem("srv-holder")
+
+        # Use an unused port
+        import socket as _socket
+        with _socket.socket() as s:
+            s.bind(("127.0.0.1", 0))
+            port = s.getsockname()[1]
+
+        srv = start_cmp_server(
+            host="127.0.0.1", port=port, ca=self.ca,
+            tls_cert_path=str(cert_path), tls_key_path=str(key_path),
+            tls_reload_interval=0,
+        )
+        try:
+            self.assertIsNotNone(srv.ctx_holder)
+            self.assertIsInstance(srv.ctx_holder, TLSContextHolder)
+        finally:
+            srv.shutdown()
+
+    def test_reload_tls_method_exists_on_tls_server(self):
+        """TLS-mode server must expose a callable reload_tls() method."""
+        from cmp_server import start_cmp_server
+
+        cert_path, key_path = self._write_self_signed_pem("srv-reload-method")
+        import socket as _socket
+        with _socket.socket() as s:
+            s.bind(("127.0.0.1", 0))
+            port = s.getsockname()[1]
+
+        srv = start_cmp_server(
+            host="127.0.0.1", port=port, ca=self.ca,
+            tls_cert_path=str(cert_path), tls_key_path=str(key_path),
+            tls_reload_interval=0,
+        )
+        try:
+            self.assertTrue(callable(getattr(srv, "reload_tls", None)),
+                            "TLS server must expose a callable reload_tls()")
+        finally:
+            srv.shutdown()
+
+    def test_reload_tls_returns_true(self):
+        """reload_tls() must return True when the cert reloads successfully."""
+        from cmp_server import start_cmp_server
+
+        cert_path, key_path = self._write_self_signed_pem("srv-reload-true")
+        import socket as _socket
+        with _socket.socket() as s:
+            s.bind(("127.0.0.1", 0))
+            port = s.getsockname()[1]
+
+        srv = start_cmp_server(
+            host="127.0.0.1", port=port, ca=self.ca,
+            tls_cert_path=str(cert_path), tls_key_path=str(key_path),
+            tls_reload_interval=0,
+        )
+        try:
+            self.assertTrue(srv.reload_tls(),
+                            "reload_tls() must return True on success")
+        finally:
+            srv.shutdown()
+
+    def test_reload_tls_swaps_context(self):
+        """reload_tls() must install a new SSLContext in the holder."""
+        from cmp_server import start_cmp_server
+
+        cert_path, key_path = self._write_self_signed_pem("srv-reload-swap")
+        import socket as _socket
+        with _socket.socket() as s:
+            s.bind(("127.0.0.1", 0))
+            port = s.getsockname()[1]
+
+        srv = start_cmp_server(
+            host="127.0.0.1", port=port, ca=self.ca,
+            tls_cert_path=str(cert_path), tls_key_path=str(key_path),
+            tls_reload_interval=0,
+        )
+        try:
+            old_ctx = srv.ctx_holder.get()
+            srv.reload_tls()
+            new_ctx = srv.ctx_holder.get()
+            self.assertIsNot(old_ctx, new_ctx,
+                             "reload_tls() must replace the SSLContext object")
+        finally:
+            srv.shutdown()
+
+    def test_plain_http_server_reload_tls_returns_false(self):
+        """Plain-HTTP server's reload_tls() must return False (no TLS active)."""
+        from cmp_server import start_cmp_server
+        import socket as _socket
+        with _socket.socket() as s:
+            s.bind(("127.0.0.1", 0))
+            port = s.getsockname()[1]
+
+        srv = start_cmp_server(host="127.0.0.1", port=port, ca=self.ca)
+        try:
+            self.assertFalse(srv.reload_tls(),
+                             "Plain-HTTP server reload_tls() must return False")
+        finally:
+            srv.shutdown()
+
+
+# ===========================================================================
+# Intermediate CA
+# ===========================================================================
+
+def _make_intermediate_ca(root_dir: str, inter_dir: str):
+    """
+    Helper: create a root CA + an intermediate CA signed by the root.
+
+    Returns (root_ca, inter_ca) where inter_ca has _parent_chain set.
+    The parent chain PEM is written to <inter_dir>/ca-chain.pem and loaded
+    automatically by the CertificateAuthority constructor.
+    """
+    root_ca = _make_ca(root_dir)
+
+    # Issue an intermediate CA cert signed by the root
+    inter_key, inter_cert = root_ca.issue_sub_ca("Test Intermediate CA")
+
+    # Write inter CA key + cert into inter_dir so CA.__init__ loads them
+    inter_path = Path(inter_dir)
+    inter_path.mkdir(parents=True, exist_ok=True)
+    (inter_path / "ca.key").write_bytes(
+        inter_key.private_bytes(
+            Encoding.PEM,
+            serialization.PrivateFormat.TraditionalOpenSSL,
+            serialization.NoEncryption(),
+        )
+    )
+    (inter_path / "ca.crt").write_bytes(inter_cert.public_bytes(Encoding.PEM))
+
+    # Write the parent chain (just the root cert in this case)
+    (inter_path / "ca-chain.pem").write_bytes(root_ca.ca_cert_pem)
+
+    # Load the intermediate CA — it will auto-discover ca-chain.pem
+    inter_ca = pki.CertificateAuthority(ca_dir=inter_dir)
+    return root_ca, inter_ca
+
+
+class TestIntermediateCA(unittest.TestCase):
+    """Verify intermediate CA mode: chain loading, validation, and propagation."""
+
+    def setUp(self):
+        self._tmp_root  = tempfile.mkdtemp()
+        self._tmp_inter = tempfile.mkdtemp()
+        self.root_ca, self.inter_ca = _make_intermediate_ca(
+            self._tmp_root, self._tmp_inter
+        )
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self._tmp_root, ignore_errors=True)
+        shutil.rmtree(self._tmp_inter, ignore_errors=True)
+
+    # ── basic chain loading ──────────────────────────────────────────────────
+
+    def test_is_intermediate_true(self):
+        self.assertTrue(self.inter_ca.is_intermediate,
+                        "inter_ca must report is_intermediate=True")
+
+    def test_root_not_intermediate(self):
+        self.assertFalse(self.root_ca.is_intermediate,
+                         "root_ca must report is_intermediate=False")
+
+    def test_parent_chain_length(self):
+        self.assertEqual(len(self.inter_ca._parent_chain), 1,
+                         "intermediate CA should have exactly one parent cert")
+
+    def test_parent_is_root_cert(self):
+        parent = self.inter_ca._parent_chain[0]
+        self.assertEqual(parent.subject, self.root_ca.ca_cert.subject,
+                         "parent chain cert[0] subject must match root CA subject")
+
+    def test_parent_signed_intermediate(self):
+        """Root public key must verify the intermediate CA cert signature."""
+        try:
+            self.root_ca.ca_key.public_key().verify(
+                self.inter_ca.ca_cert.signature,
+                self.inter_ca.ca_cert.tbs_certificate_bytes,
+                asym_padding.PKCS1v15(),
+                SHA256(),
+            )
+            verified = True
+        except Exception:
+            verified = False
+        self.assertTrue(verified,
+                        "Root CA must have signed the intermediate CA cert")
+
+    # ── ca_chain_ders ────────────────────────────────────────────────────────
+
+    def test_ca_chain_ders_length(self):
+        ders = self.inter_ca.ca_chain_ders
+        self.assertEqual(len(ders), 2,
+                         "ca_chain_ders must contain [inter_der, root_der]")
+
+    def test_ca_chain_ders_first_is_own_cert(self):
+        ders = self.inter_ca.ca_chain_ders
+        own = x509.load_der_x509_certificate(ders[0])
+        self.assertEqual(own.subject, self.inter_ca.ca_cert.subject,
+                         "ca_chain_ders[0] must be the intermediate CA cert itself")
+
+    def test_ca_chain_ders_second_is_root(self):
+        ders = self.inter_ca.ca_chain_ders
+        root = x509.load_der_x509_certificate(ders[1])
+        self.assertEqual(root.subject, self.root_ca.ca_cert.subject,
+                         "ca_chain_ders[1] must be the root CA cert")
+
+    def test_root_chain_ders_length_one(self):
+        self.assertEqual(len(self.root_ca.ca_chain_ders), 1,
+                         "Root CA ca_chain_ders must have exactly one entry")
+
+    # ── ca_chain_pem ─────────────────────────────────────────────────────────
+
+    def test_ca_chain_pem_contains_two_certs(self):
+        import re
+        pem = self.inter_ca.ca_chain_pem
+        blocks = re.findall(rb"-----BEGIN CERTIFICATE-----", pem)
+        self.assertEqual(len(blocks), 2,
+                         "ca_chain_pem must contain exactly two PEM blocks")
+
+    def test_ca_chain_pem_first_block_is_intermediate(self):
+        """First PEM block in ca_chain_pem must be the intermediate CA cert."""
+        import re
+        pem = self.inter_ca.ca_chain_pem
+        first_block = re.search(
+            rb"-----BEGIN CERTIFICATE-----.*?-----END CERTIFICATE-----",
+            pem, re.DOTALL,
+        ).group(0)
+        cert = x509.load_pem_x509_certificate(first_block)
+        self.assertEqual(cert.subject, self.inter_ca.ca_cert.subject)
+
+    def test_root_chain_pem_contains_one_cert(self):
+        import re
+        pem = self.root_ca.ca_chain_pem
+        blocks = re.findall(rb"-----BEGIN CERTIFICATE-----", pem)
+        self.assertEqual(len(blocks), 1,
+                         "Root CA ca_chain_pem must contain exactly one PEM block")
+
+    # ── validation: bad chain is rejected ───────────────────────────────────
+
+    def test_invalid_parent_cert_rejected(self):
+        """A parent chain PEM signed by a different key must raise ValueError."""
+        other_dir = tempfile.mkdtemp()
+        try:
+            wrong_root = _make_ca(other_dir)   # different key, different cert
+            inter_path = Path(self._tmp_inter)
+            # Overwrite the chain with the wrong root cert
+            bad_chain_path = inter_path / "bad-chain.pem"
+            bad_chain_path.write_bytes(wrong_root.ca_cert_pem)
+            with self.assertRaises(ValueError):
+                pki.CertificateAuthority(
+                    ca_dir=self._tmp_inter,
+                    parent_chain_path=str(bad_chain_path),
+                )
+        finally:
+            import shutil
+            shutil.rmtree(other_dir, ignore_errors=True)
+
+    def test_missing_parent_cert_file_raises(self):
+        """A non-existent parent_chain_path must raise FileNotFoundError."""
+        with self.assertRaises(FileNotFoundError):
+            pki.CertificateAuthority(
+                ca_dir=self._tmp_inter,
+                parent_chain_path="/tmp/this_file_does_not_exist_xyz.pem",
+            )
+
+    # ── issued leaf certs ────────────────────────────────────────────────────
+
+    def test_leaf_issuer_is_intermediate(self):
+        """Leaf certs issued by the intermediate must list the intermediate as issuer."""
+        key = _gen_key()
+        cert = self.inter_ca.issue_certificate("CN=leaf-test", key.public_key())
+        self.assertEqual(cert.issuer, self.inter_ca.ca_cert.subject,
+                         "Leaf cert issuer must be the intermediate CA subject")
+
+    def test_leaf_not_issuer_of_root(self):
+        """Leaf issuer must NOT be the root CA (it is signed by the intermediate)."""
+        key = _gen_key()
+        cert = self.inter_ca.issue_certificate("CN=leaf-test2", key.public_key())
+        self.assertNotEqual(cert.issuer, self.root_ca.ca_cert.subject,
+                            "Leaf cert MUST NOT be issued directly by the root")
+
+    # ── export_pkcs12 chain ──────────────────────────────────────────────────
+
+    def test_pkcs12_contains_two_ca_certs(self):
+        """PKCS#12 bundle from intermediate CA must include intermediate + root in the bag.
+
+        When key=None, the cryptography library folds the leaf cert into the
+        third return value alongside the CA certs, so the total count is 3
+        (leaf + intermediate + root).  What matters is that both intermediate
+        and root subjects are present.
+        """
+        from cryptography.hazmat.primitives.serialization import pkcs12
+        key = _gen_key()
+        cert = self.inter_ca.issue_certificate("CN=p12-chain-test", key.public_key())
+        serial = cert.serial_number
+        p12_bytes = self.inter_ca.export_pkcs12(serial)
+        self.assertIsNotNone(p12_bytes)
+        _private_key, _cert, all_certs = pkcs12.load_key_and_certificates(
+            p12_bytes, None
+        )
+        # cryptography folds leaf into the bag when key=None; expect leaf+inter+root = 3
+        self.assertEqual(len(all_certs), 3,
+                         "PKCS#12 bag must contain leaf + intermediate + root (key=None mode)")
+        subjects = {c.subject.rfc4514_string() for c in all_certs}
+        self.assertIn(self.inter_ca.ca_cert.subject.rfc4514_string(), subjects,
+                      "Intermediate CA cert must be in the PKCS#12 bag")
+        self.assertIn(self.root_ca.ca_cert.subject.rfc4514_string(), subjects,
+                      "Root CA cert must be in the PKCS#12 bag")
+
+    def test_pkcs12_ca_bag_includes_root(self):
+        """Root CA cert must appear in the PKCS#12 CA bag."""
+        from cryptography.hazmat.primitives.serialization import pkcs12
+        key = _gen_key()
+        cert = self.inter_ca.issue_certificate("CN=p12-root-bag", key.public_key())
+        p12_bytes = self.inter_ca.export_pkcs12(cert.serial_number)
+        _k, _c, all_certs = pkcs12.load_key_and_certificates(p12_bytes, None)
+        subjects = {c.subject.rfc4514_string() for c in all_certs}
+        self.assertIn(
+            self.root_ca.ca_cert.subject.rfc4514_string(), subjects,
+            "Root CA cert MUST appear in the PKCS#12 bag"
+        )
+
+    # ── provision_tls_server_cert chain ──────────────────────────────────────
+
+    def test_tls_server_cert_file_contains_chain(self):
+        """server.crt written by provision_tls_server_cert must contain 2 PEM blocks."""
+        import re
+        cert_path, _key_path = self.inter_ca.provision_tls_server_cert("test.example.com")
+        pem = cert_path.read_bytes()
+        blocks = re.findall(rb"-----BEGIN CERTIFICATE-----", pem)
+        self.assertEqual(len(blocks), 2,
+                         "server.crt must contain leaf cert + intermediate chain cert")
+
+    def test_tls_server_cert_first_block_is_leaf(self):
+        """First PEM block in server.crt must be the server leaf cert."""
+        import re
+        cert_path, _key_path = self.inter_ca.provision_tls_server_cert("leaf.example.com")
+        pem = cert_path.read_bytes()
+        first_block = re.search(
+            rb"-----BEGIN CERTIFICATE-----.*?-----END CERTIFICATE-----",
+            pem, re.DOTALL,
+        ).group(0)
+        cert = x509.load_pem_x509_certificate(first_block)
+        self.assertEqual(cert.issuer, self.inter_ca.ca_cert.subject,
+                         "server.crt first block MUST be signed by the intermediate CA")
+
+    # ── auto-discovery of ca-chain.pem ───────────────────────────────────────
+
+    def test_auto_discovery_of_chain_file(self):
+        """CertificateAuthority must auto-load ca-chain.pem without explicit arg."""
+        # inter_ca was created without parent_chain_path= (auto-discovery)
+        self.assertTrue(self.inter_ca.is_intermediate,
+                        "Auto-discovered ca-chain.pem must activate intermediate mode")
 
 
 # ===========================================================================

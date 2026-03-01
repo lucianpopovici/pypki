@@ -14,8 +14,8 @@ Tests every endpoint across all six servers:
 
 Usage
 -----
-  # Run against default ports (plain HTTP main server):
-  python test_endpoints.py
+  # Run against default ports (requires --no-verify for self-signed CA cert):
+  python test_endpoints.py --no-verify
 
   # Run against your TLS setup:
   python test_endpoints.py \\
@@ -829,7 +829,8 @@ def test_est(cfg: argparse.Namespace, c: Client) -> Suite:
                 "Content-Transfer-Encoding": "base64",
             },
         )
-        return expect_status(r, 200, 201, 400, 401)
+        # 403 = no client cert presented (correct RFC 7030 behaviour without mTLS)
+        return expect_status(r, 200, 201, 400, 401, 403)
     check(s, "POST /.well-known/est/simplereenroll", _simplereenroll)
 
     # ── POST /.well-known/est/serverkeygen ───────────────────────
@@ -840,7 +841,8 @@ def test_est(cfg: argparse.Namespace, c: Client) -> Suite:
             data=b"",
             headers={"Content-Type": "application/pkcs10"},
         )
-        return expect_status(r, 200, 201, 400, 401, 501)
+        # 403 = no client cert (correct without mTLS), 501 = not implemented
+        return expect_status(r, 200, 201, 400, 401, 403, 501)
     check(s, "POST /.well-known/est/serverkeygen", _serverkeygen)
 
     # ── Labelled EST path ─────────────────────────────────────────
@@ -964,6 +966,7 @@ def test_webui(cfg: argparse.Namespace, c: Client) -> Suite:
         ("/metrics-ui", "Metrics"),
         ("/audit", "Audit Log"),
         ("/api-docs", "API Docs"),
+        ("/services", "Services"),
     ]
     for path, name in html_pages:
         check(s, f"GET {path} ({name} page)", lambda p=path: (
@@ -980,6 +983,34 @@ def test_webui(cfg: argparse.Namespace, c: Client) -> Suite:
         (r := c.get(f"{base}/api/metrics")).status_code == 200
         and "text/plain" in r.headers.get("Content-Type", ""),
         f"HTTP {r.status_code} ct={r.headers.get('Content-Type','?')}"
+    ))
+
+    # ── Services API ──────────────────────────────────────────────
+    check(s, "GET /api/services", lambda: expect_json(c.get(f"{base}/api/services"), 200))
+    check(s, "GET /api/services returns all 6 service names", lambda: (
+        (r := c.get(f"{base}/api/services")).ok
+        and all(k in r.json() for k in ("cmp", "acme", "scep", "est", "ocsp", "ipsec")),
+        "Expected all 6 service keys in response"
+    ))
+    check(s, "POST /api/services/unknown/start → 404", lambda: expect_status(
+        c.post(f"{base}/api/services/nonexistent/start",
+               json={"port": 9999},
+               headers={"Content-Type": "application/json"}),
+        404
+    ))
+    check(s, "POST /api/services/ocsp/start (no module) → 503 or 500", lambda: expect_status(
+        c.post(f"{base}/api/services/ocsp/start",
+               json={"port": 9001},
+               headers={"Content-Type": "application/json"}),
+        503, 500, 200  # 200 if ocsp module is actually present and port is available
+    ))
+
+    # ── PATCH /api/config ─────────────────────────────────────────
+    check(s, "PATCH /api/config (validity update)", lambda: (
+        (r := c.patch(f"{base}/api/config",
+                      json={"validity": {"end_entity_days": 365}},
+                      headers={"Content-Type": "application/json"})).status_code in (200, 500),
+        f"HTTP {r.status_code} — expected 200 (applied) or 500 (no config object)"
     ))
 
     # ── Certificate download ──────────────────────────────────────
@@ -1090,8 +1121,8 @@ def parse_args() -> argparse.Namespace:
           python test_endpoints.py --pki-url https://localhost:8443 --no-verify
         """),
     )
-    p.add_argument("--pki-url",  default="http://localhost:8443",
-                   help="PKI server base URL (default: http://localhost:8443)")
+    p.add_argument("--pki-url",  default="https://localhost:8443",
+                   help="PKI server base URL (default: https://localhost:8443)")
     p.add_argument("--acme-url", default="http://localhost:8888",
                    help="ACME server base URL (default: http://localhost:8888)")
     p.add_argument("--scep-url", default="http://localhost:8889",

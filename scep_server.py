@@ -32,7 +32,7 @@ Authentication:
     (set via --scep-challenge or PATCH /config {"scep":{"challenge":"..."}})
   - Renewal: existing cert used to sign the CMS envelope (no challenge needed)
 
-Dependencies (same as pki_cmpv2_server.py):
+Dependencies (same as pki_server.py):
     pip install cryptography
 
 Usage:
@@ -40,8 +40,8 @@ Usage:
         python scep_server.py [--host 0.0.0.0] [--port 8889] [--ca-dir ./ca]
                                [--challenge mysecret]
 
-    Integrated (via pki_cmpv2_server.py --scep-port 8889):
-        python pki_cmpv2_server.py --scep-port 8889 [--scep-challenge mysecret]
+    Integrated (via pki_server.py --scep-port 8889):
+        python pki_server.py --scep-port 8889 [--scep-challenge mysecret]
 """
 
 import argparse
@@ -688,73 +688,61 @@ class SCEPDatabase:
 
     def _init_db(self):
         conn = self._conn()
-        try:
-            conn.executescript("""
-                CREATE TABLE IF NOT EXISTS scep_transactions (
-                    transaction_id  TEXT PRIMARY KEY,
-                    status          TEXT NOT NULL DEFAULT 'pending',
-                    subject         TEXT,
-                    csr_pem         TEXT,
-                    cert_pem        TEXT,
-                    fail_info       TEXT,
-                    fail_reason     TEXT,
-                    requester_ip    TEXT,
-                    created_at      REAL,
-                    updated_at      REAL
-                );
-            """)
-            conn.commit()
-        finally:
-            conn.close()
+        conn.executescript("""
+            CREATE TABLE IF NOT EXISTS scep_transactions (
+                transaction_id  TEXT PRIMARY KEY,
+                status          TEXT NOT NULL DEFAULT 'pending',
+                subject         TEXT,
+                csr_pem         TEXT,
+                cert_pem        TEXT,
+                fail_info       TEXT,
+                fail_reason     TEXT,
+                requester_ip    TEXT,
+                created_at      REAL,
+                updated_at      REAL
+            );
+        """)
+        conn.commit()
+        conn.close()
 
     def create_transaction(self, txid: str, subject: str, csr_pem: str, ip: str):
         conn = self._conn()
-        try:
-            now = time.time()
-            conn.execute(
-                "INSERT OR REPLACE INTO scep_transactions VALUES (?,?,?,?,?,?,?,?,?,?)",
-                (txid, "pending", subject, csr_pem, None, None, None, ip, now, now)
-            )
-            conn.commit()
-        finally:
-            conn.close()
+        now = time.time()
+        conn.execute(
+            "INSERT OR REPLACE INTO scep_transactions VALUES (?,?,?,?,?,?,?,?,?,?)",
+            (txid, "pending", subject, csr_pem, None, None, None, ip, now, now)
+        )
+        conn.commit()
+        conn.close()
 
     def set_success(self, txid: str, cert_pem: str):
         conn = self._conn()
-        try:
-            conn.execute(
-                "UPDATE scep_transactions SET status='success', cert_pem=?, updated_at=? WHERE transaction_id=?",
-                (cert_pem, time.time(), txid)
-            )
-            conn.commit()
-        finally:
-            conn.close()
+        conn.execute(
+            "UPDATE scep_transactions SET status='success', cert_pem=?, updated_at=? WHERE transaction_id=?",
+            (cert_pem, time.time(), txid)
+        )
+        conn.commit()
+        conn.close()
 
     def set_failure(self, txid: str, fail_info: str, reason: str):
         conn = self._conn()
-        try:
-            conn.execute(
-                "UPDATE scep_transactions SET status='failure', fail_info=?, fail_reason=?, updated_at=? WHERE transaction_id=?",
-                (fail_info, reason, time.time(), txid)
-            )
-            conn.commit()
-        finally:
-            conn.close()
+        conn.execute(
+            "UPDATE scep_transactions SET status='failure', fail_info=?, fail_reason=?, updated_at=? WHERE transaction_id=?",
+            (fail_info, reason, time.time(), txid)
+        )
+        conn.commit()
+        conn.close()
 
     def get(self, txid: str) -> Optional[Dict[str, Any]]:
         conn = self._conn()
-        try:
-            row = conn.execute("SELECT * FROM scep_transactions WHERE transaction_id=?", (txid,)).fetchone()
-        finally:
-            conn.close()
+        row = conn.execute("SELECT * FROM scep_transactions WHERE transaction_id=?", (txid,)).fetchone()
+        conn.close()
         return dict(row) if row else None
 
     def all_transactions(self) -> list:
         conn = self._conn()
-        try:
-            rows = conn.execute("SELECT * FROM scep_transactions ORDER BY created_at DESC").fetchall()
-        finally:
-            conn.close()
+        rows = conn.execute("SELECT * FROM scep_transactions ORDER BY created_at DESC").fetchall()
+        conn.close()
         return [dict(r) for r in rows]
 
 
@@ -828,16 +816,60 @@ class SCEPHandler(http.server.BaseHTTPRequestHandler):
     def _handle_get_ca_cert(self, ca_id: str):
         """
         Return CA certificate.
-        RFC 8894 §4.2 — GetCACert returns DER for single CA, p7c chain for multiple.
+        RFC 8894 §4.2 — GetCACert returns DER for a single CA, p7c (PKCS#7
+        degenerate SignedData) when running as an intermediate CA with a chain.
         """
-        ca_der = self.ca.ca_cert.public_bytes(Encoding.DER)
-        # We have a single CA, so return plain DER with mimetype application/x-x509-ca-cert
-        self.send_response(200)
-        self.send_header("Content-Type", "application/x-x509-ca-cert")
-        self.send_header("Content-Length", str(len(ca_der)))
-        self.end_headers()
-        self.wfile.write(ca_der)
-        logger.info("GetCACert: sent CA certificate")
+        chain_ders = self.ca.ca_chain_ders   # [leaf_der, parent_der, ..., root_der]
+
+        if len(chain_ders) == 1:
+            # Root CA — return plain DER per RFC 8894 §4.2
+            self.send_response(200)
+            self.send_header("Content-Type", "application/x-x509-ca-cert")
+            self.send_header("Content-Length", str(len(chain_ders[0])))
+            self.end_headers()
+            self.wfile.write(chain_ders[0])
+            logger.info("GetCACert: sent CA certificate (root mode)")
+        else:
+            # Intermediate CA — wrap full chain in PKCS#7 degenerate SignedData
+            # per RFC 8894 §4.2 ("If the CA has multiple CA certificates, a p7c
+            # chain will be returned").
+            from cryptography.hazmat.primitives.serialization import pkcs7 as _p7
+            # Build a minimal degenerate CMS/PKCS#7 certs-only structure.
+            # We re-use the EST helper which produces the same encoding.
+            cert_bytes = b"".join(chain_ders)
+
+            def _seq(b): n=len(b); return (b"0"+(bytes([n]) if n<128 else bytes([0x80|(len(n:=n.to_bytes((n.bit_length()+7)//8,"big")))]+list(n)))+b)
+            def _ctx(n,b): l=len(b); return (bytes([0xa0|n])+(bytes([l]) if l<128 else bytes([0x80|(len(ll:=l.to_bytes((l.bit_length()+7)//8,"big")))]+list(ll)))+b)
+            def _oid(o):
+                parts=[int(x) for x in o.split(".")];v=parts[0]*40+parts[1];r=b""
+                for p in [v]+parts[2:]:
+                    g=[];g.insert(0,p&0x7f);p>>=7
+                    while p:g.insert(0,(p&0x7f)|0x80);p>>=7
+                    r+=bytes(g)
+                return b""+bytes([len(r)])+r
+            def _set(b): n=len(b); return b"1"+(bytes([n]) if n<128 else bytes([0x80|(len(nn:=n.to_bytes((n.bit_length()+7)//8,"big")))]+list(nn)))+b
+            def _int(v): return b""+bytes([v])
+
+            OID_SIGNED_DATA = "1.2.840.113549.1.7.2"
+            OID_DATA        = "1.2.840.113549.1.7.1"
+            sd_inner = (
+                _int(1)
+                + _set(b"")
+                + _seq(_oid(OID_DATA))
+                + _ctx(0, cert_bytes)
+                + _set(b"")
+            )
+            p7_der = _seq(_oid(OID_SIGNED_DATA) + _ctx(0, _seq(sd_inner)))
+
+            self.send_response(200)
+            self.send_header("Content-Type", "application/x-x509-ca-ra-cert")
+            self.send_header("Content-Length", str(len(p7_der)))
+            self.end_headers()
+            self.wfile.write(p7_der)
+            logger.info(
+                "GetCACert: sent CA chain as p7c (%d certs, intermediate mode)",
+                len(chain_ders),
+            )
 
     def _handle_get_ca_caps(self):
         """
@@ -1334,11 +1366,11 @@ def main():
 
     logging.getLogger().setLevel(args.log_level)
 
-    # Import CA from pki_cmpv2_server
+    # Import CA from pki_server
     try:
-        from pki_cmpv2_server import CertificateAuthority, ServerConfig
+        from pki_server import CertificateAuthority, ServerConfig
     except ImportError:
-        print("ERROR: pki_cmpv2_server.py not found — place it in the same directory.")
+        print("ERROR: pki_server.py not found — place it in the same directory.")
         raise SystemExit(1)
 
     ca_dir = Path(args.ca_dir)

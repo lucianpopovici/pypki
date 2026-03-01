@@ -54,7 +54,7 @@ Dependencies:
 
 Usage:
     # Plain HTTP (no mTLS)
-    python pki_server.py [--host 127.0.0.1] [--port 8080] [--ca-dir ./ca]
+    python pki_server.py [--host 0.0.0.0] [--port 8080] [--ca-dir ./ca]
 
     # mTLS enabled
     python pki_server.py --mtls --port 8443 [--ca-dir ./ca]
@@ -76,7 +76,6 @@ import json
 import logging
 import os
 import re
-import ipaddress
 import socket
 import sqlite3
 import ssl
@@ -153,6 +152,25 @@ try:
 except ImportError:
     HAS_WEBUI = False
 
+# IPsec PKI module (optional — loaded if --ipsec-port is specified)
+# RFC 4945 (IPsec cert profile) + RFC 4806 (OCSP hash/IKEv2) + RFC 4809 (requirements)
+try:
+    import ipsec_server as _ipsec_module
+    HAS_IPSEC = True
+except ImportError:
+    HAS_IPSEC = False
+
+# CMP server module — CMPv2 (RFC 4210) / CMPv3 (RFC 9480) / HTTP (RFC 6712)
+# Extracted from pki_server.py into cmp_server.py, consistent with the other
+# protocol modules: acme_server.py, scep_server.py, est_server.py, ocsp_server.py.
+try:
+    import cmp_server as _cmp_module
+    HAS_CMP = True
+except ImportError:
+    HAS_CMP = False
+    print("WARNING: cmp_server.py not found — CMPv2/CMPv3 support disabled.")
+    print("         Place cmp_server.py in the same directory as pki_server.py.")
+
 # ASN.1 imports for CMPv2 message parsing
 try:
     from pyasn1.type import univ, namedtype, tag, constraint, namedval, useful
@@ -164,9 +182,8 @@ except ImportError:
     HAS_PYASN1 = False
     print("WARNING: pyasn1 not found. Install with: pip install pyasn1 pyasn1-modules")
 
-import copy
-
-logging.basicConfig(    level=logging.INFO,
+logging.basicConfig(
+    level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s"
 )
 logger = logging.getLogger("pki-cmpv2")
@@ -428,6 +445,7 @@ class ServerConfig:
     def as_dict(self) -> Dict[str, Any]:
         self._maybe_reload()
         with self._lock:
+            import copy
             return copy.deepcopy(self._effective())
 
     # ------------------------------------------------------------------
@@ -451,7 +469,7 @@ class ServerConfig:
 
     def _effective(self) -> Dict[str, Any]:
         """Merge: defaults ← file ← CLI overrides ← in-memory edits."""
-
+        import copy
         result = copy.deepcopy(DEFAULT_CONFIG)
         self._deep_merge(result, self._data)
         self._deep_merge(result, self._cli)
@@ -481,7 +499,7 @@ class ServerConfig:
         self._file_mtime = self._config_path.stat().st_mtime
 
     def _write_defaults(self):
-
+        import copy
         merged = copy.deepcopy(DEFAULT_CONFIG)
         self._deep_merge(merged, self._cli)
         with open(self._config_path, "w") as f:
@@ -497,427 +515,6 @@ class ServerConfig:
                 base[k] = v
 
 
-
-
-class CMPv2ASN1:
-    """
-    Hand-rolled ASN.1 DER parser/builder for CMP messages.
-    Uses pyasn1 when available, falls back to manual parsing.
-    """
-
-    # CMP PKIBody types (RFC 4210 Section 5.3)
-    BODY_TYPES = {
-        0:  "ir",       # Initialization Request
-        1:  "ip",       # Initialization Response
-        2:  "cr",       # Certification Request
-        3:  "cp",       # Certification Response
-        4:  "p10cr",    # PKCS#10 Cert Request
-        5:  "popdecc",  # POP Challenge
-        6:  "popdecr",  # POP Response
-        7:  "kur",      # Key Update Request
-        8:  "kup",      # Key Update Response
-        9:  "krr",      # Key Recovery Request
-        10: "krp",      # Key Recovery Response
-        11: "rr",       # Revocation Request
-        12: "rp",       # Revocation Response
-        13: "ccr",      # Cross-Cert Request
-        14: "ccp",      # Cross-Cert Response
-        15: "ckuann",   # CA Key Update Announcement
-        16: "cann",     # Certificate Announcement
-        17: "rann",     # Revocation Announcement
-        18: "crlann",   # CRL Announcement
-        19: "pkiconf",  # PKI Confirmation
-        20: "nested",   # Nested Message
-        21: "genm",     # General Message
-        22: "genp",     # General Response
-        23: "error",    # Error Message
-        24: "certConf", # Certificate Confirmation
-        25: "pollReq",  # Polling Request
-        26: "pollRep",  # Polling Response
-    }
-
-    @staticmethod
-    def _encode_length(length: int) -> bytes:
-        if length < 0x80:
-            return bytes([length])
-        elif length < 0x100:
-            return bytes([0x81, length])
-        elif length < 0x10000:
-            return bytes([0x82, (length >> 8) & 0xFF, length & 0xFF])
-        else:
-            return bytes([0x83, (length >> 16) & 0xFF, (length >> 8) & 0xFF, length & 0xFF])
-
-    @staticmethod
-    def _decode_length(data: bytes, offset: int) -> Tuple[int, int]:
-        first = data[offset]
-        if first < 0x80:
-            return first, offset + 1
-        num_bytes = first & 0x7F
-        length = 0
-        for i in range(num_bytes):
-            length = (length << 8) | data[offset + 1 + i]
-        return length, offset + 1 + num_bytes
-
-    @classmethod
-    def _decode_tlv(cls, data: bytes, offset: int = 0) -> Tuple[int, bytes, int]:
-        """Returns (tag, value_bytes, next_offset)"""
-        tag_byte = data[offset]
-        offset += 1
-        length, offset = cls._decode_length(data, offset)
-        value = data[offset:offset + length]
-        return tag_byte, value, offset + length
-
-    @classmethod
-    def parse_pki_message(cls, der_data: bytes) -> Dict[str, Any]:
-        """
-        Parse a DER-encoded PKIMessage (RFC 4210).
-        Returns a dict with header, body type, and raw body bytes.
-        """
-        result = {
-            "raw": der_data,
-            "header": {},
-            "body_type": None,
-            "body_raw": None,
-            "protection": None,
-            "extra_certs": None,
-        }
-
-        try:
-            # PKIMessage ::= SEQUENCE { header, body, [0] protection, [1] extraCerts }
-            if der_data[0] != 0x30:
-                raise ValueError(f"Expected SEQUENCE (0x30), got 0x{der_data[0]:02x}")
-
-            # Unwrap outer SEQUENCE
-            _, outer, _ = cls._decode_tlv(der_data, 0)
-            data = outer
-            pos = 0
-
-            # Parse PKIHeader (SEQUENCE)
-            tag_b, header_bytes, pos = cls._decode_tlv(data, pos)
-            result["header"] = cls._parse_pki_header(header_bytes)
-
-            # Parse PKIBody (CHOICE with context tags [0]..[26])
-            if pos < len(data):
-                body_tag = data[pos]
-                body_len, body_val_start = cls._decode_length(data, pos + 1)
-                body_val = data[body_val_start:body_val_start + body_len]
-
-                # Context tag number = body type index
-                ctx_tag = body_tag & 0x1F
-                result["body_type"] = cls.BODY_TYPES.get(ctx_tag, f"unknown_{ctx_tag}")
-                result["body_raw"] = body_val
-                result["body_tag"] = ctx_tag
-                pos = body_val_start + body_len
-
-            # Parse optional protection [0] and extraCerts [1]
-            while pos < len(data):
-                opt_tag = data[pos]
-                opt_len, opt_val_start = cls._decode_length(data, pos + 1)
-                opt_val = data[opt_val_start:opt_val_start + opt_len]
-                if opt_tag == 0xA0:
-                    result["protection"] = opt_val
-                elif opt_tag == 0xA1:
-                    result["extra_certs"] = opt_val
-                pos = opt_val_start + opt_len
-
-        except Exception as e:
-            logger.debug(f"ASN.1 parse error: {e}")
-            result["parse_error"] = str(e)
-
-        return result
-
-    @classmethod
-    def _parse_pki_header(cls, header_bytes: bytes) -> Dict[str, Any]:
-        header = {}
-        pos = 0
-        field_idx = 0
-
-        while pos < len(header_bytes):
-            try:
-                tag_b, val, pos = cls._decode_tlv(header_bytes, pos)
-                if field_idx == 0:
-                    header["pvno"] = int.from_bytes(val, "big") if val else 2
-                elif field_idx == 1:
-                    header["sender"] = val
-                elif field_idx == 2:
-                    header["recipient"] = val
-                elif field_idx == 3:
-                    header["messageTime"] = val
-                elif field_idx == 4:
-                    header["protectionAlg"] = val
-                elif field_idx == 5:
-                    header["senderKID"] = val
-                elif field_idx == 6:
-                    header["recipKID"] = val
-                elif field_idx == 7:
-                    header["transactionID"] = val
-                elif field_idx == 8:
-                    header["senderNonce"] = val
-                elif field_idx == 9:
-                    header["recipNonce"] = val
-                field_idx += 1
-            except Exception:
-                break
-
-        return header
-
-    @classmethod
-    def build_pki_message(
-        cls,
-        body_type: int,
-        body_content: bytes,
-        transaction_id: bytes,
-        sender_nonce: bytes,
-        recip_nonce: bytes = b"",
-        status_code: int = 0,
-        pvno: int = 2,
-    ) -> bytes:
-        """Build a minimal DER-encoded PKIMessage response.
-
-        pvno=2 for CMPv2 (RFC 4210), pvno=3 for CMPv3 (RFC 9480).
-        """
-
-        def seq(content: bytes) -> bytes:
-            return b"\x30" + cls._encode_length(len(content)) + content
-
-        def ctx(n: int, content: bytes, constructed: bool = True) -> bytes:
-            tag = (0xA0 | n) if constructed else (0x80 | n)
-            return bytes([tag]) + cls._encode_length(len(content)) + content
-
-        def integer(val: int, length: int = 1) -> bytes:
-            v = val.to_bytes(length, "big")
-            return b"\x02" + cls._encode_length(len(v)) + v
-
-        def octet_string(val: bytes) -> bytes:
-            return b"\x04" + cls._encode_length(len(val)) + val
-
-        def generalizedtime(dt: datetime.datetime) -> bytes:
-            s = dt.strftime("%Y%m%d%H%M%SZ").encode()
-            return b"\x18" + cls._encode_length(len(s)) + s
-
-        def null() -> bytes:
-            return b"\x05\x00"
-
-        def oid(dotted: str) -> bytes:
-            parts = list(map(int, dotted.split(".")))
-            encoded = bytes([40 * parts[0] + parts[1]])
-            for p in parts[2:]:
-                if p == 0:
-                    encoded += b"\x00"
-                else:
-                    buf = []
-                    while p:
-                        buf.append(p & 0x7F)
-                        p >>= 7
-                    buf.reverse()
-                    for i, b_ in enumerate(buf):
-                        encoded += bytes([b_ | (0x80 if i < len(buf) - 1 else 0)])
-            return b"\x06" + cls._encode_length(len(encoded)) + encoded
-
-        # Build PKIHeader
-        pvno_field = integer(pvno)
-
-        # sender/recipient: use NULL GeneralName (directoryName with empty DN)
-        sender = ctx(4, seq(b""), constructed=True)   # GeneralName [4] directoryName
-        recipient = ctx(4, seq(b""), constructed=True)
-
-        msg_time = ctx(0, generalizedtime(datetime.datetime.now(datetime.timezone.utc)), constructed=False)
-
-        # sha256WithRSAEncryption OID for protection alg hint
-        prot_alg = ctx(1, seq(oid("1.2.840.113549.1.1.11") + null()), constructed=False)
-
-        tid = ctx(4, octet_string(transaction_id), constructed=False)
-        snonce = ctx(5, octet_string(sender_nonce), constructed=False)
-
-        header_content = pvno_field + sender + recipient + msg_time + prot_alg + tid + snonce
-        if recip_nonce:
-            header_content += ctx(6, octet_string(recip_nonce), constructed=False)
-
-        header = seq(header_content)
-
-        # Build PKIBody
-        body = ctx(body_type, body_content)
-
-        # Combine into PKIMessage
-        pki_msg = seq(header + body)
-        return pki_msg
-
-    @classmethod
-    def build_ip_cp_body(
-        cls,
-        cert_der: bytes,
-        status: int = 0,           # 0=accepted, 1=grantedWithMods, 2=rejection
-        fail_info: Optional[int] = None,
-        request_id: int = 0,
-    ) -> bytes:
-        """Build CertRepMessage body for ip/cp responses."""
-
-        def seq(c): return b"\x30" + cls._encode_length(len(c)) + c
-        def integer(v, length=1): v_b = v.to_bytes(max(length, (v.bit_length()+8)//8), "big"); return b"\x02" + cls._encode_length(len(v_b)) + v_b
-        def ctx(n, c, constructed=True): t = (0xA0 | n) if constructed else (0x80 | n); return bytes([t]) + cls._encode_length(len(c)) + c
-        def ctx_nc(n, c): return bytes([0x80 | n]) + cls._encode_length(len(c)) + c
-
-        # PKIStatusInfo
-        pki_status = seq(integer(status))
-
-        # CertifiedKeyPair (only on success)
-        if status in (0, 1) and cert_der:
-            # certOrEncCert CHOICE [0] certificate
-            cert_choice = ctx(0, ctx(0, cert_der))
-            cert_key_pair = seq(cert_choice)
-            cert_response = seq(integer(request_id) + pki_status + cert_key_pair)
-        else:
-            cert_response = seq(integer(request_id) + pki_status)
-
-        # CertRepMessage ::= SEQUENCE { [1] caPubs OPTIONAL, response SEQUENCE }
-        response_seq = seq(cert_response)
-        cert_rep = seq(response_seq)
-
-        return cert_rep
-
-    @classmethod
-    def build_error_body(cls, status: int, text: str) -> bytes:
-        def seq(c): return b"\x30" + cls._encode_length(len(c)) + c
-        def integer(v): v_b = v.to_bytes(1, "big"); return b"\x02\x01" + v_b
-        def utf8str(s):
-            e = s.encode()
-            return b"\x0c" + cls._encode_length(len(e)) + e
-
-        status_info = seq(integer(status) + utf8str(text))
-        return seq(status_info)
-
-    @classmethod
-    def build_pkiconf_body(cls) -> bytes:
-        return b"\x05\x00"  # NULL
-
-    @classmethod
-    def build_rp_body(cls, status: int = 0) -> bytes:
-        def seq(c): return b"\x30" + cls._encode_length(len(c)) + c
-        def integer(v): v_b = v.to_bytes(1, "big"); return b"\x02\x01" + v_b
-        status_info = seq(integer(status))
-        return seq(status_info)
-
-    @classmethod
-    def parse_cert_request_from_body(cls, body_raw: bytes) -> Optional[bytes]:
-        """
-        Try to extract a DER-encoded PKCS#10 CSR or CRMF CertRequest
-        from a CMPv2 ir/cr/kur body.
-        Returns DER bytes or None.
-        """
-        # CRMF CertReqMessages ::= SEQUENCE OF CertReqMsg
-        # Try to find embedded public key / subject info
-        # For simplicity we return the whole body for processing
-        return body_raw
-
-    @classmethod
-    def extract_subject_and_pubkey_from_crmf(cls, body_raw: bytes) -> Tuple[Optional[str], Optional[bytes]]:
-        """
-        Walk the CRMF body to extract the subject DN string and subjectPublicKeyInfo DER.
-        Returns (subject_str, spki_der) or (None, None).
-        """
-        # We'll do a best-effort DER walk looking for known OIDs
-        subject_str = "CN=CMPv2 Client"
-        spki_der = None
-
-        try:
-            # body_raw is CertReqMessages = SEQUENCE OF CertReqMsg
-            # Each CertReqMsg: SEQUENCE { certReq CertRequest, ... }
-            # CertRequest: SEQUENCE { certReqId INTEGER, certTemplate, ... }
-            # certTemplate: SEQUENCE with optional fields tagged [0]..[8]
-
-            pos = 0
-            # Unwrap CertReqMessages SEQUENCE
-            if body_raw[pos] != 0x30:
-                return subject_str, spki_der
-            msg_len, pos = cls._decode_length(body_raw, 1)
-            inner = body_raw[pos:pos + msg_len]
-
-            # First CertReqMsg
-            if not inner or inner[0] != 0x30:
-                return subject_str, spki_der
-            crm_len, p2 = cls._decode_length(inner, 1)
-            crm = inner[p2:p2 + crm_len]
-
-            # CertRequest
-            if not crm or crm[0] != 0x30:
-                return subject_str, spki_der
-            cr_len, p3 = cls._decode_length(crm, 1)
-            cr = crm[p3:p3 + cr_len]
-
-            # skip certReqId INTEGER
-            id_len, p4 = cls._decode_length(cr, 1)
-            p4 += id_len
-
-            # certTemplate SEQUENCE
-            if p4 >= len(cr) or cr[p4] != 0x30:
-                return subject_str, spki_der
-            tmpl_len, p5 = cls._decode_length(cr, p4 + 1)
-            tmpl = cr[p5:p5 + tmpl_len]
-
-            # Walk template fields (all OPTIONAL, context-tagged)
-            tpos = 0
-            while tpos < len(tmpl):
-                ftag = tmpl[tpos]
-                flen, fnext = cls._decode_length(tmpl, tpos + 1)
-                fval = tmpl[fnext:fnext + flen]
-                field_num = ftag & 0x1F
-
-                if field_num == 5:  # [5] subject
-                    subject_str = cls._parse_dn(fval) or subject_str
-                elif field_num == 6:  # [6] publicKey
-                    spki_der = fval
-
-                tpos = fnext + flen
-
-        except Exception as e:
-            logger.debug(f"CRMF parse error: {e}")
-
-        return subject_str, spki_der
-
-    @classmethod
-    def _parse_dn(cls, data: bytes) -> Optional[str]:
-        """Parse a DER Name into a string like CN=Foo,O=Bar"""
-        try:
-            parts = []
-            # Name ::= SEQUENCE OF RDN
-            pos = 0
-            while pos < len(data):
-                tag_b, rdn_bytes, pos = cls._decode_tlv(data, pos)
-                # RDN ::= SET OF AttributeTypeAndValue
-                rpos = 0
-                while rpos < len(rdn_bytes):
-                    _, atav_bytes, rpos = cls._decode_tlv(rdn_bytes, rpos)
-                    # AttributeTypeAndValue ::= SEQUENCE { type OID, value ANY }
-                    _, oid_bytes, apos = cls._decode_tlv(atav_bytes, 0)
-                    _, val_bytes, _ = cls._decode_tlv(atav_bytes, apos)
-                    oid_str = cls._decode_oid(oid_bytes)
-                    val_str = val_bytes.decode("utf-8", errors="replace")
-                    attr = {
-                        "2.5.4.3": "CN",
-                        "2.5.4.6": "C",
-                        "2.5.4.7": "L",
-                        "2.5.4.8": "ST",
-                        "2.5.4.10": "O",
-                        "2.5.4.11": "OU",
-                    }.get(oid_str, oid_str)
-                    parts.append(f"{attr}={val_str}")
-            return ",".join(parts) if parts else None
-        except Exception:
-            return None
-
-    @staticmethod
-    def _decode_oid(data: bytes) -> str:
-        if not data:
-            return ""
-        parts = [data[0] // 40, data[0] % 40]
-        i, cur = 1, 0
-        while i < len(data):
-            cur = (cur << 7) | (data[i] & 0x7F)
-            if not (data[i] & 0x80):
-                parts.append(cur)
-                cur = 0
-            i += 1
-        return ".".join(map(str, parts))
 
 
 # ---------------------------------------------------------------------------
@@ -936,41 +533,35 @@ class AuditLog:
 
     def _init(self):
         conn = sqlite3.connect(str(self._db))
-        try:
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS audit (
-                    id      INTEGER PRIMARY KEY AUTOINCREMENT,
-                    ts      TEXT NOT NULL,
-                    event   TEXT NOT NULL,
-                    detail  TEXT,
-                    ip      TEXT
-                )
-            """)
-            conn.commit()
-        finally:
-            conn.close()
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS audit (
+                id      INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts      TEXT NOT NULL,
+                event   TEXT NOT NULL,
+                detail  TEXT,
+                ip      TEXT
+            )
+        """)
+        conn.commit()
+        conn.close()
 
     def record(self, event: str, detail: str = "", ip: str = ""):
         ts = datetime.datetime.now(datetime.timezone.utc).isoformat()
         conn = sqlite3.connect(str(self._db))
-        try:
-            conn.execute("INSERT INTO audit(ts,event,detail,ip) VALUES(?,?,?,?)",
-                         (ts, event, detail, ip))
-            conn.commit()
-        finally:
-            conn.close()
+        conn.execute("INSERT INTO audit(ts,event,detail,ip) VALUES(?,?,?,?)",
+                     (ts, event, detail, ip))
+        conn.commit()
+        conn.close()
         logger.info(f"AUDIT [{event}] {detail}")
 
     def recent(self, n: int = 100) -> List[Dict[str, Any]]:
         conn = sqlite3.connect(str(self._db))
-        try:
-            conn.row_factory = sqlite3.Row
-            rows = conn.execute(
-                "SELECT ts,event,detail,ip FROM audit ORDER BY id DESC LIMIT ?", (n,)
-            ).fetchall()
-            return [dict(r) for r in rows]
-        finally:
-            conn.close()
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            "SELECT ts,event,detail,ip FROM audit ORDER BY id DESC LIMIT ?", (n,)
+        ).fetchall()
+        conn.close()
+        return [dict(r) for r in rows]
 
 
 # ---------------------------------------------------------------------------
@@ -1119,81 +710,96 @@ class CertProfile:
 # ---------------------------------------------------------------------------
 
 class CertificateAuthority:
-    """Self-signed CA with certificate issuance and revocation."""
+    """Self-signed CA with certificate issuance and revocation.
+
+    When running as an **intermediate CA** (ca.crt is signed by an external
+    root), pass the path to the parent chain PEM as *parent_chain_path* (or
+    place it at ``<ca_dir>/ca-chain.pem`` before starting).  The chain PEM
+    must contain one or more certificates in order from the immediate issuer
+    to the root, *not* including ca.crt itself.
+
+    With a parent chain loaded, the following all return the full chain:
+    * :attr:`ca_chain_pem` / :attr:`ca_chain_ders` — all certs root-to-leaf
+    * :meth:`provision_tls_server_cert` — appends intermediates to server.crt
+    * :meth:`build_tls_context` — loads full chain for mTLS client verification
+    * :meth:`export_pkcs12` — includes intermediates in the CA bag
+    * EST /cacerts, SCEP GetCACert, CMP GetCACerts — serve the full chain
+    """
 
     def __init__(self, ca_dir: str = "./ca", config: Optional["ServerConfig"] = None,
                  ocsp_url: str = "", crl_url: str = "",
-                 ca_key_passphrase: Optional[bytes] = None):
+                 parent_chain_path: Optional[str] = None):
+        """
+        Parameters
+        ----------
+        ca_dir            : Directory holding ca.key, ca.crt, certificates.db, …
+        config            : Optional ServerConfig for live-editable validity periods.
+        ocsp_url          : AIA OCSP URL embedded in every issued cert.
+        crl_url           : CDP URL embedded in every issued cert.
+        parent_chain_path : PEM file with the certificate(s) that signed ca.crt
+                            (parent → … → root, *not* including ca.crt itself).
+                            If omitted, <ca_dir>/ca-chain.pem is loaded automatically
+                            when it exists.  Required for intermediate CA operation.
+        """
         self.ca_dir = Path(ca_dir)
         self.ca_dir.mkdir(parents=True, exist_ok=True)
         self.db_path = self.ca_dir / "certificates.db"
         self.config  = config  # may be None (uses hardcoded defaults as fallback)
         self._ocsp_url = ocsp_url   # embedded in every issued cert AIA extension
         self._crl_url  = crl_url    # embedded in every issued cert CDP extension
-        self._ca_key_passphrase = ca_key_passphrase
         self._init_db()
         self._load_or_create_ca()
+        self._load_parent_chain(parent_chain_path)
 
     def _init_db(self):
         conn = sqlite3.connect(str(self.db_path))
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS certificates (
+                serial      INTEGER PRIMARY KEY,
+                subject     TEXT NOT NULL,
+                not_before  TEXT NOT NULL,
+                not_after   TEXT NOT NULL,
+                der         BLOB NOT NULL,
+                revoked     INTEGER DEFAULT 0,
+                revoked_at  TEXT,
+                reason      INTEGER,
+                profile     TEXT DEFAULT 'default'
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS serial_counter (
+                id    INTEGER PRIMARY KEY,
+                value INTEGER NOT NULL
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS crl_base (
+                id          INTEGER PRIMARY KEY,
+                issued_at   TEXT NOT NULL,
+                this_update TEXT NOT NULL,
+                next_update TEXT NOT NULL,
+                der         BLOB NOT NULL
+            )
+        """)
+        conn.execute("INSERT OR IGNORE INTO serial_counter VALUES (1, 1000)")
+        # Migrate: add profile column if missing (for existing DBs)
         try:
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS certificates (
-                    serial      INTEGER PRIMARY KEY,
-                    subject     TEXT NOT NULL,
-                    not_before  TEXT NOT NULL,
-                    not_after   TEXT NOT NULL,
-                    der         BLOB NOT NULL,
-                    revoked     INTEGER DEFAULT 0,
-                    revoked_at  TEXT,
-                    reason      INTEGER,
-                    profile     TEXT DEFAULT 'default'
-                )
-            """)
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS serial_counter (
-                    id    INTEGER PRIMARY KEY,
-                    value INTEGER NOT NULL
-                )
-            """)
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS crl_base (
-                    id          INTEGER PRIMARY KEY,
-                    issued_at   TEXT NOT NULL,
-                    this_update TEXT NOT NULL,
-                    next_update TEXT NOT NULL,
-                    der         BLOB NOT NULL
-                )
-            """)
-            conn.execute("INSERT OR IGNORE INTO serial_counter VALUES (1, 1000)")
-            # Migrate: add profile column if missing (for existing DBs)
-            try:
-                conn.execute("ALTER TABLE certificates ADD COLUMN profile TEXT DEFAULT 'default'")
-            except Exception:
-                pass
-            conn.commit()
-        finally:
-            conn.close()
-        # Create key_archive table (also idempotent)
-        self._init_key_archive_table()
-
-    _serial_lock = threading.Lock()
+            conn.execute("ALTER TABLE certificates ADD COLUMN profile TEXT DEFAULT 'default'")
+        except Exception:
+            pass
+        conn.commit()
+        conn.close()
 
     def _next_serial(self) -> int:
-        with self._serial_lock:
-            conn = sqlite3.connect(str(self.db_path))
-            try:
-                conn.execute("BEGIN EXCLUSIVE")
-                row = conn.execute("SELECT value FROM serial_counter WHERE id=1").fetchone()
-                serial = row[0]
-                conn.execute("UPDATE serial_counter SET value=? WHERE id=1", (serial + 1,))
-                conn.commit()
-                return serial
-            except Exception:
-                conn.rollback()
-                raise
-            finally:
-                conn.close()
+        conn = sqlite3.connect(str(self.db_path))
+        try:
+            row = conn.execute("SELECT value FROM serial_counter WHERE id=1").fetchone()
+            serial = row[0]
+            conn.execute("UPDATE serial_counter SET value=? WHERE id=1", (serial + 1,))
+            conn.commit()
+            return serial
+        finally:
+            conn.close()
 
     def _cfg(self, attr: str, default: int) -> int:
         """Read a validity value from config, falling back to default."""
@@ -1208,9 +814,7 @@ class CertificateAuthority:
         if ca_key_path.exists() and ca_cert_path.exists():
             logger.info("Loading existing CA key and certificate.")
             with open(ca_key_path, "rb") as f:
-                self.ca_key = serialization.load_pem_private_key(
-                    f.read(), password=self._ca_key_passphrase
-                )
+                self.ca_key = serialization.load_pem_private_key(f.read(), password=None)
             with open(ca_cert_path, "rb") as f:
                 self.ca_cert = x509.load_pem_x509_certificate(f.read())
         else:
@@ -1250,27 +854,138 @@ class CertificateAuthority:
                 .sign(self.ca_key, SHA256())
             )
 
-            # Encrypt CA key if passphrase provided, otherwise store unencrypted
-            if self._ca_key_passphrase:
-                key_enc = serialization.BestAvailableEncryption(self._ca_key_passphrase)
-                logger.info("CA private key will be encrypted on disk.")
-            else:
-                key_enc = NoEncryption()
-                logger.warning(
-                    "CA private key stored WITHOUT encryption. "
-                    "Use --ca-key-passphrase for production deployments."
-                )
             with open(ca_key_path, "wb") as f:
-                f.write(self.ca_key.private_bytes(Encoding.PEM, PrivateFormat.TraditionalOpenSSL, key_enc))
-            # Restrict file permissions (best-effort on platforms that support it)
-            try:
-                os.chmod(ca_key_path, 0o600)
-            except OSError:
-                pass
+                f.write(self.ca_key.private_bytes(Encoding.PEM, PrivateFormat.TraditionalOpenSSL, NoEncryption()))
             with open(ca_cert_path, "wb") as f:
                 f.write(self.ca_cert.public_bytes(Encoding.PEM))
 
             logger.info(f"CA certificate written to {ca_cert_path}")
+
+    # ------------------------------------------------------------------
+    # Intermediate CA — parent chain loading
+    # ------------------------------------------------------------------
+
+    def _load_parent_chain(self, parent_chain_path: Optional[str] = None) -> None:
+        """Load the parent certificate chain for intermediate CA operation.
+
+        Sets ``self._parent_chain``: list of x509.Certificate from immediate
+        parent to root (empty list when running as a self-signed root CA).
+
+        Search order:
+        1. *parent_chain_path* argument (if given)
+        2. ``<ca_dir>/ca-chain.pem`` (auto-discovered when present)
+        """
+        self._parent_chain: List[x509.Certificate] = []
+
+        # Determine which file to load
+        candidate: Optional[Path] = None
+        if parent_chain_path:
+            candidate = Path(parent_chain_path)
+        else:
+            auto = self.ca_dir / "ca-chain.pem"
+            if auto.exists():
+                candidate = auto
+
+        if candidate is None:
+            # Self-signed root — no parent chain needed
+            return
+
+        if not candidate.exists():
+            raise FileNotFoundError(
+                f"parent_chain_path '{candidate}' not found. "
+                "The file must contain the PEM-encoded certificate(s) that signed "
+                "ca.crt, in order from the immediate issuer to the root CA."
+            )
+
+        pem_data = candidate.read_bytes()
+        # Parse all PEM blocks in the file
+        import re as _re
+        pem_blocks = _re.findall(
+            rb"-----BEGIN CERTIFICATE-----.*?-----END CERTIFICATE-----",
+            pem_data, _re.DOTALL,
+        )
+        if not pem_blocks:
+            raise ValueError(
+                f"parent_chain_path '{candidate}' contains no PEM certificates."
+            )
+
+        for block in pem_blocks:
+            cert = x509.load_pem_x509_certificate(block)
+            self._parent_chain.append(cert)
+
+        # Validate: the first cert in the chain must have signed ca.crt
+        try:
+            issuer_pub = self._parent_chain[0].public_key()
+            issuer_pub.verify(
+                self.ca_cert.signature,
+                self.ca_cert.tbs_certificate_bytes,
+                padding.PKCS1v15(),
+                self.ca_cert.signature_hash_algorithm,
+            )
+        except Exception as exc:
+            raise ValueError(
+                f"parent_chain_path '{candidate}': the first certificate did not "
+                f"sign ca.crt — {exc}"
+            ) from exc
+
+        # Validate continuity: each cert must have signed the one before it
+        for i in range(1, len(self._parent_chain)):
+            child  = self._parent_chain[i - 1]
+            parent = self._parent_chain[i]
+            if child.issuer != parent.subject:
+                raise ValueError(
+                    f"parent_chain_path '{candidate}': chain break between "
+                    f"cert[{i-1}] (issuer={child.issuer.rfc4514_string()}) "
+                    f"and cert[{i}] (subject={parent.subject.rfc4514_string()})"
+                )
+
+        subjects = " → ".join(c.subject.rfc4514_string() for c in self._parent_chain)
+        logger.info(
+            "Intermediate CA mode — parent chain loaded (%d cert(s)): %s",
+            len(self._parent_chain), subjects,
+        )
+
+    @property
+    def is_intermediate(self) -> bool:
+        """True when this CA has a parent chain (i.e. is not a self-signed root)."""
+        return bool(self._parent_chain)
+
+    @property
+    def ca_chain_ders(self) -> List[bytes]:
+        """DER bytes of every cert in the trust chain, ordered leaf → root.
+
+        For a root CA this is ``[ca_cert_der]``.
+        For an intermediate CA this is ``[ca_cert_der, parent_der, ..., root_der]``.
+        """
+        result = [self.ca_cert_der]
+        for cert in self._parent_chain:
+            result.append(cert.public_bytes(Encoding.DER))
+        return result
+
+    @property
+    def ca_chain_pem(self) -> bytes:
+        """PEM bytes of the full trust chain, ordered leaf → root (concatenated).
+
+        Use this wherever a complete chain is needed: TLS ``load_cert_chain``,
+        EST cacerts, SCEP GetCACert (p7c), CMP GetCACerts, PKCS#12 CA bags.
+        """
+        parts: List[bytes] = [self.ca_cert_pem]
+        for cert in self._parent_chain:
+            parts.append(cert.public_bytes(Encoding.PEM))
+        return b"".join(parts)
+
+    def _write_chain_file(self) -> Path:
+        """Write (or refresh) <ca_dir>/server-chain.pem and return its path.
+
+        The file contains: server cert (if present) + intermediate(s) + root.
+        Only the intermediate portion (self._parent_chain) is written here;
+        callers prepend the leaf cert when needed.
+        """
+        chain_path = self.ca_dir / "ca-chain.pem"
+        if self._parent_chain:
+            chain_pem = b"".join(c.public_bytes(Encoding.PEM) for c in self._parent_chain)
+            chain_path.write_bytes(chain_pem)
+        return chain_path
 
     def issue_certificate(
         self,
@@ -1584,34 +1299,29 @@ class CertificateAuthority:
         with _t.start_as_current_span("ca.revoke_certificate") as _span:
             _span.set_attribute("cert.serial", serial)
             _span.set_attribute("cert.revocation_reason", reason)
-            conn = sqlite3.connect(str(self.db_path))
-            try:
-                row = conn.execute("SELECT serial FROM certificates WHERE serial=? AND revoked=0", (serial,)).fetchone()
-                if not row:
-                    return False
-                now = datetime.datetime.now(datetime.timezone.utc).isoformat()
-                conn.execute(
-                    "UPDATE certificates SET revoked=1, revoked_at=?, reason=? WHERE serial=?",
-                    (now, reason, serial),
-                )
-                conn.commit()
-                logger.info(f"Revoked certificate serial={serial} reason={reason}")
-                return True
-            except Exception as e:
-                _span.record_exception(e)
-                raise
-            finally:
-                conn.close()
+        conn = sqlite3.connect(str(self.db_path))
+        try:
+            row = conn.execute("SELECT serial FROM certificates WHERE serial=? AND revoked=0", (serial,)).fetchone()
+            if not row:
+                return False
+            now = datetime.datetime.now(datetime.timezone.utc).isoformat()
+            conn.execute(
+                "UPDATE certificates SET revoked=1, revoked_at=?, reason=? WHERE serial=?",
+                (now, reason, serial),
+            )
+            conn.commit()
+            logger.info(f"Revoked certificate serial={serial} reason={reason}")
+            return True
+        finally:
+            conn.close()
 
     def generate_crl(self) -> bytes:
         """Generate a DER-encoded CRL."""
         conn = sqlite3.connect(str(self.db_path))
-        try:
-            revoked = conn.execute(
-                "SELECT serial, revoked_at, reason FROM certificates WHERE revoked=1"
-            ).fetchall()
-        finally:
-            conn.close()
+        revoked = conn.execute(
+            "SELECT serial, revoked_at, reason FROM certificates WHERE revoked=1"
+        ).fetchall()
+        conn.close()
 
         builder = (
             x509.CertificateRevocationListBuilder()
@@ -1638,24 +1348,20 @@ class CertificateAuthority:
 
     def get_cert_by_serial(self, serial: int) -> Optional[bytes]:
         conn = sqlite3.connect(str(self.db_path))
-        try:
-            row = conn.execute("SELECT der FROM certificates WHERE serial=?", (serial,)).fetchone()
-            return row[0] if row else None
-        finally:
-            conn.close()
+        row = conn.execute("SELECT der FROM certificates WHERE serial=?", (serial,)).fetchone()
+        conn.close()
+        return row[0] if row else None
 
     def list_certificates(self) -> list:
         conn = sqlite3.connect(str(self.db_path))
-        try:
-            rows = conn.execute(
-                "SELECT serial, subject, not_before, not_after, revoked, profile FROM certificates"
-            ).fetchall()
-            return [
-                {"serial": r[0], "subject": r[1], "not_before": r[2], "not_after": r[3], "revoked": bool(r[4]), "profile": r[5] or "default"}
-                for r in rows
-            ]
-        finally:
-            conn.close()
+        rows = conn.execute(
+            "SELECT serial, subject, not_before, not_after, revoked, profile FROM certificates"
+        ).fetchall()
+        conn.close()
+        return [
+            {"serial": r[0], "subject": r[1], "not_before": r[2], "not_after": r[3], "revoked": bool(r[4]), "profile": r[5] or "default"}
+            for r in rows
+        ]
 
     def provision_tls_server_cert(self, hostname: str = "localhost") -> Tuple[Path, Path]:
         """
@@ -1691,8 +1397,21 @@ class CertificateAuthority:
 
         with open(key_path, "wb") as f:
             f.write(priv_key.private_bytes(Encoding.PEM, PrivateFormat.TraditionalOpenSSL, NoEncryption()))
+
+        # When running as intermediate CA, server.crt must include the full chain
+        # (leaf + intermediates) so TLS clients can build the path to their root.
+        # ssl.SSLContext.load_cert_chain() reads the chain from the cert file when
+        # multiple PEM blocks are present — RFC 5246 / RFC 8446 §4.4.2.
+        cert_pem = cert.public_bytes(Encoding.PEM)
+        if self._parent_chain:
+            chain_suffix = b"".join(c.public_bytes(Encoding.PEM) for c in self._parent_chain)
+            cert_pem = cert_pem + chain_suffix
+            logger.info(
+                "Intermediate CA: appended %d parent cert(s) to server.crt",
+                len(self._parent_chain),
+            )
         with open(cert_path, "wb") as f:
-            f.write(cert.public_bytes(Encoding.PEM))
+            f.write(cert_pem)
 
         logger.info(f"TLS server certificate written to {cert_path}")
         return cert_path, key_path
@@ -1823,9 +1542,27 @@ class CertificateAuthority:
 
         if require_client_cert:
             ctx.verify_mode = ssl.CERT_REQUIRED
-            ca_pem_path = self.ca_dir / "ca.crt"
-            ctx.load_verify_locations(str(ca_pem_path))
-            logger.info("TLS mode: mutual (client certificate required)")
+            # For mTLS the trust anchor must include the full chain so Python's ssl
+            # module can verify client certs that chain through intermediates.
+            # load_verify_locations() accepts a PEM file with multiple concatenated
+            # certificates (per OpenSSL convention).
+            if self._parent_chain:
+                # Write a temporary combined trust-anchor file: this CA + all parents
+                import tempfile as _tf, os as _os
+                trust_pem = self.ca_chain_pem          # leaf … root
+                with _tf.NamedTemporaryFile(delete=False, suffix=".pem") as _f:
+                    _f.write(trust_pem)
+                    _trust_tmp = _f.name
+                ctx.load_verify_locations(_trust_tmp)
+                _os.unlink(_trust_tmp)
+                logger.info(
+                    "TLS mode: mutual — trust anchor is full chain (%d cert(s))",
+                    1 + len(self._parent_chain),
+                )
+            else:
+                ca_pem_path = self.ca_dir / "ca.crt"
+                ctx.load_verify_locations(str(ca_pem_path))
+                logger.info("TLS mode: mutual (client certificate required)")
         else:
             ctx.verify_mode = ssl.CERT_NONE
             logger.info("TLS mode: one-way (server certificate only)")
@@ -1893,6 +1630,7 @@ class CertificateAuthority:
         )
 
         # Write to temp files (SSLContext.load_cert_chain needs file paths)
+        import tempfile, os
         with tempfile.NamedTemporaryFile(delete=False, suffix=".pem") as cf:
             cf.write(cert.public_bytes(Encoding.PEM))
             cert_tmp = cf.name
@@ -1928,8 +1666,17 @@ class CertificateAuthority:
             ctx.verify_mode = ssl.CERT_REQUIRED
             ctx.minimum_version = ssl.TLSVersion.TLSv1_2
 
-        ca_pem_path = self.ca_dir / "ca.crt"
-        ctx.load_verify_locations(str(ca_pem_path))
+        # For intermediate CA, include the full chain in the trust store
+        if self._parent_chain:
+            import tempfile as _tf, os as _os
+            with _tf.NamedTemporaryFile(delete=False, suffix=".pem") as _f:
+                _f.write(self.ca_chain_pem)
+                _trust_tmp = _f.name
+            ctx.load_verify_locations(_trust_tmp)
+            _os.unlink(_trust_tmp)
+        else:
+            ca_pem_path = self.ca_dir / "ca.crt"
+            ctx.load_verify_locations(str(ca_pem_path))
         return ctx
 
     def get_certificate_by_serial(self, serial: int) -> Optional[str]:
@@ -1938,20 +1685,43 @@ class CertificateAuthority:
         conn.row_factory = sqlite3.Row
         try:
             row = conn.execute(
-                "SELECT der FROM certificates WHERE serial=?", (serial,)
+                "SELECT cert_pem FROM certificates WHERE serial=?", (serial,)
             ).fetchone()
-            if not row:
-                return None
-            cert = x509.load_der_x509_certificate(row["der"])
-            return cert.public_bytes(Encoding.PEM).decode()
+            return row["cert_pem"] if row else None
         finally:
             conn.close()
 
     def generate_crl_der(self) -> bytes:
-        """Generate and return the current CRL in DER format.
-        Delegates to generate_crl() to avoid duplicated logic.
-        """
-        return self.generate_crl()
+        """Generate and return the current CRL in DER format."""
+        # Build a real CRL from the revoked serials in the DB
+        builder = (
+            x509.CertificateRevocationListBuilder()
+            .issuer_name(self.ca_cert.subject)
+            .last_update(datetime.datetime.now(datetime.timezone.utc))
+            .next_update(datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(days=7))
+        )
+        conn = sqlite3.connect(str(self.db_path))
+        conn.row_factory = sqlite3.Row
+        try:
+            rows = conn.execute(
+                "SELECT serial, revoked_at FROM certificates WHERE revoked=1"
+            ).fetchall()
+            for row in rows:
+                revoked_cert = (
+                    x509.RevokedCertificateBuilder()
+                    .serial_number(row["serial"])
+                    .revocation_date(
+                        datetime.datetime.fromtimestamp(row["revoked_at"], tz=datetime.timezone.utc)
+                        if row["revoked_at"]
+                        else datetime.datetime.now(datetime.timezone.utc)
+                    )
+                    .build()
+                )
+                builder = builder.add_revoked_certificate(revoked_cert)
+        finally:
+            conn.close()
+        crl = builder.sign(private_key=self.ca_key, algorithm=SHA256())
+        return crl.public_bytes(Encoding.DER)
 
     # ------------------------------------------------------------------
     # Sub-CA issuance
@@ -1996,11 +1766,14 @@ class CertificateAuthority:
             return None
         cert = x509.load_der_x509_certificate(der)
         enc = serialization.BestAvailableEncryption(password) if password else serialization.NoEncryption()
+        # Include the full CA chain in the PKCS#12 CA bag so that importing
+        # applications (browsers, OS key stores) can build the complete path.
+        ca_bag = [self.ca_cert] + list(self._parent_chain)
         p12 = pkcs12.serialize_key_and_certificates(
             name=f"cert-{serial}".encode(),
             key=None,
             cert=cert,
-            cas=[self.ca_cert],
+            cas=ca_bag,
             encryption_algorithm=enc,
         )
         return p12
@@ -2135,20 +1908,18 @@ class CertificateAuthority:
     # ------------------------------------------------------------------
 
     def _init_key_archive_table(self):
-        """Create key_archive table if it does not exist."""
+        """Create key_archive table if it does not exist (called from _init_db)."""
         conn = sqlite3.connect(str(self.db_path))
-        try:
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS key_archive (
-                    serial      INTEGER PRIMARY KEY,
-                    archived_at TEXT NOT NULL,
-                    encrypted   BLOB NOT NULL,
-                    subject     TEXT NOT NULL
-                )
-            """)
-            conn.commit()
-        finally:
-            conn.close()
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS key_archive (
+                serial      INTEGER PRIMARY KEY,
+                archived_at TEXT NOT NULL,
+                encrypted   BLOB NOT NULL,
+                subject     TEXT NOT NULL
+            )
+        """)
+        conn.commit()
+        conn.close()
 
     def archive_private_key(self, serial: int, private_key_pem: bytes) -> bool:
         """
@@ -2294,19 +2065,7 @@ class CertificateAuthority:
         for ext in cert.extensions:
             nc_cert = nc_cert.add_extension(ext.value, critical=ext.critical)
         nc_cert = nc_cert.add_extension(nc_ext, critical=True)
-        final_cert = nc_cert.sign(self.ca_key, SHA256())
-
-        # Update the DB record so the stored DER matches the returned certificate
-        conn = sqlite3.connect(str(self.db_path))
-        try:
-            conn.execute(
-                "UPDATE certificates SET der=? WHERE serial=?",
-                (final_cert.public_bytes(Encoding.DER), cert.serial_number),
-            )
-            conn.commit()
-        finally:
-            conn.close()
-        return final_cert
+        return nc_cert.sign(self.ca_key, SHA256())
 
     # ------------------------------------------------------------------
     # Feature 8 — Expiry monitoring
@@ -2572,7 +2331,7 @@ class CertificateAuthority:
             "# TYPE pypki_certs_by_profile gauge",
         ]
         for profile, count in m["pypki_certs_by_profile"].items():
-            safe = profile.replace('"', '\\"')
+            safe = profile.replace('"', '\"')
             lines.append(f'pypki_certs_by_profile{{profile="{safe}"}} {count}')
         lines.append("")  # trailing newline
         return "\n".join(lines) + "\n"
@@ -2952,1184 +2711,23 @@ class CertificateAuthority:
         self._ocsp_cache().pop(serial, None)
 
 
-# ---------------------------------------------------------------------------
-# CMPv2 Request Handler
-# ---------------------------------------------------------------------------
-
-class CMPv2Handler:
-    """Process incoming CMPv2 PKIMessages and generate responses."""
-
-    SUPPORTED_BODY_TYPES = {"ir", "cr", "kur", "rr", "certConf", "genm", "p10cr"}
-
-    def __init__(self, ca: CertificateAuthority):
-        self.ca = ca
-        self._pending_confirmations: Dict[bytes, Tuple[bytes, float]] = {}  # txid -> (cert_der, timestamp)
-        self._pending_ttl = 300  # 5 minutes TTL for unconfirmed certs
-        self._lock = threading.Lock()
-
-    def handle(self, der_data: bytes) -> bytes:
-        """Main entry point. Returns DER-encoded PKIMessage response."""
-        try:
-            msg = CMPv2ASN1.parse_pki_message(der_data)
-
-            if "parse_error" in msg and not msg.get("body_type"):
-                logger.warning(f"Failed to parse CMPv2 message: {msg['parse_error']}")
-                return self._build_error(
-                    b"\x00" * 16, b"\x00" * 16, b"\x00" * 16,
-                    2, "Could not parse PKIMessage"
-                )
-
-            body_type = msg.get("body_type", "unknown")
-            header = msg.get("header", {})
-            txid = header.get("transactionID", os.urandom(16))
-            snonce = header.get("senderNonce", os.urandom(16))
-
-            logger.info(f"CMPv2 request: body_type={body_type} txid={txid.hex() if txid else 'none'}")
-
-            if body_type in ("ir", "cr"):
-                return self._handle_cert_request(msg, txid, snonce, body_type)
-            elif body_type == "kur":
-                return self._handle_key_update(msg, txid, snonce)
-            elif body_type == "rr":
-                return self._handle_revocation(msg, txid, snonce)
-            elif body_type == "certConf":
-                return self._handle_cert_confirm(msg, txid, snonce)
-            elif body_type == "genm":
-                return self._handle_genm(msg, txid, snonce)
-            elif body_type == "p10cr":
-                return self._handle_p10cr(msg, txid, snonce)
-            else:
-                logger.warning(f"Unsupported body type: {body_type}")
-                return self._build_error(txid, snonce, os.urandom(16), 2, f"Unsupported body type: {body_type}")
-
-        except Exception as e:
-            logger.error(f"Error handling CMPv2 message: {e}\n{traceback.format_exc()}")
-            return self._build_error(
-                os.urandom(16), os.urandom(16), os.urandom(16),
-                2, f"Internal server error: {e}"
-            )
-
-    def _handle_cert_request(self, msg: dict, txid: bytes, snonce: bytes, req_type: str) -> bytes:
-        """Handle ir (Initialization Request) or cr (Certification Request)."""
-        body_raw = msg.get("body_raw", b"")
-        resp_body_type = 1 if req_type == "ir" else 3  # ip=1, cp=3
-
-        try:
-            subject_str, spki_der = CMPv2ASN1.extract_subject_and_pubkey_from_crmf(body_raw)
-
-            if spki_der:
-                # Parse the SubjectPublicKeyInfo to get a public key
-                pub_key = serialization.load_der_public_key(spki_der)
-                cert = self.ca.issue_certificate(subject_str or "CN=CMPv2 Client", pub_key)
-                cert_der = cert.public_bytes(Encoding.DER)
-                private_key_pem = None
-            else:
-                # No public key provided — generate one server-side
-                logger.info("No public key in request, generating key pair server-side.")
-                priv_key, cert = self.ca.generate_ephemeral_key_and_cert(
-                    subject_str or "CN=CMPv2 Client"
-                )
-                cert_der = cert.public_bytes(Encoding.DER)
-                private_key_pem = priv_key.private_bytes(
-                    Encoding.PEM, PrivateFormat.TraditionalOpenSSL, NoEncryption()
-                )
-
-            # Store pending for certConf
-            with self._lock:
-                self._evict_stale_confirmations()
-                self._pending_confirmations[txid] = (cert_der, time.time())
-
-            body = CMPv2ASN1.build_ip_cp_body(cert_der, status=0, request_id=0)
-            resp = CMPv2ASN1.build_pki_message(resp_body_type, body, txid, os.urandom(16), snonce)
-
-            logger.info(f"Certificate issued for '{subject_str}', serial={cert.serial_number}")
-            return resp
-
-        except Exception as e:
-            logger.error(f"Certificate issuance failed: {e}")
-            body = CMPv2ASN1.build_ip_cp_body(b"", status=2)
-            return CMPv2ASN1.build_pki_message(resp_body_type, body, txid, os.urandom(16), snonce)
-
-    def _handle_p10cr(self, msg: dict, txid: bytes, snonce: bytes) -> bytes:
-        """Handle PKCS#10 Certificate Request."""
-        body_raw = msg.get("body_raw", b"")
-        try:
-            # body_raw is directly the PKCS#10 CSR DER
-            csr = x509.load_der_x509_csr(body_raw)
-            subject_str = csr.subject.rfc4514_string()
-            pub_key = csr.public_key()
-            cert = self.ca.issue_certificate(subject_str, pub_key)
-            cert_der = cert.public_bytes(Encoding.DER)
-
-            with self._lock:
-                self._evict_stale_confirmations()
-                self._pending_confirmations[txid] = (cert_der, time.time())
-
-            body = CMPv2ASN1.build_ip_cp_body(cert_der, status=0, request_id=0)
-            return CMPv2ASN1.build_pki_message(3, body, txid, os.urandom(16), snonce)
-        except Exception as e:
-            logger.error(f"p10cr failed: {e}")
-            body = CMPv2ASN1.build_error_body(2, str(e))
-            return CMPv2ASN1.build_pki_message(23, body, txid, os.urandom(16), snonce)
-
-    def _handle_key_update(self, msg: dict, txid: bytes, snonce: bytes) -> bytes:
-        """Handle Key Update Request (kur -> kup)."""
-        # Treat like a cert request
-        return self._handle_cert_request(msg, txid, snonce, "cr")
-
-    def _handle_revocation(self, msg: dict, txid: bytes, snonce: bytes) -> bytes:
-        """Handle Revocation Request (rr -> rp)."""
-        body_raw = msg.get("body_raw", b"")
-
-        # Extract serial from RevDetails (RFC 4210 §5.3.9)
-        # RevDetails ::= SEQUENCE { certDetails CertTemplate, ... }
-        # CertTemplate has [1] serialNumber (context tag 1, INTEGER)
-        serial = None
-        try:
-            # RevReqContent ::= SEQUENCE OF RevDetails
-            # Each RevDetails: SEQUENCE { certDetails CertTemplate, ... }
-            pos = 0
-            if body_raw and body_raw[0] == 0x30:
-                # Unwrap outer SEQUENCE (RevReqContent)
-                _, outer_val, _ = CMPv2ASN1._decode_tlv(body_raw, 0)
-                # First RevDetails SEQUENCE
-                if outer_val and outer_val[0] == 0x30:
-                    _, rd_val, _ = CMPv2ASN1._decode_tlv(outer_val, 0)
-                    # certDetails (CertTemplate SEQUENCE)
-                    if rd_val and rd_val[0] == 0x30:
-                        _, tmpl_val, _ = CMPv2ASN1._decode_tlv(rd_val, 0)
-                        # Walk CertTemplate context-tagged fields
-                        tpos = 0
-                        while tpos < len(tmpl_val):
-                            ftag = tmpl_val[tpos]
-                            flen, fnext = CMPv2ASN1._decode_length(tmpl_val, tpos + 1)
-                            fval = tmpl_val[fnext:fnext + flen]
-                            field_num = ftag & 0x1F
-                            if field_num == 1:  # [1] serialNumber
-                                serial = int.from_bytes(fval, "big")
-                                break
-                            tpos = fnext + flen
-        except Exception as e:
-            logger.debug(f"RevDetails parse error: {e}")
-
-        if serial and self.ca.revoke_certificate(serial):
-            body = CMPv2ASN1.build_rp_body(0)
-        else:
-            logger.warning(f"Revocation: serial {serial} not found or already revoked")
-            body = CMPv2ASN1.build_rp_body(2)
-
-        return CMPv2ASN1.build_pki_message(12, body, txid, os.urandom(16), snonce)
-
-    def _evict_stale_confirmations(self):
-        """Remove pending confirmations older than _pending_ttl seconds (called under lock)."""
-        now = time.time()
-        stale = [k for k, (_, ts) in self._pending_confirmations.items()
-                 if now - ts > self._pending_ttl]
-        for k in stale:
-            self._pending_confirmations.pop(k, None)
-        if stale:
-            logger.debug(f"Evicted {len(stale)} stale pending confirmation(s)")
-
-    def _handle_cert_confirm(self, msg: dict, txid: bytes, snonce: bytes) -> bytes:
-        """Handle Certificate Confirmation (certConf -> pkiconf)."""
-        with self._lock:
-            entry = self._pending_confirmations.pop(txid, None)
-            cert_der = entry[0] if entry else None
-
-        if cert_der:
-            logger.info(f"Certificate confirmed for txid={txid.hex()}")
-        else:
-            logger.warning(f"CertConf for unknown txid={txid.hex()}")
-
-        body = CMPv2ASN1.build_pkiconf_body()
-        return CMPv2ASN1.build_pki_message(19, body, txid, os.urandom(16), snonce)
-
-    def _handle_genm(self, msg: dict, txid: bytes, snonce: bytes) -> bytes:
-        """Handle General Message — respond with CA cert info."""
-        # Build GenRepContent with CA cert
-        ca_der = self.ca.ca_cert_der
-
-        def seq(c): return b"\x30" + CMPv2ASN1._encode_length(len(c)) + c
-        def octet_string(v): return b"\x04" + CMPv2ASN1._encode_length(len(v)) + v
-        def oid(dotted):
-            parts = list(map(int, dotted.split(".")))
-            enc = bytes([40 * parts[0] + parts[1]])
-            for p in parts[2:]:
-                if p == 0:
-                    enc += b"\x00"
-                else:
-                    buf = []
-                    while p:
-                        buf.append(p & 0x7F)
-                        p >>= 7
-                    buf.reverse()
-                    enc += bytes([(b | 0x80) if i < len(buf)-1 else b for i, b in enumerate(buf)])
-            return b"\x06" + CMPv2ASN1._encode_length(len(enc)) + enc
-
-        # OID 1.3.6.1.5.5.7.4.2 = id-it-caProtEncCert  (CA Cert)
-        info_value = seq(oid("1.3.6.1.5.5.7.4.2") + octet_string(ca_der))
-        genp_body = seq(info_value)
-
-        return CMPv2ASN1.build_pki_message(22, genp_body, txid, os.urandom(16), snonce)
-
-    def _build_error(self, txid: bytes, snonce: bytes, recip_nonce: bytes, status: int, text: str) -> bytes:
-        body = CMPv2ASN1.build_error_body(status, text)
-        return CMPv2ASN1.build_pki_message(23, body, txid, os.urandom(16), snonce)
-
-
-# ---------------------------------------------------------------------------
-# CMPv3 Handler (RFC 9480 — CMP Updates)
-# ---------------------------------------------------------------------------
-
-# RFC 9480 / RFC 9483 OIDs for new genm info types
-OID_IT_GETCACERTS           = "1.3.6.1.5.5.7.4.17"   # id-it 17
-OID_IT_GETROOTCAUPDATE      = "1.3.6.1.5.5.7.4.18"   # id-it 18
-OID_IT_GETROOTCAUPDATE_RESP = "1.3.6.1.5.5.7.4.20"   # id-it 20  (RootCaKeyUpdateContent)
-OID_IT_GETCERTREQTEMPLATE   = "1.3.6.1.5.5.7.4.19"   # id-it 19
-OID_IT_CRLSTATUSLIST        = "1.3.6.1.5.5.7.4.21"   # id-it 21  (CRL update request)
-OID_IT_CRLUPDATERESP        = "1.3.6.1.5.5.7.4.22"   # id-it 22  (CRL update response)
-OID_IT_CAPROTENCERT         = "1.3.6.1.5.5.7.4.2"    # original id-it-caProtEncCert
-OID_IT_SIGNKEYPAIRTYPES     = "1.3.6.1.5.5.7.4.3"    # id-it-signKeyPairTypes
-OID_IT_ENCKEYPAIRTYPES      = "1.3.6.1.5.5.7.4.4"    # id-it-encKeyPairTypes
-OID_IT_PREFERREDSYMMALG     = "1.3.6.1.5.5.7.4.5"    # id-it-preferredSymmAlg
-OID_IT_CACERTS              = "1.3.6.1.5.5.7.4.17"
-
-# Well-known URI prefix (RFC 9480 / RFC 9811)
-CMP_WELL_KNOWN_PATH = "/.well-known/cmp"
-
-
-class CMPv3Handler(CMPv2Handler):
-    """
-    CMPv3 handler extending CMPv2Handler with RFC 9480 / RFC 9483 features:
-      - pvno=3 version negotiation
-      - Extended polling (pollReq/pollRep for all message types)
-      - New genm types: GetCACerts, GetRootCACertUpdate, GetCertReqTemplate,
-        CRLStatusList / CRLUpdateRetrieve
-      - Well-known URI path routing (/.well-known/cmp[/p/<label>])
-    """
-
-    PVNO_CMP2021 = 3   # CMPv3 version number per RFC 9480
-    PVNO_CMP2000 = 2   # CMPv2 version number per RFC 4210
-
-    # poll period in seconds when a request is queued for async processing
-    POLL_PERIOD = 5
-
-    def __init__(self, ca: "CertificateAuthority"):
-        super().__init__(ca)
-        # txid -> {"status": "waiting"|"ready"|"error", "response": bytes, "deadline": float}
-        self._polling_table: Dict[bytes, Dict] = {}
-        self._poll_lock = threading.Lock()
-
-    def handle(self, der_data: bytes) -> bytes:
-        """Override: detect pvno=3 and route to CMPv3-aware handling."""
-        try:
-            msg = CMPv2ASN1.parse_pki_message(der_data)
-            pvno = msg.get("header", {}).get("pvno", 2)
-            body_type = msg.get("body_type", "unknown")
-            header = msg.get("header", {})
-            txid = header.get("transactionID", os.urandom(16))
-            snonce = header.get("senderNonce", os.urandom(16))
-
-            # Echo back pvno=3 if client sent pvno=3
-            response_pvno = self.PVNO_CMP2021 if pvno == 3 else self.PVNO_CMP2000
-
-            logger.info(
-                f"CMPv3 request: body_type={body_type} pvno={pvno} "
-                f"txid={txid.hex() if txid else 'none'}"
-            )
-
-            # pollReq — check the polling table
-            if body_type == "pollReq":
-                return self._handle_poll_req(msg, txid, snonce, response_pvno)
-
-            # Route to appropriate handler
-            if body_type in ("ir", "cr"):
-                resp = self._handle_cert_request(msg, txid, snonce, body_type)
-            elif body_type == "kur":
-                resp = self._handle_key_update(msg, txid, snonce)
-            elif body_type == "rr":
-                resp = self._handle_revocation(msg, txid, snonce)
-            elif body_type == "certConf":
-                resp = self._handle_cert_confirm(msg, txid, snonce)
-            elif body_type == "genm":
-                resp = self._handle_genm_v3(msg, txid, snonce, response_pvno)
-            elif body_type == "p10cr":
-                resp = self._handle_p10cr(msg, txid, snonce)
-            elif body_type == "error":
-                # RFC 9480: client may send error — acknowledge it
-                logger.warning(f"Client sent error message txid={txid.hex()}")
-                body = CMPv2ASN1.build_pkiconf_body()
-                resp = CMPv2ASN1.build_pki_message(
-                    19, body, txid, os.urandom(16), snonce, pvno=response_pvno
-                )
-            else:
-                logger.warning(f"Unsupported body type: {body_type}")
-                resp = self._build_error_v3(
-                    txid, snonce, os.urandom(16), 2,
-                    f"Unsupported body type: {body_type}", response_pvno
-                )
-
-            return resp
-
-        except Exception as e:
-            logger.error(f"CMPv3 handler error: {e}\n{traceback.format_exc()}")
-            return self._build_error(
-                os.urandom(16), os.urandom(16), os.urandom(16),
-                2, f"Internal server error: {e}"
-            )
-
-    # ------------------------------------------------------------------
-    # Extended genm (RFC 9480 new info types)
-    # ------------------------------------------------------------------
-
-    def _handle_genm_v3(self, msg: dict, txid: bytes, snonce: bytes, pvno: int) -> bytes:
-        """
-        Handle General Message with RFC 9480 extended info types.
-        Falls back to CMPv2 CA cert response for unknown OIDs.
-        """
-        body_raw = msg.get("body_raw", b"")
-        req_oid = self._extract_genm_oid(body_raw)
-
-        logger.info(f"genm OID: {req_oid!r}")
-
-        def _build_genp(info_value_der: bytes) -> bytes:
-            def seq(c): return b"\x30" + CMPv2ASN1._encode_length(len(c)) + c
-            genp_body = seq(info_value_der)
-            return CMPv2ASN1.build_pki_message(
-                22, genp_body, txid, os.urandom(16), snonce, pvno=pvno
-            )
-
-        def _oid_bytes(dotted: str) -> bytes:
-            parts = list(map(int, dotted.split(".")))
-            enc = bytes([40 * parts[0] + parts[1]])
-            for p in parts[2:]:
-                if p == 0:
-                    enc += b"\x00"
-                else:
-                    buf = []
-                    while p:
-                        buf.append(p & 0x7F)
-                        p >>= 7
-                    buf.reverse()
-                    enc += bytes([(b | 0x80) if i < len(buf)-1 else b for i, b in enumerate(buf)])
-            return b"\x06" + CMPv2ASN1._encode_length(len(enc)) + enc
-
-        def _seq(c): return b"\x30" + CMPv2ASN1._encode_length(len(c)) + c
-        def _oct(v): return b"\x04" + CMPv2ASN1._encode_length(len(v)) + v
-
-        if req_oid == OID_IT_GETCACERTS:
-            # RFC 9480 §4.3.3 — GetCACerts: return all CA certs (we have one)
-            ca_der = self.ca.ca_cert_der
-            # CMCPublicationInfo / CACertSeq = SEQUENCE OF Certificate
-            ca_seq = _seq(ca_der)
-            info_val = _seq(_oid_bytes(OID_IT_GETCACERTS) + _seq(ca_seq))
-            logger.info("genm GetCACerts: returning CA certificate")
-            return _build_genp(info_val)
-
-        elif req_oid == OID_IT_GETROOTCAUPDATE:
-            # RFC 9480 §4.3.4 — GetRootCACertUpdate: return newWithNew
-            # We have no separate "next CA" so we return current cert as newWithNew.
-            # RootCaKeyUpdateContent ::= SEQUENCE { newWithNew Cert, [0] newWithOld OPTIONAL, [1] oldWithNew OPTIONAL }
-            ca_der = self.ca.ca_cert_der
-            root_update = _seq(ca_der)  # just newWithNew
-            info_val = _seq(_oid_bytes(OID_IT_GETCACERTS) + root_update)
-            logger.info("genm GetRootCACertUpdate: returning current CA cert as newWithNew")
-            return _build_genp(info_val)
-
-        elif req_oid == OID_IT_GETCERTREQTEMPLATE:
-            # RFC 9480 §4.3.5 — GetCertReqTemplate: return template hints
-            # CertReqTemplateContent ::= SEQUENCE {
-            #   certTemplate CertTemplate OPTIONAL,
-            #   keySpec Controls OPTIONAL
-            # }
-            # We return a minimal template indicating RSA-2048 is preferred.
-            def _int(v): return b"\x02\x01" + bytes([v])
-            def _ctx_impl(n, c): return bytes([0xA0 | n]) + CMPv2ASN1._encode_length(len(c)) + c
-
-            # OID for rsaEncryption key type
-            rsa_oid = _oid_bytes("1.2.840.113549.1.1.1")
-            # AlgorithmIdentifier { rsaEncryption, NULL }
-            alg_id = _seq(rsa_oid + b"\x05\x00")
-            # keySpec [0] Controls ::= SEQUENCE OF AttributeTypeAndValue
-            # Simplified: just wrap the AlgorithmIdentifier
-            key_spec = _ctx_impl(1, _seq(alg_id))
-
-            template_content = _seq(key_spec)
-            info_val = _seq(_oid_bytes(OID_IT_GETCERTREQTEMPLATE) + template_content)
-            logger.info("genm GetCertReqTemplate: returning RSA-2048 template hint")
-            return _build_genp(info_val)
-
-        elif req_oid == OID_IT_CRLSTATUSLIST:
-            # RFC 9480 §4.3.6 — CRLUpdateRetrieve: return current CRL
-            crl_der = self.ca.generate_crl_der()
-            # CRLSource = CHOICE { dpn [0] DistributionPointName, issuer [1] GeneralNames }
-            # We return the CRL directly in the genp value as CRLs SEQUENCE OF CertificateList
-            crls = _seq(crl_der)
-            info_val = _seq(_oid_bytes(OID_IT_CRLUPDATERESP) + crls)
-            logger.info("genm CRLStatusList: returning current CRL")
-            return _build_genp(info_val)
-
-        else:
-            # Fallback: original CMPv2 CA cert info (id-it-caProtEncCert)
-            ca_der = self.ca.ca_cert_der
-            info_val = _seq(_oid_bytes(OID_IT_CAPROTENCERT) + _oct(ca_der))
-            logger.info(f"genm unknown OID {req_oid!r}: falling back to caProtEncCert")
-            return _build_genp(info_val)
-
-    def _extract_genm_oid(self, body_raw: bytes) -> Optional[str]:
-        """Extract the first InfoTypeAndValue OID from a GenMsgContent body."""
-        try:
-            # GenMsgContent ::= SEQUENCE OF InfoTypeAndValue
-            # InfoTypeAndValue ::= SEQUENCE { infoType OID, infoValue ANY OPTIONAL }
-            pos = 0
-            # outer SEQUENCE
-            tag, outer, pos = CMPv2ASN1._decode_tlv(body_raw, 0)
-            # first InfoTypeAndValue
-            tag2, itav, _ = CMPv2ASN1._decode_tlv(outer, 0)
-            # OID
-            tag3, oid_val, _ = CMPv2ASN1._decode_tlv(itav, 0)
-            if tag3 == 0x06:
-                return self._decode_oid_bytes(oid_val)
-        except Exception as e:
-            logger.debug(f"genm OID extraction failed: {e}")
-        return None
-
-    @staticmethod
-    def _decode_oid_bytes(data: bytes) -> str:
-        if not data:
-            return ""
-        parts = [data[0] // 40, data[0] % 40]
-        i, cur = 1, 0
-        while i < len(data):
-            cur = (cur << 7) | (data[i] & 0x7F)
-            if not (data[i] & 0x80):
-                parts.append(cur)
-                cur = 0
-            i += 1
-        return ".".join(map(str, parts))
-
-    # ------------------------------------------------------------------
-    # Extended polling (RFC 9480 §3.4)
-    # ------------------------------------------------------------------
-
-    def queue_for_polling(self, txid: bytes, response: bytes, delay_secs: int = 0):
-        """Store a ready or pending response in the polling table."""
-        with self._poll_lock:
-            self._polling_table[txid] = {
-                "status": "ready" if delay_secs == 0 else "waiting",
-                "response": response,
-                "deadline": time.time() + delay_secs,
-            }
-
-    def _handle_poll_req(self, msg: dict, txid: bytes, snonce: bytes, pvno: int) -> bytes:
-        """
-        Handle pollReq (body type 25) — RFC 9480 §3.4 extended polling.
-        RFC 4210 only defined polling for ir/cr/kur. RFC 9480 extends it
-        to p10cr, certConf, rr, genm, and error responses.
-        """
-        def _seq(c): return b"\x30" + CMPv2ASN1._encode_length(len(c)) + c
-        def _int(v): return b"\x02\x01" + bytes([v & 0xFF])
-        def _int_big(v):
-            if v == 0: return b"\x02\x01\x00"
-            raw = []
-            n = v
-            while n:
-                raw.append(n & 0xFF)
-                n >>= 8
-            raw.reverse()
-            if raw[0] & 0x80:
-                raw.insert(0, 0)
-            return b"\x02" + CMPv2ASN1._encode_length(len(raw)) + bytes(raw)
-
-        with self._poll_lock:
-            entry = self._polling_table.get(txid)
-
-        if entry is None:
-            # Unknown txid — send error
-            return self._build_error_v3(
-                txid, snonce, os.urandom(16), 2,
-                f"Unknown transactionID in pollReq", pvno
-            )
-
-        if entry["status"] == "ready" or time.time() >= entry["deadline"]:
-            # Return the queued response
-            with self._poll_lock:
-                self._polling_table.pop(txid, None)
-            logger.info(f"pollReq: txid={txid.hex()!r} — returning ready response")
-            return entry["response"]
-
-        # Still waiting — send pollRep
-        # PollRepContent ::= SEQUENCE OF SEQUENCE { certReqId INTEGER, checkAfter INTEGER, reason UTF8String }
-        check_after = max(1, int(entry["deadline"] - time.time()))
-        poll_entry = _seq(
-            _int_big(0)           # certReqId
-            + _int_big(check_after)  # checkAfter (seconds)
-        )
-        poll_rep_body = _seq(poll_entry)
-        logger.info(f"pollReq: txid={txid.hex()!r} — still waiting, checkAfter={check_after}s")
-        return CMPv2ASN1.build_pki_message(
-            26, poll_rep_body, txid, os.urandom(16), snonce, pvno=pvno
-        )
-
-    def _build_error_v3(
-        self, txid: bytes, snonce: bytes, recip_nonce: bytes,
-        status: int, text: str, pvno: int
-    ) -> bytes:
-        body = CMPv2ASN1.build_error_body(status, text)
-        return CMPv2ASN1.build_pki_message(
-            23, body, txid, os.urandom(16), snonce, pvno=pvno
-        )
-
-
-# ---------------------------------------------------------------------------
-# HTTP Server (RFC 6712 - CMP over HTTP)
-# ---------------------------------------------------------------------------
-
-class CMPv2HTTPHandler(http.server.BaseHTTPRequestHandler):
-    """
-    HTTP handler for CMPv2 as per RFC 6712.
-    POST /<path> with Content-Type: application/pkixcmp
-    """
-
-    cmp_handler: CMPv2Handler = None  # Set by server
-    ca: CertificateAuthority = None
-    audit_log: "AuditLog" = None
-    rate_limiter: "RateLimiter" = None
-    admin_api_key: Optional[str] = None  # If set, required for sensitive endpoints
-    admin_allowed_cns: Optional[List[str]] = None  # mTLS CN allowlist for admin ops
-
-    # Endpoints that require admin authentication
-    _ADMIN_ENDPOINTS = {
-        "/api/revoke", "/api/sub-ca", "/api/name-constrained-ca",
-    }
-    _ADMIN_ENDPOINT_PATTERNS = [
-        r"^/api/certs/\d+/archive$",
-        r"^/api/certs/\d+/recover$",
-        r"^/api/certs/\d+/renew$",
-    ]
-
-    def _require_admin(self, path: str) -> bool:
-        """Check if this path requires admin auth, and if so, verify credentials.
-        Returns True if access is allowed, False if denied (and sends 403)."""
-        # Determine if this is an admin endpoint
-        is_admin = path in self._ADMIN_ENDPOINTS or path == "/config"
-        if not is_admin:
-            for pattern in self._ADMIN_ENDPOINT_PATTERNS:
-                if re.match(pattern, path):
-                    is_admin = True
-                    break
-        if not is_admin:
-            return True  # Not an admin endpoint — allow
-
-        # If no admin key is configured, allow (backward compat)
-        if not self.admin_api_key and not self.admin_allowed_cns:
-            return True
-
-        # Check API key header
-        if self.admin_api_key:
-            provided = self.headers.get("X-Admin-Key", "")
-            if hmac.compare_digest(provided, self.admin_api_key):
-                return True
-
-        # Check mTLS client CN allowlist
-        if self.admin_allowed_cns:
-            client_cn = self._get_client_cn()
-            if client_cn and client_cn in self.admin_allowed_cns:
-                return True
-
-        self._send_json({"error": "admin authentication required"}, 403)
-        if self.audit_log:
-            self.audit_log.record("auth_denied", f"path={path}", self.client_address[0])
-        return False
-
-    def log_message(self, format, *args):
-        client_cn = self._get_client_cn()
-        prefix = f"[mTLS:{client_cn}] " if client_cn else ""
-        logger.info(f"HTTP {prefix}{self.address_string()} - {format % args}")
-
-    def _get_client_cn(self) -> Optional[str]:
-        """Return the CN from the peer's client certificate, or None."""
-        try:
-            peer_cert = self.connection.getpeercert()
-            if peer_cert:
-                for field in peer_cert.get("subject", []):
-                    for k, v in field:
-                        if k == "commonName":
-                            return v
-        except Exception:
-            pass
-        return None
-
-    def do_POST_api(self, path: str, body: bytes):
-        """Handle POST requests to /api/* management endpoints."""
-        if not self._require_admin(path):
-            return
-        try:
-            data = json.loads(body) if body else {}
-        except json.JSONDecodeError:
-            self._send_json({"error": "invalid JSON"}, 400)
-            return
-
-        if path == "/api/sub-ca":
-            cn = data.get("cn", "PyPKI Intermediate CA")
-            validity_days = int(data.get("validity_days", 1825))
-            try:
-                key, cert = self.ca.issue_sub_ca(
-                    cn=cn, validity_days=validity_days, audit=self.audit_log
-                )
-                cert_pem = cert.public_bytes(Encoding.PEM).decode()
-                key_pem = key.private_bytes(Encoding.PEM,
-                                            PrivateFormat.TraditionalOpenSSL,
-                                            NoEncryption()).decode()
-                if self.audit_log:
-                    self.audit_log.record("issue_sub_ca",
-                                          f"cn={cn} serial={cert.serial_number}",
-                                          self.client_address[0])
-                self._send_json({
-                    "ok": True,
-                    "serial": cert.serial_number,
-                    "subject": cert.subject.rfc4514_string(),
-                    "cert_pem": cert_pem,
-                    "key_pem": key_pem,
-                })
-            except Exception as e:
-                self._send_json({"error": str(e)}, 500)
-
-        elif re.match(r"^/api/certs/\d+/renew$", path):
-            # Feature 9: POST /api/certs/<serial>/renew
-            try:
-                serial = int(path.split("/")[3])
-                validity_days = data.get("validity_days")
-                new_cert = self.ca.renew_certificate(
-                    serial=serial,
-                    validity_days=int(validity_days) if validity_days else None,
-                    audit=self.audit_log,
-                    requester_ip=self.client_address[0],
-                )
-                if new_cert is None:
-                    self._send_json({"error": "certificate not found"}, 404)
-                else:
-                    self._send_json({
-                        "ok": True,
-                        "old_serial": serial,
-                        "new_serial": new_cert.serial_number,
-                        "subject": new_cert.subject.rfc4514_string(),
-                        "not_after": new_cert.not_valid_after_utc.isoformat(),
-                        "cert_pem": new_cert.public_bytes(Encoding.PEM).decode(),
-                    })
-            except (ValueError, IndexError):
-                self._send_json({"error": "invalid serial"}, 400)
-
-        elif path == "/api/revoke":
-            serial = data.get("serial")
-            reason = int(data.get("reason", 0))
-            if serial is None:
-                self._send_json({"error": "serial required"}, 400)
-                return
-            ok = self.ca.revoke_certificate(int(serial), reason)
-            if self.audit_log:
-                self.audit_log.record("revoke",
-                                      f"serial={serial} reason={reason}",
-                                      self.client_address[0])
-            self._send_json({"ok": ok, "serial": serial})
-
-        elif re.match(r"^/api/certs/\d+/archive$", path):
-            # Feature 6: POST /api/certs/<serial>/archive  — key archival
-            try:
-                serial = int(path.split("/")[3])
-                key_pem = data.get("key_pem", "")
-                if not key_pem:
-                    self._send_json({"error": "key_pem required in request body"}, 400)
-                    return
-                ok = self.ca.archive_private_key(serial, key_pem.encode())
-                self._send_json({"ok": ok, "serial": serial, "archived": True})
-            except Exception as e:
-                self._send_json({"error": str(e)}, 500)
-
-        elif re.match(r"^/api/certs/\d+/recover$", path):
-            # Feature 6: POST /api/certs/<serial>/recover  — key recovery
-            try:
-                serial = int(path.split("/")[3])
-                key_pem = self.ca.recover_private_key(serial)
-                if key_pem is None:
-                    self._send_json({"error": "no archived key for this serial"}, 404)
-                else:
-                    self._send_json({"ok": True, "serial": serial, "key_pem": key_pem.decode()})
-            except Exception as e:
-                self._send_json({"error": str(e)}, 500)
-
-        elif path == "/api/name-constrained-ca":
-            # Feature 7: POST /api/name-constrained-ca — issue a name-constrained sub-CA
-            try:
-                cn = data.get("cn", "Name-Constrained Sub-CA")
-                validity_days = int(data.get("validity_days", 1825))
-                permitted_dns  = data.get("permitted_dns", [])
-                excluded_dns   = data.get("excluded_dns", [])
-                permitted_emails = data.get("permitted_emails", [])
-                excluded_ips   = data.get("excluded_ips", [])
-                priv_key = rsa.generate_private_key(public_exponent=65537, key_size=4096)
-                cert = self.ca.issue_certificate_with_name_constraints(
-                    subject_str=f"CN={cn},O=PyPKI Constrained CA",
-                    public_key=priv_key.public_key(),
-                    validity_days=validity_days,
-                    permitted_dns=permitted_dns,
-                    excluded_dns=excluded_dns,
-                    permitted_emails=permitted_emails,
-                    excluded_ips=excluded_ips,
-                )
-                self._send_json({
-                    "ok": True,
-                    "serial": cert.serial_number,
-                    "subject": cert.subject.rfc4514_string(),
-                    "cert_pem": cert.public_bytes(Encoding.PEM).decode(),
-                    "key_pem": priv_key.private_bytes(Encoding.PEM, PrivateFormat.TraditionalOpenSSL, NoEncryption()).decode(),
-                })
-            except Exception as e:
-                self._send_json({"error": str(e)}, 500)
-
-        else:
-            self._send_json({"error": "unknown API endpoint"}, 404)
-
-    def do_POST(self):
-        content_length = int(self.headers.get("Content-Length", 0))
-        body = self.rfile.read(content_length)
-        req_path = self.path.split("?")[0].rstrip("/")
-
-        # Management API (POST /api/*)
-        if req_path.startswith("/api/"):
-            self.do_POST_api(req_path, body)
-            return
-
-        content_type = self.headers.get("Content-Type", "")
-        if content_type not in ("application/pkixcmp", "application/pkixcmp-poll",
-                                 "application/octet-stream"):
-            logger.warning(f"Unexpected Content-Type: {content_type}")
-
-        # Log authenticated client identity
-        client_cn = self._get_client_cn()
-        if client_cn:
-            logger.info(f"Authenticated mTLS client: CN={client_cn}")
-
-        # Rate limiting
-        if self.rate_limiter:
-            ip = self.client_address[0]
-            if not self.rate_limiter.allow(ip):
-                logger.warning(f"Rate limit exceeded for {ip}")
-                self.send_response(429)
-                self.send_header("Content-Type", "text/plain")
-                self.send_header("Retry-After", "60")
-                rl_body = b"Rate limit exceeded. Try again in 60 seconds."
-                self.send_header("Content-Length", str(len(rl_body)))
-                self.end_headers()
-                self.wfile.write(rl_body)
-                return
-
-        # RFC 9480/9811 well-known CMP URI (/.well-known/cmp[/p/<label>])
-        cmp_path = self.path.split("?")[0]
-        if cmp_path.startswith(CMP_WELL_KNOWN_PATH):
-            label = self._extract_cmp_label(cmp_path)
-            if label:
-                logger.info(f"CMP well-known URI — CA label: {label!r}")
-
-        try:
-            response_der = self.cmp_handler.handle(body)
-            self.send_response(200)
-            self.send_header("Content-Type", "application/pkixcmp")
-            self.send_header("Content-Length", str(len(response_der)))
-            self.end_headers()
-            self.wfile.write(response_der)
-        except Exception as e:
-            logger.error(f"Handler error: {e}")
-            self.send_response(500)
-            self.end_headers()
-
-    @staticmethod
-    def _extract_cmp_label(path: str) -> Optional[str]:
-        """
-        Extract the CA label from a well-known CMP URI.
-        /.well-known/cmp/p/<label>/...  → label
-        /.well-known/cmp/<op>           → None
-        """
-        rest = path[len(CMP_WELL_KNOWN_PATH):].lstrip("/")
-        parts = rest.split("/")
-        if len(parts) >= 2 and parts[0] == "p":
-            return parts[1]
-        return None
-
-    def do_PATCH(self):
-        """PATCH /config — live-update validity periods and other settings."""
-        if self.path.rstrip("/") != "/config":
-            self.send_response(404)
-            self.end_headers()
-            return
-
-        if not self._require_admin("/config"):
-            return
-
-        content_length = int(self.headers.get("Content-Length", 0))
-        body = self.rfile.read(content_length)
-
-        try:
-            updates = json.loads(body)
-        except json.JSONDecodeError as e:
-            self._send_json({"error": f"Invalid JSON: {e}"}, 400)
-            return
-
-        # Validate numeric validity values if present
-        validity = updates.get("validity", {})
-        for key, val in validity.items():
-            if not isinstance(val, int) or val < 1:
-                self._send_json({"error": f"validity.{key} must be a positive integer"}, 400)
-                return
-            if val > 36500:
-                self._send_json({"error": f"validity.{key} exceeds maximum of 36500 days"}, 400)
-                return
-
-        result = self.ca.config.patch(updates)
-        logger.info(f"Config patched by {self.address_string()}: {updates}")
-        self._send_json({"ok": True, "config": result})
-
-    def do_GET(self):
-        """Simple HTTP API for management."""
-        path = self.path.split("?")[0].rstrip("/")
-
-        if path == "/config":
-            if self.ca.config:
-                self._send_json(self.ca.config.as_dict())
-            else:
-                self._send_json(DEFAULT_CONFIG)
-            return
-
-        elif path == "/ca/cert" or path == "/ca/cert.pem":
-            data = self.ca.ca_cert_pem
-            self.send_response(200)
-            self.send_header("Content-Type", "application/x-pem-file")
-            self.send_header("Content-Length", str(len(data)))
-            self.end_headers()
-            self.wfile.write(data)
-
-        elif path == "/ca/cert.der":
-            data = self.ca.ca_cert_der
-            self.send_response(200)
-            self.send_header("Content-Type", "application/pkix-cert")
-            self.send_header("Content-Length", str(len(data)))
-            self.end_headers()
-            self.wfile.write(data)
-
-        elif path == "/ca/crl":
-            try:
-                data = self.ca.generate_crl()
-                self.send_response(200)
-                self.send_header("Content-Type", "application/pkix-crl")
-                self.send_header("Content-Length", str(len(data)))
-                self.end_headers()
-                self.wfile.write(data)
-            except Exception as e:
-                self._send_json({"error": str(e)}, 500)
-
-        elif path == "/api/certs":
-            # Feature 12: optional filters ?profile=tls_server&expiring_in=30
-            qs = self.path.split("?", 1)[1] if "?" in self.path else ""
-            params: dict = {}
-            for kv in qs.split("&"):
-                if "=" in kv:
-                    k, _, v = kv.partition("=")
-                    params[k] = v
-            profile_filter = params.get("profile")
-            expiring_in    = params.get("expiring_in")
-            if expiring_in is not None:
-                try:
-                    days = int(expiring_in)
-                    certs = self.ca.expiring_certificates(days_ahead=days)
-                    if profile_filter:
-                        certs = [c for c in certs if c.get("profile") == profile_filter]
-                    self._send_json({"certificates": certs, "filter": "expiring", "days_ahead": days})
-                except ValueError:
-                    self._send_json({"error": "expiring_in must be an integer"}, 400)
-            else:
-                certs = self.ca.list_certificates()
-                if profile_filter:
-                    certs = [c for c in certs if c.get("profile") == profile_filter]
-                self._send_json({"certificates": certs})
-
-        elif path == "/api/whoami":
-            # Returns the authenticated client's certificate subject
-            client_cn = self._get_client_cn()
-            try:
-                peer = self.connection.getpeercert()
-            except Exception:
-                peer = None
-            self._send_json({
-                "authenticated": client_cn is not None,
-                "common_name": client_cn,
-                "peer_cert": str(peer) if peer else None,
-            })
-
-        elif path == "/bootstrap":
-            # Plain-HTTP endpoint: issues a fresh client cert (use only on bootstrap port)
-            # Security: enforce rate limiting and optional bootstrap token
-            if self.rate_limiter and not self.rate_limiter.allow(self.client_address[0]):
-                self._send_json({"error": "rate limit exceeded"}, 429)
-                return
-            # Check optional bootstrap token
-            bootstrap_token = getattr(self, "bootstrap_token", None)
-            if bootstrap_token:
-                provided_token = self.headers.get("X-Bootstrap-Token", "")
-                if "?" in self.path:
-                    for param in self.path.split("?")[1].split("&"):
-                        if param.startswith("token="):
-                            provided_token = param[6:]
-                if not hmac.compare_digest(provided_token, bootstrap_token):
-                    self._send_json({"error": "invalid or missing bootstrap token"}, 403)
-                    return
-            cn = self.headers.get("X-Client-CN") or "bootstrap-client"
-            # Also accept ?cn= query param
-            if "?" in self.path:
-                for param in self.path.split("?")[1].split("&"):
-                    if param.startswith("cn="):
-                        cn = param[3:]
-            # Sanitize CN — only allow safe characters
-            cn = re.sub(r'[^a-zA-Z0-9._\-]', '_', cn)[:64]
-            try:
-                cert_pem, key_pem = self.ca.issue_client_cert(cn)
-                bundle = cert_pem + key_pem + self.ca.ca_cert_pem
-                self.send_response(200)
-                self.send_header("Content-Type", "application/x-pem-file")
-                self.send_header("Content-Disposition", f'attachment; filename="{cn}-bundle.pem"')
-                self.send_header("Content-Length", str(len(bundle)))
-                self.end_headers()
-                self.wfile.write(bundle)
-                logger.info(f"Bootstrap: issued client cert CN={cn}")
-            except Exception as e:
-                self._send_json({"error": str(e)}, 500)
-
-        elif path == "/health":
-            self._send_json({
-                "status": "ok",
-                "ca_subject": self.ca.ca_cert.subject.rfc4514_string(),
-                "ca_serial": self.ca.ca_cert.serial_number,
-            })
-
-        elif path == "/metrics":
-            # Feature 11: Prometheus-compatible metrics endpoint
-            body = self.ca.metrics_prometheus().encode()
-            self.send_response(200)
-            self.send_header("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
-            return
-
-        elif path == "/api/expiring":
-            # Feature 8: GET /api/expiring?days=30
-            qs = self.path.split("?", 1)[1] if "?" in self.path else ""
-            params = {}
-            for kv in qs.split("&"):
-                if "=" in kv:
-                    k, _, v = kv.partition("=")
-                    params[k] = v
-            try:
-                days = int(params.get("days", 30))
-            except ValueError:
-                days = 30
-            expiring = self.ca.expiring_certificates(days_ahead=days)
-            self._send_json({"expiring": expiring, "days_ahead": days, "count": len(expiring)})
-
-        elif path == "/ca/delta-crl":
-            try:
-                data = self.ca.generate_delta_crl()
-                self.send_response(200)
-                self.send_header("Content-Type", "application/pkix-crl")
-                self.send_header("Content-Length", str(len(data)))
-                self.end_headers()
-                self.wfile.write(data)
-            except Exception as e:
-                self._send_json({"error": str(e)}, 500)
-
-        elif path.startswith("/api/certs/") and path.endswith("/p12"):
-            # GET /api/certs/<serial>/p12
-            try:
-                serial = int(path.split("/")[3])
-                p12 = self.ca.export_pkcs12(serial)
-                if p12 is None:
-                    self._send_json({"error": "certificate not found"}, 404)
-                else:
-                    self.send_response(200)
-                    self.send_header("Content-Type", "application/x-pkcs12")
-                    self.send_header("Content-Disposition",
-                                     f'attachment; filename="cert-{serial}.p12"')
-                    self.send_header("Content-Length", str(len(p12)))
-                    self.end_headers()
-                    self.wfile.write(p12)
-            except (ValueError, IndexError):
-                self._send_json({"error": "invalid serial"}, 400)
-
-        elif path.startswith("/api/certs/") and path.endswith("/pem"):
-            try:
-                serial = int(path.split("/")[3])
-                der = self.ca.get_cert_by_serial(serial)
-                if not der:
-                    self._send_json({"error": "certificate not found"}, 404)
-                else:
-                    pem = x509.load_der_x509_certificate(der).public_bytes(Encoding.PEM)
-                    self.send_response(200)
-                    self.send_header("Content-Type", "application/x-pem-file")
-                    self.send_header("Content-Disposition",
-                                     f'attachment; filename="cert-{serial}.pem"')
-                    self.send_header("Content-Length", str(len(pem)))
-                    self.end_headers()
-                    self.wfile.write(pem)
-            except (ValueError, IndexError):
-                self._send_json({"error": "invalid serial"}, 400)
-
-        elif path == "/api/audit":
-            if self.audit_log:
-                self._send_json({"events": self.audit_log.recent(200)})
-            else:
-                self._send_json({"events": []})
-
-        elif path == "/api/rate-limit":
-            if self.rate_limiter:
-                ip = self.client_address[0]
-                self._send_json(self.rate_limiter.status(ip))
-            else:
-                self._send_json({"rate_limiting": "disabled"})
-
-        elif path.startswith(CMP_WELL_KNOWN_PATH):
-            # RFC 9811: GET /.well-known/cmp -> return CA certificate
-            label = self._extract_cmp_label(path)
-            data = self.ca.ca_cert_pem
-            self.send_response(200)
-            self.send_header("Content-Type", "application/x-pem-file")
-            self.send_header("Content-Length", str(len(data)))
-            if label:
-                self.send_header("X-CMP-CA-Label", label)
-            self.end_headers()
-            self.wfile.write(data)
-
-        else:
-            self._send_json({
-                "endpoints": {
-                    "POST /": "CMPv2/CMPv3 endpoint (application/pkixcmp)",
-                    "POST /.well-known/cmp": "RFC 9811 well-known CMP URI",
-                    "POST /.well-known/cmp/p/<label>": "Named CA well-known CMP URI (RFC 9811)",
-                    "GET  /config": "View current configuration",
-                    "PATCH /config": "Live-update: PATCH /config with JSON {validity:{end_entity_days:90}}",
-                    "GET /ca/cert.pem": "CA certificate (PEM)",
-                    "GET /ca/cert.der": "CA certificate (DER)",
-                    "GET /ca/crl": "Certificate Revocation List (DER)",
-                    "GET /ca/delta-crl": "Delta CRL (RFC 5280 §5.2.4)",
-                    "GET /api/certs": "List issued certificates (JSON)",
-                    "GET /api/certs/<serial>/pem": "Download certificate as PEM",
-                    "GET /api/certs/<serial>/p12": "Download certificate as PKCS#12 bundle",
-                    "POST /api/sub-ca": "Issue subordinate CA certificate",
-                    "POST /api/revoke": "Revoke certificate {serial, reason}",
-                    "GET /api/audit": "Structured audit log (last 200 events)",
-                    "GET /api/rate-limit": "Rate limit status for calling IP",
-                    "GET /api/whoami": "Show authenticated mTLS client identity",
-                    "GET /bootstrap?cn=<n>": "Issue client cert bundle (bootstrap port only)",
-                    "GET /health": "Health check",
-                    "GET /metrics": "Prometheus text-format metrics",
-                    "GET /api/expiring?days=30": "Certificates expiring within N days",
-                    "GET /.well-known/cmp": "RFC 9811 well-known CMP CA cert (GET)",
-                    "POST /api/certs/<serial>/renew": "Renew certificate (same key + profile)",
-                    "POST /api/certs/<serial>/archive": "Archive subscriber private key (key escrow)",
-                    "POST /api/certs/<serial>/recover": "Recover archived private key",
-                    "POST /api/name-constrained-ca": "Issue name-constrained sub-CA",
-                }
-            })
-
-    def _send_json(self, data: dict, code: int = 200):
-        body = json.dumps(data, indent=2).encode()
-        self.send_response(code)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
-
-
-class ThreadedHTTPServer(http.server.ThreadingHTTPServer):
-    allow_reuse_address = True
-    daemon_threads = True
-
-
-class TLSServer(ThreadedHTTPServer):
-    """
-    HTTPS server that wraps each accepted socket with an SSLContext.
-
-    Modes (controlled by the SSLContext verify_mode):
-      - One-way TLS  (ssl.CERT_NONE)     : --tls   (server cert only)
-      - Mutual  TLS  (ssl.CERT_REQUIRED) : --mtls  (client cert required)
-    """
-    ssl_context: ssl.SSLContext = None
-
-    def get_request(self):
-        sock, addr = super().get_request()
-        try:
-            tls_sock = self.ssl_context.wrap_socket(sock, server_side=True)
-            return tls_sock, addr
-        except ssl.SSLError as e:
-            logger.warning(f"TLS handshake failed from {addr}: {e}")
-            sock.close()
-            raise
-
-# Backwards-compatible alias
-MTLSServer = TLSServer
-
-
-# ---------------------------------------------------------------------------
-# CLI / Main
-# ---------------------------------------------------------------------------
-
-def make_handler(ca: CertificateAuthority, cmp_handler,
-                 audit_log: Optional[AuditLog] = None,
-                 rate_limiter: Optional[RateLimiter] = None,
-                 admin_api_key: Optional[str] = None,
-                 admin_allowed_cns: Optional[List[str]] = None,
-                 bootstrap_token: Optional[str] = None):
-    """Create a bound HTTP handler class with CA and CMP handler attached."""
-    class BoundHandler(CMPv2HTTPHandler):
-        pass
-    BoundHandler.ca = ca
-    BoundHandler.cmp_handler = cmp_handler
-    BoundHandler.audit_log = audit_log
-    BoundHandler.rate_limiter = rate_limiter
-    BoundHandler.admin_api_key = admin_api_key
-    BoundHandler.admin_allowed_cns = admin_allowed_cns
-    BoundHandler.bootstrap_token = bootstrap_token
-    return BoundHandler
-
-
-def make_cmpv3_handler(ca: CertificateAuthority, cmp_handler,
-                       audit_log: Optional[AuditLog] = None,
-                       rate_limiter: Optional[RateLimiter] = None,
-                       admin_api_key: Optional[str] = None,
-                       admin_allowed_cns: Optional[List[str]] = None,
-                       bootstrap_token: Optional[str] = None):
-    """Alias for make_handler (kept for backward compatibility)."""
-    return make_handler(ca, cmp_handler, audit_log, rate_limiter,
-                        admin_api_key, admin_allowed_cns, bootstrap_token)
-
-
-def start_bootstrap_server(host: str, port: int, ca: CertificateAuthority, cmp_handler: CMPv2Handler):
-    """
-    Start a plain-HTTP server on a separate port for bootstrapping client certs.
-    This should only be accessible on a trusted network / localhost.
-    """
-    handler_class = make_handler(ca, cmp_handler)
-    srv = ThreadedHTTPServer((host, port), handler_class)
-    t = threading.Thread(target=srv.serve_forever, daemon=True)
-    t.start()
-    logger.info(f"Bootstrap HTTP server listening on http://{host}:{port}")
-    return srv
-
-
 def main():
     parser = argparse.ArgumentParser(description="PKI Server with CMPv2 Support + mTLS")
-    parser.add_argument("--host", default="127.0.0.1", help="Bind address (default: 127.0.0.1)")
+    parser.add_argument("--host", default="0.0.0.0", help="Bind address (default: 0.0.0.0)")
     parser.add_argument("--port", type=int, default=8080, help="Port (default: 8080)")
     parser.add_argument("--ca-dir", default="./ca", help="CA data directory (default: ./ca)")
     parser.add_argument("--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"])
+    parser.add_argument(
+        "--parent-cert", default=None, metavar="PATH",
+        help=(
+            "PEM file containing the certificate(s) that signed ca.crt, enabling "
+            "intermediate CA mode.  List certs from the immediate parent to the root, "
+            "one per PEM block.  When present: TLS handshakes include the full chain, "
+            "EST /cacerts serves the full chain, SCEP GetCACert returns a p7c, "
+            "CMP GetCACerts lists all CA certs, and PKCS#12 bundles include the chain. "
+            "You may also place this file at <ca-dir>/ca-chain.pem and omit this flag."
+        ),
+    )
     tls_group = parser.add_argument_group(
         "TLS options",
         "Use --tls for one-way TLS (server cert only) or --mtls for mutual TLS. "
@@ -4160,6 +2758,18 @@ def main():
     tls_group.add_argument(
         "--tls13-only", action="store_true", default=False,
         help="Enforce TLS 1.3 only — refuse TLS 1.2 connections (requires --tls or --mtls)"
+    )
+    tls_group.add_argument(
+        "--tls-reload-interval", type=int, default=60, metavar="SECS",
+        help=(
+            "Seconds between certificate-file mtime checks for automatic "
+            "zero-downtime TLS reload (default: 60). "
+            "Set 0 to disable the file watcher and rely solely on "
+            "POST /api/reload-tls (e.g. from a certbot deploy-hook). "
+            "Useful with Let's Encrypt: point --tls-cert at the certbot "
+            "fullchain.pem — the server will pick up renewals automatically "
+            "without any restart or deploy-hook."
+        ),
     )
     parser.add_argument(
         "--bootstrap-port", type=int, default=None,
@@ -4247,6 +2857,18 @@ def main():
     ops_group.add_argument(
         "--web-port", type=int, default=None, metavar="PORT",
         help="Start web dashboard on this port (e.g. 8090)"
+    )
+    ops_group.add_argument(
+        "--ipsec-port", type=int, default=None, metavar="PORT",
+        help="Start IPsec PKI server on this port (RFC 4945/4806/4809, auto-TLS from CA)"
+    )
+    ops_group.add_argument(
+        "--ipsec-tls-cert", default=None, metavar="PATH",
+        help="PEM TLS cert for IPsec server (auto-provisioned from CA if omitted)"
+    )
+    ops_group.add_argument(
+        "--ipsec-tls-key", default=None, metavar="PATH",
+        help="PEM TLS key for IPsec server (auto-provisioned from CA if omitted)"
     )
     ops_group.add_argument(
         "--rate-limit", type=int, default=0, metavar="N",
@@ -4360,30 +2982,6 @@ def main():
     validity_group.add_argument("--ca-days", type=int, default=None,
                                 metavar="DAYS", help="CA cert lifetime on first creation (default: 3650)")
 
-    security_group = parser.add_argument_group(
-        "Security options",
-        "Authentication and key protection settings."
-    )
-    security_group.add_argument(
-        "--ca-key-passphrase", default=None, metavar="PASS",
-        help="Passphrase for CA private key encryption on disk. "
-             "Can also be set via PYPKI_CA_KEY_PASSPHRASE env var."
-    )
-    security_group.add_argument(
-        "--admin-api-key", default=None, metavar="KEY",
-        help="API key required for admin endpoints (revoke, sub-ca, key recovery, config). "
-             "Clients must send X-Admin-Key header. Can also be set via PYPKI_ADMIN_API_KEY env var."
-    )
-    security_group.add_argument(
-        "--admin-allowed-cns", default=None, metavar="CN1,CN2",
-        help="Comma-separated list of mTLS client CNs allowed to call admin endpoints"
-    )
-    security_group.add_argument(
-        "--bootstrap-token", default=None, metavar="TOKEN",
-        help="Shared secret required for bootstrap endpoint. "
-             "Clients must send X-Bootstrap-Token header or ?token= query param."
-    )
-
     args = parser.parse_args()
 
     logging.getLogger().setLevel(args.log_level)
@@ -4418,28 +3016,15 @@ def main():
     ocsp_url = getattr(args, "ocsp_url", "")
     crl_url  = getattr(args, "crl_url", "")
 
-    # CA key passphrase — CLI arg or env var
-    ca_key_passphrase = getattr(args, "ca_key_passphrase", None)
-    if ca_key_passphrase is None:
-        ca_key_passphrase = os.environ.get("PYPKI_CA_KEY_PASSPHRASE")
-    ca_key_passphrase_bytes = ca_key_passphrase.encode() if ca_key_passphrase else None
-
-    ca = CertificateAuthority(ca_dir=args.ca_dir, config=config,
-                               ocsp_url=ocsp_url, crl_url=crl_url,
-                               ca_key_passphrase=ca_key_passphrase_bytes)
-
-    # Admin API key — CLI arg or env var
-    admin_api_key = getattr(args, "admin_api_key", None)
-    if admin_api_key is None:
-        admin_api_key = os.environ.get("PYPKI_ADMIN_API_KEY")
-
-    # Admin allowed CNs for mTLS
-    admin_allowed_cns = None
-    if getattr(args, "admin_allowed_cns", None):
-        admin_allowed_cns = [cn.strip() for cn in args.admin_allowed_cns.split(",")]
-
-    # Bootstrap token
-    bootstrap_token = getattr(args, "bootstrap_token", None)
+    ca = CertificateAuthority(
+        ca_dir=args.ca_dir,
+        config=config,
+        ocsp_url=ocsp_url,
+        crl_url=crl_url,
+        parent_chain_path=getattr(args, "parent_cert", None),
+    )
+    # Store reload interval on ca so sub-modules (ipsec_server) can read it
+    ca._tls_reload_interval = getattr(args, "tls_reload_interval", 60)
 
     # Feature 8: expiry monitor thread
     _expiry_days = getattr(args, "expiry_warn_days", 30)
@@ -4470,169 +3055,66 @@ def main():
     if audit_log:
         audit_log.record("startup", f"port={args.port} tls={'mtls' if args.mtls else 'tls' if args.tls else 'none'}")
 
-    # Use CMPv3Handler (RFC 9480) by default; fall back to CMPv2Handler if --no-cmpv3
-    if getattr(args, "cmpv3", True):
-        cmp_handler = CMPv3Handler(ca)
-        handler_class = make_cmpv3_handler(ca, cmp_handler, audit_log, rate_limiter,
-                                            admin_api_key=admin_api_key,
-                                            admin_allowed_cns=admin_allowed_cns,
-                                            bootstrap_token=bootstrap_token)
-        logger.info("CMPv3 handler active (RFC 9480 — pvno auto-negotiation, well-known URI)")
-    else:
-        cmp_handler = CMPv2Handler(ca)
-        handler_class = make_handler(ca, cmp_handler, audit_log, rate_limiter,
-                                      admin_api_key=admin_api_key,
-                                      admin_allowed_cns=admin_allowed_cns,
-                                      bootstrap_token=bootstrap_token)
-        logger.info("CMPv2 handler active (--no-cmpv3 specified)")
+    if not HAS_CMP:
+        print("ERROR: cmp_server.py is required. "
+              "Place it in the same directory as pki_server.py.")
+        raise SystemExit(1)
 
+    # ── CMP server (delegated to cmp_server.py) ───────────────────────────────
     scheme = "http"
     tls_mode_label = "plain HTTP"
+    cmp_tls_cert = cmp_tls_key = None
 
     if args.tls or args.mtls:
-        # Resolve server cert/key — use BYO files if supplied, else auto-issue from CA
         if args.tls_cert and args.tls_key:
-            cert_path = args.tls_cert
-            key_path  = args.tls_key
-            logger.info(f"Using provided TLS certificate: {cert_path}")
+            cmp_tls_cert, cmp_tls_key = args.tls_cert, args.tls_key
+            logger.info(f"Using provided TLS certificate: {cmp_tls_cert}")
         else:
-            cert_path, key_path = ca.provision_tls_server_cert(args.tls_hostname)
-            cert_path = str(cert_path)
-            key_path  = str(key_path)
-
-        require_client = args.mtls
-
-        # Build ALPN protocol list from flags
-        alpn_protos: List[str] = []
-        if args.alpn_h2:
-            alpn_protos.append(CertificateAuthority.ALPN_H2)
-        if getattr(args, "alpn_http", True):
-            alpn_protos.append(CertificateAuthority.ALPN_HTTP1)
-        if args.alpn_cmp:
-            alpn_protos.append(CertificateAuthority.ALPN_CMP)
-        if args.alpn_acme:
-            alpn_protos.append(CertificateAuthority.ALPN_ACME)
-        if not alpn_protos:
-            alpn_protos = [CertificateAuthority.ALPN_HTTP1]
-
-        ssl_ctx = ca.build_tls_context(
-            cert_path=cert_path,
-            key_path=key_path,
-            require_client_cert=require_client,
-            alpn_protocols=alpn_protos,
-            tls13_only=getattr(args, "tls13_only", False),
-        )
-
-        server = TLSServer((args.host, args.port), handler_class)
-        server.ssl_context = ssl_ctx
+            _cp, _kp = ca.provision_tls_server_cert(args.tls_hostname)
+            cmp_tls_cert, cmp_tls_key = str(_cp), str(_kp)
         scheme = "https"
-
+        tls_mode_label = (
+            "mutual TLS (client cert required)" if args.mtls
+            else "TLS (server cert only)"
+        )
         if args.mtls:
-            tls_mode_label = "mutual TLS (client cert required)"
             logger.info(f"mTLS — clients must present a cert signed by: {ca.ca_dir / 'ca.crt'}")
-        else:
-            tls_mode_label = "TLS (server cert only)"
-    else:
-        server = ThreadedHTTPServer((args.host, args.port), handler_class)
+
+    alpn_protos: List[str] = []
+    if args.alpn_h2:
+        alpn_protos.append(CertificateAuthority.ALPN_H2)
+    if getattr(args, "alpn_http", True):
+        alpn_protos.append(CertificateAuthority.ALPN_HTTP1)
+    if args.alpn_cmp:
+        alpn_protos.append(CertificateAuthority.ALPN_CMP)
+    if args.alpn_acme:
+        alpn_protos.append(CertificateAuthority.ALPN_ACME)
+    if not alpn_protos:
+        alpn_protos = [CertificateAuthority.ALPN_HTTP1]
+
+    server = _cmp_module.start_cmp_server(
+        host=args.host,
+        port=args.port,
+        ca=ca,
+        audit_log=audit_log,
+        rate_limiter=rate_limiter,
+        use_cmpv3=getattr(args, "cmpv3", True),
+        tls_cert_path=cmp_tls_cert,
+        tls_key_path=cmp_tls_key,
+        require_client_cert=getattr(args, "mtls", False),
+        tls13_only=getattr(args, "tls13_only", False),
+        alpn_protocols=alpn_protos,
+        tls_reload_interval=getattr(args, "tls_reload_interval", 60),
+    )
+    proto_label = "CMPv3 (RFC 9480)" if getattr(args, "cmpv3", True) else "CMPv2 (RFC 4210)"
+    logger.info(f"{proto_label} active on {scheme}://{args.host}:{args.port}")
 
     bootstrap_srv = None
     if args.bootstrap_port:
-        bootstrap_srv = start_bootstrap_server(args.host, args.bootstrap_port, ca, cmp_handler)
-
-    # -----------------------------------------------------------------------
-    # Build ServiceManager — owns lifecycle of all optional sub-services.
-    # Services are registered here but NOT yet started; start_all_enabled()
-    # is called below after the individual startup blocks, so that the legacy
-    # variables (acme_srv, scep_srv, …) still point to the live servers.
-    # -----------------------------------------------------------------------
-    _sm = None
-    try:
-        from service_manager import ServiceManager as _SM
-
-        _sm = _SM(config_path=ca_dir / "config.json")
-
-        # CMP is the main server — show it in the UI as running but mark it
-        # unmanaged (factory=None) so the UI cannot stop/restart it.
-        _sm.register(
-            "cmp", "CMPv2/v3 Server",
-            factory=None,
-            config={"host": args.host, "port": args.port},
-            enabled=True,
+        bootstrap_srv = _cmp_module.start_bootstrap_server(
+            args.host, args.bootstrap_port, ca,
+            _cmp_module.CMPv2Handler(ca),
         )
-        # The constructor already sets state=running when factory is None + enabled
-
-        if args.acme_port and HAS_ACME:
-            _sm.register(
-                "acme", "ACME Server",
-                factory=_acme_module.start_acme_server,
-                config=dict(
-                    host=args.host,
-                    port=args.acme_port,
-                    ca=ca,
-                    ca_dir=ca_dir,
-                    auto_approve_dns=args.acme_auto_approve_dns,
-                    base_url=args.acme_base_url or f"http://{args.host}:{args.acme_port}",
-                    cert_validity_days=getattr(args, "acme_cert_days", 90),
-                    short_lived_threshold_days=getattr(args, "acme_short_lived_threshold", 7),
-                    dns01_hook=_dns01_hook,
-                ),
-                enabled=True,
-            )
-
-        if args.scep_port and HAS_SCEP:
-            _sm.register(
-                "scep", "SCEP Server",
-                factory=_scep_module.start_scep_server,
-                config=dict(
-                    host=args.host,
-                    port=args.scep_port,
-                    ca=ca,
-                    ca_dir=ca_dir,
-                    challenge=args.scep_challenge,
-                ),
-                enabled=True,
-            )
-
-        if args.est_port and HAS_EST:
-            _est_users = {}
-            for _e in (args.est_user or []):
-                _u, _, _p = _e.partition(":")
-                _est_users[_u] = _p
-            _sm.register(
-                "est", "EST Server",
-                factory=_est_module.start_est_server,
-                config=dict(
-                    host=args.host,
-                    port=args.est_port,
-                    ca=ca,
-                    ca_dir=ca_dir,
-                    users=_est_users if _est_users else None,
-                    require_auth=args.est_require_auth,
-                    tls_cert_path=args.est_tls_cert,
-                    tls_key_path=args.est_tls_key,
-                ),
-                enabled=True,
-            )
-
-        if getattr(args, "ocsp_port", None) and HAS_OCSP:
-            _sm.register(
-                "ocsp", "OCSP Responder",
-                factory=_ocsp_module.start_ocsp_server,
-                config=dict(
-                    host=args.host,
-                    port=args.ocsp_port,
-                    ca=ca,
-                    cache_seconds=getattr(args, "ocsp_cache_seconds", 300),
-                ),
-                enabled=True,
-            )
-
-    except ImportError:
-        logger.warning(
-            "service_manager.py not found — service lifecycle management disabled. "
-            "Place service_manager.py in the same directory as pki_server.py."
-        )
-        _sm = None
 
     # Start ACME server if requested
     acme_srv = None
@@ -4641,22 +3123,27 @@ def main():
             print("WARNING: acme_server.py not found — ACME support disabled.")
             print("         Place acme_server.py in the same directory as pki_server.py.")
         else:
-            if _sm and _sm.get("acme"):
-                _sm.start("acme")
-                acme_srv = _sm.get("acme")._server
-            else:
-                acme_base = args.acme_base_url or f"http://{args.host}:{args.acme_port}"
-                acme_srv = _acme_module.start_acme_server(
-                    host=args.host,
-                    port=args.acme_port,
-                    ca=ca,
-                    ca_dir=ca_dir,
-                    auto_approve_dns=args.acme_auto_approve_dns,
-                    base_url=acme_base,
-                    cert_validity_days=getattr(args, "acme_cert_days", 90),
-                    short_lived_threshold_days=getattr(args, "acme_short_lived_threshold", 7),
-                    dns01_hook=_dns01_hook,  # Feature 5: real dns-01 resolver hook
-                )
+            # Use tls_hostname (or localhost) instead of 0.0.0.0 for the ACME base URL
+            # so directory URLs are reachable by clients (0.0.0.0 is a bind addr, not a hostname)
+            _acme_hostname = (
+                args.acme_base_url.split("://")[1].split(":")[0]
+                if args.acme_base_url
+                else (getattr(args, "tls_hostname", None) or "localhost")
+                if args.host in ("0.0.0.0", "::")
+                else args.host
+            )
+            acme_base = args.acme_base_url or f"http://{_acme_hostname}:{args.acme_port}"
+            acme_srv = _acme_module.start_acme_server(
+                host=args.host,
+                port=args.acme_port,
+                ca=ca,
+                ca_dir=ca_dir,
+                auto_approve_dns=args.acme_auto_approve_dns,
+                base_url=acme_base,
+                cert_validity_days=getattr(args, "acme_cert_days", 90),
+                short_lived_threshold_days=getattr(args, "acme_short_lived_threshold", 7),
+                dns01_hook=_dns01_hook,  # Feature 5: real dns-01 resolver hook
+            )
 
     # Start SCEP server if requested
     scep_srv = None
@@ -4665,17 +3152,13 @@ def main():
             print("WARNING: scep_server.py not found — SCEP support disabled.")
             print("         Place scep_server.py in the same directory as pki_server.py.")
         else:
-            if _sm and _sm.get("scep"):
-                _sm.start("scep")
-                scep_srv = _sm.get("scep")._server
-            else:
-                scep_srv = _scep_module.start_scep_server(
-                    host=args.host,
-                    port=args.scep_port,
-                    ca=ca,
-                    ca_dir=ca_dir,
-                    challenge=args.scep_challenge,
-                )
+            scep_srv = _scep_module.start_scep_server(
+                host=args.host,
+                port=args.scep_port,
+                ca=ca,
+                ca_dir=ca_dir,
+                challenge=args.scep_challenge,
+            )
 
     # Start EST server if requested
     est_srv = None
@@ -4684,24 +3167,21 @@ def main():
             print("WARNING: est_server.py not found — EST support disabled.")
             print("         Place est_server.py in the same directory as pki_server.py.")
         else:
-            if _sm and _sm.get("est"):
-                _sm.start("est")
-                est_srv = _sm.get("est")._server
-            else:
-                est_users = {}
-                for entry in (args.est_user or []):
-                    u, _, p = entry.partition(":")
-                    est_users[u] = p
-                est_srv = _est_module.start_est_server(
-                    host=args.host,
-                    port=args.est_port,
-                    ca=ca,
-                    ca_dir=ca_dir,
-                    users=est_users if est_users else None,
-                    require_auth=args.est_require_auth,
-                    tls_cert_path=args.est_tls_cert,
-                    tls_key_path=args.est_tls_key,
-                )
+            est_users = {}
+            for entry in (args.est_user or []):
+                u, _, p = entry.partition(":")
+                est_users[u] = p
+            est_srv = _est_module.start_est_server(
+                host=args.host,
+                port=args.est_port,
+                ca=ca,
+                ca_dir=ca_dir,
+                users=est_users if est_users else None,
+                require_auth=args.est_require_auth,
+                tls_cert_path=args.est_tls_cert,
+                tls_key_path=args.est_tls_key,
+                tls_reload_interval=getattr(args, "tls_reload_interval", 60),
+            )
 
     # Start OCSP responder if requested
     ocsp_srv = None
@@ -4709,20 +3189,32 @@ def main():
         if not HAS_OCSP:
             print("WARNING: ocsp_server.py not found — OCSP support disabled.")
         else:
-            if _sm and _sm.get("ocsp"):
-                _sm.start("ocsp")
-                ocsp_srv = _sm.get("ocsp")._server
-            else:
-                ocsp_srv = _ocsp_module.start_ocsp_server(
-                    host=args.host,
-                    port=args.ocsp_port,
-                    ca=ca,
-                    cache_seconds=getattr(args, "ocsp_cache_seconds", 300),
-                )
+            ocsp_srv = _ocsp_module.start_ocsp_server(
+                host=args.host,
+                port=args.ocsp_port,
+                ca=ca,
+                cache_seconds=getattr(args, "ocsp_cache_seconds", 300),
+            )
 
-    # Start config-file watcher AFTER all services are up
-    if _sm is not None:
-        _sm.start_config_watcher()
+    # Start IPsec PKI server if requested (RFC 4945 / RFC 4806 / RFC 4809)
+    ipsec_srv = None
+    if getattr(args, "ipsec_port", None):
+        if not HAS_IPSEC:
+            print("WARNING: ipsec_server.py not found — IPsec PKI server disabled.")
+        else:
+            _ipsec_ocsp_url  = getattr(args, "ocsp_url", None) or None
+            _ipsec_crl_url   = getattr(args, "crl_url",  None) or None
+            _ipsec_tls_cert  = getattr(args, "ipsec_tls_cert", None) or None
+            _ipsec_tls_key   = getattr(args, "ipsec_tls_key",  None) or None
+            ipsec_srv = _ipsec_module.start_ipsec_server(
+                host=args.host,
+                port=args.ipsec_port,
+                ca=ca,
+                ocsp_url=_ipsec_ocsp_url,
+                crl_url=_ipsec_crl_url,
+                tls_cert_path=_ipsec_tls_cert,
+                tls_key_path=_ipsec_tls_key,
+            )
 
     # Start Web UI if requested
     web_srv = None
@@ -4745,69 +3237,77 @@ def main():
                 scep_base_url=_scep_base,
                 est_base_url=_est_base,
                 ocsp_base_url=_ocsp_base,
-                admin_api_key=admin_api_key,
-                admin_allowed_cns=admin_allowed_cns,
-                service_manager=_sm,
             )
 
+    ca_mode_label = (
+        f"intermediate ({len(ca._parent_chain)} parent cert(s))"
+        if ca.is_intermediate else "root (self-signed)"
+    )
     acme_line = f"http://{args.host}:{args.acme_port}/acme/directory" if (args.acme_port and HAS_ACME) else "disabled"
     scep_line = f"http://{args.host}:{args.scep_port}/scep" if (args.scep_port and HAS_SCEP) else "disabled"
     est_line  = f"https://{args.host}:{args.est_port}/.well-known/est" if (args.est_port and HAS_EST) else "disabled"
     ocsp_line = f"http://{args.host}:{args.ocsp_port}/ocsp" if (getattr(args,"ocsp_port",None) and HAS_OCSP) else "disabled"
     web_line  = f"http://{args.host}:{args.web_port}" if getattr(args,"web_port",None) else "disabled"
+    ipsec_line = f"https://{args.host}:{args.ipsec_port}/ipsec" if (getattr(args,"ipsec_port",None) and HAS_IPSEC) else "disabled"
     cmp_wk    = f"{scheme}://{args.host}:{args.port}/.well-known/cmp"
     rl_info   = f"{args.rate_limit}/min per IP" if getattr(args,"rate_limit",0) > 0 else "disabled"
+    _tls_reload_interval = getattr(args, "tls_reload_interval", 60)
+    tls_reload_info = (f"{_tls_reload_interval}s poll + POST /api/reload-tls"
+                       if (args.tls or args.mtls) else "n/a (no TLS)")
     audit_info = "ca/audit.db" if getattr(args,"audit",True) else "disabled"
     boot_line = f"http://{args.host}:{args.bootstrap_port}/bootstrap?cn=<n>" if args.bootstrap_port else "disabled"
-    space = " "
+
     print(f"""
 ╔══════════════════════════════════════════════════════════════════╗
-║         PyPKI CMPv2 + ACME Server (RFC 4210 / RFC 8555 + TLS)    ║
+║         PyPKI CMPv2 + ACME Server (RFC 4210 / RFC 8555 + TLS)  ║
 ╠══════════════════════════════════════════════════════════════════╣
-║  Listening (CMPv2): {scheme}://{args.host}:{args.port:<28}║
-║  Listening (ACME) : {acme_line:<45}║
-║  CA Dir           : {args.ca_dir:<45}║
-║  TLS Mode         : {tls_mode_label:<45}║
-║  Bootstrap        : {boot_line:<45}║
-║  Listening (SCEP) : {scep_line:<45}║
-║  Listening (EST)  : {est_line:<45}║
-║  Listening (OCSP) : {ocsp_line:<45}║
-║  Web Dashboard    : {web_line:<45}║
-║  CMP Well-Known   : {cmp_wk:<45}║
-║  Rate Limiting    : {rl_info:<45}║
-║  Audit Log        : {audit_info:<45}║
-║  Metrics          : {scheme}://{args.host}:{args.port}/metrics                ║
-║  Expiry Monitor   : {str(_expiry_days)+"d" if _expiry_days else "disabled":<45}║
+║  Listening (CMPv2): {scheme}://{args.host}:{args.port:<32}║
+║  Listening (ACME) : {acme_line:<47}║
+║  CA Dir           : {args.ca_dir:<47}║
+║  CA Mode          : {ca_mode_label:<47}║
+║  TLS Mode         : {tls_mode_label:<47}║
+║  Bootstrap        : {boot_line:<47}║
+║  Listening (SCEP) : {scep_line:<47}║
+║  Listening (EST)  : {est_line:<47}║
+║  Listening (OCSP) : {ocsp_line:<47}║
+║  Web Dashboard    : {web_line:<47}║
+║  IPsec PKI        : {ipsec_line:<47}║
+║  CMP Well-Known   : {cmp_wk:<47}║
+║  Rate Limiting    : {rl_info:<47}║
+║  Audit Log        : {audit_info:<47}║
+║  Metrics          : {scheme}://{args.host}:{args.port}/metrics                      ║
+║  Expiry Monitor   : {str(_expiry_days)+"d" if _expiry_days else "disabled":<47}║
+║  TLS Cert Reload  : {tls_reload_info:<47}║
 ╠══════════════════════════════════════════════════════════════════╣
-║  Validity periods (change live: PATCH /config)                   ║
+║  Validity periods (change live: PATCH /config)                  ║
 ║    End-entity   : {config.end_entity_days:<3} days                                       ║
 ║    Client cert  : {config.client_cert_days:<3} days                                       ║
 ║    TLS server   : {config.tls_server_days:<3} days                                       ║
 ║    CA cert      : {config.ca_days:<4} days                                      ║
 ╠══════════════════════════════════════════════════════════════════╣
-║  CMPv2 Endpoint  : POST {scheme}://{args.host}:{args.port}/{space:<8}           ║
-║  ACME Directory  : GET  {acme_line:<41}║
-║  SCEP Endpoint   : {scep_line:<46}║
-║  Config          : GET/PATCH {scheme}://{args.host}:{args.port}/config{space:<8}║
-║  CA Certificate  : GET  {scheme}://{args.host}:{args.port}/ca/cert.pem{space:<7} ║
-║  CRL             : GET  {scheme}://{args.host}:{args.port}/ca/crl{space:<13}║
-║  Health Check    : GET  {scheme}://{args.host}:{args.port}/health{space:<13}║
+║  CMPv2 Endpoint  : POST {scheme}://{args.host}:{args.port}/           ║
+║  ACME Directory  : GET  {acme_line:<40}║
+║  SCEP Endpoint   : {scep_line:<48}║
+║  Config          : GET/PATCH {scheme}://{args.host}:{args.port}/config ║
+║  CA Certificate  : GET  {scheme}://{args.host}:{args.port}/ca/cert.pem ║
+║  CRL             : GET  {scheme}://{args.host}:{args.port}/ca/crl      ║
+║  Health Check    : GET  {scheme}://{args.host}:{args.port}/health      ║
 ╠══════════════════════════════════════════════════════════════════╣
-║  Supported CMPv2/CMPv3 operations:                               ║
-║    ir, cr, kur, rr, certConf, genm, p10cr (CMPv2 / RFC 4210)     ║
-║    pollReq/pollRep - extended polling (CMPv3 / RFC 9480)         ║
-║    genm GetCACerts, GetRootCACertUpdate, GetCertReqTemplate      ║
-║    Well-known URI: POST/GET /.well-known/cmp[/p/<label>]         ║
+║  Supported CMPv2/CMPv3 operations:                              ║
+║    ir, cr, kur, rr, certConf, genm, p10cr (CMPv2 / RFC 4210)   ║
+║    pollReq/pollRep - extended polling (CMPv3 / RFC 9480)        ║
+║    genm GetCACerts, GetRootCACertUpdate, GetCertReqTemplate     ║
+║    Well-known URI: POST/GET /.well-known/cmp[/p/<label>]        ║
 ╠══════════════════════════════════════════════════════════════════╣
-║  Supported ACME operations (RFC 8555 + RFC 9608):                ║
-║    new-account, new-order, http-01, dns-01, finalize, revoke     ║
-║    noRevAvail (RFC 9608) auto-applied to short-lived certs       ║
+║  Supported ACME operations (RFC 8555 + RFC 9608):              ║
+║    new-account, new-order, http-01, dns-01, finalize, revoke   ║
+║    noRevAvail (RFC 9608) auto-applied to short-lived certs     ║
 ╠══════════════════════════════════════════════════════════════════╣
-║  Supported SCEP operations (RFC 8894):                           ║
-║    GetCACaps, GetCACert, PKCSReq, CertPoll, GetCert, GetCRL      ║
+║  Supported SCEP operations (RFC 8894):                          ║
+║    GetCACaps, GetCACert, PKCSReq, CertPoll, GetCert, GetCRL    ║
 ╠══════════════════════════════════════════════════════════════════╣
-║  Supported EST operations (RFC 7030):                            ║
-║    cacerts, simpleenroll, simplereenroll, csrattrs, serverkeygen ║
+║  Supported EST operations (RFC 7030):                           ║
+║    cacerts, simpleenroll, simplereenroll, csrattrs, serverkeygen║
 ╚══════════════════════════════════════════════════════════════════╝
 """)
 
@@ -4860,10 +3360,28 @@ def main():
             print(f"  ⚠ dns-01 auto-approval is ON — do not use in production!")
         print()
 
+    if 'est_srv' not in dir():
+        est_srv = None
+    if 'ocsp_srv' not in dir():
+        ocsp_srv = None
+    if 'web_srv' not in dir():
+        web_srv = None
+
+    # Collect all servers that may have a TLS watcher to stop on shutdown
+    _tls_servers = [s for s in [server, est_srv, ipsec_srv] if s is not None]
+
     try:
-        server.serve_forever()
+        # CMP server runs in its own daemon thread (started by start_cmp_server).
+        # Block the main thread here so the process stays alive.
+        while True:
+            time.sleep(1)
     except KeyboardInterrupt:
         print("\nShutting down PKI server...")
+        # Stop TLS cert watchers first so they don't log spurious errors
+        for _srv in _tls_servers:
+            _w = getattr(_srv, "_tls_watcher", None)
+            if _w is not None:
+                _w.stop()
         server.shutdown()
         if bootstrap_srv:
             bootstrap_srv.shutdown()
@@ -4875,6 +3393,8 @@ def main():
             est_srv.shutdown()
         if ocsp_srv:
             ocsp_srv.shutdown()
+        if ipsec_srv:
+            ipsec_srv.shutdown()
         if web_srv:
             web_srv.shutdown()
         if audit_log:

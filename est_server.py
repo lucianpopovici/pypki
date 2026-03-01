@@ -33,7 +33,7 @@ RFC 7030 key points implemented:
     hinting which extensions and key type the CA prefers
   - Proper HTTP 401 + WWW-Authenticate on auth failure
 
-Dependencies: same as pki_cmpv2_server.py (cryptography)
+Dependencies: same as pki_server.py (cryptography)
 """
 
 import base64
@@ -175,6 +175,32 @@ class ESTCMSBuilder:
             + _set(b"")    # signerInfos (empty for degenerate)
         )
 
+        return _seq(
+            _oid(OID_SIGNED_DATA)
+            + _ctx(0, _seq(sd_inner))
+        )
+
+    @staticmethod
+    def certs_only_chain(chain_ders: list) -> bytes:
+        """
+        Build a PKCS#7 certs-only SignedData from an ordered list of DER certs.
+
+        Unlike :meth:`certs_only`, this variant accepts an arbitrary list of
+        DER-encoded certificates (e.g. the full CA chain from
+        ``ca.ca_chain_ders``) and encodes them all in the certificates bag.
+        This is the correct form for EST /cacerts when running as an
+        intermediate CA (RFC 7030 §4.1 requires the full chain).
+        """
+        cert_bytes = b"".join(chain_ders)
+        certs_field = _ctx(0, cert_bytes)
+        eci = _seq(_oid(OID_DATA))
+        sd_inner = (
+            _integer(1)
+            + _set(b"")
+            + eci
+            + certs_field
+            + _set(b"")
+        )
         return _seq(
             _oid(OID_SIGNED_DATA)
             + _ctx(0, _seq(sd_inner))
@@ -349,9 +375,17 @@ class ESTHandler(http.server.BaseHTTPRequestHandler):
         GET /.well-known/est/cacerts
         RFC 7030 §4.1 — return CA certificate chain as base64-encoded
         PKCS#7 certs-only SignedData.
+
+        For an intermediate CA the PKCS#7 bag contains every cert in the chain
+        (this CA + parent(s) up to the root) so EST clients can build the full
+        path.  The degenerate SignedData format encodes all certs in the
+        certificates [0] field; order is leaf-first per common convention.
         """
-        ca_der = self.ca.ca_cert_der
-        pkcs7 = ESTCMSBuilder.certs_only([], ca_der)
+        # Build list of all chain DERs (leaf → root) and encode as certs-only PKCS#7.
+        # certs_only() treats the last argument as the "CA cert" and prepends any
+        # additional certs in the first list; we pass all parents as the extra list.
+        chain_ders = self.ca.ca_chain_ders   # [leaf_der, parent_der, ..., root_der]
+        pkcs7 = ESTCMSBuilder.certs_only_chain(chain_ders)
         b64 = base64.b64encode(pkcs7)
 
         self.send_response(200)
@@ -419,8 +453,9 @@ class ESTHandler(http.server.BaseHTTPRequestHandler):
             return
 
         cert_der = cert.public_bytes(Encoding.DER)
-        ca_der = self.ca.ca_cert_der
-        pkcs7 = ESTCMSBuilder.certs_only([cert_der], ca_der)
+        # Include the full CA chain so clients can verify the cert path end-to-end.
+        chain_ders = [cert_der] + self.ca.ca_chain_ders   # issued cert + this CA + parents
+        pkcs7 = ESTCMSBuilder.certs_only_chain(chain_ders)
         b64 = base64.b64encode(pkcs7)
 
         op = "simplereenroll" if renew else "simpleenroll"
@@ -476,8 +511,8 @@ class ESTHandler(http.server.BaseHTTPRequestHandler):
             return
 
         cert_der = cert.public_bytes(Encoding.DER)
-        ca_der = self.ca.ca_cert_der
-        pkcs7 = ESTCMSBuilder.certs_only([cert_der], ca_der)
+        chain_ders = [cert_der] + self.ca.ca_chain_ders
+        pkcs7 = ESTCMSBuilder.certs_only_chain(chain_ders)
         cert_b64 = base64.b64encode(pkcs7)
 
         # PKCS#8 private key DER (unencrypted PrivateKeyInfo)
@@ -657,6 +692,23 @@ class ESTHandler(http.server.BaseHTTPRequestHandler):
 # Integration entry point
 # ---------------------------------------------------------------------------
 
+def _build_est_tls_context(
+    cert_path: str,
+    key_path: str,
+    ca: "CertificateAuthority",
+) -> ssl.SSLContext:
+    """Build a hardened SSLContext for the EST server."""
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+    ctx.options |= ssl.OP_NO_COMPRESSION
+    ctx.set_ciphers("ECDHE+AESGCM:ECDHE+CHACHA20:DHE+AESGCM:DHE+CHACHA20:!aNULL:!eNULL:!RC4:!DES:!MD5")
+    ctx.load_cert_chain(certfile=cert_path, keyfile=key_path)
+    # Accept (but don't require) client certs for TLS client auth
+    ctx.verify_mode = ssl.CERT_OPTIONAL
+    ctx.load_verify_locations(str(ca.ca_dir / "ca.crt"))
+    return ctx
+
+
 def start_est_server(
     host: str,
     port: int,
@@ -666,6 +718,7 @@ def start_est_server(
     require_auth: bool = False,
     tls_cert_path: Optional[str] = None,
     tls_key_path: Optional[str] = None,
+    tls_reload_interval: int = 60,
 ) -> http.server.HTTPServer:
     """
     Start the EST server in a background daemon thread.
@@ -673,8 +726,20 @@ def start_est_server(
     EST MUST run over TLS (RFC 7030 §3). We auto-issue a server TLS cert
     from the CA if tls_cert_path/tls_key_path are not supplied.
 
+    The server uses per-connection TLS wrapping (not socket-level wrapping)
+    so that the certificate can be reloaded without a restart — either
+    automatically (mtime watcher, every *tls_reload_interval* seconds) or
+    on demand via ``srv.reload_tls()``.
+
+    Parameters
+    ----------
+    tls_reload_interval : Seconds between cert-file mtime polls.  Set 0 to
+                          disable the automatic watcher.
+
     Returns the HTTPServer so the caller can shut it down.
     """
+    from cmp_server import TLSContextHolder, TlsCertWatcher
+
     user_store = ESTUserStore(users)
 
     class BoundESTHandler(ESTHandler):
@@ -685,33 +750,66 @@ def start_est_server(
     BoundESTHandler.require_auth = require_auth
 
     import http.server as _hs
-    class _ThreadedServer(_hs.ThreadingHTTPServer):
-        allow_reuse_address = True
-        daemon_threads = True
 
-    srv = _ThreadedServer((host, port), BoundESTHandler)
-
-    # Wrap with TLS — EST requires HTTPS
+    # Resolve cert/key paths
     if tls_cert_path and tls_key_path:
         cert_path = tls_cert_path
-        key_path = tls_key_path
+        key_path  = tls_key_path
     else:
-        cert_path, key_path = ca.provision_tls_server_cert(host)
-        cert_path = str(cert_path)
-        key_path = str(key_path)
+        _cp, _kp  = ca.provision_tls_server_cert(host)
+        cert_path = str(_cp)
+        key_path  = str(_kp)
 
-    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-    ctx.minimum_version = ssl.TLSVersion.TLSv1_2
-    ctx.options |= ssl.OP_NO_COMPRESSION
-    ctx.set_ciphers("ECDHE+AESGCM:ECDHE+CHACHA20:DHE+AESGCM:DHE+CHACHA20:!aNULL:!eNULL:!RC4:!DES:!MD5")
-    ctx.load_cert_chain(certfile=cert_path, keyfile=key_path)
+    def _build_ctx(cp, kp):
+        return _build_est_tls_context(cp, kp, ca)
 
-    # Optional: accept client certs for TLS client auth
-    ctx.verify_mode = ssl.CERT_OPTIONAL
-    ca_pem = str(ca.ca_dir / "ca.crt")
-    ctx.load_verify_locations(ca_pem)
+    ctx    = _build_ctx(cert_path, key_path)
+    holder = TLSContextHolder(ctx)
 
-    srv.socket = ctx.wrap_socket(srv.socket, server_side=True)
+    # Per-connection TLS server — reads ctx_holder on every accept()
+    class _TLSThreadedServer(_hs.ThreadingHTTPServer):
+        allow_reuse_address = True
+        daemon_threads      = True
+        ctx_holder: TLSContextHolder = None
+
+        def get_request(self):
+            sock, addr = super().get_request()
+            try:
+                tls_sock = self.ctx_holder.get().wrap_socket(sock, server_side=True)
+                return tls_sock, addr
+            except ssl.SSLError as exc:
+                logger.warning("EST TLS handshake failed from %s: %s", addr, exc)
+                sock.close()
+                raise
+
+    srv = _TLSThreadedServer((host, port), BoundESTHandler)
+    srv.ctx_holder = holder
+
+    # Automatic cert-file watcher
+    if tls_reload_interval > 0:
+        watcher = TlsCertWatcher(
+            holder=holder,
+            cert_path=cert_path,
+            key_path=key_path,
+            build_ctx=_build_ctx,
+            poll_interval=tls_reload_interval,
+        ).start()
+        srv._tls_watcher = watcher
+    else:
+        srv._tls_watcher = None
+
+    def _reload_tls() -> bool:
+        if srv._tls_watcher:
+            return srv._tls_watcher.reload_now()
+        try:
+            holder.swap(_build_ctx(cert_path, key_path))
+            logger.info("EST TLS context reloaded via reload_tls()")
+            return True
+        except Exception as exc:
+            logger.error("EST TLS reload failed: %s", exc)
+            return False
+
+    srv.reload_tls = _reload_tls
 
     t = threading.Thread(target=srv.serve_forever, daemon=True)
     t.start()
@@ -743,9 +841,9 @@ def main():
     logging.getLogger().setLevel(args.log_level)
 
     try:
-        from pki_cmpv2_server import CertificateAuthority, ServerConfig
+        from pki_server import CertificateAuthority, ServerConfig
     except ImportError:
-        print("ERROR: pki_cmpv2_server.py not found — place it in the same directory.")
+        print("ERROR: pki_server.py not found — place it in the same directory.")
         raise SystemExit(1)
 
     ca_dir = Path(args.ca_dir)
