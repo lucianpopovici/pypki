@@ -54,7 +54,7 @@ Dependencies:
 
 Usage:
     # Plain HTTP (no mTLS)
-    python pki_server.py [--host 0.0.0.0] [--port 8080] [--ca-dir ./ca]
+    python pki_server.py [--host localhost] [--port 8080] [--ca-dir ./ca]
 
     # mTLS enabled
     python pki_server.py --mtls --port 8443 [--ca-dir ./ca]
@@ -2741,7 +2741,7 @@ except ImportError:
 
 def main():
     parser = argparse.ArgumentParser(description="PKI Server with CMPv2 Support + mTLS")
-    parser.add_argument("--host", default="0.0.0.0", help="Bind address (default: 0.0.0.0)")
+    parser.add_argument("--host", default="localhost", help="Bind address (default: localhost)")
     parser.add_argument("--port", type=int, default=8080, help="Port (default: 8080)")
     parser.add_argument("--ca-dir", default="./ca", help="CA data directory (default: ./ca)")
     parser.add_argument("--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"])

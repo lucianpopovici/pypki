@@ -824,7 +824,7 @@ def start_est_server(
 def main():
     import argparse
     parser = argparse.ArgumentParser(description="EST Server (RFC 7030)")
-    parser.add_argument("--host", default="0.0.0.0")
+    parser.add_argument("--host", default="localhost")
     parser.add_argument("--port", type=int, default=8443)
     parser.add_argument("--ca-dir", default="./ca")
     parser.add_argument("--user", action="append", metavar="USER:PASS",

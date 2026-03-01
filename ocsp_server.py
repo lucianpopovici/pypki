@@ -685,7 +685,7 @@ def start_ocsp_server(
 def main():
     import argparse
     parser = argparse.ArgumentParser(description="OCSP Responder (RFC 6960 / RFC 5019)")
-    parser.add_argument("--host", default="0.0.0.0")
+    parser.add_argument("--host", default="localhost")
     parser.add_argument("--port", type=int, default=8080)
     parser.add_argument("--ca-dir", default="./ca")
     parser.add_argument("--cache-seconds", type=int, default=300)

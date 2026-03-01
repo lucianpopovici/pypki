@@ -750,12 +750,12 @@ class WebUIHandler(http.server.BaseHTTPRequestHandler):
             "      const s=parseInt(document.getElementById('rev-serial').value);"
             "      const r=parseInt(document.getElementById('rev-reason').value);"
             "      if(!s) return;"
-            "      fetch('/api/revoke',{method:'POST',"
-            "        headers:{'Content-Type':'application/json'},"
-            "        body:JSON.stringify({serial:s,reason:r})})"
-            "        .then(r=>r.json()).then(d=>{"
+            "      fetch('/api/revoke',{{method:'POST',"
+            "        headers:{{'Content-Type':'application/json'}},"
+            "        body:JSON.stringify({{serial:s,reason:r}})}})"
+            "        .then(r=>r.json()).then(d=>{{"
             "          document.getElementById('rev-result').textContent=JSON.stringify(d,null,2);"
-            "        });"
+            "        }});"
             '    ">Revoke</button>'
             '    <pre id="rev-result" style="margin-top:14px"></pre>'
             "  </div>"

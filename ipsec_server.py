@@ -2652,7 +2652,7 @@ def main():
     parser = argparse.ArgumentParser(
         description="PyPKI IPsec Server — RFC 4945 / RFC 4806 / RFC 4809"
     )
-    parser.add_argument("--host",      default="0.0.0.0")
+    parser.add_argument("--host",      default="localhost")
     parser.add_argument("--port",      type=int, default=8085)
     parser.add_argument("--ca-dir",    default="./ca")
     parser.add_argument("--ocsp-url",  default="",

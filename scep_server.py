@@ -37,7 +37,7 @@ Dependencies (same as pki_server.py):
 
 Usage:
     Standalone:
-        python scep_server.py [--host 0.0.0.0] [--port 8889] [--ca-dir ./ca]
+        python scep_server.py [--host localhost] [--port 8889] [--ca-dir ./ca]
                                [--challenge mysecret]
 
     Integrated (via pki_server.py --scep-port 8889):
@@ -1355,7 +1355,7 @@ def start_scep_server(
 
 def main():
     parser = argparse.ArgumentParser(description="SCEP Server (RFC 8894)")
-    parser.add_argument("--host", default="0.0.0.0")
+    parser.add_argument("--host", default="localhost")
     parser.add_argument("--port", type=int, default=8889)
     parser.add_argument("--ca-dir", default="./ca")
     parser.add_argument("--challenge", default="",

@@ -54,7 +54,7 @@ Dependencies (already required by pki_server.py):
 
 Usage:
     Standalone:
-        python acme_server.py [--host 0.0.0.0] [--port 8888] [--ca-dir ./ca]
+        python acme_server.py [--host localhost] [--port 8888] [--ca-dir ./ca]
 
     Integrated (imported by pki_server.py via --acme-port):
         python pki_server.py --acme-port 8888
@@ -1639,7 +1639,7 @@ if __name__ == "__main__":
     import importlib.util
 
     parser = argparse.ArgumentParser(description="ACME Server (RFC 8555)")
-    parser.add_argument("--host", default="0.0.0.0")
+    parser.add_argument("--host", default="localhost")
     parser.add_argument("--port", type=int, default=8888)
     parser.add_argument("--ca-dir", default="./ca")
     parser.add_argument("--base-url", default=None,
