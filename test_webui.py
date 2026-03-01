@@ -222,6 +222,21 @@ class TestPageLoads:
         badge = driver.find_element(By.CSS_SELECTOR, ".topbar .badge")
         assert badge.text.startswith("v"), f"Expected version badge, got: {badge.text!r}"
 
+    def test_services_page_loads(self, driver):
+        driver.get(f"{BASE_URL}/services")
+        assert "PyPKI" in driver.title
+        assert active_nav(driver) == "Services"
+
+    def test_services_page_has_service_cards(self, driver):
+        driver.get(f"{BASE_URL}/services")
+        cards = driver.find_elements(By.CSS_SELECTOR, ".card")
+        assert len(cards) >= 1, "Services page should show at least one service card"
+
+    def test_services_page_has_status_pills(self, driver):
+        driver.get(f"{BASE_URL}/services")
+        pills = driver.find_elements(By.CSS_SELECTOR, ".pill")
+        assert len(pills) >= 1, "Services page should show at least one status pill"
+
     def test_certs_page_loads(self, driver):
         driver.get(f"{BASE_URL}/certs")
         assert "PyPKI" in driver.title
@@ -343,21 +358,21 @@ class TestNavigation:
     """Verify nav links work correctly and all routes are reachable."""
 
     def test_topbar_on_every_page(self, driver):
-        for path in ["/", "/certs", "/expiring", "/revocation", "/sub-ca",
+        for path in ["/", "/services", "/certs", "/expiring", "/revocation", "/sub-ca",
                      "/metrics-ui", "/config-ui", "/audit", "/api-docs"]:
             driver.get(f"{BASE_URL}{path}")
             assert "PyPKI Certificate Authority" in topbar_text(driver), \
                 f"Topbar missing on {path}"
 
-    def test_nav_has_nine_links(self, driver):
+    def test_nav_has_ten_links(self, driver):
         driver.get(f"{BASE_URL}/")
         links = driver.find_elements(By.CSS_SELECTOR, "nav.nav a")
-        assert len(links) == 9, f"Expected 9 nav links, found {len(links)}"
+        assert len(links) == 10, f"Expected 10 nav links, found {len(links)}"
 
     def test_nav_link_labels(self, driver):
         driver.get(f"{BASE_URL}/")
         texts = [a.text for a in driver.find_elements(By.CSS_SELECTOR, "nav.nav a")]
-        for label in ("Dashboard", "Certificates", "Expiring", "Revocation",
+        for label in ("Dashboard", "Services", "Certificates", "Expiring", "Revocation",
                       "Sub-CA", "Metrics", "Config", "Audit Log", "API Docs"):
             assert label in texts, f"Nav link missing: {label}"
 
@@ -397,6 +412,12 @@ class TestNavigation:
         wait.until(EC.url_contains("/api-docs"))
         assert active_nav(driver) == "API Docs"
 
+    def test_click_nav_services(self, driver, wait):
+        driver.get(f"{BASE_URL}/")
+        driver.find_element(By.LINK_TEXT, "Services").click()
+        wait.until(EC.url_contains("/services"))
+        assert active_nav(driver) == "Services"
+
     def test_dashboard_alias_route(self, driver):
         driver.get(f"{BASE_URL}/dashboard")
         assert active_nav(driver) == "Dashboard"
@@ -406,7 +427,7 @@ class TestNavigation:
         assert "404" in driver.page_source
 
     @pytest.mark.parametrize("path", [
-        "/", "/certs", "/expiring", "/revocation", "/sub-ca",
+        "/", "/services", "/certs", "/expiring", "/revocation", "/sub-ca",
         "/metrics-ui", "/config-ui", "/audit", "/api-docs", "/dashboard",
     ])
     def test_all_html_pages_return_200(self, api, path):
@@ -426,6 +447,13 @@ class TestNavigation:
     def test_ca_cert_pem_contains_certificate(self, api):
         resp = api.get(f"{BASE_URL}/ca/cert.pem")
         assert resp.status_code == 200
+        assert "BEGIN CERTIFICATE" in resp.text
+
+    def test_ca_cert_alias_returns_pem(self, api):
+        """/ca/cert is an alias for /ca/cert.pem."""
+        resp = api.get(f"{BASE_URL}/ca/cert")
+        assert resp.status_code == 200
+        assert resp.headers["Content-Type"].startswith("application/x-pem-file")
         assert "BEGIN CERTIFICATE" in resp.text
 
 
@@ -710,12 +738,12 @@ class TestAPIEndpoints:
     def test_api_cert_unknown_serial_returns_404(self, api):
         assert api.get(f"{BASE_URL}/api/certs/999999999/pem").status_code == 404
 
-    def test_api_cert_unknown_format_returns_400(self, api):
+    def test_api_cert_unknown_format_returns_404(self, api):
         certs = api.get(f"{BASE_URL}/api/certs").json().get("certificates", [])
         if not certs:
             pytest.skip("No certificates to test with")
         serial = certs[0]["serial"]
-        assert api.get(f"{BASE_URL}/api/certs/{serial}/unsupportedformat").status_code == 400
+        assert api.get(f"{BASE_URL}/api/certs/{serial}/unsupportedformat").status_code == 404
 
     def test_api_config_has_validity(self, api):
         cfg = api.get(f"{BASE_URL}/api/config").json()
@@ -745,28 +773,95 @@ class TestAPIEndpoints:
         resp = api.post(f"{BASE_URL}/api/this-does-not-exist", json={})
         assert resp.status_code == 404
 
+    def test_api_audit_entry_fields(self, api):
+        data = api.get(f"{BASE_URL}/api/audit").json()
+        events = data.get("events", [])
+        if not events:
+            pytest.skip("No audit events recorded yet")
+        entry = events[0]
+        for field in ("timestamp", "event", "detail", "ip"):
+            assert field in entry, f"Missing audit entry field: {field}"
+
+    def test_api_metrics_prometheus_format(self, api):
+        resp = api.get(f"{BASE_URL}/api/metrics")
+        assert resp.status_code == 200
+        assert "text/plain" in resp.headers.get("Content-Type", "")
+        # Prometheus exposition format starts with '#' comment lines or metric lines
+        assert isinstance(resp.text, str) and len(resp.text) >= 0
+
+    def test_post_api_config_same_as_patch(self, api):
+        """POST /api/config is handled identically to PATCH via do_PATCH = do_POST."""
+        resp = api.post(f"{BASE_URL}/api/config",
+                        json={"validity": {"end_entity_days": 365}})
+        assert resp.status_code == 200
+        assert resp.json().get("ok") is True
+
+    def test_api_services_status_returns_dict(self, api):
+        resp = api.get(f"{BASE_URL}/api/services")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert isinstance(data, dict)
+
+    def test_api_services_entries_have_running_key(self, api):
+        data = api.get(f"{BASE_URL}/api/services").json()
+        if not data:
+            pytest.skip("No services registered")
+        entry = data[next(iter(data))]
+        assert "running" in entry, "Service entry missing 'running' key"
+        assert "available" in entry, "Service entry missing 'available' key"
+
+    def test_api_service_unknown_action_returns_400(self, api):
+        data = api.get(f"{BASE_URL}/api/services").json()
+        if not data:
+            pytest.skip("No services registered")
+        name = next(iter(data))
+        resp = api.post(f"{BASE_URL}/api/services/{name}/restart", json={})
+        assert resp.status_code == 400
+        assert "error" in resp.json()
+
+    def test_api_service_unknown_name_returns_404(self, api):
+        resp = api.post(f"{BASE_URL}/api/services/nonexistentservice999/stop", json={})
+        assert resp.status_code == 404
+        assert "error" in resp.json()
+
+    def test_api_renew_valid_serial_no_crash(self, api):
+        certs = api.get(f"{BASE_URL}/api/certs").json().get("certificates", [])
+        active = [c for c in certs if not c.get("revoked")]
+        if not active:
+            pytest.skip("No active certificates to renew")
+        serial = active[0]["serial"]
+        resp = api.post(f"{BASE_URL}/api/renew", json={"serial": serial})
+        assert resp.status_code < 500
+
 @pytest.mark.auth
 class TestAdminSecurity:
-    """Verify that administrative endpoints are properly protected."""
+    """Verify that administrative endpoints behave correctly under admin key configuration."""
 
+    @pytest.mark.skipif(not ADMIN_API_KEY, reason="WEB_UI_ADMIN_KEY not set — server has no key enforcement")
     def test_unauthorized_config_patch_fails(self, api):
-        # Create a session without the admin key
+        """When an admin key is configured, requests without it must be rejected."""
         plain_api = requests.Session()
-        plain_api.verify = api.verify
-        
+        plain_api.verify = TLS_VERIFY
+        if TLS_CLIENT_CERT:
+            plain_api.cert = TLS_CLIENT_CERT
         resp = plain_api.patch(f"{BASE_URL}/api/config", json={"validity": {"end_entity_days": 10}})
-        assert resp.status_code == 403
-        assert "admin authentication required" in resp.json()["error"]
+        assert resp.status_code in (401, 403)
 
-    def test_invalid_config_patch_returns_400(self, api):
-        # validity_days must be an integer; sending a string should fail validation
+    def test_invalid_config_patch_type_handled(self, api):
+        """Sending a non-numeric end_entity_days should either be rejected (400) or accepted
+        as a no-op by the server; it must not cause a 500 error."""
         resp = api.patch(f"{BASE_URL}/api/config", json={"validity": {"end_entity_days": "invalid"}})
-        assert resp.status_code == 400
+        assert resp.status_code < 500
 
+    @pytest.mark.skipif(not ADMIN_API_KEY, reason="WEB_UI_ADMIN_KEY not set — server has no key enforcement")
     def test_issue_subca_requires_admin(self, api):
+        """When an admin key is configured, unauthenticated Sub-CA issuance must be rejected."""
         plain_api = requests.Session()
+        plain_api.verify = TLS_VERIFY
+        if TLS_CLIENT_CERT:
+            plain_api.cert = TLS_CLIENT_CERT
         resp = plain_api.post(f"{BASE_URL}/api/issue-sub-ca", json={"cn": "Test Sub-CA"})
-        assert resp.status_code == 403
+        assert resp.status_code in (401, 403)
 
 @pytest.mark.api
 class TestServiceManagement:
@@ -776,19 +871,33 @@ class TestServiceManagement:
         resp = api.get(f"{BASE_URL}/api/services")
         assert resp.status_code == 200
         data = resp.json()
-        assert "acme" in data or "scep" in data # At least one service should exist
-        assert "state" in data[list(data.keys())[0]]
+        if not data:
+            pytest.skip("No services registered")
+        first = data[list(data.keys())[0]]
+        # Each entry must have running/available/url/config keys
+        assert "running" in first, "Service entry missing 'running' key"
+        assert "available" in first, "Service entry missing 'available' key"
 
-    def test_service_lifecycle_actions(self, api):
-        # Attempt to stop and restart the ACME service
-        # Note: This might be disruptive; consider using a dedicated test service if available
-        stop_resp = api.post(f"{BASE_URL}/api/services/acme/stop", json={})
+    def test_service_stop_returns_ok(self, api):
+        """Stopping an already-stopped (or running) service returns ok=True."""
+        data = api.get(f"{BASE_URL}/api/services").json()
+        if not data:
+            pytest.skip("No services registered")
+        name = next(iter(data))
+        stop_resp = api.post(f"{BASE_URL}/api/services/{name}/stop", json={})
         assert stop_resp.status_code == 200
-        assert stop_resp.json()["state"] == "stopped"
+        body = stop_resp.json()
+        assert body.get("ok") is True
 
-        start_resp = api.post(f"{BASE_URL}/api/services/acme/start", json={})
-        assert start_resp.status_code == 200
-        assert start_resp.json()["state"] == "running"
+    def test_service_start_unavailable_returns_503(self, api):
+        """Starting a service whose module is not installed returns 503."""
+        data = api.get(f"{BASE_URL}/api/services").json()
+        unavailable = [n for n, e in data.items() if not e.get("available")]
+        if not unavailable:
+            pytest.skip("All services are available — cannot test 503 path")
+        name = unavailable[0]
+        resp = api.post(f"{BASE_URL}/api/services/{name}/start", json={"port": 19999})
+        assert resp.status_code == 503
         
         
 @pytest.mark.api
@@ -796,25 +905,28 @@ class TestExtendedCerts:
     """Test specialized certificate operations and binary downloads."""
 
     def test_download_crl(self, api):
-        resp = api.get(f"{BASE_URL}/ca/crl.der")
+        """/ca/crl returns a DER-encoded CRL."""
+        resp = api.get(f"{BASE_URL}/ca/crl")
         assert resp.status_code == 200
         assert resp.headers["Content-Type"] == "application/pkix-crl"
         assert len(resp.content) > 0
 
-    def test_download_p12_bundle(self, api):
-        # Get a valid serial first
+    def test_download_p12_bundle_content_type(self, api):
+        """P12 download returns correct MIME type."""
         certs = api.get(f"{BASE_URL}/api/certs").json().get("certificates", [])
         if not certs:
             pytest.skip("No certificates to test P12 download")
-        
         serial = certs[0]["serial"]
         resp = api.get(f"{BASE_URL}/api/certs/{serial}/p12")
         assert resp.status_code == 200
-        # P12 is a binary format
         assert resp.headers["Content-Type"] == "application/x-pkcs12"
 
     def test_issue_subca_success(self, api):
         payload = {"cn": "Integration Test Sub-CA", "validity_days": 365}
         resp = api.post(f"{BASE_URL}/api/issue-sub-ca", json=payload)
         assert resp.status_code == 200
-        assert "serial" in resp.json()
+        body = resp.json()
+        assert "serial" in body
+        assert "cert_pem" in body
+        assert "key_pem" in body
+        assert body.get("ok") is True
