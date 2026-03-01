@@ -74,6 +74,7 @@ from pki_server import (
     RateLimiter,
     CertProfile,
     ServerConfig,
+    DEFAULT_CONFIG,
 )
 
 logging.basicConfig(

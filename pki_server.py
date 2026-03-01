@@ -102,6 +102,9 @@ from cryptography.x509.oid import NameOID, ExtendedKeyUsageOID
 OID_NO_REV_AVAIL = x509.ObjectIdentifier("2.5.29.56")
 NO_REV_AVAIL_THRESHOLD_DAYS = 7  # certs valid <=7 days SHOULD carry noRevAvail
 
+# RFC 9480 §4.1 / RFC 6712 §3.6 — well-known CMP path
+CMP_WELL_KNOWN_PATH = "/.well-known/cmp"
+
 # RFC 8398/9598 — SmtpUTF8Mailbox otherName OID for non-ASCII email in SAN
 OID_SMTP_UTF8_MAILBOX = x509.ObjectIdentifier("1.3.6.1.5.5.7.8.9")
 
@@ -160,16 +163,13 @@ try:
 except ImportError:
     HAS_IPSEC = False
 
-# CMP server module — CMPv2 (RFC 4210) / CMPv3 (RFC 9480) / HTTP (RFC 6712)
-# Extracted from pki_server.py into cmp_server.py, consistent with the other
-# protocol modules: acme_server.py, scep_server.py, est_server.py, ocsp_server.py.
-try:
-    import cmp_server as _cmp_module
-    HAS_CMP = True
-except ImportError:
-    HAS_CMP = False
-    print("WARNING: cmp_server.py not found — CMPv2/CMPv3 support disabled.")
-    print("         Place cmp_server.py in the same directory as pki_server.py.")
+# cmp_server is imported at the BOTTOM of this module (after all classes are
+# defined) to break the circular import: cmp_server.py does
+#   from pki_server import CertificateAuthority, AuditLog, …
+# which would fail if pki_server tried to import cmp_server before those
+# classes are defined.  HAS_CMP / _cmp_module are set in the deferred block.
+HAS_CMP = False
+_cmp_module = None
 
 # ASN.1 imports for CMPv2 message parsing
 try:
@@ -2710,6 +2710,34 @@ class CertificateAuthority:
         """Remove a cached OCSP staple (e.g. after revocation)."""
         self._ocsp_cache().pop(serial, None)
 
+
+
+# ===========================================================================
+# Deferred CMP module import — resolves the circular import:
+#   cmp_server.py does  "from pki_server import CertificateAuthority, …"
+# All CMP classes and helpers are re-exported here so callers can use
+#   import pki_server as pki; pki.CMPv2Handler(ca)
+# ===========================================================================
+try:
+    import cmp_server as _cmp_module
+    HAS_CMP = True
+    # Re-export public CMP API
+    from cmp_server import (
+        CMP_WELL_KNOWN_PATH,
+        CMPv2ASN1,
+        CMPv2Handler,
+        CMPv3Handler,
+        CMPv2HTTPHandler,
+        ThreadedHTTPServer,
+        TLSServer,
+        make_handler,
+        make_cmpv3_handler,
+        start_bootstrap_server,
+    )
+except ImportError:
+    HAS_CMP = False
+    print("WARNING: cmp_server.py not found — CMPv2/CMPv3 support disabled.")
+    print("         Place cmp_server.py in the same directory as pki_server.py.")
 
 def main():
     parser = argparse.ArgumentParser(description="PKI Server with CMPv2 Support + mTLS")
