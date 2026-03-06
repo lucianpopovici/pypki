@@ -1,0 +1,51 @@
+[Unit]
+Description=PyPKI Certificate Authority Server
+Documentation=https://github.com/pypki/pypki
+After=network.target
+Wants=network.target
+
+[Service]
+Type=simple
+User=pypki
+Group=pypki
+
+# Working directory must contain pki_server.py and companion modules
+WorkingDirectory=/opt/pypki
+
+# ExecStart: launch the CMP server (always on) + web dashboard (always on).
+# On first start no optional services run; the user enables them via the web UI.
+# On restart, services previously enabled via the web UI are auto-started from
+# the persisted "services" section in <ca-dir>/config.json.
+ExecStart=/usr/bin/python3 /opt/pypki/pki_server.py \
+    --host 0.0.0.0 \
+    --port 8080 \
+    --web-port 8090 \
+    --ca-dir /var/lib/pypki/ca \
+    --log-level INFO
+
+# Restart policy: always restart on failure so the service recovers automatically.
+Restart=on-failure
+RestartSec=5s
+
+# Give the server time to start up (CA key generation can take a moment on first run)
+TimeoutStartSec=30s
+
+# Graceful shutdown: send SIGTERM and wait up to 15 s for a clean exit
+TimeoutStopSec=15s
+KillMode=mixed
+KillSignal=SIGTERM
+
+# Logging — all output goes to the systemd journal
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=pypki
+
+# Security hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/pypki
+ProtectHome=true
+
+[Install]
+WantedBy=multi-user.target

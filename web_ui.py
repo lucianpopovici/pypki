@@ -379,6 +379,8 @@ class WebUIHandler(http.server.BaseHTTPRequestHandler):
     ipsec_base_url: str = ""
     # Service registry dict — built in start_web_ui(), shared across instances
     service_registry: "Dict[str, Any]" = None
+    # ServerConfig reference for persisting service enabled state to config.json
+    server_config = None
 
     def log_message(self, fmt, *args):
         logger.debug("WebUI %s - %s", self.client_address[0], fmt % args)
@@ -1167,6 +1169,11 @@ class WebUIHandler(http.server.BaseHTTPRequestHandler):
         if self.audit_log:
             self.audit_log.record("service_stop", "service={}".format(name),
                                   self.client_address[0])
+        if self.server_config:
+            try:
+                self.server_config.patch({"services": {name: {"enabled": False}}})
+            except Exception as _e:
+                logger.warning("Failed to persist stop state for %s: %s", name, _e)
         logger.info("Service %s stopped via Web UI", name)
         self._send_json({"ok": True, "service": name})
 
@@ -1204,6 +1211,14 @@ class WebUIHandler(http.server.BaseHTTPRequestHandler):
             self.audit_log.record("service_start",
                                   "service={} url={}".format(name, url),
                                   self.client_address[0])
+        if self.server_config:
+            try:
+                _persist_cfg = {k: v for k, v in final.items()
+                                if isinstance(v, (str, int, float, bool, type(None)))}
+                _persist_cfg["enabled"] = True
+                self.server_config.patch({"services": {name: _persist_cfg}})
+            except Exception as _e:
+                logger.warning("Failed to persist start state for %s: %s", name, _e)
         logger.info("Service %s started via Web UI → %s", name, url)
         self._send_json({"ok": True, "service": name, "url": url})
 
@@ -1347,6 +1362,8 @@ def start_web_ui(
     est_module=None,
     ocsp_module=None,
     ipsec_module=None,
+    # ServerConfig reference for persisting service enabled/disabled state.
+    server_config=None,
 ) -> http.server.HTTPServer:
     """
     Start the PyPKI web dashboard in a background daemon thread.
@@ -1411,6 +1428,7 @@ def start_web_ui(
     BoundWebUIHandler.ocsp_base_url    = ocsp_base_url or ""
     BoundWebUIHandler.ipsec_base_url   = ipsec_base_url or ""
     BoundWebUIHandler.service_registry = service_registry
+    BoundWebUIHandler.server_config    = server_config
 
     class _ThreadedServer(http.server.ThreadingHTTPServer):
         allow_reuse_address = True
