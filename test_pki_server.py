@@ -817,7 +817,7 @@ class TestAuditLog(unittest.TestCase):
     def test_timestamp_format_is_iso8601(self):
         self.log.record("startup", "", "")
         events = self.log.recent(1)
-        ts = events[0]["ts"]
+        ts = events[0]["timestamp"]
         # ISO 8601 — must parse without error
         datetime.datetime.fromisoformat(ts)
 
@@ -3354,6 +3354,380 @@ class TestIntermediateCA(unittest.TestCase):
         # inter_ca was created without parent_chain_path= (auto-discovery)
         self.assertTrue(self.inter_ca.is_intermediate,
                         "Auto-discovered ca-chain.pem must activate intermediate mode")
+
+
+# ===========================================================================
+# pypki.py — entry-point config loader and argv builder
+# ===========================================================================
+
+import importlib, types as _types
+
+def _import_pypki():
+    """Import pypki without triggering pki_server.main()."""
+    import importlib.util
+    spec = importlib.util.spec_from_file_location(
+        "pypki", Path(__file__).parent / "pypki.py"
+    )
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+class TestPypkiConfigLoader(unittest.TestCase):
+    """Unit tests for pypki._load_config()."""
+
+    def setUp(self):
+        self._tmp = tempfile.mkdtemp()
+        self._pypki = _import_pypki()
+
+    def _write(self, data: dict) -> Path:
+        p = Path(self._tmp) / "pypki.json"
+        p.write_text(json.dumps(data))
+        return p
+
+    def test_load_valid_config(self):
+        p = self._write({"host": "127.0.0.1", "cmp": {"port": 9999}})
+        cfg = self._pypki._load_config(p)
+        self.assertEqual(cfg["host"], "127.0.0.1")
+        self.assertEqual(cfg["cmp"]["port"], 9999)
+
+    def test_load_missing_file_exits(self):
+        with self.assertRaises(SystemExit):
+            self._pypki._load_config(Path(self._tmp) / "nonexistent.json")
+
+    def test_load_returns_dict(self):
+        p = self._write({})
+        self.assertIsInstance(self._pypki._load_config(p), dict)
+
+
+class TestPypkiBuildArgv(unittest.TestCase):
+    """Unit tests for pypki._build_argv()."""
+
+    def setUp(self):
+        self._pypki = _import_pypki()
+
+    def _argv(self, cfg: dict) -> list:
+        return self._pypki._build_argv(cfg)
+
+    # ── web_ui is always on ─────────────────────────────────────────────────
+
+    def test_web_port_always_present(self):
+        argv = self._argv({})
+        self.assertIn("--web-port", argv)
+
+    def test_web_port_value(self):
+        argv = self._argv({"web_ui": {"port": 9090}})
+        idx = argv.index("--web-port")
+        self.assertEqual(argv[idx + 1], "9090")
+
+    def test_web_no_auth_flag(self):
+        argv = self._argv({"web_ui": {"no_auth": True}})
+        self.assertIn("--web-no-auth", argv)
+
+    def test_web_auth_flag_absent_when_false(self):
+        argv = self._argv({"web_ui": {"no_auth": False}})
+        self.assertNotIn("--web-no-auth", argv)
+
+    # ── CMP port ────────────────────────────────────────────────────────────
+
+    def test_cmp_port_default(self):
+        argv = self._argv({})
+        idx = argv.index("--port")
+        self.assertEqual(argv[idx + 1], "8080")
+
+    def test_cmp_port_custom(self):
+        argv = self._argv({"cmp": {"port": 7070}})
+        idx = argv.index("--port")
+        self.assertEqual(argv[idx + 1], "7070")
+
+    # ── optional services only appear when enabled ──────────────────────────
+
+    def test_acme_absent_when_disabled(self):
+        argv = self._argv({"acme": {"enabled": False, "port": 8888}})
+        self.assertNotIn("--acme-port", argv)
+
+    def test_acme_present_when_enabled(self):
+        argv = self._argv({"acme": {"enabled": True, "port": 8888}})
+        self.assertIn("--acme-port", argv)
+        idx = argv.index("--acme-port")
+        self.assertEqual(argv[idx + 1], "8888")
+
+    def test_scep_absent_when_disabled(self):
+        self.assertNotIn("--scep-port", self._argv({"scep": {"enabled": False}}))
+
+    def test_scep_present_when_enabled(self):
+        argv = self._argv({"scep": {"enabled": True, "port": 8889}})
+        self.assertIn("--scep-port", argv)
+
+    def test_est_absent_when_disabled(self):
+        self.assertNotIn("--est-port", self._argv({"est": {"enabled": False}}))
+
+    def test_est_present_when_enabled(self):
+        argv = self._argv({"est": {"enabled": True, "port": 8443}})
+        self.assertIn("--est-port", argv)
+
+    def test_ocsp_absent_when_disabled(self):
+        self.assertNotIn("--ocsp-port", self._argv({"ocsp": {"enabled": False}}))
+
+    def test_ocsp_present_when_enabled(self):
+        argv = self._argv({"ocsp": {"enabled": True, "port": 9001}})
+        self.assertIn("--ocsp-port", argv)
+
+    def test_ipsec_absent_when_disabled(self):
+        self.assertNotIn("--ipsec-port", self._argv({"ipsec": {"enabled": False}}))
+
+    def test_ipsec_present_when_enabled(self):
+        argv = self._argv({"ipsec": {"enabled": True, "port": 8444}})
+        self.assertIn("--ipsec-port", argv)
+
+    # ── TLS modes ───────────────────────────────────────────────────────────
+
+    def test_tls_mode_none_no_flag(self):
+        argv = self._argv({"tls": {"mode": "none"}})
+        self.assertNotIn("--tls", argv)
+        self.assertNotIn("--mtls", argv)
+
+    def test_tls_mode_tls_flag(self):
+        argv = self._argv({"tls": {"mode": "tls"}})
+        self.assertIn("--tls", argv)
+        self.assertNotIn("--mtls", argv)
+
+    def test_tls_mode_mtls_flag(self):
+        argv = self._argv({"tls": {"mode": "mtls"}})
+        self.assertIn("--mtls", argv)
+        self.assertNotIn("--tls", argv)
+
+    def test_tls13_only_flag(self):
+        argv = self._argv({"tls": {"mode": "tls", "tls13_only": True}})
+        self.assertIn("--tls13-only", argv)
+
+    def test_tls13_only_absent_when_false(self):
+        argv = self._argv({"tls": {"mode": "tls", "tls13_only": False}})
+        self.assertNotIn("--tls13-only", argv)
+
+    # ── validity periods ─────────────────────────────────────────────────────
+
+    def test_validity_end_entity_days(self):
+        argv = self._argv({"validity": {"end_entity_days": 730}})
+        idx = argv.index("--end-entity-days")
+        self.assertEqual(argv[idx + 1], "730")
+
+    def test_validity_ca_days(self):
+        argv = self._argv({"validity": {"ca_days": 3650}})
+        idx = argv.index("--ca-days")
+        self.assertEqual(argv[idx + 1], "3650")
+
+    # ── host / ca-dir ────────────────────────────────────────────────────────
+
+    def test_host_passed_through(self):
+        argv = self._argv({"host": "192.168.1.1"})
+        idx = argv.index("--host")
+        self.assertEqual(argv[idx + 1], "192.168.1.1")
+
+    def test_ca_dir_passed_through(self):
+        argv = self._argv({"ca_dir": "/data/pki"})
+        idx = argv.index("--ca-dir")
+        self.assertEqual(argv[idx + 1], "/data/pki")
+
+    def test_log_level_passed_through(self):
+        argv = self._argv({"log_level": "DEBUG"})
+        idx = argv.index("--log-level")
+        self.assertEqual(argv[idx + 1], "DEBUG")
+
+    # ── result type ──────────────────────────────────────────────────────────
+
+    def test_returns_list_of_strings(self):
+        argv = self._argv({})
+        self.assertIsInstance(argv, list)
+        for item in argv:
+            self.assertIsInstance(item, str)
+
+
+class TestPypkiCircularImportFix(unittest.TestCase):
+    """Verify the HAS_CMP / _cmp_module patch applied by pypki.main()."""
+
+    def test_pki_server_has_cmp_after_pypki_patch(self):
+        """After pypki patches pki_server, HAS_CMP must be True."""
+        pypki = _import_pypki()
+        # Re-import pki_server fresh to simulate the circular-import failure
+        import pki_server
+        if not pki_server.HAS_CMP:
+            import cmp_server as _cmp
+            pki_server._cmp_module = _cmp
+            pki_server.HAS_CMP = True
+        self.assertTrue(pki_server.HAS_CMP)
+
+    def test_cmp_module_callable_after_patch(self):
+        import pki_server, cmp_server
+        if not pki_server.HAS_CMP:
+            pki_server._cmp_module = cmp_server
+            pki_server.HAS_CMP = True
+        self.assertTrue(callable(getattr(pki_server._cmp_module, "start_cmp_server", None)))
+
+
+# ===========================================================================
+# web_ui.py — PAM setup unit tests
+# ===========================================================================
+
+class TestWebUIPamSetup(unittest.TestCase):
+    """
+    Unit tests for the PAM ctypes setup in web_ui.py.
+    These tests verify the fix (libc.calloc / libc.strdup) without
+    requiring a real PAM conversation (no root, no /etc/shadow access needed).
+    """
+
+    def setUp(self):
+        import web_ui
+        self.web_ui = web_ui
+
+    def test_libc_loaded_when_pam_available(self):
+        """If libpam is present, libc must also be loaded for safe memory allocation."""
+        if not self.web_ui.HAS_PAM:
+            self.skipTest("libpam not available on this system")
+        self.assertIsNotNone(self.web_ui._libc,
+                             "_libc must be loaded alongside libpam")
+
+    def test_pam_response_resp_field_is_void_ptr(self):
+        """
+        _PamResponse.resp MUST be c_void_p, not c_char_p.
+        PAM calls free() on this pointer; c_char_p would point into Python-managed
+        memory causing 'free(): invalid size' / core dump.
+        """
+        if not self.web_ui.HAS_PAM:
+            self.skipTest("libpam not available on this system")
+        import ctypes
+        fields = dict(self.web_ui._PamResponse._fields_)
+        self.assertEqual(fields["resp"], ctypes.c_void_p,
+                         "_PamResponse.resp must be c_void_p so PAM can safely free() it")
+
+    def test_libc_calloc_configured(self):
+        """libc.calloc must have restype=c_void_p so it returns an integer address."""
+        if not self.web_ui.HAS_PAM:
+            self.skipTest("libpam not available on this system")
+        import ctypes
+        self.assertEqual(self.web_ui._libc.calloc.restype, ctypes.c_void_p)
+
+    def test_libc_strdup_configured(self):
+        """libc.strdup must have restype=c_void_p so it returns a malloc'd pointer."""
+        if not self.web_ui.HAS_PAM:
+            self.skipTest("libpam not available on this system")
+        import ctypes
+        self.assertEqual(self.web_ui._libc.strdup.restype, ctypes.c_void_p)
+
+    def test_pam_authenticate_wrong_creds_returns_false(self):
+        """
+        pam_authenticate() must return (False, reason) for bad credentials
+        without crashing (the old code would segfault / dump core).
+        """
+        if not self.web_ui.HAS_PAM:
+            self.skipTest("libpam not available on this system")
+        ok, reason = self.web_ui.pam_authenticate(
+            "__nonexistent_user_xyz__", "wrong_password_xyz"
+        )
+        self.assertFalse(ok)
+        self.assertIsInstance(reason, str)
+        self.assertGreater(len(reason), 0)
+
+    def test_pam_authenticate_returns_tuple(self):
+        """pam_authenticate() must always return a (bool, str) tuple."""
+        if not self.web_ui.HAS_PAM:
+            self.skipTest("libpam not available on this system")
+        result = self.web_ui.pam_authenticate("user", "pass")
+        self.assertIsInstance(result, tuple)
+        self.assertEqual(len(result), 2)
+        self.assertIsInstance(result[0], bool)
+        self.assertIsInstance(result[1], str)
+
+    def test_pam_not_available_returns_false(self):
+        """When HAS_PAM is False, pam_authenticate() must return (False, message)."""
+        original = self.web_ui.HAS_PAM
+        self.web_ui.HAS_PAM = False
+        try:
+            ok, reason = self.web_ui.pam_authenticate("user", "pass")
+            self.assertFalse(ok)
+            self.assertIn("not available", reason.lower())
+        finally:
+            self.web_ui.HAS_PAM = original
+
+
+# ===========================================================================
+# pki_server.py — start_web_ui receives module references
+# ===========================================================================
+
+class TestStartWebUiModulePassthrough(unittest.TestCase):
+    """
+    Verify that pki_server passes *_module kwargs to start_web_ui so
+    the Services page can start/stop services.
+    """
+
+    def test_start_web_ui_accepts_module_kwargs(self):
+        """start_web_ui must accept cmp_module / acme_module / etc. without error."""
+        import web_ui, pki_server, cmp_server, ocsp_server
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            ca = pki.CertificateAuthority(ca_dir=tmp)
+            # Use a high ephemeral port unlikely to conflict
+            srv = web_ui.start_web_ui(
+                host="127.0.0.1",
+                port=0,          # OS picks a free port
+                ca=ca,
+                require_auth=False,
+                cmp_module=cmp_server,
+                ocsp_module=ocsp_server,
+            )
+            try:
+                self.assertIsNotNone(srv)
+            finally:
+                srv.shutdown()
+
+    def test_service_registry_available_flag_with_modules(self):
+        """When a module is passed, its service entry must have available=True."""
+        import web_ui, cmp_server
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            ca = pki.CertificateAuthority(ca_dir=tmp)
+            srv = web_ui.start_web_ui(
+                host="127.0.0.1", port=0, ca=ca,
+                require_auth=False,
+                cmp_module=cmp_server,
+            )
+            try:
+                import urllib.request, json as _json
+                port = srv.server_address[1]
+                resp = urllib.request.urlopen(
+                    f"http://127.0.0.1:{port}/api/services", timeout=3
+                )
+                data = _json.loads(resp.read())
+                self.assertTrue(data.get("cmp", {}).get("available"),
+                                "cmp service must be available=True when module is passed")
+            finally:
+                srv.shutdown()
+
+    def test_service_registry_available_false_without_module(self):
+        """When no module is passed, the service entry must have available=False."""
+        import web_ui
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            ca = pki.CertificateAuthority(ca_dir=tmp)
+            srv = web_ui.start_web_ui(
+                host="127.0.0.1", port=0, ca=ca,
+                require_auth=False,
+                # no acme_module passed
+            )
+            try:
+                import urllib.request, json as _json
+                port = srv.server_address[1]
+                resp = urllib.request.urlopen(
+                    f"http://127.0.0.1:{port}/api/services", timeout=3
+                )
+                data = _json.loads(resp.read())
+                self.assertFalse(data.get("acme", {}).get("available"),
+                                 "acme service must be available=False when no module passed")
+            finally:
+                srv.shutdown()
 
 
 # ===========================================================================

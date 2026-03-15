@@ -43,15 +43,28 @@ try:
     import ctypes.util as _ctutil
 
     _libpam_path = _ctutil.find_library("pam")
+    _libc_path   = _ctutil.find_library("c")
     _libpam = ctypes.CDLL(_libpam_path) if _libpam_path else None
+    _libc   = ctypes.CDLL(_libc_path)   if _libc_path   else None
 
-    if _libpam:
+    if _libpam and _libc:
+        # ---- libc allocation helpers (PAM will free() these) ----
+        _libc.calloc.restype  = ctypes.c_void_p
+        _libc.calloc.argtypes = [ctypes.c_size_t, ctypes.c_size_t]
+        _libc.strdup.restype  = ctypes.c_void_p
+        _libc.strdup.argtypes = [ctypes.c_char_p]
+        _libc.free.restype    = None
+        _libc.free.argtypes   = [ctypes.c_void_p]
+
         # ---- PAM C structures ----
         class _PamMessage(ctypes.Structure):
             _fields_ = [("msg_style", ctypes.c_int), ("msg", ctypes.c_char_p)]
 
+        # resp is c_void_p (not c_char_p) so we can store a raw malloc'd pointer
+        # that PAM will later free() — assigning a Python c_char_p here would
+        # point into Python-managed memory which PAM must not free.
         class _PamResponse(ctypes.Structure):
-            _fields_ = [("resp", ctypes.c_char_p), ("resp_retcode", ctypes.c_int)]
+            _fields_ = [("resp", ctypes.c_void_p), ("resp_retcode", ctypes.c_int)]
 
         _CONV_FUNC = ctypes.CFUNCTYPE(
             ctypes.c_int,
@@ -82,6 +95,7 @@ try:
 
 except Exception:
     _libpam = None
+    _libc   = None
     HAS_PAM = False
 
 
@@ -100,16 +114,21 @@ def pam_authenticate(username: str, password: str, service: str = "login") -> Tu
 
     @_CONV_FUNC
     def _conv(n_messages, messages, p_response, app_data):
-        # Allocate response array
-        addr = _libpam.pam_start  # any symbol — just need calloc
-        resp = (_PamResponse * n_messages)()
+        # Allocate the response array with libc calloc so PAM can free() it.
+        # Using Python's allocator here causes "free(): invalid size" / core dump
+        # because PAM unconditionally calls free() on the pointer we return.
+        resp_ptr = _libc.calloc(n_messages, ctypes.sizeof(_PamResponse))
+        if not resp_ptr:
+            return 1  # PAM_BUF_ERR
+        resp = (_PamResponse * n_messages).from_address(resp_ptr)
         for i in range(n_messages):
             msg = messages[i].contents
-            # PAM_PROMPT_ECHO_OFF (1) and PAM_PROMPT_ECHO_ON (2) both get the password
+            # PAM_PROMPT_ECHO_OFF (1) and PAM_PROMPT_ECHO_ON (2) both get the password.
+            # strdup allocates with malloc so PAM can free() resp[i].resp safely.
             if msg.msg_style in (1, 2):
-                resp[i].resp = ctypes.c_char_p(_password)
+                resp[i].resp = _libc.strdup(_password)
             resp[i].resp_retcode = 0
-        p_response[0] = ctypes.cast(resp, ctypes.POINTER(_PamResponse))
+        p_response[0] = ctypes.cast(resp_ptr, ctypes.POINTER(_PamResponse))
         return 0  # PAM_SUCCESS
 
     handle = ctypes.c_void_p()
@@ -220,6 +239,10 @@ class SessionStore:
 
 # Module-level session store (shared across all handler instances)
 _session_store = SessionStore()
+
+# Set to True when the server is started with authentication enabled.
+# Used by _page() to conditionally render the Sign Out nav link.
+_auth_enabled: bool = True
 
 
 
@@ -489,8 +512,9 @@ def _page(title: str, body: str, active: str = "") -> str:
         )
         for label, href, tag in nav_links
     )
-    # Sign Out link — floated right
-    nav += '<a href="/logout" style="margin-left:auto;color:#f87171;">Sign Out</a>'
+    # Sign Out link — floated right, only when auth is enabled
+    if _auth_enabled:
+        nav += '<a href="/logout" style="margin-left:auto;color:#f87171;">Sign Out</a>'
     return """<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -893,6 +917,10 @@ class WebUIHandler(http.server.BaseHTTPRequestHandler):
         try:
             data = json.loads(raw) if raw else {}
         except Exception:
+            ctype = self.headers.get("Content-Type", "")
+            if "application/json" in ctype:
+                self._send_json({"error": "malformed JSON"}, 400)
+                return
             data = {}
         try:
             if path == "/api/revoke":
@@ -1011,7 +1039,7 @@ class WebUIHandler(http.server.BaseHTTPRequestHandler):
         cards = ""
         for (name, label, icon, rfc, desc, default_port, fields) in _SERVICE_DEFS:
             entry   = reg.get(name, {})
-            running = bool(entry.get("server"))
+            running = entry.get("server") is not None
             avail   = entry.get("available", False)
             url     = entry.get("url", "")
             saved   = entry.get("config", {})
@@ -1201,12 +1229,12 @@ class WebUIHandler(http.server.BaseHTTPRequestHandler):
             "      const s=parseInt(document.getElementById('rev-serial').value);"
             "      const r=parseInt(document.getElementById('rev-reason').value);"
             "      if(!s) return;"
-            "      fetch('/api/revoke',{method:'POST',"
-            "        headers:{'Content-Type':'application/json'},"
-            "        body:JSON.stringify({serial:s,reason:r})})"
-            "        .then(r=>r.json()).then(d=>{"
+            "      fetch('/api/revoke',{{method:'POST',"
+            "        headers:{{'Content-Type':'application/json'}},"
+            "        body:JSON.stringify({{serial:s,reason:r}})}})"
+            "        .then(r=>r.json()).then(d=>{{"
             "          document.getElementById('rev-result').textContent=JSON.stringify(d,null,2);"
-            "        });"
+            "        }});"
             '    ">Revoke</button>'
             '    <pre id="rev-result" style="margin-top:14px"></pre>'
             "  </div>"
@@ -1329,16 +1357,16 @@ class WebUIHandler(http.server.BaseHTTPRequestHandler):
 
         renew_js = (
             "<script>"
-            "function renewCert(serial) {"
+            "function renewCert(serial) {{"
             "  if (!confirm('Renew cert ' + serial + '?')) return;"
-            "  fetch('/api/renew', {method:'POST',"
-            "    headers:{'Content-Type':'application/json'},"
-            "    body: JSON.stringify({serial: serial})})"
-            "    .then(r => r.json()).then(d => {"
+            "  fetch('/api/renew', {{method:'POST',"
+            "    headers:{{'Content-Type':'application/json'}},"
+            "    body: JSON.stringify({{serial: serial}})}})"
+            "    .then(r => r.json()).then(d => {{"
             "      if (d.error) alert('Error: ' + d.error);"
-            "      else { alert('Renewed! New serial: ' + d.serial); location.reload(); }"
-            "    });"
-            "}"
+            "      else {{ alert('Renewed! New serial: ' + d.serial); location.reload(); }}"
+            "    }});"
+            "}}"
             "</script>"
         )
         inner = (
@@ -1573,7 +1601,7 @@ class WebUIHandler(http.server.BaseHTTPRequestHandler):
             if name.startswith("_"):
                 continue
             out[name] = {
-                "running":   bool(entry.get("server")),
+                "running":   entry.get("server") is not None,
                 "available": entry.get("available", False),
                 "url":       entry.get("url", ""),
                 "config":    entry.get("config", {}),
@@ -1610,6 +1638,7 @@ class WebUIHandler(http.server.BaseHTTPRequestHandler):
             return
         try:
             srv.shutdown()
+            srv.server_close()
         except Exception as e:
             logger.warning("Error shutting down %s: %s", name, e)
         entry["server"] = None
@@ -1631,6 +1660,7 @@ class WebUIHandler(http.server.BaseHTTPRequestHandler):
         if old_srv:
             try:
                 old_srv.shutdown()
+                old_srv.server_close()
             except Exception:
                 pass
             entry["server"] = None
@@ -1746,6 +1776,9 @@ class WebUIHandler(http.server.BaseHTTPRequestHandler):
         self.send_response(code)
         self.send_header("Content-Type", "text/html; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
+        self.send_header("X-Frame-Options", "DENY")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Cache-Control", "no-store")
         self.end_headers()
         self.wfile.write(body)
 
@@ -1854,6 +1887,10 @@ def start_web_ui(
 
     class BoundWebUIHandler(WebUIHandler):
         pass
+
+    # Update module-level flag so _page() knows whether to show Sign Out
+    global _auth_enabled
+    _auth_enabled = require_auth
 
     BoundWebUIHandler.ca               = ca
     BoundWebUIHandler.audit_log        = audit_log

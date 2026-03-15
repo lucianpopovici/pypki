@@ -2,19 +2,13 @@
 """
 PyPKI Web UI Test Suite
 =======================
-Selenium/pytest tests for the PyPKI HTML dashboard (web_ui.py).
+Playwright/pytest tests for the PyPKI HTML dashboard (web_ui.py).
 
-Start the server (plain HTTP):
-    python pki_server.py --web-port 8008
-
-Start with one-way TLS:
-    python pki_server.py --web-port 8008 --tls
-
-Start with mutual TLS:
-    python pki_server.py --web-port 8008 --mtls
+Start the server (no auth, for testing):
+    python pypki.py pypki.test.json
 
 Run all tests:
-    pytest test_webui.py -v
+    pytest test_webui.py -v --base-url http://localhost:8090 --browser chromium
 
 Run by category:
     pytest test_webui.py -v -m ui
@@ -24,28 +18,11 @@ Run by category:
     pytest test_webui.py -v -m api
 
 Environment variables:
-    WEB_UI_URL          Base URL of the web UI (default: http://localhost:8008)
-                        Set to https://localhost:8008 if TLS is enabled.
-    WEB_UI_ADMIN_KEY    Admin API key if --admin-api-key was used to start the server.
-    WEB_UI_CA_CERT      Path to the CA certificate PEM file for TLS verification.
-                        Set to "false" to disable TLS certificate verification (dev only).
+    WEB_UI_URL          Base URL of the web UI (default: http://localhost:8090)
+    WEB_UI_CA_CERT      Path to CA certificate PEM file for TLS verification.
+                        Set to "false" to disable TLS certificate verification.
     WEB_UI_CLIENT_CERT  Path to client certificate PEM file (for mTLS).
     WEB_UI_CLIENT_KEY   Path to client private key PEM file (for mTLS).
-
-Examples:
-    # Plain HTTP
-    WEB_UI_URL=http://localhost:8008 pytest test_webui.py -v
-
-    # One-way TLS (verify with CA cert)
-    WEB_UI_URL=https://localhost:8008 WEB_UI_CA_CERT=./ca/ca.crt pytest test_webui.py -v
-
-    # One-way TLS (skip verification — dev/test only)
-    WEB_UI_URL=https://localhost:8008 WEB_UI_CA_CERT=false pytest test_webui.py -v
-
-    # Mutual TLS
-    WEB_UI_URL=https://localhost:8008 WEB_UI_CA_CERT=./ca/ca.crt \\
-        WEB_UI_CLIENT_CERT=./client.crt WEB_UI_CLIENT_KEY=./client.key \\
-        pytest test_webui.py -v
 """
 
 import os
@@ -55,45 +32,36 @@ import warnings
 import pytest
 import requests
 import urllib3
-from selenium import webdriver
-from selenium.webdriver.chrome.options import Options
-from selenium.webdriver.chrome.service import Service
-from selenium.webdriver.common.by import By
-from selenium.webdriver.support import expected_conditions as EC
-from selenium.webdriver.support.ui import WebDriverWait
+from playwright.sync_api import sync_playwright, Page
+
 
 # ---------------------------------------------------------------------------
-# Configuration — driven entirely by environment variables
+# pytest CLI options for PAM credentials
+# ---------------------------------------------------------------------------
+# Configuration
 # ---------------------------------------------------------------------------
 
-BASE_URL = os.environ.get("WEB_UI_URL", "http://localhost:8008").rstrip("/")
-WAIT_TIMEOUT = 10  # seconds
-ADMIN_API_KEY = os.environ.get("WEB_UI_ADMIN_KEY", "")
+BASE_URL = os.environ.get("WEB_UI_URL", "http://localhost:8090").rstrip("/")
+WAIT_TIMEOUT = 10_000  # milliseconds (Playwright uses ms)
 
-# TLS configuration
-_ca_cert_env = os.environ.get("WEB_UI_CA_CERT", "")
-_client_cert = os.environ.get("WEB_UI_CLIENT_CERT", "")
-_client_key = os.environ.get("WEB_UI_CLIENT_KEY", "")
+_ca_cert_env    = os.environ.get("WEB_UI_CA_CERT", "")
+_client_cert    = os.environ.get("WEB_UI_CLIENT_CERT", "")
+_client_key     = os.environ.get("WEB_UI_CLIENT_KEY", "")
 
-# TLS_VERIFY: False = skip verification, str = path to CA bundle, True = system bundle
 if _ca_cert_env.lower() == "false":
     TLS_VERIFY = False
     warnings.warn(
-        "WEB_UI_CA_CERT=false: TLS certificate verification is DISABLED. "
-        "Only use this in a trusted test environment.",
+        "WEB_UI_CA_CERT=false: TLS certificate verification is DISABLED.",
         stacklevel=1,
     )
 elif _ca_cert_env:
-    TLS_VERIFY = _ca_cert_env   # path to CA bundle PEM
+    TLS_VERIFY = _ca_cert_env
 else:
-    TLS_VERIFY = True           # use system trust store
+    TLS_VERIFY = True
 
-# mTLS client certificate: (cert_path, key_path) tuple or None
 TLS_CLIENT_CERT = (_client_cert, _client_key) if (_client_cert and _client_key) else None
-
 IS_TLS = BASE_URL.startswith("https://")
 
-# Suppress InsecureRequestWarning when verification is intentionally disabled
 if TLS_VERIFY is False:
     urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
@@ -102,61 +70,33 @@ if TLS_VERIFY is False:
 # Fixtures
 # ---------------------------------------------------------------------------
 
-
 @pytest.fixture(scope="session")
-def driver():
-    """Session-scoped headless Chrome WebDriver with optional TLS configuration."""
-    opts = Options()
-    opts.add_argument("--headless")
-    opts.add_argument("--no-sandbox")
-    opts.add_argument("--disable-dev-shm-usage")
-    opts.add_argument("--disable-gpu")
-    opts.add_argument("--window-size=1280,900")
-
-    if IS_TLS and TLS_VERIFY is False:
-        # Allow Chrome to connect to servers with self-signed / untrusted certs
-        opts.add_argument("--ignore-certificate-errors")
-        opts.add_argument("--allow-insecure-localhost")
-
-    if IS_TLS and TLS_VERIFY and isinstance(TLS_VERIFY, str):
-        # Tell Chrome to trust a specific CA certificate file
-        opts.add_argument(f"--ssl-client-certificate-path={TLS_VERIFY}")
-
-    if TLS_CLIENT_CERT:
-        # mTLS: Chrome needs the client certificate + key in PKCS#12 format.
-        # For test environments this usually means adding the cert to an NSS
-        # database; for simplicity we note this limitation here and fall back
-        # to the requests-only tests for mTLS-protected endpoints.
-        pass  # Selenium mTLS support is browser/profile-specific; see note above.
-
-    try:
-        from webdriver_manager.chrome import ChromeDriverManager
-        service = Service(ChromeDriverManager().install())
-        drv = webdriver.Chrome(service=service, options=opts)
-    except Exception:
-        drv = webdriver.Chrome(options=opts)
-
-    drv.implicitly_wait(5)
-    yield drv
-    drv.quit()
+def browser():
+    """Session-scoped headless Chromium browser."""
+    with sync_playwright() as p:
+        launch_kwargs = dict(headless=True)
+        browser = p.chromium.launch(**launch_kwargs)
+        yield browser
+        browser.close()
 
 
 @pytest.fixture(scope="session")
-def wait(driver):
-    return WebDriverWait(driver, WAIT_TIMEOUT)
+def page(browser):
+    """Session-scoped browser page.  TLS errors are ignored for self-signed CA certs."""
+    ctx = browser.new_context(
+        ignore_https_errors=(TLS_VERIFY is False or IS_TLS),
+        base_url=BASE_URL,
+    )
+    pg = ctx.new_page()
+    pg.set_default_timeout(WAIT_TIMEOUT)
+    yield pg
+    ctx.close()
 
 
 @pytest.fixture(scope="session")
 def api():
-    """
-    requests.Session pre-configured with:
-      - Optional admin API key header
-      - TLS verification setting (CA bundle path, False, or True)
-      - Optional mTLS client certificate
-    """
+    """requests.Session pre-configured with TLS settings."""
     s = requests.Session()
-    if ADMIN_API_KEY:
-        s.headers["X-Admin-Key"] = ADMIN_API_KEY
     s.verify = TLS_VERIFY
     if TLS_CLIENT_CERT:
         s.cert = TLS_CLIENT_CERT
@@ -167,182 +107,180 @@ def api():
 # Helpers
 # ---------------------------------------------------------------------------
 
+def topbar_text(page: Page) -> str:
+    loc = page.locator(".topbar h1")
+    return loc.inner_text() if loc.count() > 0 else ""
 
-def topbar_text(driver) -> str:
-    el = driver.find_elements(By.CSS_SELECTOR, ".topbar h1")
-    return el[0].text if el else ""
 
-
-def active_nav(driver) -> str:
-    active = driver.find_elements(By.CSS_SELECTOR, "nav.nav a.active")
-    return active[0].text if active else ""
+def active_nav(page: Page) -> str:
+    loc = page.locator("nav.nav a.active")
+    return loc.inner_text() if loc.count() > 0 else ""
 
 
 # ---------------------------------------------------------------------------
 # [ui] Page load tests
 # ---------------------------------------------------------------------------
 
-
 @pytest.mark.ui
 class TestPageLoads:
     """Verify every dashboard page loads with correct title, nav, and content."""
 
-    def test_dashboard_loads(self, driver):
-        driver.get(f"{BASE_URL}/")
-        assert "PyPKI" in driver.title
-        assert "PyPKI Certificate Authority" in topbar_text(driver)
+    def test_dashboard_loads(self, page):
+        page.goto(f"{BASE_URL}/")
+        assert "PyPKI" in page.title()
+        assert "PyPKI Certificate Authority" in topbar_text(page)
 
-    def test_dashboard_active_nav(self, driver):
-        driver.get(f"{BASE_URL}/")
-        assert active_nav(driver) == "Dashboard"
+    def test_dashboard_active_nav(self, page):
+        page.goto(f"{BASE_URL}/")
+        assert active_nav(page) == "Dashboard"
 
-    def test_dashboard_stats_grid_has_four_boxes(self, driver):
-        driver.get(f"{BASE_URL}/")
-        stat_boxes = driver.find_elements(By.CSS_SELECTOR, ".stats-grid .stat-box")
-        assert len(stat_boxes) == 4
+    def test_dashboard_stats_grid_has_four_boxes(self, page):
+        page.goto(f"{BASE_URL}/")
+        boxes = page.locator(".stats-grid .stat-box").all()
+        assert len(boxes) == 4
 
-    def test_dashboard_stat_labels(self, driver):
-        driver.get(f"{BASE_URL}/")
-        labels = [el.text for el in driver.find_elements(By.CSS_SELECTOR, ".stat-box .lbl")]
+    def test_dashboard_stat_labels(self, page):
+        page.goto(f"{BASE_URL}/")
+        labels = [el.inner_text() for el in page.locator(".stat-box .lbl").all()]
         for expected in ("Total certificates", "Active", "Revoked", "Expired"):
             assert expected in labels, f"Missing stat label: {expected}"
 
-    def test_dashboard_ca_card_present(self, driver):
-        driver.get(f"{BASE_URL}/")
-        headings = [h.text for h in driver.find_elements(By.CSS_SELECTOR, ".card-head h2")]
+    def test_dashboard_ca_card_present(self, page):
+        page.goto(f"{BASE_URL}/")
+        headings = [h.inner_text() for h in page.locator(".card-head h2").all()]
         assert "Certificate Authority" in headings
 
-    def test_dashboard_download_ca_cert_button(self, driver):
-        driver.get(f"{BASE_URL}/")
-        btn = driver.find_element(By.LINK_TEXT, "Download CA Cert")
+    def test_dashboard_download_ca_cert_button(self, page):
+        page.goto(f"{BASE_URL}/")
+        btn = page.get_by_role("link", name="Download CA Cert")
         assert "/ca/cert.pem" in btn.get_attribute("href")
 
-    def test_version_badge_present(self, driver):
-        driver.get(f"{BASE_URL}/")
-        badge = driver.find_element(By.CSS_SELECTOR, ".topbar .badge")
-        assert badge.text.startswith("v"), f"Expected version badge, got: {badge.text!r}"
+    def test_version_badge_present(self, page):
+        page.goto(f"{BASE_URL}/")
+        badge = page.locator(".topbar .badge").first
+        assert badge.inner_text().startswith("v")
 
-    def test_services_page_loads(self, driver):
-        driver.get(f"{BASE_URL}/services")
-        assert "PyPKI" in driver.title
-        assert active_nav(driver) == "Services"
+    def test_services_page_loads(self, page):
+        page.goto(f"{BASE_URL}/services")
+        assert "PyPKI" in page.title()
+        assert active_nav(page) == "Services"
 
-    def test_services_page_has_service_cards(self, driver):
-        driver.get(f"{BASE_URL}/services")
-        cards = driver.find_elements(By.CSS_SELECTOR, ".card")
-        assert len(cards) >= 1, "Services page should show at least one service card"
+    def test_services_page_has_service_cards(self, page):
+        page.goto(f"{BASE_URL}/services")
+        cards = page.locator(".card").all()
+        assert len(cards) >= 1
 
-    def test_services_page_has_status_pills(self, driver):
-        driver.get(f"{BASE_URL}/services")
-        pills = driver.find_elements(By.CSS_SELECTOR, ".pill")
-        assert len(pills) >= 1, "Services page should show at least one status pill"
+    def test_services_page_has_status_pills(self, page):
+        page.goto(f"{BASE_URL}/services")
+        pills = page.locator(".pill").all()
+        assert len(pills) >= 1
 
-    def test_certs_page_loads(self, driver):
-        driver.get(f"{BASE_URL}/certs")
-        assert "PyPKI" in driver.title
-        assert active_nav(driver) == "Certificates"
+    def test_certs_page_loads(self, page):
+        page.goto(f"{BASE_URL}/certs")
+        assert "PyPKI" in page.title()
+        assert active_nav(page) == "Certificates"
 
-    def test_certs_page_table_headers(self, driver):
-        driver.get(f"{BASE_URL}/certs")
-        headers = [th.text for th in driver.find_elements(By.CSS_SELECTOR, "table thead th")]
+    def test_certs_page_table_headers(self, page):
+        page.goto(f"{BASE_URL}/certs")
+        headers = [th.inner_text() for th in page.locator("table thead th").all()]
         for col in ("Serial", "Subject", "Not Before", "Not After", "Status", "Actions"):
             assert col in headers, f"Missing column: {col}"
 
-    def test_certs_page_search_input_present(self, driver):
-        driver.get(f"{BASE_URL}/certs")
-        search = driver.find_element(By.ID, "search")
+    def test_certs_page_search_input_present(self, page):
+        page.goto(f"{BASE_URL}/certs")
+        search = page.locator("#search")
         assert search.get_attribute("placeholder") is not None
 
-    def test_expiring_page_loads(self, driver):
-        driver.get(f"{BASE_URL}/expiring")
-        assert "PyPKI" in driver.title
-        assert active_nav(driver) == "Expiring"
+    def test_expiring_page_loads(self, page):
+        page.goto(f"{BASE_URL}/expiring")
+        assert "PyPKI" in page.title()
+        assert active_nav(page) == "Expiring"
 
-    def test_expiring_page_heading(self, driver):
-        driver.get(f"{BASE_URL}/expiring")
-        headings = [h.text for h in driver.find_elements(By.CSS_SELECTOR, ".card-head h2")]
+    def test_expiring_page_heading(self, page):
+        page.goto(f"{BASE_URL}/expiring")
+        headings = [h.inner_text() for h in page.locator(".card-head h2").all()]
         assert any("Expiring" in h for h in headings)
 
-    def test_revocation_page_loads(self, driver):
-        driver.get(f"{BASE_URL}/revocation")
-        assert "PyPKI" in driver.title
-        assert active_nav(driver) == "Revocation"
+    def test_revocation_page_loads(self, page):
+        page.goto(f"{BASE_URL}/revocation")
+        assert "PyPKI" in page.title()
+        assert active_nav(page) == "Revocation"
 
-    def test_revocation_form_fields_present(self, driver):
-        driver.get(f"{BASE_URL}/revocation")
-        assert driver.find_element(By.ID, "rev-serial")
-        assert driver.find_element(By.ID, "rev-reason")
+    def test_revocation_form_fields_present(self, page):
+        page.goto(f"{BASE_URL}/revocation")
+        assert page.locator("#rev-serial").count() > 0
+        assert page.locator("#rev-reason").count() > 0
 
-    def test_revocation_reason_options(self, driver):
-        driver.get(f"{BASE_URL}/revocation")
-        opts = [o.text for o in driver.find_elements(By.CSS_SELECTOR, "#rev-reason option")]
+    def test_revocation_reason_options(self, page):
+        page.goto(f"{BASE_URL}/revocation")
+        opts = [o.inner_text() for o in page.locator("#rev-reason option").all()]
         for reason in ("Unspecified", "Key Compromise", "CA Compromise", "Cessation Of Operation"):
             assert reason in opts, f"Missing revocation reason: {reason}"
 
-    def test_subca_page_loads(self, driver):
-        driver.get(f"{BASE_URL}/sub-ca")
-        assert "PyPKI" in driver.title
-        assert active_nav(driver) == "Sub-CA"
+    def test_subca_page_loads(self, page):
+        page.goto(f"{BASE_URL}/sub-ca")
+        assert "PyPKI" in page.title()
+        assert active_nav(page) == "Sub-CA"
 
-    def test_subca_form_fields_present(self, driver):
-        driver.get(f"{BASE_URL}/sub-ca")
-        assert driver.find_element(By.ID, "subca-cn")
-        assert driver.find_element(By.ID, "subca-days")
+    def test_subca_form_fields_present(self, page):
+        page.goto(f"{BASE_URL}/sub-ca")
+        assert page.locator("#subca-cn").count() > 0
+        assert page.locator("#subca-days").count() > 0
 
-    def test_subca_default_values(self, driver):
-        driver.get(f"{BASE_URL}/sub-ca")
-        assert driver.find_element(By.ID, "subca-cn").get_attribute("value") == "PyPKI Intermediate CA"
-        assert driver.find_element(By.ID, "subca-days").get_attribute("value") == "1825"
+    def test_subca_default_values(self, page):
+        page.goto(f"{BASE_URL}/sub-ca")
+        assert page.locator("#subca-cn").get_attribute("value") == "PyPKI Intermediate CA"
+        assert page.locator("#subca-days").get_attribute("value") == "1825"
 
-    def test_metrics_page_loads(self, driver):
-        driver.get(f"{BASE_URL}/metrics-ui")
-        assert "PyPKI" in driver.title
-        assert active_nav(driver) == "Metrics"
+    def test_metrics_page_loads(self, page):
+        page.goto(f"{BASE_URL}/metrics-ui")
+        assert "PyPKI" in page.title()
+        assert active_nav(page) == "Metrics"
 
-    def test_metrics_page_raw_link(self, driver):
-        driver.get(f"{BASE_URL}/metrics-ui")
-        btn = driver.find_element(By.LINK_TEXT, "Raw /api/metrics")
+    def test_metrics_page_raw_link(self, page):
+        page.goto(f"{BASE_URL}/metrics-ui")
+        btn = page.get_by_role("link", name="Raw /api/metrics")
         assert "/api/metrics" in btn.get_attribute("href")
 
-    def test_config_page_loads(self, driver):
-        driver.get(f"{BASE_URL}/config-ui")
-        assert "PyPKI" in driver.title
-        assert active_nav(driver) == "Config"
+    def test_config_page_loads(self, page):
+        page.goto(f"{BASE_URL}/config-ui")
+        assert "PyPKI" in page.title()
+        assert active_nav(page) == "Config"
 
-    def test_config_page_ee_days_number_input(self, driver):
-        driver.get(f"{BASE_URL}/config-ui")
-        inp = driver.find_element(By.ID, "ee_days")
+    def test_config_page_ee_days_number_input(self, page):
+        page.goto(f"{BASE_URL}/config-ui")
+        inp = page.locator("#ee_days")
         assert inp.get_attribute("type") == "number"
 
-    def test_config_page_json_pre_block(self, driver):
-        driver.get(f"{BASE_URL}/config-ui")
-        pre = driver.find_element(By.CSS_SELECTOR, ".card-body pre")
-        assert pre.text.strip().startswith("{"), "Expected JSON config in <pre> block"
+    def test_config_page_json_pre_block(self, page):
+        page.goto(f"{BASE_URL}/config-ui")
+        pre = page.locator(".card-body pre").first
+        assert pre.inner_text().strip().startswith("{"), "Expected JSON config in <pre> block"
 
-    def test_config_page_apply_button_present(self, driver):
-        driver.get(f"{BASE_URL}/config-ui")
-        buttons = driver.find_elements(By.CSS_SELECTOR, ".card-body .btn-primary")
-        assert any("Apply" in b.text for b in buttons)
+    def test_config_page_apply_button_present(self, page):
+        page.goto(f"{BASE_URL}/config-ui")
+        buttons = [b.inner_text() for b in page.locator(".card-body .btn-primary").all()]
+        assert any("Apply" in b for b in buttons)
 
-    def test_audit_page_loads(self, driver):
-        driver.get(f"{BASE_URL}/audit")
-        assert "PyPKI" in driver.title
-        assert active_nav(driver) == "Audit Log"
+    def test_audit_page_loads(self, page):
+        page.goto(f"{BASE_URL}/audit")
+        assert "PyPKI" in page.title()
+        assert active_nav(page) == "Audit Log"
 
-    def test_audit_page_table_headers(self, driver):
-        driver.get(f"{BASE_URL}/audit")
-        headers = [th.text for th in driver.find_elements(By.CSS_SELECTOR, "table thead th")]
+    def test_audit_page_table_headers(self, page):
+        page.goto(f"{BASE_URL}/audit")
+        headers = [th.inner_text() for th in page.locator("table thead th").all()]
         for col in ("Timestamp", "Event", "Detail", "IP"):
             assert col in headers, f"Missing audit column: {col}"
 
-    def test_api_docs_page_loads(self, driver):
-        driver.get(f"{BASE_URL}/api-docs")
-        assert "PyPKI" in driver.title
-        assert active_nav(driver) == "API Docs"
+    def test_api_docs_page_loads(self, page):
+        page.goto(f"{BASE_URL}/api-docs")
+        assert "PyPKI" in page.title()
+        assert active_nav(page) == "API Docs"
 
-    def test_api_docs_table_has_methods(self, driver):
-        driver.get(f"{BASE_URL}/api-docs")
-        methods = [td.text for td in driver.find_elements(By.CSS_SELECTOR, "table tbody td:first-child")]
+    def test_api_docs_table_has_methods(self, page):
+        page.goto(f"{BASE_URL}/api-docs")
+        methods = [td.inner_text() for td in page.locator("table tbody td:first-child").all()]
         assert "GET" in methods
         assert "POST" in methods
         assert "PATCH" in methods
@@ -352,79 +290,78 @@ class TestPageLoads:
 # [navigation] Route reachability and nav-bar behaviour
 # ---------------------------------------------------------------------------
 
-
 @pytest.mark.navigation
 class TestNavigation:
     """Verify nav links work correctly and all routes are reachable."""
 
-    def test_topbar_on_every_page(self, driver):
+    def test_topbar_on_every_page(self, page):
         for path in ["/", "/services", "/certs", "/expiring", "/revocation", "/sub-ca",
                      "/metrics-ui", "/config-ui", "/audit", "/api-docs"]:
-            driver.get(f"{BASE_URL}{path}")
-            assert "PyPKI Certificate Authority" in topbar_text(driver), \
+            page.goto(f"{BASE_URL}{path}")
+            assert "PyPKI Certificate Authority" in topbar_text(page), \
                 f"Topbar missing on {path}"
 
-    def test_nav_has_ten_links(self, driver):
-        driver.get(f"{BASE_URL}/")
-        links = driver.find_elements(By.CSS_SELECTOR, "nav.nav a")
+    def test_nav_has_ten_links(self, page):
+        page.goto(f"{BASE_URL}/")
+        links = page.locator("nav.nav a").all()
         assert len(links) == 10, f"Expected 10 nav links, found {len(links)}"
 
-    def test_nav_link_labels(self, driver):
-        driver.get(f"{BASE_URL}/")
-        texts = [a.text for a in driver.find_elements(By.CSS_SELECTOR, "nav.nav a")]
+    def test_nav_link_labels(self, page):
+        page.goto(f"{BASE_URL}/")
+        texts = [a.inner_text() for a in page.locator("nav.nav a").all()]
         for label in ("Dashboard", "Services", "Certificates", "Expiring", "Revocation",
                       "Sub-CA", "Metrics", "Config", "Audit Log", "API Docs"):
             assert label in texts, f"Nav link missing: {label}"
 
-    def test_click_nav_certificates(self, driver, wait):
-        driver.get(f"{BASE_URL}/")
-        driver.find_element(By.LINK_TEXT, "Certificates").click()
-        wait.until(EC.url_contains("/certs"))
-        assert active_nav(driver) == "Certificates"
+    def test_click_nav_certificates(self, page):
+        page.goto(f"{BASE_URL}/")
+        page.get_by_role("link", name="Certificates").click()
+        page.wait_for_url("**/certs")
+        assert active_nav(page) == "Certificates"
 
-    def test_click_nav_audit_log(self, driver, wait):
-        driver.get(f"{BASE_URL}/")
-        driver.find_element(By.LINK_TEXT, "Audit Log").click()
-        wait.until(EC.url_contains("/audit"))
-        assert active_nav(driver) == "Audit Log"
+    def test_click_nav_audit_log(self, page):
+        page.goto(f"{BASE_URL}/")
+        page.get_by_role("link", name="Audit Log").click()
+        page.wait_for_url("**/audit")
+        assert active_nav(page) == "Audit Log"
 
-    def test_click_nav_config(self, driver, wait):
-        driver.get(f"{BASE_URL}/")
-        driver.find_element(By.LINK_TEXT, "Config").click()
-        wait.until(EC.url_contains("/config-ui"))
-        assert active_nav(driver) == "Config"
+    def test_click_nav_config(self, page):
+        page.goto(f"{BASE_URL}/")
+        page.get_by_role("link", name="Config").click()
+        page.wait_for_url("**/config-ui")
+        assert active_nav(page) == "Config"
 
-    def test_click_nav_sub_ca(self, driver, wait):
-        driver.get(f"{BASE_URL}/")
-        driver.find_element(By.LINK_TEXT, "Sub-CA").click()
-        wait.until(EC.url_contains("/sub-ca"))
-        assert active_nav(driver) == "Sub-CA"
+    def test_click_nav_sub_ca(self, page):
+        page.goto(f"{BASE_URL}/")
+        page.get_by_role("link", name="Sub-CA").click()
+        page.wait_for_url("**/sub-ca")
+        assert active_nav(page) == "Sub-CA"
 
-    def test_click_nav_revocation(self, driver, wait):
-        driver.get(f"{BASE_URL}/")
-        driver.find_element(By.LINK_TEXT, "Revocation").click()
-        wait.until(EC.url_contains("/revocation"))
-        assert active_nav(driver) == "Revocation"
+    def test_click_nav_revocation(self, page):
+        page.goto(f"{BASE_URL}/")
+        page.get_by_role("link", name="Revocation").click()
+        page.wait_for_url("**/revocation")
+        assert active_nav(page) == "Revocation"
 
-    def test_click_nav_api_docs(self, driver, wait):
-        driver.get(f"{BASE_URL}/")
-        driver.find_element(By.LINK_TEXT, "API Docs").click()
-        wait.until(EC.url_contains("/api-docs"))
-        assert active_nav(driver) == "API Docs"
+    def test_click_nav_api_docs(self, page):
+        page.goto(f"{BASE_URL}/")
+        page.get_by_role("link", name="API Docs").click()
+        page.wait_for_url("**/api-docs")
+        assert active_nav(page) == "API Docs"
 
-    def test_click_nav_services(self, driver, wait):
-        driver.get(f"{BASE_URL}/")
-        driver.find_element(By.LINK_TEXT, "Services").click()
-        wait.until(EC.url_contains("/services"))
-        assert active_nav(driver) == "Services"
+    def test_click_nav_services(self, page):
+        page.goto(f"{BASE_URL}/")
+        page.locator("nav.nav").get_by_role("link", name="Services").click()
+        page.wait_for_url("**/services")
+        assert active_nav(page) == "Services"
 
-    def test_dashboard_alias_route(self, driver):
-        driver.get(f"{BASE_URL}/dashboard")
-        assert active_nav(driver) == "Dashboard"
+    def test_dashboard_alias_route(self, page):
+        page.goto(f"{BASE_URL}/dashboard")
+        assert active_nav(page) == "Dashboard"
 
-    def test_404_page(self, driver):
-        driver.get(f"{BASE_URL}/does-not-exist-xyz")
-        assert "404" in driver.page_source
+    def test_404_page(self, page):
+        page.goto(f"{BASE_URL}/does-not-exist-xyz")
+        assert "404" in page.content()
 
     @pytest.mark.parametrize("path", [
         "/", "/services", "/certs", "/expiring", "/revocation", "/sub-ca",
@@ -450,7 +387,6 @@ class TestNavigation:
         assert "BEGIN CERTIFICATE" in resp.text
 
     def test_ca_cert_alias_returns_pem(self, api):
-        """/ca/cert is an alias for /ca/cert.pem."""
         resp = api.get(f"{BASE_URL}/ca/cert")
         assert resp.status_code == 200
         assert resp.headers["Content-Type"].startswith("application/x-pem-file")
@@ -461,41 +397,34 @@ class TestNavigation:
 # [forms] Form interactions and API mutations
 # ---------------------------------------------------------------------------
 
-
 @pytest.mark.forms
 class TestForms:
     """Test interactive form elements: search filter, config patch, sub-CA, revocation."""
 
-    def test_search_filters_table(self, driver):
-        driver.get(f"{BASE_URL}/certs")
-        rows = driver.find_elements(By.CSS_SELECTOR, "table tbody tr")
+    def test_search_filters_table(self, page):
+        page.goto(f"{BASE_URL}/certs")
+        rows = page.locator("table tbody tr").all()
         if len(rows) < 1:
             pytest.skip("No certificates present")
 
-        search = driver.find_element(By.ID, "search")
-        search.clear()
-        search.send_keys("ZZZNOMATCH_ZZZNOMATCH_XYZ")
-        time.sleep(0.4)
+        page.locator("#search").fill("ZZZNOMATCH_ZZZNOMATCH_XYZ")
+        page.wait_for_timeout(400)
 
-        visible = [r for r in driver.find_elements(By.CSS_SELECTOR, "table tbody tr")
-                   if r.is_displayed()]
+        visible = [r for r in page.locator("table tbody tr").all() if r.is_visible()]
         assert len(visible) == 0, "Search filter did not hide non-matching rows"
 
-    def test_search_clear_restores_rows(self, driver):
-        driver.get(f"{BASE_URL}/certs")
-        all_rows = driver.find_elements(By.CSS_SELECTOR, "table tbody tr")
+    def test_search_clear_restores_rows(self, page):
+        page.goto(f"{BASE_URL}/certs")
+        all_rows = page.locator("table tbody tr").all()
         if not all_rows:
             pytest.skip("No certificates present")
 
-        search = driver.find_element(By.ID, "search")
-        search.clear()
-        search.send_keys("ZZZNOMATCH_ZZZNOMATCH_XYZ")
-        time.sleep(0.3)
-        search.clear()
-        time.sleep(0.3)
+        page.locator("#search").fill("ZZZNOMATCH_ZZZNOMATCH_XYZ")
+        page.wait_for_timeout(300)
+        page.locator("#search").fill("")
+        page.wait_for_timeout(300)
 
-        visible = [r for r in driver.find_elements(By.CSS_SELECTOR, "table tbody tr")
-                   if r.is_displayed()]
+        visible = [r for r in page.locator("table tbody tr").all() if r.is_visible()]
         assert len(visible) == len(all_rows)
 
     def test_api_get_config_returns_json(self, api):
@@ -506,12 +435,10 @@ class TestForms:
     def test_api_patch_config_end_entity_days(self, api):
         original = api.get(f"{BASE_URL}/api/config").json()
         original_days = original.get("validity", {}).get("end_entity_days", 365)
-
         resp = api.patch(f"{BASE_URL}/api/config",
                          json={"validity": {"end_entity_days": 400}})
         assert resp.status_code == 200
         assert resp.json().get("ok") is True
-
         api.patch(f"{BASE_URL}/api/config",
                   json={"validity": {"end_entity_days": original_days}})
 
@@ -528,51 +455,38 @@ class TestForms:
                          headers={"Content-Type": "application/json"})
         assert 400 <= resp.status_code < 500
 
-    def test_config_page_ee_days_matches_api(self, api, driver):
+    def test_config_page_ee_days_matches_api(self, api, page):
         cfg = api.get(f"{BASE_URL}/api/config").json()
         api_days = str(cfg.get("validity", {}).get("end_entity_days", ""))
         if not api_days:
             pytest.skip("end_entity_days not in config")
+        page.goto(f"{BASE_URL}/config-ui")
+        assert page.locator("#ee_days").get_attribute("value") == api_days
 
-        driver.get(f"{BASE_URL}/config-ui")
-        inp = driver.find_element(By.ID, "ee_days")
-        assert inp.get_attribute("value") == api_days
-
-    def test_config_page_patch_via_ui_shows_result(self, api, driver, wait):
-        driver.get(f"{BASE_URL}/config-ui")
-        inp = driver.find_element(By.ID, "ee_days")
-        inp.clear()
-        inp.send_keys("399")
-
-        driver.find_element(By.XPATH, "//button[text()='Apply']").click()
-
-        result_pre = driver.find_element(By.ID, "cfg-result")
-        wait.until(lambda d: result_pre.text.strip() != "")
-        text = result_pre.text.lower()
+    def test_config_page_patch_via_ui_shows_result(self, api, page):
+        page.goto(f"{BASE_URL}/config-ui")
+        page.locator("#ee_days").fill("399")
+        page.locator("button:has-text('Apply')").click()
+        page.wait_for_function(
+            "() => document.getElementById('cfg-result').textContent.trim() !== ''"
+        )
+        text = page.locator("#cfg-result").inner_text().lower()
         assert "ok" in text or "config" in text
-
         api.patch(f"{BASE_URL}/api/config", json={"validity": {"end_entity_days": 365}})
 
-    def test_subca_form_shows_result_on_submit(self, driver, wait):
-        driver.get(f"{BASE_URL}/sub-ca")
-        cn_input = driver.find_element(By.ID, "subca-cn")
-        cn_input.clear()
-        cn_input.send_keys("Selenium Test Intermediate CA")
-
-        days_input = driver.find_element(By.ID, "subca-days")
-        days_input.clear()
-        days_input.send_keys("730")
-
-        driver.find_element(By.XPATH,
-                            "//button[contains(text(),'Issue Sub-CA Certificate')]").click()
-
-        result_pre = driver.find_element(By.ID, "subca-result")
-        wait.until(lambda d: result_pre.text.strip() != "")
-        assert result_pre.text.strip() != ""
+    def test_subca_form_shows_result_on_submit(self, page):
+        page.goto(f"{BASE_URL}/sub-ca")
+        page.locator("#subca-cn").fill("Playwright Test Intermediate CA")
+        page.locator("#subca-days").fill("730")
+        page.locator("button:has-text('Issue Sub-CA Certificate')").click()
+        page.wait_for_function(
+            "() => document.getElementById('subca-result').textContent.trim() !== ''"
+        )
+        assert page.locator("#subca-result").inner_text().strip() != ""
 
     def test_subca_api_returns_cert_and_key(self, api):
         resp = api.post(f"{BASE_URL}/api/issue-sub-ca",
-                        json={"cn": "API Selenium Test Sub-CA", "validity_days": 365})
+                        json={"cn": "API Playwright Test Sub-CA", "validity_days": 365})
         assert resp.status_code < 500
         if resp.status_code == 200:
             data = resp.json()
@@ -580,9 +494,9 @@ class TestForms:
             assert "key_pem" in data
             assert "BEGIN CERTIFICATE" in data["cert_pem"]
 
-    def test_revocation_revoke_button_present(self, driver):
-        driver.get(f"{BASE_URL}/revocation")
-        btns = driver.find_elements(By.CSS_SELECTOR, ".btn-danger")
+    def test_revocation_revoke_button_present(self, page):
+        page.goto(f"{BASE_URL}/revocation")
+        btns = page.locator(".btn-danger").all()
         assert len(btns) >= 1
 
     def test_api_revoke_nonexistent_serial_no_crash(self, api):
@@ -596,26 +510,24 @@ class TestForms:
 # [auth] Authentication and security headers
 # ---------------------------------------------------------------------------
 
-
 @pytest.mark.auth
 class TestAuth:
-    """Verify authentication, security headers, and CSRF protection."""
+    """Verify security headers and CSRF protection (server runs with --web-no-auth)."""
 
     def _plain_session(self) -> requests.Session:
-        """A fresh session with TLS config but NO admin key — for auth boundary tests."""
         s = requests.Session()
         s.verify = TLS_VERIFY
         if TLS_CLIENT_CERT:
             s.cert = TLS_CLIENT_CERT
         return s
 
-    def test_html_pages_accessible_without_admin_key(self):
+    def test_html_pages_accessible_without_auth(self):
         s = self._plain_session()
         for path in ["/", "/certs", "/expiring", "/revocation", "/sub-ca",
                      "/metrics-ui", "/config-ui", "/audit", "/api-docs"]:
             resp = s.get(f"{BASE_URL}{path}")
             assert resp.status_code == 200, \
-                f"Expected 200 without admin key for {path}, got {resp.status_code}"
+                f"Expected 200 for {path}, got {resp.status_code}"
 
     def test_api_config_get_public(self):
         assert self._plain_session().get(f"{BASE_URL}/api/config").status_code == 200
@@ -640,35 +552,6 @@ class TestAuth:
         assert resp.status_code == 200
         assert "BEGIN CERTIFICATE" in resp.text
 
-    @pytest.mark.skipif(not ADMIN_API_KEY, reason="WEB_UI_ADMIN_KEY not set")
-    def test_patch_config_with_valid_key_succeeds(self, api):
-        resp = api.patch(f"{BASE_URL}/api/config",
-                         json={"validity": {"end_entity_days": 365}})
-        assert resp.status_code == 200
-        assert resp.json().get("ok") is True
-
-    @pytest.mark.skipif(not ADMIN_API_KEY, reason="WEB_UI_ADMIN_KEY not set")
-    def test_patch_config_with_wrong_key_is_403(self):
-        s = self._plain_session()
-        s.headers["X-Admin-Key"] = "DEFINITELY_WRONG_KEY_XYZ"
-        resp = s.patch(f"{BASE_URL}/api/config",
-                       json={"validity": {"end_entity_days": 365}})
-        assert resp.status_code in (401, 403)
-
-    @pytest.mark.skipif(not ADMIN_API_KEY, reason="WEB_UI_ADMIN_KEY not set")
-    def test_revoke_without_key_is_403(self):
-        resp = self._plain_session().post(f"{BASE_URL}/api/revoke",
-                                          json={"serial": 1, "reason": 0})
-        assert resp.status_code in (401, 403)
-
-    @pytest.mark.skipif(not ADMIN_API_KEY, reason="WEB_UI_ADMIN_KEY not set")
-    def test_issue_sub_ca_without_key_is_403(self):
-        resp = self._plain_session().post(f"{BASE_URL}/api/issue-sub-ca",
-                                          json={"cn": "Unauthorized CA", "validity_days": 365})
-        assert resp.status_code in (401, 403)
-
-    # ---- Security headers ----
-
     def test_x_frame_options_deny(self):
         assert self._plain_session().get(f"{BASE_URL}/").headers.get("X-Frame-Options") == "DENY"
 
@@ -678,26 +561,19 @@ class TestAuth:
     def test_cache_control_no_store(self):
         assert "no-store" in self._plain_session().get(f"{BASE_URL}/").headers.get("Cache-Control", "")
 
-    # ---- CSRF ----
-
     def test_patch_config_bad_origin_rejected(self):
         s = self._plain_session()
         resp = s.patch(
             f"{BASE_URL}/api/config",
             json={"validity": {"end_entity_days": 365}},
-            headers={
-                "Content-Type": "application/json",
-                "Origin": "https://evil.example.com",
-            },
+            headers={"Content-Type": "application/json", "Origin": "https://evil.example.com"},
         )
-        # 403 = CSRF blocked; 200 = server running without auth configured (backward compat)
         assert resp.status_code in (200, 403)
 
 
 # ---------------------------------------------------------------------------
 # [api] JSON API unit tests (no browser required)
 # ---------------------------------------------------------------------------
-
 
 @pytest.mark.api
 class TestAPIEndpoints:
@@ -733,7 +609,7 @@ class TestAPIEndpoints:
         resp = api.get(f"{BASE_URL}/api/certs/{serial}/p12")
         assert resp.status_code == 200
         assert resp.headers["Content-Type"].startswith("application/x-pkcs12")
-        assert resp.content[0] == 0x30, "PKCS#12 should start with ASN.1 SEQUENCE (0x30)"
+        assert resp.content[0] == 0x30
 
     def test_api_cert_unknown_serial_returns_404(self, api):
         assert api.get(f"{BASE_URL}/api/certs/999999999/pem").status_code == 404
@@ -786,11 +662,8 @@ class TestAPIEndpoints:
         resp = api.get(f"{BASE_URL}/api/metrics")
         assert resp.status_code == 200
         assert "text/plain" in resp.headers.get("Content-Type", "")
-        # Prometheus exposition format starts with '#' comment lines or metric lines
-        assert isinstance(resp.text, str) and len(resp.text) >= 0
 
     def test_post_api_config_same_as_patch(self, api):
-        """POST /api/config is handled identically to PATCH via do_PATCH = do_POST."""
         resp = api.post(f"{BASE_URL}/api/config",
                         json={"validity": {"end_entity_days": 365}})
         assert resp.status_code == 200
@@ -807,8 +680,8 @@ class TestAPIEndpoints:
         if not data:
             pytest.skip("No services registered")
         entry = data[next(iter(data))]
-        assert "running" in entry, "Service entry missing 'running' key"
-        assert "available" in entry, "Service entry missing 'available' key"
+        assert "running" in entry
+        assert "available" in entry
 
     def test_api_service_unknown_action_returns_400(self, api):
         data = api.get(f"{BASE_URL}/api/services").json()
@@ -833,39 +706,24 @@ class TestAPIEndpoints:
         resp = api.post(f"{BASE_URL}/api/renew", json={"serial": serial})
         assert resp.status_code < 500
 
+
 @pytest.mark.auth
 class TestAdminSecurity:
-    """Verify that administrative endpoints behave correctly under admin key configuration."""
-
-    @pytest.mark.skipif(not ADMIN_API_KEY, reason="WEB_UI_ADMIN_KEY not set — server has no key enforcement")
-    def test_unauthorized_config_patch_fails(self, api):
-        """When an admin key is configured, requests without it must be rejected."""
-        plain_api = requests.Session()
-        plain_api.verify = TLS_VERIFY
-        if TLS_CLIENT_CERT:
-            plain_api.cert = TLS_CLIENT_CERT
-        resp = plain_api.patch(f"{BASE_URL}/api/config", json={"validity": {"end_entity_days": 10}})
-        assert resp.status_code in (401, 403)
+    """Verify that administrative endpoints behave correctly."""
 
     def test_invalid_config_patch_type_handled(self, api):
-        """Sending a non-numeric end_entity_days should either be rejected (400) or accepted
-        as a no-op by the server; it must not cause a 500 error."""
-        resp = api.patch(f"{BASE_URL}/api/config", json={"validity": {"end_entity_days": "invalid"}})
+        resp = api.patch(f"{BASE_URL}/api/config",
+                         json={"validity": {"end_entity_days": "invalid"}})
         assert resp.status_code < 500
 
-    @pytest.mark.skipif(not ADMIN_API_KEY, reason="WEB_UI_ADMIN_KEY not set — server has no key enforcement")
-    def test_issue_subca_requires_admin(self, api):
-        """When an admin key is configured, unauthenticated Sub-CA issuance must be rejected."""
-        plain_api = requests.Session()
-        plain_api.verify = TLS_VERIFY
-        if TLS_CLIENT_CERT:
-            plain_api.cert = TLS_CLIENT_CERT
-        resp = plain_api.post(f"{BASE_URL}/api/issue-sub-ca", json={"cn": "Test Sub-CA"})
-        assert resp.status_code in (401, 403)
+    def test_issue_subca_cn_required(self, api):
+        resp = api.post(f"{BASE_URL}/api/issue-sub-ca", json={})
+        assert resp.status_code < 500
+
 
 @pytest.mark.api
 class TestServiceManagement:
-    """Test the integration with ServiceManager for controlling sub-servers."""
+    """Test service start/stop via the API."""
 
     def test_list_services(self, api):
         resp = api.get(f"{BASE_URL}/api/services")
@@ -874,45 +732,143 @@ class TestServiceManagement:
         if not data:
             pytest.skip("No services registered")
         first = data[list(data.keys())[0]]
-        # Each entry must have running/available/url/config keys
-        assert "running" in first, "Service entry missing 'running' key"
-        assert "available" in first, "Service entry missing 'available' key"
+        assert "running" in first
+        assert "available" in first
 
     def test_service_stop_returns_ok(self, api):
-        """Stopping an already-stopped (or running) service returns ok=True."""
         data = api.get(f"{BASE_URL}/api/services").json()
         if not data:
             pytest.skip("No services registered")
-        name = next(iter(data))
+        running = {n: e for n, e in data.items() if e.get("running")}
+        if not running:
+            pytest.skip("No running services to stop")
+        name = next(iter(running))
         stop_resp = api.post(f"{BASE_URL}/api/services/{name}/stop", json={})
         assert stop_resp.status_code == 200
-        body = stop_resp.json()
-        assert body.get("ok") is True
+        assert stop_resp.json().get("ok") is True
+        # Restart so later tests that expect this service running still pass
+        api.post(f"{BASE_URL}/api/services/{name}/start", json={})
 
     def test_service_start_unavailable_returns_503(self, api):
-        """Starting a service whose module is not installed returns 503."""
         data = api.get(f"{BASE_URL}/api/services").json()
         unavailable = [n for n, e in data.items() if not e.get("available")]
         if not unavailable:
-            pytest.skip("All services are available — cannot test 503 path")
+            pytest.skip("All services are available")
         name = unavailable[0]
         resp = api.post(f"{BASE_URL}/api/services/{name}/start", json={"port": 19999})
         assert resp.status_code == 503
-        
-        
+
+
+@pytest.mark.api
+class TestPageRenderFixes:
+    """Regression tests for the .format() KeyError bugs fixed in web_ui.py."""
+
+    def test_revocation_page_no_internal_error(self, api):
+        resp = api.get(f"{BASE_URL}/revocation")
+        assert resp.status_code == 200
+        assert "Internal error" not in resp.text
+
+    def test_revocation_page_has_serial_input(self, api):
+        resp = api.get(f"{BASE_URL}/revocation")
+        assert resp.status_code == 200
+        assert 'id="rev-serial"' in resp.text
+
+    def test_revocation_page_has_reason_select(self, api):
+        resp = api.get(f"{BASE_URL}/revocation")
+        assert 'id="rev-reason"' in resp.text
+
+    def test_revocation_page_has_revoke_button(self, api):
+        resp = api.get(f"{BASE_URL}/revocation")
+        assert "Revoke" in resp.text
+
+    def test_expiring_page_no_internal_error(self, api):
+        resp = api.get(f"{BASE_URL}/expiring")
+        assert resp.status_code == 200
+        assert "Internal error" not in resp.text
+
+    def test_all_pages_no_internal_error(self, api):
+        pages = ["/", "/services", "/certs", "/expiring", "/revocation",
+                 "/sub-ca", "/config-ui", "/audit", "/api-docs", "/metrics-ui"]
+        for path in pages:
+            resp = api.get(f"{BASE_URL}{path}")
+            assert "Internal error" not in resp.text, \
+                f"Page {path} returned an internal error: {resp.text[:300]}"
+
+
+@pytest.mark.api
+class TestServicesWithModules:
+    """Verify Services page reflects module availability."""
+
+    def test_api_services_returns_dict(self, api):
+        resp = api.get(f"{BASE_URL}/api/services")
+        assert resp.status_code == 200
+        assert isinstance(resp.json(), dict)
+
+    def test_api_services_known_keys_present(self, api):
+        data = api.get(f"{BASE_URL}/api/services").json()
+        for svc in ("cmp", "acme", "scep", "est", "ocsp"):
+            assert svc in data, f"Expected '{svc}' in /api/services response"
+
+    def test_api_services_cmp_available(self, api):
+        data = api.get(f"{BASE_URL}/api/services").json()
+        assert data.get("cmp", {}).get("available") is True
+
+    def test_api_services_cmp_running(self, api):
+        data = api.get(f"{BASE_URL}/api/services").json()
+        assert data.get("cmp", {}).get("running") is True
+
+    def test_api_services_entry_shape(self, api):
+        data = api.get(f"{BASE_URL}/api/services").json()
+        for name, entry in data.items():
+            for key in ("running", "available", "url", "config"):
+                assert key in entry, f"Service '{name}' missing key '{key}'"
+
+    def test_services_page_no_internal_error(self, api):
+        resp = api.get(f"{BASE_URL}/services")
+        assert resp.status_code == 200
+        assert "Internal error" not in resp.text
+
+    def test_services_page_shows_cmp_running(self, api):
+        resp = api.get(f"{BASE_URL}/services")
+        assert resp.status_code == 200
+        assert "Running" in resp.text or "running" in resp.text.lower()
+
+    def test_stop_available_service_returns_ok(self, api):
+        data = api.get(f"{BASE_URL}/api/services").json()
+        stopped_available = [
+            n for n, e in data.items()
+            if e.get("available") and not e.get("running")
+        ]
+        if not stopped_available:
+            pytest.skip("No stopped-but-available services to test stop on")
+        name = stopped_available[0]
+        resp = api.post(f"{BASE_URL}/api/services/{name}/stop", json={})
+        assert resp.status_code == 200
+        assert resp.json().get("ok") is True
+
+    def test_start_unavailable_service_returns_503(self, api):
+        data = api.get(f"{BASE_URL}/api/services").json()
+        unavailable = [n for n, e in data.items() if not e.get("available")]
+        if not unavailable:
+            pytest.skip("All services are available")
+        resp = api.post(
+            f"{BASE_URL}/api/services/{unavailable[0]}/start",
+            json={"port": 29999},
+        )
+        assert resp.status_code == 503
+
+
 @pytest.mark.api
 class TestExtendedCerts:
     """Test specialized certificate operations and binary downloads."""
 
     def test_download_crl(self, api):
-        """/ca/crl returns a DER-encoded CRL."""
         resp = api.get(f"{BASE_URL}/ca/crl")
         assert resp.status_code == 200
         assert resp.headers["Content-Type"] == "application/pkix-crl"
         assert len(resp.content) > 0
 
     def test_download_p12_bundle_content_type(self, api):
-        """P12 download returns correct MIME type."""
         certs = api.get(f"{BASE_URL}/api/certs").json().get("certificates", [])
         if not certs:
             pytest.skip("No certificates to test P12 download")
@@ -930,3 +886,129 @@ class TestExtendedCerts:
         assert "cert_pem" in body
         assert "key_pem" in body
         assert body.get("ok") is True
+
+
+# ---------------------------------------------------------------------------
+# [auth] PAM login tests  (server must be started with auth enabled)
+# Run with:  pytest test_webui.py -k TestPamLogin --pam-user pypkitest --pam-pass pypkitest123
+# ---------------------------------------------------------------------------
+
+@pytest.mark.auth
+class TestPamLogin:
+    """
+    End-to-end PAM authentication tests using Playwright.
+    The server must be running with auth enabled (pypki.auth.json / no_auth=false).
+    Credentials are supplied via --pam-user / --pam-pass CLI options or the
+    WEB_UI_PAM_USER / WEB_UI_PAM_PASS environment variables.
+    """
+
+    def _skip_if_no_creds(self, pam_user, pam_pass):
+        if not pam_user or not pam_pass:
+            pytest.skip("PAM credentials not provided (--pam-user / --pam-pass)")
+
+    def test_login_page_renders(self, page, pam_user, pam_pass):
+        self._skip_if_no_creds(pam_user, pam_pass)
+        page.goto(f"{BASE_URL}/login")
+        assert page.locator("form").count() > 0
+        assert page.locator("input[name=username]").count() > 0
+        assert page.locator("input[name=password]").count() > 0
+
+    def test_unauthenticated_redirect_to_login(self, page, pam_user, pam_pass):
+        """Accessing a protected page without a session must redirect to /login."""
+        self._skip_if_no_creds(pam_user, pam_pass)
+        # Use a fresh context so there is no active session cookie
+        with page.context.browser.new_context(base_url=BASE_URL) as ctx:
+            p = ctx.new_page()
+            p.goto(f"{BASE_URL}/")
+            assert "/login" in p.url, f"Expected redirect to /login, got {p.url}"
+
+    def test_wrong_password_shows_error(self, page, pam_user, pam_pass):
+        self._skip_if_no_creds(pam_user, pam_pass)
+        with page.context.browser.new_context(base_url=BASE_URL) as ctx:
+            p = ctx.new_page()
+            p.goto(f"{BASE_URL}/login")
+            p.locator("input[name=username]").fill(pam_user)
+            p.locator("input[name=password]").fill("definitelyWrongPassword!!")
+            p.locator("button[type=submit]").click()
+            # Must stay on /login and show an error message
+            assert "/login" in p.url
+            content = p.content()
+            assert "Invalid" in content or "incorrect" in content.lower() \
+                or "failed" in content.lower() or "error" in content.lower()
+
+    def test_correct_credentials_grant_access(self, page, pam_user, pam_pass):
+        self._skip_if_no_creds(pam_user, pam_pass)
+        with page.context.browser.new_context(base_url=BASE_URL) as ctx:
+            p = ctx.new_page()
+            p.goto(f"{BASE_URL}/login")
+            p.locator("input[name=username]").fill(pam_user)
+            p.locator("input[name=password]").fill(pam_pass)
+            p.locator("button[type=submit]").click()
+            p.wait_for_url(f"{BASE_URL}/", timeout=WAIT_TIMEOUT)
+            assert "PyPKI" in p.title()
+
+    def test_session_cookie_set_after_login(self, page, pam_user, pam_pass):
+        self._skip_if_no_creds(pam_user, pam_pass)
+        with page.context.browser.new_context(base_url=BASE_URL) as ctx:
+            p = ctx.new_page()
+            p.goto(f"{BASE_URL}/login")
+            p.locator("input[name=username]").fill(pam_user)
+            p.locator("input[name=password]").fill(pam_pass)
+            p.locator("button[type=submit]").click()
+            p.wait_for_url(f"{BASE_URL}/", timeout=WAIT_TIMEOUT)
+            cookies = ctx.cookies()
+            session_cookies = [c for c in cookies if "session" in c["name"].lower()
+                               or "pypki" in c["name"].lower()]
+            assert len(session_cookies) > 0, "No session cookie set after login"
+
+    def test_authenticated_session_reaches_dashboard(self, page, pam_user, pam_pass):
+        self._skip_if_no_creds(pam_user, pam_pass)
+        with page.context.browser.new_context(base_url=BASE_URL) as ctx:
+            p = ctx.new_page()
+            p.goto(f"{BASE_URL}/login")
+            p.locator("input[name=username]").fill(pam_user)
+            p.locator("input[name=password]").fill(pam_pass)
+            p.locator("button[type=submit]").click()
+            p.wait_for_url(f"{BASE_URL}/", timeout=WAIT_TIMEOUT)
+            assert "PyPKI Certificate Authority" in p.locator(".topbar h1").inner_text()
+
+    def test_authenticated_session_reaches_all_pages(self, page, pam_user, pam_pass):
+        self._skip_if_no_creds(pam_user, pam_pass)
+        with page.context.browser.new_context(base_url=BASE_URL) as ctx:
+            p = ctx.new_page()
+            # Log in once
+            p.goto(f"{BASE_URL}/login")
+            p.locator("input[name=username]").fill(pam_user)
+            p.locator("input[name=password]").fill(pam_pass)
+            p.locator("button[type=submit]").click()
+            p.wait_for_url(f"{BASE_URL}/", timeout=WAIT_TIMEOUT)
+            # Visit all pages — none should redirect back to /login
+            for path in ["/services", "/certs", "/revocation", "/audit", "/config-ui"]:
+                p.goto(f"{BASE_URL}{path}")
+                assert "/login" not in p.url, \
+                    f"Got redirected to /login on {path} despite active session"
+
+    def test_api_blocked_without_session(self, pam_user, pam_pass):
+        """Mutating API endpoints must return 401/403 without a valid session."""
+        self._skip_if_no_creds(pam_user, pam_pass)
+        s = requests.Session()
+        s.verify = TLS_VERIFY
+        resp = s.post(f"{BASE_URL}/api/revoke", json={"serial": 1, "reason": 0})
+        assert resp.status_code in (401, 403), \
+            f"Expected 401/403 without session, got {resp.status_code}"
+
+    def test_api_accessible_with_session_cookie(self, pam_user, pam_pass):
+        """After logging in via the form, the session cookie should allow API calls."""
+        self._skip_if_no_creds(pam_user, pam_pass)
+        s = requests.Session()
+        s.verify = TLS_VERIFY
+        # Fetch login form (sets any CSRF cookie if applicable)
+        s.get(f"{BASE_URL}/login")
+        resp = s.post(f"{BASE_URL}/login",
+                      data={"username": pam_user, "password": pam_pass},
+                      allow_redirects=True)
+        assert resp.status_code == 200
+        # Now the session cookie should be set — config GET must succeed
+        cfg = s.get(f"{BASE_URL}/api/config")
+        assert cfg.status_code == 200
+        assert isinstance(cfg.json(), dict)

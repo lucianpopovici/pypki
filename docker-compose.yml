@@ -1,0 +1,13 @@
+services:
+  tests:
+    build: .
+    container_name: pypki-tests
+    volumes:
+      # Mount CA dir so certs persist between runs (optional)
+      - pypki-ca:/app/ca
+    environment:
+      - WEB_UI_URL=http://localhost:8090
+      - PYTHONPATH=/app
+
+volumes:
+  pypki-ca:

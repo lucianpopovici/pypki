@@ -1,0 +1,29 @@
+{
+  "_comment": "Test configuration — no auth, fixed ports, minimal services",
+  "host": "0.0.0.0",
+  "ca_dir": "./ca",
+  "log_level": "WARNING",
+
+  "cmp": { "port": 8080 },
+
+  "web_ui": {
+    "port": 8090,
+    "no_auth": true,
+    "pam_service": "login"
+  },
+
+  "acme":  { "enabled": false, "port": 8888 },
+  "scep":  { "enabled": false, "port": 8889 },
+  "est":   { "enabled": false, "port": 8443 },
+  "ocsp":  { "enabled": true,  "port": 9001, "cache_seconds": 300, "url": "" },
+  "ipsec": { "enabled": false, "port": 8444 },
+
+  "tls": { "mode": "none" },
+
+  "validity": {
+    "end_entity_days":  365,
+    "client_cert_days": 365,
+    "tls_server_days":  365,
+    "ca_days":          3650
+  }
+}

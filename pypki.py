@@ -17,6 +17,13 @@ import json
 import sys
 from pathlib import Path
 
+# Ensure the directory containing pypki.py is on sys.path so that
+# pki_server.py (and its siblings cmp_server.py, acme_server.py, etc.)
+# can be imported regardless of the working directory.
+_HERE = Path(__file__).resolve().parent
+if str(_HERE) not in sys.path:
+    sys.path.insert(0, str(_HERE))
+
 
 def _load_config(path: Path) -> dict:
     if not path.exists():
@@ -149,7 +156,18 @@ def main():
     print(f"[pypki] Starting with config: {config_path}")
     print(f"[pypki] Args: {' '.join(argv)}\n")
 
+    # pki_server imports cmp_server at module level, and cmp_server in turn
+    # does `from pki_server import ...` — a circular import that fails when
+    # pki_server hasn't finished initialising yet.  The fix: import pki_server
+    # first (cmp_server will fail silently, leaving HAS_CMP=False), then
+    # import cmp_server explicitly (pki_server is now in sys.modules so the
+    # circular `from pki_server import` succeeds), then patch pki_server so
+    # it sees the now-loaded cmp_server.
     import pki_server
+    if not pki_server.HAS_CMP:
+        import cmp_server as _cmp
+        pki_server._cmp_module = _cmp
+        pki_server.HAS_CMP = True
     pki_server.main()
 
 

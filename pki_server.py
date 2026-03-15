@@ -160,16 +160,12 @@ try:
 except ImportError:
     HAS_IPSEC = False
 
-# CMP server module — CMPv2 (RFC 4210) / CMPv3 (RFC 9480) / HTTP (RFC 6712)
-# Extracted from pki_server.py into cmp_server.py, consistent with the other
-# protocol modules: acme_server.py, scep_server.py, est_server.py, ocsp_server.py.
-try:
-    import cmp_server as _cmp_module
-    HAS_CMP = True
-except ImportError:
-    HAS_CMP = False
-    print("WARNING: cmp_server.py not found — CMPv2/CMPv3 support disabled.")
-    print("         Place cmp_server.py in the same directory as pki_server.py.")
+# CMP server module import is deferred to after all class definitions to avoid
+# circular imports: cmp_server.py does `from pki_server import CertificateAuthority, ...`
+# which requires pki_server to be fully loaded first.
+# The actual import block appears just before main() at the bottom of this file.
+HAS_CMP = False
+_cmp_module = None
 
 # ASN.1 imports for CMPv2 message parsing
 try:
@@ -468,11 +464,13 @@ class ServerConfig:
     # ------------------------------------------------------------------
 
     def _effective(self) -> Dict[str, Any]:
-        """Merge: defaults ← file ← CLI overrides ← in-memory edits."""
+        """Merge: defaults ← CLI overrides ← file / in-memory edits.
+        _data (loaded from file + live PATCH calls) wins over _cli so that
+        the Config-UI PATCH endpoint can persistently override CLI defaults."""
         import copy
         result = copy.deepcopy(DEFAULT_CONFIG)
-        self._deep_merge(result, self._data)
         self._deep_merge(result, self._cli)
+        self._deep_merge(result, self._data)
         return result
 
     def _maybe_reload(self):
@@ -558,7 +556,7 @@ class AuditLog:
         conn = sqlite3.connect(str(self._db))
         conn.row_factory = sqlite3.Row
         rows = conn.execute(
-            "SELECT ts,event,detail,ip FROM audit ORDER BY id DESC LIMIT ?", (n,)
+            "SELECT ts AS timestamp,event,detail,ip FROM audit ORDER BY id DESC LIMIT ?", (n,)
         ).fetchall()
         conn.close()
         return [dict(r) for r in rows]
@@ -2711,6 +2709,34 @@ class CertificateAuthority:
         self._ocsp_cache().pop(serial, None)
 
 
+# ---------------------------------------------------------------------------
+# CMP server module — CMPv2 (RFC 4210) / CMPv3 (RFC 9480) / HTTP (RFC 6712)
+# Extracted from pki_server.py into cmp_server.py, consistent with the other
+# protocol modules: acme_server.py, scep_server.py, est_server.py, ocsp_server.py.
+# Imported HERE (after all class definitions) to avoid the circular import:
+#   cmp_server.py does `from pki_server import CertificateAuthority, ...`
+#   which requires pki_server to be fully loaded first.
+# ---------------------------------------------------------------------------
+try:
+    import cmp_server as _cmp_module
+    HAS_CMP = True
+    # Re-export CMP symbols so callers can do `import pki_server as pki; pki.CMPv3Handler`
+    CMP_WELL_KNOWN_PATH    = _cmp_module.CMP_WELL_KNOWN_PATH
+    CMPv2ASN1              = _cmp_module.CMPv2ASN1
+    CMPv2Handler           = _cmp_module.CMPv2Handler
+    CMPv3Handler           = _cmp_module.CMPv3Handler
+    CMPv2HTTPHandler       = _cmp_module.CMPv2HTTPHandler
+    ThreadedHTTPServer     = _cmp_module.ThreadedHTTPServer
+    TLSServer              = _cmp_module.TLSServer
+    make_handler           = _cmp_module.make_handler
+    make_cmpv3_handler     = _cmp_module.make_cmpv3_handler
+    start_bootstrap_server = _cmp_module.start_bootstrap_server
+except ImportError:
+    HAS_CMP = False
+    print("WARNING: cmp_server.py not found — CMPv2/CMPv3 support disabled.")
+    print("         Place cmp_server.py in the same directory as pki_server.py.")
+
+
 def main():
     parser = argparse.ArgumentParser(description="PKI Server with CMPv2 Support + mTLS")
     parser.add_argument("--host", default="0.0.0.0", help="Bind address (default: 0.0.0.0)")
@@ -3247,6 +3273,20 @@ def main():
                 scep_base_url=_scep_base,
                 est_base_url=_est_base,
                 ocsp_base_url=_ocsp_base,
+                # Running server objects — let the UI reflect current state
+                cmp_server=server,
+                acme_server=acme_srv,
+                scep_server=scep_srv,
+                est_server=est_srv,
+                ocsp_server=ocsp_srv,
+                ipsec_server=ipsec_srv,
+                # Module references — required for start/stop from the Services page
+                cmp_module=_cmp_module   if HAS_CMP   else None,
+                acme_module=_acme_module if HAS_ACME  else None,
+                scep_module=_scep_module if HAS_SCEP  else None,
+                est_module=_est_module   if HAS_EST   else None,
+                ocsp_module=_ocsp_module if HAS_OCSP  else None,
+                ipsec_module=_ipsec_module if HAS_IPSEC else None,
             )
 
     ca_mode_label = (
