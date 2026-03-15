@@ -10,7 +10,7 @@ Tests every endpoint across all six servers:
   • scep_server.py  (SCEP)       — default http://localhost:8889
   • est_server.py   (EST)        — default https://localhost:8444
   • ocsp_server.py  (OCSP)       — default http://localhost:8082
-  • web_ui.py       (Web UI)     — default http://localhost:8090
+  • web_ui.py       (Web UI)     — default http://localhost:8008
 
 Usage
 -----
@@ -24,7 +24,7 @@ Usage
     --scep-url http://pki.internal:8889  \\
     --est-url  https://pki.internal:8444 \\
     --ocsp-url http://pki.internal:8082  \\
-    --web-url  http://pki.internal:8090  \\
+    --web-url  http://pki.internal:8008  \\
     --ca-cert  ./ca/ca.crt
 
   # Skip TLS verification entirely (testing only):
@@ -871,12 +871,17 @@ def test_ocsp(cfg: argparse.Namespace, c: Client) -> Suite:
 
     # ── Fetch CA cert for building proper OCSP requests ──────────
     ca_cert = None
+    ca_cert_error = None
     try:
-        r = c.get(f"{cfg.pki_url}/ca/cert.pem")
+        # Always skip TLS verification here: we're fetching the CA cert itself,
+        # which cannot be verified against a system bundle by definition.
+        r = c.session.get(f"{cfg.pki_url}/ca/cert.pem", verify=False, timeout=c.timeout)
         if r.ok:
             ca_cert = x509.load_pem_x509_certificate(r.content)
-    except Exception:
-        pass
+        else:
+            ca_cert_error = f"HTTP {r.status_code} from {cfg.pki_url}/ca/cert.pem"
+    except Exception as e:
+        ca_cert_error = str(e)
 
     # ── GET /ocsp/ → 400 (no request) ───────────────────────────
     check(s, "GET /ocsp/ → 400 (no b64 payload)", lambda: expect_status(
@@ -927,8 +932,9 @@ def test_ocsp(cfg: argparse.Namespace, c: Client) -> Suite:
             )
         check(s, "GET /ocsp/<base64> (RFC 5019 cacheable GET)", _get_ocsp)
     else:
-        fail(s, "POST /ocsp (well-formed)", "Could not fetch CA cert for OCSP request building")
-        fail(s, "GET /ocsp/<base64> (RFC 5019)", "Could not fetch CA cert")
+        reason = f": {ca_cert_error}" if ca_cert_error else ""
+        fail(s, "POST /ocsp (well-formed)", f"Could not fetch CA cert for OCSP request building{reason}")
+        fail(s, "GET /ocsp/<base64> (RFC 5019)", f"Could not fetch CA cert{reason}")
 
     # ── Cache-Control header on GET response ─────────────────────
     if ca_cert:
@@ -1114,7 +1120,7 @@ def parse_args() -> argparse.Namespace:
             --scep-url http://pki.internal:8889  \\
             --est-url  https://pki.internal:8444 \\
             --ocsp-url http://pki.internal:8082  \\
-            --web-url  http://pki.internal:8090  \\
+            --web-url  http://pki.internal:8008  \\
             --ca-cert  ./ca/ca.crt
 
           # Skip TLS verification (quick smoke test):
@@ -1131,8 +1137,8 @@ def parse_args() -> argparse.Namespace:
                    help="EST server base URL (default: https://localhost:8444)")
     p.add_argument("--ocsp-url", default="http://localhost:8082",
                    help="OCSP server base URL (default: http://localhost:8082)")
-    p.add_argument("--web-url",  default="http://localhost:8090",
-                   help="Web UI base URL (default: http://localhost:8090)")
+    p.add_argument("--web-url",  default="http://localhost:8008",
+                   help="Web UI base URL (default: http://localhost:8008)")
     p.add_argument("--ca-cert",  default=None, metavar="PATH",
                    help="CA certificate PEM for TLS verification (default: system bundle)")
     p.add_argument("--no-verify", action="store_true",
@@ -1152,12 +1158,33 @@ def main():
     VERBOSE = cfg.verbose
 
     # Determine TLS verify setting
+    _tmp_ca_file = None
     if cfg.no_verify:
         verify = False
     elif cfg.ca_cert:
         verify = cfg.ca_cert
     else:
-        verify = True  # use system CA bundle
+        # Auto-bootstrap: fetch the PyPKI CA cert (verify=False for the bootstrap
+        # only) and merge it with the system CA bundle so that both self-signed
+        # PyPKI certs and externally-signed certs verify correctly.
+        try:
+            import tempfile, requests as _req
+            _r = _req.get(f"{cfg.pki_url}/ca/cert.pem", verify=False, timeout=10)
+            if _r.ok and b"BEGIN CERTIFICATE" in _r.content:
+                # Build a combined bundle: PyPKI CA + system trust store
+                try:
+                    import certifi
+                    _system_bundle = open(certifi.where(), "rb").read()
+                except Exception:
+                    _system_bundle = b""
+                _tmp_ca_file = tempfile.NamedTemporaryFile(suffix=".pem", delete=False)
+                _tmp_ca_file.write(_r.content + b"\n" + _system_bundle)
+                _tmp_ca_file.flush()
+                verify = _tmp_ca_file.name
+            else:
+                verify = True  # fall back to system bundle
+        except Exception:
+            verify = True  # fall back to system bundle
 
     c = Client(verify=verify, timeout=cfg.timeout)
 
@@ -1170,7 +1197,9 @@ def main():
     print(f"║  EST   : {cfg.est_url:<49}║")
     print(f"║  OCSP  : {cfg.ocsp_url:<49}║")
     print(f"║  WebUI : {cfg.web_url:<49}║")
-    print(f"║  TLS   : {'disabled (--no-verify)' if cfg.no_verify else cfg.ca_cert or 'system bundle':<49}║")
+    tls_label = ('disabled (--no-verify)' if cfg.no_verify
+                 else cfg.ca_cert or ('auto-fetched CA cert' if _tmp_ca_file else 'system bundle'))
+    print(f"║  TLS   : {tls_label:<49}║")
     print("╚══════════════════════════════════════════════════════════╝")
 
     runners = {
@@ -1196,6 +1225,11 @@ def main():
                     traceback.print_exc()
 
     n_fail = print_summary()
+
+    if _tmp_ca_file is not None:
+        _tmp_ca_file.close()
+        os.unlink(_tmp_ca_file.name)
+
     sys.exit(0 if n_fail == 0 else 1)
 
 

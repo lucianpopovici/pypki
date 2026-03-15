@@ -9,6 +9,43 @@ This project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Documentation
+
+#### RFC compliance analysis — RFC 9370, RFC 9180, RFC 9763
+
+Assessed three additional RFCs for relevance to PyPKI:
+
+**RFC 9370 — Multiple Key Exchanges in IKEv2** — Not applicable. This RFC
+governs the IKEv2 VPN handshake protocol (multiple hybrid PQC+classical key
+exchange rounds during SA setup). It is implemented by VPN gateways such as
+strongSwan, Cisco IOS-XE, and Palo Alto PAN-OS — not by the PKI server that
+issues their certificates. PyPKI's existing RFC 4945 / RFC 4806 / RFC 4809
+coverage addresses all CA-side obligations for IKEv2 deployments. Added to
+Protocol compliance table with N/A status and rationale.
+
+**RFC 9180 — HPKE (Hybrid Public Key Encryption)** — Not applicable. HPKE is
+an encryption scheme used in TLS Encrypted Client Hello (ECH), Oblivious HTTP
+(OHTTP), and Messaging Layer Security (MLS). It has no intersection with X.509
+certificate issuance or management. Added to Protocol compliance table with N/A
+status and rationale.
+
+**RFC 9763 — Related Certificates for Multiple Authentications** — Relevant;
+planned. Defines a `relatedCertRequest` CSR attribute and a `RelatedCertificate`
+X.509 extension (OID `1.3.6.1.5.5.7.1.36`) for linking a classical cert to its
+PQC counterpart. Primary use case is dual-certificate TLS 1.3 authentication
+during the classical → ML-DSA migration period. Implementation is deferred
+until ML-DSA support is available (the two features are co-dependent). Added to
+Protocol compliance table with 🗓️ Planned status and to the Roadmap section.
+
+#### Roadmap updates
+
+- ML-DSA prerequisites clarified: the `cryptography` pre-built wheel bundles
+  its own OpenSSL; rebuilding from source (`--no-binary cryptography`) against
+  system OpenSSL 3.3+ is required to expose the `mldsa` binding
+- RFC 9763 roadmap entry added alongside ML-DSA, covering `issue_certificate_pair()`,
+  `RelatedCertificate` extension embedding, CSR `relatedCertRequest` parsing,
+  and `POST /api/certs/<serial>/related` endpoint
+
 ---
 
 ## [0.10.0] — 2026-03-01

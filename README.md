@@ -1694,6 +1694,79 @@ Every issued certificate includes:
 | RFC 4945 | IPsec PKI Profile — IKEv1 + IKEv2 | ✅ Full (all §3/§4/§5 CA-side obligations) |
 | RFC 4806 | IKEv2 OCSP Extensions | ✅ Full (CA-cert hash + OCSP-cert hash; Cert Encoding 14) |
 | RFC 4809 | IPsec Certificate Management Requirements | ✅ Full (issue, enroll, update, renew, batch, approval queue, confirm, signed-revoc) |
+| RFC 9370 | Multiple Key Exchanges in IKEv2 | N/A — IKEv2 handshake protocol; implemented by VPN gateways (strongSwan, Cisco, etc.), not by the PKI. PyPKI issues the certificates *used by* IKEv2 peers (RFC 4945/4806/4809). |
+| RFC 9180 | HPKE — Hybrid Public Key Encryption | N/A — encryption scheme for TLS ECH, OHTTP, and MLS messaging; unrelated to X.509 certificate issuance or management. |
+| RFC 9763 | Related Certificates for Multiple Authentications | 🗓️ Planned — defines `relatedCertRequest` CSR attribute and `RelatedCertificate` X.509 extension for linking classical + PQC cert pairs. Tracked in Roadmap below. |
+
+---
+
+## Roadmap
+
+### Post-Quantum Cryptography (ML-DSA / FIPS 204)
+
+PyPKI does not yet support ML-DSA (Module Lattice Digital Signature Algorithm,
+FIPS 204 — formerly Dilithium) or any other post-quantum algorithm. This is a
+planned feature, pending two prerequisites:
+
+**Prerequisites**
+
+| Prerequisite | Status |
+|---|---|
+| OpenSSL 3.3+ with ML-DSA support | Required on the server; check with `openssl version` |
+| `cryptography` Python bindings for ML-DSA | Present in `cryptography` ≥ 44 **only when compiled against OpenSSL 3.3+**; the pre-built wheel bundles its own OpenSSL and may not expose `mldsa` even on OpenSSL 3.5 systems. Rebuild from source: `pip install cryptography --no-binary cryptography --upgrade` |
+| Finalised ML-DSA OIDs in CMP / EST / SCEP / ACME RFCs | IETF drafts in progress |
+
+**Verify your environment**
+
+```bash
+# Should print OpenSSL 3.3 or later
+python3 -c "from cryptography.hazmat.backends.openssl import backend; print(backend.openssl_version_text())"
+
+# If the above is 3.3+, test the binding
+python3 -c "from cryptography.hazmat.primitives.asymmetric import mldsa; print('ML-DSA: available')"
+```
+
+**Planned implementation scope**
+
+- `--ca-key-type rsa4096|mldsa44|mldsa65|mldsa87` — select CA key algorithm at first-run time
+- `_load_or_create_ca()` — generate ML-DSA key pair when selected; store as PKCS#8
+- `issue_certificate()` — ML-DSA signing path (no RSA padding; deterministic or hedged per FIPS 204)
+- `build_tls_context()` — TLS 1.3 hybrid PQC key exchange (`X25519MLKEM768`) once Python's `ssl` module exposes the required knobs
+- Protocol OID support — updated CMP, EST, SCEP, and ACME handlers once algorithm identifiers are finalised in the relevant IETF drafts
+- `TestMLDSA` test class — key generation, cert issuance, signature verification, chain validation; all tests `@skipUnless(HAS_MLDSA, "requires cryptography compiled against OpenSSL 3.3+")`
+
+---
+
+### RFC 9763 — Related Certificates for Multiple Authentications
+
+RFC 9763 defines two new structures designed specifically for the classical → PQC
+migration period:
+
+| Structure | Type | Purpose |
+|---|---|---|
+| `relatedCertRequest` | CSR attribute | Client signals "link this new cert to an existing cert I already hold" |
+| `RelatedCertificate` | X.509 extension | Issued cert embeds a hash + issuer/serial reference to its counterpart |
+
+**Why this matters for PQC migration**
+
+During the transition period, a device needs *two* certificates for the same
+identity — one classical (RSA/EC, for legacy peers) and one ML-DSA (for
+PQC-capable peers). TLS 1.3 can present both and negotiate which to use. RFC 9763
+provides the linkage mechanism so relying parties can verify the two certs belong
+to the same entity.
+
+**Dependency on ML-DSA**
+
+RFC 9763 support will be implemented together with ML-DSA. There is no value in
+issuing "related" classical certs without a PQC counterpart to relate them to.
+
+**Planned implementation scope**
+
+- `issue_certificate()` — new `related_cert_serial` parameter; when provided, embeds `RelatedCertificate` extension (OID `1.3.6.1.5.5.7.1.36`) pointing at the counterpart cert
+- `issue_certificate_pair()` — convenience method that issues both a classical and ML-DSA cert in a single call, automatically cross-linking them via `RelatedCertificate`
+- CSR parsing — recognise `relatedCertRequest` attribute in incoming CSRs (CMP `p10cr`, EST `simpleenroll`, SCEP `PKCSReq`)
+- New REST endpoint — `POST /api/certs/<serial>/related` returns the related cert if one exists
+- `TestRFC9763RelatedCerts` test class
 
 ---
 

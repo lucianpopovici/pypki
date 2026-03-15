@@ -1,0 +1,72 @@
+{
+  "_comment": "PyPKI startup configuration. Run with: python pypki.py",
+  "host": "0.0.0.0",
+  "ca_dir": "./ca",
+  "log_level": "INFO",
+
+  "cmp": {
+    "port": 8080,
+    "comment": "CMPv2/v3 main server — always started, cannot be disabled here"
+  },
+
+  "web_ui": {
+    "comment": "Web dashboard — always on",
+    "port": 8090,
+    "no_auth": false,
+    "pam_service": "login"
+  },
+
+  "acme": {
+    "enabled": false,
+    "port": 8888,
+    "cert_days": 90,
+    "short_lived_threshold_days": 7,
+    "auto_approve_dns": false,
+    "base_url": ""
+  },
+
+  "scep": {
+    "enabled": false,
+    "port": 8889,
+    "challenge": ""
+  },
+
+  "est": {
+    "enabled": false,
+    "port": 8443,
+    "require_auth": true,
+    "tls_cert": "",
+    "tls_key": ""
+  },
+
+  "ocsp": {
+    "enabled": true,
+    "port": 9001,
+    "cache_seconds": 300,
+    "url": ""
+  },
+
+  "ipsec": {
+    "enabled": false,
+    "port": 8444,
+    "tls_cert": "",
+    "tls_key": ""
+  },
+
+  "tls": {
+    "mode": "none",
+    "comment": "mode: none | tls | mtls",
+    "hostname": "localhost",
+    "cert": "",
+    "key": "",
+    "tls13_only": false,
+    "reload_interval": 60
+  },
+
+  "validity": {
+    "end_entity_days": 365,
+    "client_cert_days": 365,
+    "tls_server_days": 365,
+    "ca_days": 3650
+  }
+}

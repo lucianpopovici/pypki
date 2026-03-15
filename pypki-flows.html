@@ -1,0 +1,2292 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>PyPKI — Protocol Flow Diagrams</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/mermaid/10.6.1/mermaid.min.js"></script>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;600&family=IBM+Plex+Sans:ital,wght@0,300;0,400;0,600;0,700;1,400&display=swap');
+
+  :root {
+    --navy:   #0d1526;
+    --navy2:  #1a2340;
+    --navy3:  #243055;
+    --blue:   #3b82f6;
+    --blue2:  #60a5fa;
+    --teal:   #14b8a6;
+    --amber:  #f59e0b;
+    --red:    #ef4444;
+    --green:  #10b981;
+    --text:   #e2e8f0;
+    --muted:  #94a3b8;
+    --border: #2d3f5e;
+    --card:   #111d35;
+  }
+
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+
+  body {
+    font-family: 'IBM Plex Sans', sans-serif;
+    background: var(--navy);
+    color: var(--text);
+    display: flex;
+    min-height: 100vh;
+  }
+
+  /* ── Sidebar ── */
+  #sidebar {
+    width: 240px;
+    min-width: 240px;
+    background: var(--navy2);
+    border-right: 1px solid var(--border);
+    position: sticky;
+    top: 0;
+    height: 100vh;
+    overflow-y: auto;
+    display: flex;
+    flex-direction: column;
+  }
+
+  .sidebar-logo {
+    padding: 22px 20px 16px;
+    border-bottom: 1px solid var(--border);
+  }
+  .sidebar-logo h1 {
+    font-size: 1.05rem;
+    font-weight: 700;
+    color: #fff;
+    letter-spacing: .02em;
+  }
+  .sidebar-logo p {
+    font-size: .72rem;
+    color: var(--muted);
+    margin-top: 3px;
+    font-family: 'IBM Plex Mono', monospace;
+  }
+
+  .sidebar-group { padding: 14px 0 4px; }
+  .sidebar-group-label {
+    font-size: .65rem;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: .12em;
+    color: var(--muted);
+    padding: 0 20px 6px;
+  }
+  .sidebar-link {
+    display: flex;
+    align-items: center;
+    gap: 9px;
+    padding: 7px 20px;
+    font-size: .82rem;
+    color: var(--muted);
+    text-decoration: none;
+    cursor: pointer;
+    transition: background .15s, color .15s;
+    border-left: 2px solid transparent;
+  }
+  .sidebar-link:hover { background: rgba(255,255,255,.04); color: var(--text); }
+  .sidebar-link.active {
+    color: var(--blue2);
+    border-left-color: var(--blue);
+    background: rgba(59,130,246,.08);
+  }
+  .sidebar-link .dot {
+    width: 6px; height: 6px;
+    border-radius: 50%;
+    flex-shrink: 0;
+  }
+
+  /* ── Main content ── */
+  #main {
+    flex: 1;
+    overflow-y: auto;
+    padding: 0 0 80px;
+  }
+
+  .page-header {
+    background: linear-gradient(135deg, var(--navy2) 0%, #0f1e3a 100%);
+    border-bottom: 1px solid var(--border);
+    padding: 36px 48px 32px;
+  }
+  .page-header h2 {
+    font-size: 1.6rem;
+    font-weight: 700;
+    color: #fff;
+  }
+  .page-header p {
+    color: var(--muted);
+    margin-top: 6px;
+    font-size: .92rem;
+    max-width: 600px;
+    line-height: 1.55;
+  }
+  .page-header .rfc-tag {
+    display: inline-block;
+    background: rgba(59,130,246,.15);
+    border: 1px solid rgba(59,130,246,.3);
+    color: var(--blue2);
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: .72rem;
+    padding: 3px 10px;
+    border-radius: 20px;
+    margin-top: 10px;
+    margin-right: 6px;
+  }
+
+  .section-wrapper {
+    display: none;
+    padding: 36px 48px;
+  }
+  .section-wrapper.active { display: block; }
+
+  /* ── Flow card ── */
+  .flow-card {
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    margin-bottom: 36px;
+    overflow: hidden;
+  }
+  .flow-card-head {
+    background: var(--navy2);
+    padding: 16px 22px;
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    border-bottom: 1px solid var(--border);
+  }
+  .flow-card-head h3 {
+    font-size: .95rem;
+    font-weight: 600;
+    color: #fff;
+  }
+  .op-badge {
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: .72rem;
+    padding: 3px 9px;
+    border-radius: 4px;
+    font-weight: 600;
+  }
+  .op-badge.enroll  { background: rgba(16,185,129,.15); color: #6ee7b7; border: 1px solid rgba(16,185,129,.25); }
+  .op-badge.renew   { background: rgba(59,130,246,.15); color: var(--blue2); border: 1px solid rgba(59,130,246,.25); }
+  .op-badge.revoke  { background: rgba(239,68,68,.15);  color: #fca5a5; border: 1px solid rgba(239,68,68,.25); }
+  .op-badge.query   { background: rgba(245,158,11,.15); color: #fcd34d; border: 1px solid rgba(245,158,11,.25); }
+  .op-badge.auth    { background: rgba(168,85,247,.15); color: #d8b4fe; border: 1px solid rgba(168,85,247,.25); }
+  .op-badge.confirm { background: rgba(20,184,166,.15); color: #5eead4; border: 1px solid rgba(20,184,166,.25); }
+
+  .flow-diagram {
+    padding: 24px;
+    overflow-x: auto;
+    background: #0a1220;
+  }
+
+  .flow-explain {
+    padding: 18px 22px;
+    border-top: 1px solid var(--border);
+  }
+  .flow-explain h4 {
+    font-size: .78rem;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: .1em;
+    color: var(--muted);
+    margin-bottom: 10px;
+  }
+  .flow-explain p {
+    font-size: .87rem;
+    line-height: 1.65;
+    color: #b0bdd0;
+    margin-bottom: 8px;
+  }
+  .flow-explain p:last-child { margin-bottom: 0; }
+
+  .steps {
+    list-style: none;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    margin-top: 10px;
+  }
+  .steps li {
+    display: flex;
+    gap: 12px;
+    align-items: flex-start;
+    font-size: .87rem;
+    color: #b0bdd0;
+    line-height: 1.55;
+  }
+  .step-num {
+    flex-shrink: 0;
+    width: 22px;
+    height: 22px;
+    border-radius: 50%;
+    background: var(--navy3);
+    border: 1px solid var(--border);
+    color: var(--blue2);
+    font-size: .72rem;
+    font-weight: 700;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    margin-top: 1px;
+    font-family: 'IBM Plex Mono', monospace;
+  }
+  code {
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: .82em;
+    background: rgba(59,130,246,.12);
+    color: var(--blue2);
+    padding: 1px 5px;
+    border-radius: 3px;
+  }
+
+  .note-box {
+    background: rgba(245,158,11,.08);
+    border: 1px solid rgba(245,158,11,.25);
+    border-radius: 6px;
+    padding: 10px 14px;
+    font-size: .83rem;
+    color: #fcd34d;
+    margin-top: 12px;
+    line-height: 1.55;
+  }
+  .note-box::before { content: "⚑  "; font-size: .9em; }
+
+  /* mermaid override for dark theme */
+  .mermaid svg { max-width: 100%; }
+
+  /* scrollbar */
+  ::-webkit-scrollbar { width: 6px; height: 6px; }
+  ::-webkit-scrollbar-track { background: var(--navy); }
+  ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+</style>
+</head>
+<body>
+
+<!-- ═══════════════════════════ SIDEBAR ═══════════════════════════ -->
+<nav id="sidebar">
+  <div class="sidebar-logo">
+    <h1>🔐 PyPKI</h1>
+    <p>Protocol Flow Diagrams</p>
+  </div>
+
+  <div class="sidebar-group">
+    <div class="sidebar-group-label">CMPv2 / CMPv3</div>
+    <a class="sidebar-link active" onclick="show('cmp-ir')">
+      <span class="dot" style="background:#10b981"></span> Initialization Request
+    </a>
+    <a class="sidebar-link" onclick="show('cmp-cr')">
+      <span class="dot" style="background:#10b981"></span> Certification Request
+    </a>
+    <a class="sidebar-link" onclick="show('cmp-kur')">
+      <span class="dot" style="background:#3b82f6"></span> Key Update Request
+    </a>
+    <a class="sidebar-link" onclick="show('cmp-rr')">
+      <span class="dot" style="background:#ef4444"></span> Revocation Request
+    </a>
+    <a class="sidebar-link" onclick="show('cmp-certconf')">
+      <span class="dot" style="background:#14b8a6"></span> Certificate Confirmation
+    </a>
+    <a class="sidebar-link" onclick="show('cmp-p10cr')">
+      <span class="dot" style="background:#10b981"></span> PKCS#10 Request
+    </a>
+    <a class="sidebar-link" onclick="show('cmp-genm')">
+      <span class="dot" style="background:#f59e0b"></span> General Message
+    </a>
+    <a class="sidebar-link" onclick="show('cmp-poll')">
+      <span class="dot" style="background:#f59e0b"></span> Async Polling (CMPv3)
+    </a>
+  </div>
+
+  <div class="sidebar-group">
+    <div class="sidebar-group-label">ACME (RFC 8555)</div>
+    <a class="sidebar-link" onclick="show('acme-account')">
+      <span class="dot" style="background:#10b981"></span> Account Registration
+    </a>
+    <a class="sidebar-link" onclick="show('acme-http01')">
+      <span class="dot" style="background:#10b981"></span> http-01 Challenge
+    </a>
+    <a class="sidebar-link" onclick="show('acme-dns01')">
+      <span class="dot" style="background:#10b981"></span> dns-01 Challenge
+    </a>
+    <a class="sidebar-link" onclick="show('acme-alpn')">
+      <span class="dot" style="background:#10b981"></span> tls-alpn-01 Challenge
+    </a>
+    <a class="sidebar-link" onclick="show('acme-revoke')">
+      <span class="dot" style="background:#ef4444"></span> Certificate Revocation
+    </a>
+  </div>
+
+  <div class="sidebar-group">
+    <div class="sidebar-group-label">SCEP (RFC 8894)</div>
+    <a class="sidebar-link" onclick="show('scep-getcacert')">
+      <span class="dot" style="background:#f59e0b"></span> GetCACert / GetCACaps
+    </a>
+    <a class="sidebar-link" onclick="show('scep-pkcsreq')">
+      <span class="dot" style="background:#10b981"></span> PKCSReq Enrollment
+    </a>
+    <a class="sidebar-link" onclick="show('scep-poll')">
+      <span class="dot" style="background:#f59e0b"></span> CertPoll (manual RA)
+    </a>
+    <a class="sidebar-link" onclick="show('scep-getcrl')">
+      <span class="dot" style="background:#f59e0b"></span> GetCRL
+    </a>
+  </div>
+
+  <div class="sidebar-group">
+    <div class="sidebar-group-label">EST (RFC 7030)</div>
+    <a class="sidebar-link" onclick="show('est-cacerts')">
+      <span class="dot" style="background:#f59e0b"></span> cacerts
+    </a>
+    <a class="sidebar-link" onclick="show('est-enroll')">
+      <span class="dot" style="background:#10b981"></span> simpleenroll
+    </a>
+    <a class="sidebar-link" onclick="show('est-reenroll')">
+      <span class="dot" style="background:#3b82f6"></span> simplereenroll
+    </a>
+    <a class="sidebar-link" onclick="show('est-serverkeygen')">
+      <span class="dot" style="background:#10b981"></span> serverkeygen
+    </a>
+  </div>
+
+  <div class="sidebar-group">
+    <div class="sidebar-group-label">IPsec PKI (RFC 4945)</div>
+    <a class="sidebar-link" onclick="show('ipsec-enroll')">
+      <span class="dot" style="background:#10b981"></span> CSR Enrollment
+    </a>
+    <a class="sidebar-link" onclick="show('ipsec-batch')">
+      <span class="dot" style="background:#10b981"></span> Batch Issuance
+    </a>
+    <a class="sidebar-link" onclick="show('ipsec-approve')">
+      <span class="dot" style="background:#a855f7"></span> Approval Queue
+    </a>
+    <a class="sidebar-link" onclick="show('ipsec-update')">
+      <span class="dot" style="background:#3b82f6"></span> PKC Update / Renew
+    </a>
+  </div>
+
+  <div class="sidebar-group">
+    <div class="sidebar-group-label">OCSP (RFC 6960)</div>
+    <a class="sidebar-link" onclick="show('ocsp-get')">
+      <span class="dot" style="background:#f59e0b"></span> GET Binding
+    </a>
+    <a class="sidebar-link" onclick="show('ocsp-staple')">
+      <span class="dot" style="background:#f59e0b"></span> OCSP Stapling
+    </a>
+  </div>
+
+  <div class="sidebar-group">
+    <div class="sidebar-group-label">Software Signing</div>
+    <a class="sidebar-link" onclick="show('sign-issue')">
+      <span class="dot" style="background:#10b981"></span> Issue Signing Cert
+    </a>
+    <a class="sidebar-link" onclick="show('sign-cms')">
+      <span class="dot" style="background:#3b82f6"></span> Sign a File (CMS)
+    </a>
+    <a class="sidebar-link" onclick="show('sign-verify')">
+      <span class="dot" style="background:#f59e0b"></span> Verify Signature
+    </a>
+    <a class="sidebar-link" onclick="show('sign-revoke')">
+      <span class="dot" style="background:#ef4444"></span> Revoke &amp; Re-sign
+    </a>
+  </div>
+
+  <div class="sidebar-group">
+    <div class="sidebar-group-label">Web UI</div>
+    <a class="sidebar-link" onclick="show('webui-auth')">
+      <span class="dot" style="background:#a855f7"></span> PAM Authentication
+    </a>
+  </div>
+</nav>
+
+<!-- ═══════════════════════════ MAIN ═══════════════════════════ -->
+<main id="main">
+
+<!-- ▸▸▸ CMP — IR ◂◂◂ -->
+<div id="sec-cmp-ir" class="section-wrapper active">
+  <div class="page-header">
+    <h2>CMPv2 — Initialization Request</h2>
+    <p>First-time certificate enrollment for a client that has no prior relationship with the CA. The client proves possession of the private key via a self-signed proof-of-possession (POPO) structure embedded in the CRMF request.</p>
+    <span class="rfc-tag">RFC 4210</span>
+    <span class="rfc-tag">RFC 4211 CRMF</span>
+    <span class="rfc-tag">RFC 6712 CMP/HTTP</span>
+  </div>
+  <div class="section-wrapper active" style="padding-top:28px">
+    <div class="flow-card">
+      <div class="flow-card-head">
+        <h3>ir / ip — Initialization Request / Response</h3>
+        <span class="op-badge enroll">ENROLL</span>
+      </div>
+      <div class="flow-diagram">
+        <div class="mermaid">
+sequenceDiagram
+    autonumber
+    participant C as Client
+    participant CA as PyPKI CA
+
+    Note over C: Generate RSA/EC key pair
+    C->>C: Build CertTemplate (CN, SAN, keyAlg)
+    C->>C: Sign POPO (proof-of-possession)
+    C->>C: Wrap in PKIMessage (body=ir, pvno=cmp2000)
+
+    C->>CA: POST /pki  [PKIMessage ir]
+    Note over CA: Validate message header
+    Note over CA: Verify POPO signature
+    Note over CA: Apply certificate profile
+    Note over CA: Issue X.509 certificate
+    CA-->>C: PKIMessage ip [CertResponse, PKIStatusInfo=accepted]
+
+    C->>C: Verify issuer signature on cert
+    C->>C: Store certificate + private key
+
+    C->>CA: POST /pki  [PKIMessage certConf]
+    CA-->>C: PKIMessage pkiConf
+        </div>
+      </div>
+      <div class="flow-explain">
+        <h4>How it works</h4>
+        <ul class="steps">
+          <li><span class="step-num">1</span>The client generates a fresh key pair and builds a <code>CertTemplate</code> (RFC 4211 §5) specifying desired subject DN, SANs, and key algorithm.</li>
+          <li><span class="step-num">2</span>Proof-of-possession (<code>POPO</code>) is created by signing the <code>CertRequest</code> structure with the new private key — demonstrating ownership without revealing the key.</li>
+          <li><span class="step-num">3</span>The CA validates the PKIMessage header, verifies the POPO, applies the requested profile (EKU, KeyUsage), issues the cert, and returns a <code>PKIMessage</code> with body type <code>ip</code>.</li>
+          <li><span class="step-num">4</span>A mandatory two-phase <code>certConf</code> / <code>pkiConf</code> handshake confirms receipt. The cert is only considered issued after this exchange.</li>
+        </ul>
+        <div class="note-box">
+          PyPKI auto-detects CMPv2 vs CMPv3 from the <code>pvno</code> field. For CMPv3 (RFC 9480), extended polling (<code>pollReq</code>/<code>pollRep</code>) is available if the CA defers issuance.
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ▸▸▸ CMP — CR ◂◂◂ -->
+<div id="sec-cmp-cr" class="section-wrapper">
+  <div class="page-header">
+    <h2>CMPv2 — Certification Request</h2>
+    <p>General-purpose certificate request for a client that already has a valid certificate from this CA. Used for issuing additional certificates, requesting certificates with different profiles, or obtaining certs for other subjects.</p>
+    <span class="rfc-tag">RFC 4210 §5.3.3</span>
+  </div>
+  <div class="section-wrapper active">
+    <div class="flow-card">
+      <div class="flow-card-head">
+        <h3>cr / cp — Certification Request / Response</h3>
+        <span class="op-badge enroll">ENROLL</span>
+      </div>
+      <div class="flow-diagram">
+        <div class="mermaid">
+sequenceDiagram
+    autonumber
+    participant C as Client
+    participant CA as PyPKI CA
+
+    Note over C: Already holds a valid cert from this CA
+    C->>C: Build new CertTemplate + POPO
+    C->>C: Sign PKIMessage with existing cert key (senderKID)
+
+    C->>CA: POST /pki  [PKIMessage cr]
+    Note over CA: Authenticate sender (existing cert)
+    Note over CA: Verify POPO on new key
+    Note over CA: Issue certificate
+    CA-->>C: PKIMessage cp [CertResponse status=accepted]
+
+    C->>CA: POST /pki  [PKIMessage certConf]
+    CA-->>C: PKIMessage pkiConf
+        </div>
+      </div>
+      <div class="flow-explain">
+        <h4>How it works</h4>
+        <ul class="steps">
+          <li><span class="step-num">1</span><code>cr</code> differs from <code>ir</code> in that the PKIMessage is authenticated using the client's <em>existing</em> certificate — the sender is known to the CA.</li>
+          <li><span class="step-num">2</span>The CA verifies the message signature against the sender's current certificate before issuing the new one. This provides a chain of trust for the new cert.</li>
+          <li><span class="step-num">3</span>The two-phase <code>certConf</code> / <code>pkiConf</code> exchange still applies.</li>
+        </ul>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ▸▸▸ CMP — KUR ◂◂◂ -->
+<div id="sec-cmp-kur" class="section-wrapper">
+  <div class="page-header">
+    <h2>CMPv2 — Key Update Request</h2>
+    <p>Certificate renewal with a brand-new key pair. The old certificate is implicitly revoked once the new one is issued. Used when a device rotates its keys on schedule or after a compromise.</p>
+    <span class="rfc-tag">RFC 4210 §5.3.5</span>
+  </div>
+  <div class="section-wrapper active">
+    <div class="flow-card">
+      <div class="flow-card-head">
+        <h3>kur / kup — Key Update Request / Response</h3>
+        <span class="op-badge renew">RENEW</span>
+      </div>
+      <div class="flow-diagram">
+        <div class="mermaid">
+sequenceDiagram
+    autonumber
+    participant C as Client
+    participant CA as PyPKI CA
+
+    Note over C: Old cert approaching expiry OR key rotation policy
+    C->>C: Generate NEW key pair
+    C->>C: Build CertTemplate with new public key
+    C->>C: Sign PKIMessage with OLD private key (proves possession of old cert)
+
+    C->>CA: POST /pki  [PKIMessage kur, signed with old key]
+    Note over CA: Authenticate with old certificate
+    Note over CA: Verify POPO on new public key
+    Note over CA: Issue new certificate (same subject)
+    Note over CA: Mark old certificate as superseded
+    CA-->>C: PKIMessage kup [new certificate]
+
+    C->>CA: POST /pki  [PKIMessage certConf]
+    CA-->>C: PKIMessage pkiConf
+    Note over C: Retire old key pair
+        </div>
+      </div>
+      <div class="flow-explain">
+        <h4>How it works</h4>
+        <ul class="steps">
+          <li><span class="step-num">1</span>The client generates a new key pair but signs the KUR message with its <em>old</em> private key. This proves the legitimate holder is requesting the update — not an attacker.</li>
+          <li><span class="step-num">2</span>A POPO for the <em>new</em> key is also included, proving ownership of the incoming key.</li>
+          <li><span class="step-num">3</span>The CA issues the new certificate and marks the old one as superseded (CRL reason <code>superseded</code> if explicit revocation is configured).</li>
+        </ul>
+        <div class="note-box">
+          KUR preserves the subject DN and SANs from the original cert unless the <code>CertTemplate</code> explicitly overrides them.
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ▸▸▸ CMP — RR ◂◂◂ -->
+<div id="sec-cmp-rr" class="section-wrapper">
+  <div class="page-header">
+    <h2>CMPv2 — Revocation Request</h2>
+    <p>Revoke one or more certificates. The client authenticates with its certificate and provides a revocation reason code.</p>
+    <span class="rfc-tag">RFC 4210 §5.3.9</span>
+    <span class="rfc-tag">RFC 5280 §5.3.1 reason codes</span>
+  </div>
+  <div class="section-wrapper active">
+    <div class="flow-card">
+      <div class="flow-card-head">
+        <h3>rr / rp — Revocation Request / Response</h3>
+        <span class="op-badge revoke">REVOKE</span>
+      </div>
+      <div class="flow-diagram">
+        <div class="mermaid">
+sequenceDiagram
+    autonumber
+    participant C as Client
+    participant CA as PyPKI CA
+    participant CRL as CRL/OCSP
+
+    C->>C: Build RevDetails (issuer, serial, reasonCode)
+    C->>C: Sign PKIMessage with own certificate
+
+    C->>CA: POST /pki  [PKIMessage rr]
+    Note over CA: Authenticate sender
+    Note over CA: Locate certificate by serial
+    Note over CA: Set revoked=true, record reason + time
+    CA->>CRL: Update internal revocation DB
+    CA-->>C: PKIMessage rp [PKIStatusInfo=accepted]
+
+    Note over CRL: Next CRL issued will include this serial
+    Note over CRL: OCSP responder returns revoked immediately
+        </div>
+      </div>
+      <div class="flow-explain">
+        <h4>How it works</h4>
+        <ul class="steps">
+          <li><span class="step-num">1</span>The <code>RevDetails</code> structure (RFC 4210 §5.3.9) contains the issuer name, serial number, and an optional <code>CRLReason</code> (0=unspecified, 1=keyCompromise, 3=affiliationChanged, etc.).</li>
+          <li><span class="step-num">2</span>PyPKI records the revocation immediately in SQLite. The OCSP responder returns <code>revoked</code> status from this point on.</li>
+          <li><span class="step-num">3</span>The next generated CRL includes the serial. CRL download endpoints (<code>/ca/crl</code>) serve the freshly-signed CRL on every request.</li>
+        </ul>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ▸▸▸ CMP — certConf ◂◂◂ -->
+<div id="sec-cmp-certconf" class="section-wrapper">
+  <div class="page-header">
+    <h2>CMPv2 — Certificate Confirmation</h2>
+    <p>Two-phase commit ensuring the client has received and validated the certificate before the CA considers issuance complete. Required after every ir, cr, and kur exchange.</p>
+    <span class="rfc-tag">RFC 4210 §5.3.18</span>
+  </div>
+  <div class="section-wrapper active">
+    <div class="flow-card">
+      <div class="flow-card-head">
+        <h3>certConf / pkiConf — Certificate Confirmation</h3>
+        <span class="op-badge confirm">CONFIRM</span>
+      </div>
+      <div class="flow-diagram">
+        <div class="mermaid">
+sequenceDiagram
+    autonumber
+    participant C as Client
+    participant CA as PyPKI CA
+
+    Note over CA: Has just sent ip/cp/kup with new certificate
+    Note over C: Validates certificate chain
+    Note over C: Checks subject, SANs, validity period
+    Note over C: Computes certHash = SHA-256(DER cert)
+
+    C->>CA: POST /pki  [PKIMessage certConf, certHash]
+
+    alt certHash matches issued certificate
+        Note over CA: Mark issuance as confirmed
+        CA-->>C: PKIMessage pkiConf [accepted]
+    else certHash mismatch
+        Note over CA: Mark certificate as rejected
+        Note over CA: Add to revocation list
+        CA-->>C: PKIMessage pkiConf [rejection]
+    end
+        </div>
+      </div>
+      <div class="flow-explain">
+        <h4>How it works</h4>
+        <ul class="steps">
+          <li><span class="step-num">1</span>After receiving a certificate the client must send a <code>certConf</code> containing the SHA-256 hash of the DER-encoded certificate.</li>
+          <li><span class="step-num">2</span>If the client detected a problem (wrong subject, invalid chain) it can send a <code>certStatus</code> with a rejection code, triggering automatic revocation on the CA side.</li>
+          <li><span class="step-num">3</span>If no <code>certConf</code> arrives within the configured timeout, PyPKI treats the cert as unconfirmed and may revoke it (configurable policy).</li>
+        </ul>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ▸▸▸ CMP — p10cr ◂◂◂ -->
+<div id="sec-cmp-p10cr" class="section-wrapper">
+  <div class="page-header">
+    <h2>CMPv2 — PKCS#10 Request</h2>
+    <p>Submit a standard PKCS#10 CSR (RFC 2986) over the CMP transport layer. Useful when the client already has CSR generation tooling but needs CMP for network transport.</p>
+    <span class="rfc-tag">RFC 4210 §5.3.4</span>
+    <span class="rfc-tag">RFC 2986 PKCS#10</span>
+  </div>
+  <div class="section-wrapper active">
+    <div class="flow-card">
+      <div class="flow-card-head">
+        <h3>p10cr / cp — PKCS#10 CSR via CMP</h3>
+        <span class="op-badge enroll">ENROLL</span>
+      </div>
+      <div class="flow-diagram">
+        <div class="mermaid">
+sequenceDiagram
+    autonumber
+    participant C as Client
+    participant CA as PyPKI CA
+
+    C->>C: Generate key pair
+    C->>C: Build standard PKCS#10 CSR (openssl req / keytool)
+    C->>C: Wrap CSR into PKIMessage body=p10cr
+
+    C->>CA: POST /pki  [PKIMessage p10cr, body=PKCS#10 CSR]
+    Note over CA: Validate CSR signature (self-signed proof)
+    Note over CA: Extract subject, SANs from CSR
+    Note over CA: Apply profile, issue certificate
+    CA-->>C: PKIMessage cp [certificate, status=accepted]
+
+    C->>CA: POST /pki  [PKIMessage certConf]
+    CA-->>C: PKIMessage pkiConf
+        </div>
+      </div>
+      <div class="flow-explain">
+        <h4>How it works</h4>
+        <ul class="steps">
+          <li><span class="step-num">1</span><code>p10cr</code> carries a plain RFC 2986 PKCS#10 CSR as the message body. The PKCS#10 self-signature serves as the proof-of-possession — no separate CRMF POPO is needed.</li>
+          <li><span class="step-num">2</span>This is the simplest CMP enrollment path and is compatible with any standard CSR generation tool (<code>openssl req</code>, Java's <code>keytool</code>, etc.).</li>
+          <li><span class="step-num">3</span>The response is a standard <code>cp</code> (Certification Response) message identical to what <code>cr</code> returns.</li>
+        </ul>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ▸▸▸ CMP — genm ◂◂◂ -->
+<div id="sec-cmp-genm" class="section-wrapper">
+  <div class="page-header">
+    <h2>CMPv2 — General Message</h2>
+    <p>Out-of-band information exchange. Used to retrieve the CA certificate, root CA update, or certificate request template before enrollment begins.</p>
+    <span class="rfc-tag">RFC 4210 §5.3.19</span>
+    <span class="rfc-tag">RFC 9480 §4 (CMPv3)</span>
+    <span class="rfc-tag">RFC 9811 well-known URI</span>
+  </div>
+  <div class="section-wrapper active">
+    <div class="flow-card">
+      <div class="flow-card-head">
+        <h3>genm / genp — General Message / Response</h3>
+        <span class="op-badge query">QUERY</span>
+      </div>
+      <div class="flow-diagram">
+        <div class="mermaid">
+sequenceDiagram
+    autonumber
+    participant C as Client
+    participant CA as PyPKI CA
+
+    rect rgb(20,30,50)
+        Note over C,CA: GetCACerts (id-it-caCerts)
+        C->>CA: POST /.well-known/cmp  [genm, infoType=id-it-caCerts]
+        CA-->>C: genp [CMPCertificates = CA cert chain]
+    end
+
+    rect rgb(20,30,50)
+        Note over C,CA: GetRootCACertUpdate (id-it-rootCaKeyUpdate)
+        C->>CA: POST /.well-known/cmp  [genm, infoType=id-it-rootCaKeyUpdate]
+        CA-->>C: genp [RootCaKeyUpdateContent: oldRoot, newRoot, newWithOld]
+    end
+
+    rect rgb(20,30,50)
+        Note over C,CA: GetCertReqTemplate (id-it-certReqTemplate)
+        C->>CA: POST /.well-known/cmp  [genm, infoType=id-it-certReqTemplate]
+        CA-->>C: genp [CertReqTemplateContent: allowed SANs, key sizes]
+    end
+        </div>
+      </div>
+      <div class="flow-explain">
+        <h4>How it works</h4>
+        <ul class="steps">
+          <li><span class="step-num">1</span><code>GetCACerts</code> retrieves the full CA certificate chain. Clients use this to bootstrap trust before their first enrollment, eliminating the need to distribute the CA cert out-of-band.</li>
+          <li><span class="step-num">2</span><code>GetRootCACertUpdate</code> supports planned CA key rollovers — the CA distributes old-signed-with-new and new-signed-with-old cross-certificates so clients can transition gracefully.</li>
+          <li><span class="step-num">3</span><code>GetCertReqTemplate</code> (RFC 9480) lets clients discover which subject DN attributes, SANs, and key types the CA will accept before spending time generating a CSR.</li>
+        </ul>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ▸▸▸ CMP — Poll ◂◂◂ -->
+<div id="sec-cmp-poll" class="section-wrapper">
+  <div class="page-header">
+    <h2>CMPv3 — Asynchronous Polling</h2>
+    <p>When the CA cannot issue a certificate immediately (manual RA approval, HSM queue), it returns a "waiting" status. The client polls until the cert is ready.</p>
+    <span class="rfc-tag">RFC 9480 §3.4 (CMPv3)</span>
+    <span class="rfc-tag">RFC 4210 §5.3.22</span>
+  </div>
+  <div class="section-wrapper active">
+    <div class="flow-card">
+      <div class="flow-card-head">
+        <h3>pollReq / pollRep — Asynchronous Polling</h3>
+        <span class="op-badge query">ASYNC</span>
+      </div>
+      <div class="flow-diagram">
+        <div class="mermaid">
+sequenceDiagram
+    autonumber
+    participant C as Client
+    participant CA as PyPKI CA
+    participant RA as RA / Admin
+
+    C->>CA: POST /pki  [PKIMessage ir/cr]
+    Note over CA: Requires manual approval
+    CA-->>C: PKIMessage ip [status=waiting, certReqId=42]
+
+    loop Poll until ready (checkAfter seconds)
+        C->>CA: POST /pki  [PKIMessage pollReq, certReqId=42]
+        alt Still pending
+            CA-->>C: pollRep [certReqId=42, checkAfter=60]
+            Note over C: Wait checkAfter seconds
+        else Admin approved
+            CA-->>C: ip [certificate, status=accepted]
+        end
+    end
+
+    C->>CA: POST /pki  [PKIMessage certConf]
+    CA-->>C: pkiConf
+
+    Note over RA: Admin triggered approval via<br/>POST /api/approve or Web UI
+        </div>
+      </div>
+      <div class="flow-explain">
+        <h4>How it works</h4>
+        <ul class="steps">
+          <li><span class="step-num">1</span>The CA returns <code>status=waiting</code> with a <code>certReqId</code> handle when it cannot issue immediately (e.g. the approval queue is enabled).</li>
+          <li><span class="step-num">2</span>The client repeatedly sends <code>pollReq</code> messages containing the <code>certReqId</code>. The CA responds with <code>pollRep</code> and a <code>checkAfter</code> backoff value in seconds.</li>
+          <li><span class="step-num">3</span>Once an administrator approves the request (via Web UI or <code>POST /api/approve</code>), the next <code>pollReq</code> receives the full <code>ip</code> response containing the certificate.</li>
+        </ul>
+        <div class="note-box">
+          CMPv3 (RFC 9480) formalises the polling mechanism. PyPKI auto-upgrades to CMPv3 polling when the client sends <code>pvno=cmp2021</code>.
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ▸▸▸ ACME — Account ◂◂◂ -->
+<div id="sec-acme-account" class="section-wrapper">
+  <div class="page-header">
+    <h2>ACME — Account Registration</h2>
+    <p>Before ordering any certificate, the ACME client creates an account by submitting its public key. All subsequent requests are signed with the account key (JWS).</p>
+    <span class="rfc-tag">RFC 8555 §7.3</span>
+    <span class="rfc-tag">RFC 7638 JWK Thumbprint</span>
+  </div>
+  <div class="section-wrapper active">
+    <div class="flow-card">
+      <div class="flow-card-head">
+        <h3>new-account — Account Registration</h3>
+        <span class="op-badge enroll">REGISTER</span>
+      </div>
+      <div class="flow-diagram">
+        <div class="mermaid">
+sequenceDiagram
+    autonumber
+    participant C as ACME Client (certbot)
+    participant CA as PyPKI ACME Server
+
+    C->>CA: GET /acme/directory
+    CA-->>C: 200 JSON {newNonce, newAccount, newOrder, …}
+
+    C->>CA: HEAD /acme/new-nonce
+    CA-->>C: 200  Replay-Nonce: [fresh nonce]
+
+    C->>C: Generate account key pair (RSA / EC)
+    C->>C: Build newAccount payload + JWS-sign with account key
+
+    C->>CA: POST /acme/new-account  [JWS: {termsOfServiceAgreed, contact}]
+    Note over CA: Validate JWS signature
+    Note over CA: Create account record
+    Note over CA: Assign account URI
+    CA-->>C: 201 Created  Location: /acme/acct/1  [account object]
+        </div>
+      </div>
+      <div class="flow-explain">
+        <h4>How it works</h4>
+        <ul class="steps">
+          <li><span class="step-num">1</span>The client fetches the directory to discover all endpoint URLs. This is the only hard-coded URL the client needs.</li>
+          <li><span class="step-num">2</span>A fresh <strong>nonce</strong> is required for every POST. Nonces prevent replay attacks — the server rejects any request reusing a nonce.</li>
+          <li><span class="step-num">3</span>The account is identified by the <strong>JWK Thumbprint</strong> (RFC 7638) of the account public key. The returned <code>Location</code> header is the account URI used in all subsequent requests.</li>
+        </ul>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ▸▸▸ ACME — http-01 ◂◂◂ -->
+<div id="sec-acme-http01" class="section-wrapper">
+  <div class="page-header">
+    <h2>ACME — http-01 Challenge</h2>
+    <p>Prove control of a domain by serving a token file over plain HTTP. The CA fetches the file from the domain's web server to verify ownership before issuing a certificate.</p>
+    <span class="rfc-tag">RFC 8555 §8.3</span>
+  </div>
+  <div class="section-wrapper active">
+    <div class="flow-card">
+      <div class="flow-card-head">
+        <h3>new-order → http-01 → finalize → download</h3>
+        <span class="op-badge enroll">ENROLL</span>
+      </div>
+      <div class="flow-diagram">
+        <div class="mermaid">
+sequenceDiagram
+    autonumber
+    participant C as ACME Client
+    participant WS as Client Web Server
+    participant CA as PyPKI ACME Server
+
+    C->>CA: POST /acme/new-order  [identifiers: [{type:dns, value:example.com}]]
+    CA-->>C: 201 order object [authorizations: [/acme/authz/1], finalize URL]
+
+    C->>CA: POST /acme/authz/1
+    CA-->>C: 200 authorization [challenges: [{type:http-01, token:XYZ}]]
+
+    C->>C: keyAuthorization = token + "." + base64url(JWK thumbprint)
+    C->>WS: Deploy /.well-known/acme-challenge/XYZ → keyAuthorization
+
+    C->>CA: POST /acme/challenge/1  [{}]  (trigger validation)
+    CA->>WS: GET http://example.com/.well-known/acme-challenge/XYZ
+    WS-->>CA: 200  keyAuthorization string
+    Note over CA: Verify keyAuthorization matches
+    Note over CA: Mark authorization as valid
+
+    CA-->>C: 200 challenge [status=valid]
+
+    C->>C: Generate CSR (private key + subject)
+    C->>CA: POST /acme/order/1/finalize  [csr: base64url(DER CSR)]
+    Note over CA: Validate CSR against authorized identifiers
+    Note over CA: Issue certificate
+    CA-->>C: 200 order [status=valid, certificate: /acme/cert/1]
+
+    C->>CA: POST /acme/cert/1
+    CA-->>C: 200  PEM certificate chain
+        </div>
+      </div>
+      <div class="flow-explain">
+        <h4>How it works</h4>
+        <ul class="steps">
+          <li><span class="step-num">1</span>The client requests an order for one or more domain names. The CA returns an authorization URL per identifier.</li>
+          <li><span class="step-num">2</span>The <code>http-01</code> challenge token is placed at <code>/.well-known/acme-challenge/{token}</code>. The file content is <code>token.JWK_thumbprint</code> — this ties the challenge to the account key.</li>
+          <li><span class="step-num">3</span>The client POSTs an empty body to the challenge URL to tell the CA to validate. PyPKI fetches the URL and verifies the content.</li>
+          <li><span class="step-num">4</span>Once all authorizations are valid, the client submits its CSR to <code>/finalize</code>. The CA issues the cert and makes it available at the certificate URL.</li>
+        </ul>
+        <div class="note-box">
+          http-01 requires that port 80 be reachable from the CA. It cannot be used for wildcard certificates.
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ▸▸▸ ACME — dns-01 ◂◂◂ -->
+<div id="sec-acme-dns01" class="section-wrapper">
+  <div class="page-header">
+    <h2>ACME — dns-01 Challenge</h2>
+    <p>Prove control of a domain by publishing a TXT record in DNS. Supports wildcard certificates and works when port 80 is blocked.</p>
+    <span class="rfc-tag">RFC 8555 §8.4</span>
+    <span class="rfc-tag">RFC 2136 Dynamic DNS hook</span>
+  </div>
+  <div class="section-wrapper active">
+    <div class="flow-card">
+      <div class="flow-card-head">
+        <h3>dns-01 Challenge</h3>
+        <span class="op-badge enroll">ENROLL</span>
+      </div>
+      <div class="flow-diagram">
+        <div class="mermaid">
+sequenceDiagram
+    autonumber
+    participant C as ACME Client
+    participant DNS as DNS Server
+    participant CA as PyPKI ACME Server
+
+    C->>CA: POST /acme/new-order  [identifiers: *.example.com]
+    CA-->>C: 201 order + authorization URL
+
+    C->>CA: POST /acme/authz/1
+    CA-->>C: 200 [challenges: [{type: dns-01, token: ABC}]]
+
+    C->>C: digest = base64url(SHA-256(token + "." + thumbprint))
+    C->>DNS: Add TXT record: _acme-challenge.example.com → digest
+
+    Note over C: Wait for DNS propagation
+    C->>CA: POST /acme/challenge/1  [{}]
+
+    CA->>DNS: TXT query: _acme-challenge.example.com
+    DNS-->>CA: TXT [digest]
+    Note over CA: Verify digest matches expected value
+    Note over CA: Authorization = valid ✓
+
+    C->>CA: POST /acme/order/1/finalize  [CSR]
+    CA-->>C: 200 order [status=valid, certificate URL]
+    C->>CA: POST /acme/cert/1
+    CA-->>C: 200  PEM wildcard certificate
+        </div>
+      </div>
+      <div class="flow-explain">
+        <h4>How it works</h4>
+        <ul class="steps">
+          <li><span class="step-num">1</span>The digest published in DNS is <code>base64url(SHA-256(keyAuthorization))</code>, not the token itself. This prevents token replay across different CA accounts.</li>
+          <li><span class="step-num">2</span>PyPKI queries <code>_acme-challenge.{domain}</code> for TXT records and checks the digest against the expected value.</li>
+          <li><span class="step-num">3</span>dns-01 is the only challenge type that allows wildcard certificates (<code>*.example.com</code>). It also works behind firewalls where port 80 is unavailable.</li>
+        </ul>
+        <div class="note-box">
+          PyPKI ships RFC 2136 Dynamic DNS and webhook hooks — configure via <code>--acme-dns-hook</code> or <code>--acme-rfc2136-server</code> to automate TXT record creation/deletion.
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ▸▸▸ ACME — tls-alpn-01 ◂◂◂ -->
+<div id="sec-acme-alpn" class="section-wrapper">
+  <div class="page-header">
+    <h2>ACME — tls-alpn-01 Challenge</h2>
+    <p>Prove domain control via a specially-crafted TLS certificate served on port 443 with the <code>acme-tls/1</code> ALPN protocol identifier. No DNS changes required.</p>
+    <span class="rfc-tag">RFC 8737</span>
+    <span class="rfc-tag">RFC 7301 TLS ALPN</span>
+  </div>
+  <div class="section-wrapper active">
+    <div class="flow-card">
+      <div class="flow-card-head">
+        <h3>tls-alpn-01 Challenge (RFC 8737)</h3>
+        <span class="op-badge enroll">ENROLL</span>
+      </div>
+      <div class="flow-diagram">
+        <div class="mermaid">
+sequenceDiagram
+    autonumber
+    participant C as ACME Client (port 443)
+    participant CA as PyPKI ACME Server
+
+    C->>CA: POST /acme/new-order  [identifier: example.com]
+    CA-->>C: 201 order + authz URL
+
+    C->>CA: POST /acme/authz/1
+    CA-->>C: 200 [challenges: [{type: tls-alpn-01, token: TKN}]]
+
+    C->>C: keyAuthorization = token + "." + thumbprint
+    C->>C: acmeValidation = base64url(SHA-256(keyAuthorization))
+    C->>C: Generate self-signed TLS cert:
+    Note over C:   SAN = example.com<br/>  id-pe-acmeIdentifier (OID 1.3.6.1.5.5.7.1.31)<br/>  = acmeValidation (critical)
+    C->>C: Serve cert on :443 with ALPN "acme-tls/1"
+
+    C->>CA: POST /acme/challenge/1  [{}]
+
+    CA->>C: TLS ClientHello  ALPN=[acme-tls/1]  SNI=example.com
+    C-->>CA: TLS ServerHello  [validation cert]
+    Note over CA: Verify SAN, extract id-pe-acmeIdentifier
+    Note over CA: Compare with expected acmeValidation
+    Note over CA: Authorization = valid ✓
+
+    C->>CA: POST /acme/order/1/finalize  [CSR]
+    CA-->>C: 200 certificate URL
+        </div>
+      </div>
+      <div class="flow-explain">
+        <h4>How it works</h4>
+        <ul class="steps">
+          <li><span class="step-num">1</span>The client creates a self-signed TLS certificate containing a critical extension <code>id-pe-acmeIdentifier</code> (OID <code>1.3.6.1.5.5.7.1.31</code>) carrying the SHA-256 digest of the key authorization.</li>
+          <li><span class="step-num">2</span>The certificate is served only when the TLS handshake uses the <code>acme-tls/1</code> ALPN protocol, so it doesn't interfere with normal HTTPS traffic.</li>
+          <li><span class="step-num">3</span>PyPKI initiates a TLS connection to port 443 of the domain being validated, requesting the <code>acme-tls/1</code> ALPN, and extracts the extension value from the presented certificate.</li>
+        </ul>
+        <div class="note-box">
+          tls-alpn-01 requires control of port 443. It cannot be used for wildcard certificates, but requires no DNS changes — ideal for single-domain web servers.
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ▸▸▸ ACME — revoke ◂◂◂ -->
+<div id="sec-acme-revoke" class="section-wrapper">
+  <div class="page-header">
+    <h2>ACME — Certificate Revocation</h2>
+    <p>Revoke a certificate using the ACME account that issued it, or by signing the request with the certificate's own private key.</p>
+    <span class="rfc-tag">RFC 8555 §7.6</span>
+  </div>
+  <div class="section-wrapper active">
+    <div class="flow-card">
+      <div class="flow-card-head">
+        <h3>revokeCert — Certificate Revocation</h3>
+        <span class="op-badge revoke">REVOKE</span>
+      </div>
+      <div class="flow-diagram">
+        <div class="mermaid">
+sequenceDiagram
+    autonumber
+    participant C as ACME Client
+    participant CA as PyPKI ACME Server
+
+    rect rgb(20,30,50)
+        Note over C,CA: Method 1 — Account key authorisation
+        C->>C: Sign request with ACME account key (JWS)
+        C->>CA: POST /acme/revoke-cert [certificate: DER, reason: 1]
+        Note over CA: Verify account owns the cert
+        Note over CA: Mark revoked, update OCSP/CRL
+        CA-->>C: 200 OK
+    end
+
+    rect rgb(20,30,50)
+        Note over C,CA: Method 2 — Certificate key authorisation (key compromise)
+        C->>C: Sign request with certificate's own private key
+        C->>CA: POST /acme/revoke-cert [certificate: DER, reason: 1]
+        Note over CA: Verify signature with cert public key
+        Note over CA: Mark revoked — keyCompromise
+        CA-->>C: 200 OK
+    end
+        </div>
+      </div>
+      <div class="flow-explain">
+        <h4>How it works</h4>
+        <ul class="steps">
+          <li><span class="step-num">1</span><strong>Method 1</strong>: The account that ordered the certificate can revoke it by signing with the account key. This is the normal path (e.g. certbot revoke).</li>
+          <li><span class="step-num">2</span><strong>Method 2</strong>: If an account is lost but the certificate's private key is still available, the revocation request can be signed directly with the certificate key. PyPKI verifies the signature against the cert's own public key.</li>
+          <li><span class="step-num">3</span>The <code>reason</code> field maps to RFC 5280 CRL reason codes. Revocation takes effect immediately in PyPKI's OCSP responder.</li>
+        </ul>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ▸▸▸ SCEP — GetCACert ◂◂◂ -->
+<div id="sec-scep-getcacert" class="section-wrapper">
+  <div class="page-header">
+    <h2>SCEP — GetCACert / GetCACaps</h2>
+    <p>Bootstrap operations that let a device discover the CA certificate and the SCEP capabilities (algorithms, features) before attempting enrollment.</p>
+    <span class="rfc-tag">RFC 8894 §3.3 / §3.5</span>
+  </div>
+  <div class="section-wrapper active">
+    <div class="flow-card">
+      <div class="flow-card-head">
+        <h3>GetCACert and GetCACaps</h3>
+        <span class="op-badge query">BOOTSTRAP</span>
+      </div>
+      <div class="flow-diagram">
+        <div class="mermaid">
+sequenceDiagram
+    autonumber
+    participant D as Device
+    participant CA as PyPKI SCEP Server
+
+    D->>CA: GET /scep?operation=GetCACaps
+    CA-->>D: 200 text/plain  [SHA-256 AES POSTPKIOperation Renewal]
+
+    D->>CA: GET /scep?operation=GetCACert
+    alt Single CA (no RA)
+        CA-->>D: 200 application/x-x509-ca-cert  [CA cert DER]
+    else RA mode (separate RA cert)
+        CA-->>D: 200 application/x-x509-ca-ra-cert  [PKCS#7 chain: CA + RA certs]
+    end
+
+    Note over D: Import CA cert into local trust store
+    Note over D: Note RA cert for encryption (PKCSReq)
+        </div>
+      </div>
+      <div class="flow-explain">
+        <h4>How it works</h4>
+        <ul class="steps">
+          <li><span class="step-num">1</span><code>GetCACaps</code> returns a newline-separated list of capabilities: supported hash algorithms (<code>SHA-256</code>), cipher (<code>AES</code>), and optional features like <code>Renewal</code>, <code>POSTPKIOperation</code>.</li>
+          <li><span class="step-num">2</span><code>GetCACert</code> returns the CA certificate (DER). If an RA is present, a PKCS#7 chain containing both the CA and RA certificates is returned — the device must encrypt enrollment payloads to the RA cert.</li>
+          <li><span class="step-num">3</span>These are GET operations with no authentication. Devices perform them before they have any credentials.</li>
+        </ul>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ▸▸▸ SCEP — PKCSReq ◂◂◂ -->
+<div id="sec-scep-pkcsreq" class="section-wrapper">
+  <div class="page-header">
+    <h2>SCEP — PKCSReq Enrollment</h2>
+    <p>The core SCEP enrollment operation. The device wraps a PKCS#10 CSR in a CMS SignedData/EnvelopedData structure and submits it to the CA.</p>
+    <span class="rfc-tag">RFC 8894 §4</span>
+    <span class="rfc-tag">RFC 2986 PKCS#10</span>
+    <span class="rfc-tag">RFC 5652 CMS</span>
+  </div>
+  <div class="section-wrapper active">
+    <div class="flow-card">
+      <div class="flow-card-head">
+        <h3>PKCSReq — Certificate Enrollment</h3>
+        <span class="op-badge enroll">ENROLL</span>
+      </div>
+      <div class="flow-diagram">
+        <div class="mermaid">
+sequenceDiagram
+    autonumber
+    participant D as Device
+    participant CA as PyPKI SCEP Server
+
+    Note over D: Prerequisites: CA cert from GetCACert
+    D->>D: Generate key pair
+    D->>D: Build PKCS#10 CSR (CN, SANs)
+    D->>D: CMS EnvelopedData: encrypt CSR with CA public key (AES-256)
+    D->>D: CMS SignedData: sign envelope with self-signed device cert
+
+    D->>CA: POST /scep  [PKCSReq: SignedData{EnvelopedData{CSR}}]
+    Note over CA: Verify outer SignedData signature
+    Note over CA: Decrypt EnvelopedData (CA private key)
+    Note over CA: Validate CSR signature + challenge password
+
+    alt Auto-approve
+        Note over CA: Issue certificate
+        CA-->>D: CertRep [status=SUCCESS, CMS EnvelopedData{cert}]
+        D->>D: Decrypt CertRep with device private key
+    else Pending (manual approval)
+        CA-->>D: CertRep [status=PENDING, transactionID]
+    end
+        </div>
+      </div>
+      <div class="flow-explain">
+        <h4>How it works</h4>
+        <ul class="steps">
+          <li><span class="step-num">1</span>The request uses a double-envelope: the CSR is encrypted inside a CMS <code>EnvelopedData</code> (so the CA private key is needed to read it), which is then signed in a CMS <code>SignedData</code> wrapper (proving the sender holds the corresponding private key).</li>
+          <li><span class="step-num">2</span>The <code>challenge password</code> (if configured) is an additional shared secret that the device must include to prove authorization.</li>
+          <li><span class="step-num">3</span>The certificate response is also CMS-enveloped, encrypted to the device's public key. Only the device that generated the key pair can decrypt its own certificate.</li>
+        </ul>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ▸▸▸ SCEP — Poll ◂◂◂ -->
+<div id="sec-scep-poll" class="section-wrapper">
+  <div class="page-header">
+    <h2>SCEP — CertPoll (Manual RA)</h2>
+    <p>When the CA returns PENDING, the device must poll periodically until the RA approves the request.</p>
+    <span class="rfc-tag">RFC 8894 §4.3</span>
+  </div>
+  <div class="section-wrapper active">
+    <div class="flow-card">
+      <div class="flow-card-head">
+        <h3>CertPoll — Pending Request Polling</h3>
+        <span class="op-badge query">ASYNC</span>
+      </div>
+      <div class="flow-diagram">
+        <div class="mermaid">
+sequenceDiagram
+    autonumber
+    participant D as Device
+    participant CA as PyPKI SCEP Server
+    participant RA as RA / Admin
+
+    D->>CA: PKCSReq
+    CA-->>D: CertRep [status=PENDING, transactionID=TXN-001]
+
+    RA->>CA: POST /api/approve  [transactionID=TXN-001]
+    Note over CA: Issue certificate and cache it
+
+    loop Poll (e.g. every 60 seconds)
+        D->>CA: POST /scep  [CertPoll, transactionID=TXN-001]
+        alt Not yet approved
+            CA-->>D: CertRep [status=PENDING]
+        else Approved
+            CA-->>D: CertRep [status=SUCCESS, certificate]
+        end
+    end
+        </div>
+      </div>
+      <div class="flow-explain">
+        <h4>How it works</h4>
+        <ul class="steps">
+          <li><span class="step-num">1</span>The <code>transactionID</code> is a device-generated unique identifier (typically SHA-1 of the public key) that correlates the <code>PKCSReq</code> with its <code>CertPoll</code> requests.</li>
+          <li><span class="step-num">2</span>Once an administrator approves the request the certificate is stored server-side keyed by <code>transactionID</code>. The next <code>CertPoll</code> picks it up.</li>
+        </ul>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ▸▸▸ SCEP — GetCRL ◂◂◂ -->
+<div id="sec-scep-getcrl" class="section-wrapper">
+  <div class="page-header">
+    <h2>SCEP — GetCRL</h2>
+    <p>Retrieve the current Certificate Revocation List from the SCEP server. The response is CMS-wrapped.</p>
+    <span class="rfc-tag">RFC 8894 §4.5</span>
+  </div>
+  <div class="section-wrapper active">
+    <div class="flow-card">
+      <div class="flow-card-head">
+        <h3>GetCRL — CRL Retrieval</h3>
+        <span class="op-badge query">QUERY</span>
+      </div>
+      <div class="flow-diagram">
+        <div class="mermaid">
+sequenceDiagram
+    autonumber
+    participant D as Device
+    participant CA as PyPKI SCEP Server
+
+    D->>D: Build GetCRL request (issuer, serialNumber of any current cert)
+    D->>D: Wrap in CMS SignedData (signed with device cert)
+
+    D->>CA: POST /scep  [GetCRL: SignedData{IssuerAndSerialNumber}]
+    Note over CA: Authenticate device
+    Note over CA: Generate fresh CRL (signed by CA key)
+    CA-->>D: CertRep [status=SUCCESS, CMS SignedData{CRL DER}]
+
+    D->>D: Import CRL into local validation store
+        </div>
+      </div>
+      <div class="flow-explain">
+        <h4>How it works</h4>
+        <ul class="steps">
+          <li><span class="step-num">1</span>Unlike HTTP-based CRL downloads, SCEP's <code>GetCRL</code> is authenticated — the device signs the request with its enrolled certificate, preventing anonymous CRL harvesting.</li>
+          <li><span class="step-num">2</span>PyPKI generates a fresh CRL on every <code>GetCRL</code> request (signed with the CA key) rather than serving a cached file. The CRL is wrapped in a CMS <code>SignedData</code> envelope.</li>
+        </ul>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ▸▸▸ EST — cacerts ◂◂◂ -->
+<div id="sec-est-cacerts" class="section-wrapper">
+  <div class="page-header">
+    <h2>EST — cacerts (Trust Anchor Bootstrap)</h2>
+    <p>Retrieve the CA certificate chain over TLS. Clients use this to bootstrap trust before enrolling. The response is a PKCS#7 structure containing all CA certificates.</p>
+    <span class="rfc-tag">RFC 7030 §4.1</span>
+  </div>
+  <div class="section-wrapper active">
+    <div class="flow-card">
+      <div class="flow-card-head">
+        <h3>GET /.well-known/est/cacerts</h3>
+        <span class="op-badge query">BOOTSTRAP</span>
+      </div>
+      <div class="flow-diagram">
+        <div class="mermaid">
+sequenceDiagram
+    autonumber
+    participant C as EST Client
+    participant CA as PyPKI EST Server (TLS)
+
+    Note over C: Has no CA cert yet — must accept server cert on first contact
+    C->>CA: GET /.well-known/est/cacerts  [TLS, no client auth]
+    Note over CA: No authentication required for cacerts
+    CA-->>C: 200 application/pkcs7-mime  [PKCS#7 certs-only: CA chain]
+
+    C->>C: Verify PKCS#7 signature
+    C->>C: Import CA cert(s) into local trust store
+    Note over C: Now ready for authenticated enrollment
+        </div>
+      </div>
+      <div class="flow-explain">
+        <h4>How it works</h4>
+        <ul class="steps">
+          <li><span class="step-num">1</span><code>cacerts</code> is intentionally unauthenticated so devices with no pre-existing trust can bootstrap. The response is a <code>certs-only</code> PKCS#7 (CMS ContentType <code>id-smime-ct-certs-only</code>).</li>
+          <li><span class="step-num">2</span>For intermediate CA deployments, PyPKI returns the full chain (leaf + all intermediates + root) so clients can build a complete trust path.</li>
+          <li><span class="step-num">3</span>The TLS session itself provides some protection against MITM — devices should pin the fingerprint on first use and re-verify on subsequent contacts.</li>
+        </ul>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ▸▸▸ EST — simpleenroll ◂◂◂ -->
+<div id="sec-est-enroll" class="section-wrapper">
+  <div class="page-header">
+    <h2>EST — simpleenroll</h2>
+    <p>Submit a PKCS#10 CSR over HTTPS and receive a signed certificate. The client authenticates with HTTP Basic auth or a TLS client certificate.</p>
+    <span class="rfc-tag">RFC 7030 §4.2</span>
+  </div>
+  <div class="section-wrapper active">
+    <div class="flow-card">
+      <div class="flow-card-head">
+        <h3>POST /.well-known/est/simpleenroll</h3>
+        <span class="op-badge enroll">ENROLL</span>
+      </div>
+      <div class="flow-diagram">
+        <div class="mermaid">
+sequenceDiagram
+    autonumber
+    participant C as EST Client
+    participant CA as PyPKI EST Server (mTLS / Basic Auth)
+
+    C->>C: Generate key pair
+    C->>C: Build PKCS#10 CSR  (DER → base64)
+
+    C->>CA: POST /.well-known/est/simpleenroll
+    Note right of C: Content-Type: application/pkcs10<br/>Authorization: Basic user:pass  (or mTLS)<br/>Body: base64(PKCS#10 DER)
+
+    Note over CA: Authenticate client (Basic or TLS client cert)
+    Note over CA: Decode + validate CSR
+    Note over CA: Issue certificate
+    CA-->>C: 200 application/pkcs7-mime  [certs-only PKCS#7]
+
+    C->>C: Extract DER cert from PKCS#7
+    C->>C: Verify chain against cacerts
+        </div>
+      </div>
+      <div class="flow-explain">
+        <h4>How it works</h4>
+        <ul class="steps">
+          <li><span class="step-num">1</span>The CSR is base64-encoded (not base64url) and sent as the POST body with Content-Type <code>application/pkcs10</code>. Line breaks in the base64 are stripped by the server.</li>
+          <li><span class="step-num">2</span>Authentication can be HTTP Basic (username/password) or mTLS (client certificate). PyPKI supports both; mTLS is preferred for production.</li>
+          <li><span class="step-num">3</span>The response is a <code>certs-only</code> PKCS#7 containing the issued certificate. The client extracts the leaf cert and verifies it chains to the CA cert obtained via <code>cacerts</code>.</li>
+        </ul>
+        <div class="note-box">
+          Enable mTLS with <code>--est-require-client-cert</code>. Without it, Basic auth is the fallback. Never use EST without TLS.
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ▸▸▸ EST — simplereenroll ◂◂◂ -->
+<div id="sec-est-reenroll" class="section-wrapper">
+  <div class="page-header">
+    <h2>EST — simplereenroll</h2>
+    <p>Renew an existing certificate using the current certificate as authentication. The subject and SANs are preserved; only the validity period is extended.</p>
+    <span class="rfc-tag">RFC 7030 §4.2.2</span>
+  </div>
+  <div class="section-wrapper active">
+    <div class="flow-card">
+      <div class="flow-card-head">
+        <h3>POST /.well-known/est/simplereenroll</h3>
+        <span class="op-badge renew">RENEW</span>
+      </div>
+      <div class="flow-diagram">
+        <div class="mermaid">
+sequenceDiagram
+    autonumber
+    participant C as EST Client
+    participant CA as PyPKI EST Server
+
+    Note over C: Current cert nearing expiry
+    C->>C: Generate new key pair (or reuse existing)
+    C->>C: Build CSR — subject/SANs must match current cert
+
+    C->>CA: POST /.well-known/est/simplereenroll
+    Note right of C: TLS client cert = current certificate<br/>Body: base64(new CSR)
+
+    Note over CA: Authenticate via TLS client cert
+    Note over CA: Verify CSR subject/SANs match current cert
+    Note over CA: Issue renewed certificate (new serial, extended validity)
+    CA-->>C: 200  [new certificate in PKCS#7]
+
+    C->>C: Replace old cert + key with new pair
+        </div>
+      </div>
+      <div class="flow-explain">
+        <h4>How it works</h4>
+        <ul class="steps">
+          <li><span class="step-num">1</span><code>simplereenroll</code> uses the existing certificate as the TLS client certificate for authentication, establishing a clear ownership chain between old and new certs.</li>
+          <li><span class="step-num">2</span>PyPKI enforces that the new CSR's subject DN and SANs match the current certificate — this prevents elevation of privilege via renewal.</li>
+          <li><span class="step-num">3</span>The old certificate is NOT automatically revoked. If you want immediate revocation of the old cert, call <code>POST /api/revoke</code> after receiving the new one.</li>
+        </ul>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ▸▸▸ EST — serverkeygen ◂◂◂ -->
+<div id="sec-est-serverkeygen" class="section-wrapper">
+  <div class="page-header">
+    <h2>EST — serverkeygen</h2>
+    <p>The CA generates the key pair on behalf of the client and returns both the certificate and the private key. Used for constrained devices that cannot generate strong keys themselves.</p>
+    <span class="rfc-tag">RFC 7030 §4.4</span>
+  </div>
+  <div class="section-wrapper active">
+    <div class="flow-card">
+      <div class="flow-card-head">
+        <h3>POST /.well-known/est/serverkeygen</h3>
+        <span class="op-badge enroll">KEYGEN</span>
+      </div>
+      <div class="flow-diagram">
+        <div class="mermaid">
+sequenceDiagram
+    autonumber
+    participant C as EST Client (constrained device)
+    participant CA as PyPKI EST Server
+
+    C->>C: Build minimal CSR (subject/SANs only, no key)
+    C->>CA: POST /.well-known/est/serverkeygen
+    Note right of C: Content-Type: application/pkcs10<br/>Body: base64(CSR with placeholder key)
+
+    Note over CA: Authenticate client
+    Note over CA: Generate RSA-4096 / EC-P256 key pair
+    Note over CA: Issue certificate with generated public key
+    Note over CA: Encrypt private key in PKCS#7 EnvelopedData
+
+    CA-->>C: 200 multipart/mixed
+    Note left of CA:  Part 1: application/pkcs7-mime (certificate)<br/> Part 2: application/pkcs8 (encrypted private key)
+
+    C->>C: Decrypt private key (using TLS session key or pre-shared key)
+    C->>C: Store key + cert securely
+        </div>
+      </div>
+      <div class="flow-explain">
+        <h4>How it works</h4>
+        <ul class="steps">
+          <li><span class="step-num">1</span>The client sends a CSR containing only the desired subject and SANs. The public key in the CSR is a placeholder; the CA replaces it with the generated public key.</li>
+          <li><span class="step-num">2</span>The CA returns a <code>multipart/mixed</code> response: the certificate in Part 1 and the private key (PKCS#8) encrypted in a CMS <code>EnvelopedData</code> in Part 2.</li>
+          <li><span class="step-num">3</span>The private key transport is secured by the TLS session. The device must securely store the key after receipt — there is no second chance to retrieve it.</li>
+        </ul>
+        <div class="note-box">
+          Server-side key generation means the CA momentarily holds the private key. Use only when the device genuinely cannot generate its own keys. The key is not stored by PyPKI after delivery.
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ▸▸▸ IPsec — Enroll ◂◂◂ -->
+<div id="sec-ipsec-enroll" class="section-wrapper">
+  <div class="page-header">
+    <h2>IPsec PKI — CSR Enrollment</h2>
+    <p>PKCS#10 CSR enrollment for VPN gateways, tunnel endpoints, and VPN users. Issues RFC 4945-compliant certificates with appropriate EKU and SAN types.</p>
+    <span class="rfc-tag">RFC 4945</span>
+    <span class="rfc-tag">RFC 4806</span>
+    <span class="rfc-tag">RFC 4809 §3.4.5</span>
+  </div>
+  <div class="section-wrapper active">
+    <div class="flow-card">
+      <div class="flow-card-head">
+        <h3>POST /ipsec/enroll — PKCS#10 CSR Enrollment</h3>
+        <span class="op-badge enroll">ENROLL</span>
+      </div>
+      <div class="flow-diagram">
+        <div class="mermaid">
+sequenceDiagram
+    autonumber
+    participant GW as IPsec Gateway
+    participant CA as PyPKI IPsec Server (TLS)
+
+    GW->>GW: Generate key pair
+    GW->>GW: Build PKCS#10 CSR
+    Note over GW:   Profile: ipsec_tunnel (gateway)<br/>   SAN: IP:203.0.113.1 or DNS:vpn.example.com<br/>   EKU: iKEIntermediate (1.3.6.1.5.5.7.3.17)
+
+    GW->>CA: POST /ipsec/enroll  [CSR PEM, profile, confirmation_required]
+    Note over CA: Validate RFC 4945 §3.1 SAN requirements
+    Note over CA: No wildcards, no CIDR notation
+    Note over CA: Issue certificate
+
+    alt confirmation_required = false
+        CA-->>GW: 200  [cert_pem, serial]
+    else confirmation_required = true
+        CA-->>GW: 202  [pending_id, status=pending]
+        GW->>CA: POST /ipsec/confirm  [pending_id]
+        CA-->>GW: 200  [cert_pem, serial]
+    end
+        </div>
+      </div>
+      <div class="flow-explain">
+        <h4>How it works</h4>
+        <ul class="steps">
+          <li><span class="step-num">1</span>Three profiles are available: <code>ipsec_tunnel</code> (VPN gateway — <code>iKEIntermediate</code> EKU, IP/DNS SAN), <code>ipsec_end</code> (host — <code>clientAuth</code>), <code>ipsec_user</code> (human user — <code>emailAddress</code> SAN).</li>
+          <li><span class="step-num">2</span>RFC 4945 §3.1 prohibits wildcard SANs and CIDR notation in IP SANs. PyPKI enforces these rules and rejects non-compliant CSRs.</li>
+          <li><span class="step-num">3</span>RFC 4809 §3.4.10 defines an optional confirmation step — the peer explicitly acknowledges receipt. PyPKI supports <code>confirmation_required: true</code> for this two-phase flow.</li>
+        </ul>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ▸▸▸ IPsec — Batch ◂◂◂ -->
+<div id="sec-ipsec-batch" class="section-wrapper">
+  <div class="page-header">
+    <h2>IPsec PKI — Batch Issuance</h2>
+    <p>Issue multiple RFC 4945-compliant certificates in a single API call. Used for provisioning large fleets of VPN endpoints.</p>
+    <span class="rfc-tag">RFC 4809 §3.1.2</span>
+  </div>
+  <div class="section-wrapper active">
+    <div class="flow-card">
+      <div class="flow-card-head">
+        <h3>POST /ipsec/batch-issue — Batch Certificate Issuance</h3>
+        <span class="op-badge enroll">BATCH</span>
+      </div>
+      <div class="flow-diagram">
+        <div class="mermaid">
+sequenceDiagram
+    autonumber
+    participant Mgmt as Management System
+    participant CA as PyPKI IPsec Server
+
+    Mgmt->>CA: POST /ipsec/batch-issue
+    Note right of Mgmt: [{cn, san_ip, profile}, {cn, san_ip, profile}, …]
+
+    loop For each request in batch
+        Note over CA: Generate key pair
+        Note over CA: Issue RFC 4945 certificate
+        Note over CA: Record in audit log
+    end
+
+    CA-->>Mgmt: 200  [{serial, cert_pem, key_pem}, …]
+    Note over Mgmt: Store key material securely per device
+    Note over Mgmt: Push cert+key to each device via MDM/SCEP
+        </div>
+      </div>
+      <div class="flow-explain">
+        <h4>How it works</h4>
+        <ul class="steps">
+          <li><span class="step-num">1</span>The request body is a JSON array of certificate specifications. Each entry contains <code>cn</code>, <code>san_ip</code> or <code>san_dns</code>, and <code>profile</code>.</li>
+          <li><span class="step-num">2</span>PyPKI generates a key pair for each entry server-side and issues the certificate. Private keys are returned in the response and must be distributed to devices securely (e.g. via MDM or SCEP).</li>
+          <li><span class="step-num">3</span>Each issuance is atomically recorded in the audit log. If any single entry fails validation, only that entry fails — other certs in the batch are still issued.</li>
+        </ul>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ▸▸▸ IPsec — Approve ◂◂◂ -->
+<div id="sec-ipsec-approve" class="section-wrapper">
+  <div class="page-header">
+    <h2>IPsec PKI — Approval Queue</h2>
+    <p>When <code>require_approval: true</code> is set, certificate requests are queued for administrator review before issuance. Provides a human-in-the-loop control point.</p>
+    <span class="rfc-tag">RFC 4809 §3.4.4</span>
+  </div>
+  <div class="section-wrapper active">
+    <div class="flow-card">
+      <div class="flow-card-head">
+        <h3>Approval Queue Flow</h3>
+        <span class="op-badge auth">APPROVE</span>
+      </div>
+      <div class="flow-diagram">
+        <div class="mermaid">
+sequenceDiagram
+    autonumber
+    participant GW as IPsec Gateway
+    participant CA as PyPKI IPsec Server
+    participant Admin as Administrator
+
+    GW->>CA: POST /ipsec/issue  [require_approval: true]
+    Note over CA: Validate request structure
+    Note over CA: Store in approval queue, assign request_id
+    CA-->>GW: 202 Accepted  [request_id: REQ-007, status: pending]
+
+    Admin->>CA: GET /ipsec/queue
+    CA-->>Admin: 200  [list of pending requests]
+
+    Admin->>CA: POST /ipsec/approve/REQ-007
+    Note over CA: Issue certificate
+    Note over CA: Move to approved state
+    CA-->>Admin: 200  [cert issued, serial]
+
+    GW->>CA: GET /ipsec/cert/{serial}
+    CA-->>GW: 200  [cert_pem]
+
+    alt Admin rejects
+        Admin->>CA: POST /ipsec/reject/REQ-007 [reason]
+        CA-->>GW: 403 on next poll [request rejected: reason]
+    end
+        </div>
+      </div>
+      <div class="flow-explain">
+        <h4>How it works</h4>
+        <ul class="steps">
+          <li><span class="step-num">1</span>When <code>require_approval</code> is set in the request (or in the server's global config), the CA stores the request and immediately returns <code>202 Accepted</code> with a <code>request_id</code>.</li>
+          <li><span class="step-num">2</span>The administrator reviews the queue via <code>GET /ipsec/queue</code> and approves or rejects each request. The approval triggers immediate issuance.</li>
+          <li><span class="step-num">3</span>The requesting gateway can poll <code>GET /ipsec/cert/{serial}</code> or check request status. Approvals and rejections are audit-logged with the administrator's IP and timestamp.</li>
+        </ul>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ▸▸▸ IPsec — Update/Renew ◂◂◂ -->
+<div id="sec-ipsec-update" class="section-wrapper">
+  <div class="page-header">
+    <h2>IPsec PKI — PKC Update &amp; Renewal</h2>
+    <p>Two distinct renewal operations defined by RFC 4809: key update (new key pair, same subject) and renewal (same key, extended validity).</p>
+    <span class="rfc-tag">RFC 4809 §3.3 (update)</span>
+    <span class="rfc-tag">RFC 4809 §3.5 (renew)</span>
+  </div>
+  <div class="section-wrapper active">
+    <div class="flow-card">
+      <div class="flow-card-head">
+        <h3>PKC Update (new key) vs Renewal (same key)</h3>
+        <span class="op-badge renew">RENEW</span>
+      </div>
+      <div class="flow-diagram">
+        <div class="mermaid">
+sequenceDiagram
+    autonumber
+    participant GW as IPsec Gateway
+    participant CA as PyPKI IPsec Server
+
+    rect rgb(20,30,50)
+        Note over GW,CA: PKC Update — RFC 4809 §3.3 (key rotation)
+        GW->>GW: Generate NEW key pair
+        GW->>CA: POST /ipsec/update  [new_csr_pem, old_serial]
+        Note over CA: Verify CSR signed with NEW key
+        Note over CA: Match subject/SANs to old cert
+        Note over CA: Issue new cert, mark old as superseded
+        CA-->>GW: 200  [new cert_pem, new_serial]
+    end
+
+    rect rgb(20,30,50)
+        Note over GW,CA: PKC Renewal — RFC 4809 §3.5 (validity extension)
+        GW->>CA: POST /ipsec/renew  [serial]
+        Note over CA: Verify gateway still holds key (auth)
+        Note over CA: Issue new cert with SAME key, extended validity
+        Note over CA: Old cert NOT automatically revoked
+        CA-->>GW: 200  [renewed cert_pem, new_serial]
+    end
+        </div>
+      </div>
+      <div class="flow-explain">
+        <h4>How it works</h4>
+        <ul class="steps">
+          <li><span class="step-num">1</span><strong>PKC Update</strong> is a full key rotation: a new key pair is generated, a new CSR is submitted, and the old certificate is superseded. Use this for scheduled key rotation or after a suspected key compromise.</li>
+          <li><span class="step-num">2</span><strong>PKC Renewal</strong> extends the validity of the existing certificate using the same public key. It is faster and avoids redistributing keys to peer gateways. The old certificate remains valid until expiry unless explicitly revoked.</li>
+          <li><span class="step-num">3</span>Both operations preserve the original subject DN and SAN values (RFC 4809 constraint). Profile changes require a fresh enrollment.</li>
+        </ul>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ▸▸▸ OCSP — GET ◂◂◂ -->
+<div id="sec-ocsp-get" class="section-wrapper">
+  <div class="page-header">
+    <h2>OCSP — Certificate Status Check</h2>
+    <p>Real-time revocation check using the Online Certificate Status Protocol. PyPKI supports both GET (RFC 5019) and POST (RFC 6960) bindings.</p>
+    <span class="rfc-tag">RFC 6960</span>
+    <span class="rfc-tag">RFC 5019 Lightweight OCSP (GET)</span>
+    <span class="rfc-tag">RFC 4806 IKEv2 OCSP Extensions</span>
+  </div>
+  <div class="section-wrapper active">
+    <div class="flow-card">
+      <div class="flow-card-head">
+        <h3>GET / POST OCSP Request — Certificate Status</h3>
+        <span class="op-badge query">STATUS</span>
+      </div>
+      <div class="flow-diagram">
+        <div class="mermaid">
+sequenceDiagram
+    autonumber
+    participant C as TLS Client / Browser
+    participant SRV as TLS Server
+    participant OCSP as PyPKI OCSP Responder
+
+    rect rgb(20,30,50)
+        Note over C,OCSP: GET binding (RFC 5019 — cacheable)
+        C->>C: Build OCSPRequest DER → base64url encode
+        C->>OCSP: GET /ocsp/{base64url(OCSPRequest)}
+        Note over OCSP: Lookup serial in revocation DB
+        Note over OCSP: Sign OCSPResponse with responder key
+        OCSP-->>C: 200  OCSPResponse DER  [good | revoked | unknown]
+        Note over OCSP: Cache-Control: max-age=300
+    end
+
+    rect rgb(20,30,50)
+        Note over C,OCSP: POST binding (RFC 6960 — large requests)
+        C->>OCSP: POST /ocsp  Content-Type: application/ocsp-request  [OCSPRequest DER]
+        OCSP-->>C: 200  Content-Type: application/ocsp-response  [OCSPResponse DER]
+    end
+
+    rect rgb(20,30,50)
+        Note over C,OCSP: IKEv2 OCSP (RFC 4806) — hash of CA cert in request
+        SRV->>OCSP: OCSPRequest + ResponderID = byKey (CA cert hash)
+        OCSP-->>SRV: OCSPResponse [thisUpdate, nextUpdate, Cert Encoding 14]
+    end
+        </div>
+      </div>
+      <div class="flow-explain">
+        <h4>How it works</h4>
+        <ul class="steps">
+          <li><span class="step-num">1</span>The <strong>OCSPRequest</strong> contains the issuer name hash, issuer key hash (SHA-1 or SHA-256), and the serial number of the certificate being checked.</li>
+          <li><span class="step-num">2</span>The <strong>GET binding</strong> (RFC 5019) base64url-encodes the DER request as a URL path segment. This enables HTTP caching at proxies and CDNs — ideal for high-volume TLS deployments.</li>
+          <li><span class="step-num">3</span>PyPKI signs the OCSP response with the CA key (same key, no separate OCSP signing cert required). The response includes <code>thisUpdate</code> and <code>nextUpdate</code> timestamps.</li>
+          <li><span class="step-num">4</span>For revoked certificates the response includes <code>revocationTime</code> and <code>revocationReason</code> from the SQLite revocation record.</li>
+        </ul>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ▸▸▸ OCSP — Stapling ◂◂◂ -->
+<div id="sec-ocsp-staple" class="section-wrapper">
+  <div class="page-header">
+    <h2>OCSP — Stapling</h2>
+    <p>The TLS server pre-fetches its own OCSP response and bundles ("staples") it into the TLS handshake, eliminating the client's need to contact the OCSP responder directly.</p>
+    <span class="rfc-tag">RFC 6961 TLS OCSP Stapling</span>
+    <span class="rfc-tag">RFC 6960 §2.2</span>
+  </div>
+  <div class="section-wrapper active">
+    <div class="flow-card">
+      <div class="flow-card-head">
+        <h3>OCSP Stapling Cache + Background Refresh</h3>
+        <span class="op-badge query">STAPLE</span>
+      </div>
+      <div class="flow-diagram">
+        <div class="mermaid">
+sequenceDiagram
+    autonumber
+    participant C as TLS Client
+    participant SRV as TLS Server (PyPKI / nginx)
+    participant OCSP as PyPKI OCSP Responder
+
+    Note over SRV: Background refresh thread (every ~60 s)
+    SRV->>OCSP: POST /ocsp  [OCSPRequest for own cert]
+    OCSP-->>SRV: OCSPResponse [good, nextUpdate=+5min]
+    SRV->>SRV: Cache stapled response
+
+    C->>SRV: TLS ClientHello  [status_request extension]
+    SRV-->>C: TLS ServerHello
+    SRV-->>C: Certificate
+    SRV-->>C: CertificateStatus [stapled OCSPResponse]
+    SRV-->>C: ServerHelloDone
+
+    C->>C: Verify stapled response signature (CA public key)
+    C->>C: Check thisUpdate ≤ now ≤ nextUpdate
+    Note over C: No network round-trip to OCSP responder needed ✓
+        </div>
+      </div>
+      <div class="flow-explain">
+        <h4>How it works</h4>
+        <ul class="steps">
+          <li><span class="step-num">1</span>PyPKI's TLS server maintains a background refresh thread that periodically fetches a fresh OCSP response for its own TLS certificate and caches it in memory.</li>
+          <li><span class="step-num">2</span>When a TLS client sends a <code>status_request</code> extension in its <code>ClientHello</code>, the server attaches the cached OCSP response in a <code>CertificateStatus</code> message.</li>
+          <li><span class="step-num">3</span>The client verifies the stapled response using the CA's public key. Since the response is signed, the TLS server cannot forge it — the client just avoids a network round-trip.</li>
+        </ul>
+        <div class="note-box">
+          PyPKI's OCSP cache TTL defaults to 300 seconds (<code>--ocsp-cache-seconds</code>). The refresh interval should be less than half the <code>nextUpdate</code> window to ensure the cached response never expires during a TLS handshake.
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ▸▸▸ SIGN — Issue ◂◂◂ -->
+<div id="sec-sign-issue" class="section-wrapper">
+  <div class="page-header">
+    <h2>Software Signing — Issue a Code-Signing Certificate</h2>
+    <p>Issue a certificate with the <code>codeSigning</code> EKU and <code>digitalSignature + contentCommitment</code> key usage. The private key is generated client-side and never leaves the requester.</p>
+    <span class="rfc-tag">RFC 5280 EKU</span>
+    <span class="rfc-tag">id-kp-codeSigning OID 1.3.6.1.5.5.7.3.3</span>
+    <span class="rfc-tag">X.509 KeyUsage</span>
+  </div>
+  <div class="section-wrapper active">
+    <div class="flow-card">
+      <div class="flow-card-head">
+        <h3>REST API — CSR-based issuance (private key stays on client)</h3>
+        <span class="op-badge enroll">ENROLL</span>
+      </div>
+      <div class="flow-diagram">
+        <div class="mermaid">
+sequenceDiagram
+    autonumber
+    participant Dev as Developer / CI Pipeline
+    participant CA as PyPKI CA
+
+    Dev->>Dev: Generate RSA-4096 or EC-P256 key pair
+    Note over Dev: openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:4096
+
+    Dev->>Dev: Create PKCS#10 CSR
+    Note over Dev: openssl req -new -key sign.key -subj "/CN=Release Signing/O=Acme/C=US"
+
+    Dev->>CA: POST /api/issue [csr_pem, profile="code_signing", validity_days=365]
+    Note over CA: Validate CSR self-signature (POPO)
+    Note over CA: Apply code_signing profile:
+    Note over CA:   KeyUsage: digitalSignature + contentCommitment (critical)
+    Note over CA:   EKU: id-kp-codeSigning 1.3.6.1.5.5.7.3.3 (critical)
+    Note over CA:   BasicConstraints: cA=FALSE (critical)
+    Note over CA: Issue and store in SQLite
+    CA-->>Dev: 200 {cert_pem, serial}
+
+    Dev->>Dev: Verify chain against ca.crt
+    Dev->>Dev: Store sign.key in HSM / secrets vault
+    Dev->>Dev: Distribute sign.crt to build pipeline
+        </div>
+      </div>
+      <div class="flow-explain">
+        <h4>Key certificate attributes</h4>
+        <ul class="steps">
+          <li><span class="step-num">1</span><strong>KeyUsage: digitalSignature</strong> — permits signing arbitrary data. <strong>contentCommitment</strong> (non-repudiation) — the signer cannot later deny the act of signing.</li>
+          <li><span class="step-num">2</span><strong>EKU: id-kp-codeSigning</strong> (OID <code>1.3.6.1.5.5.7.3.3</code>) — tells verifiers (Windows, macOS, Java, Cosign) this cert is authorised for software signing, not TLS or email.</li>
+          <li><span class="step-num">3</span><strong>BasicConstraints: cA=FALSE</strong> — the cert cannot sign other certificates. A stolen signing key cannot become a rogue CA.</li>
+          <li><span class="step-num">4</span>The private key is generated client-side and never transmitted to PyPKI. For production, store it in an HSM or secrets manager (HashiCorp Vault, AWS KMS, YubiKey).</li>
+        </ul>
+        <div class="note-box">
+          Also available via CMPv2 (<code>cr</code> with <code>profile=code_signing</code>) and EST (<code>simpleenroll</code>). The REST API + external CSR is the simplest CI/CD integration.
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ▸▸▸ SIGN — CMS Sign ◂◂◂ -->
+<div id="sec-sign-cms" class="section-wrapper">
+  <div class="page-header">
+    <h2>Software Signing — Sign a File (CMS/PKCS#7)</h2>
+    <p>Create a detached CMS <code>SignedData</code> structure that cryptographically binds a digest of the artefact to the signing certificate. An optional RFC 3161 timestamp extends validity beyond the cert's lifetime.</p>
+    <span class="rfc-tag">RFC 5652 CMS SignedData</span>
+    <span class="rfc-tag">RFC 3161 Timestamp</span>
+    <span class="rfc-tag">PKCS#7</span>
+  </div>
+  <div class="section-wrapper active">
+    <div class="flow-card">
+      <div class="flow-card-head">
+        <h3>CMS SignedData creation + RFC 3161 countersignature</h3>
+        <span class="op-badge enroll">SIGN</span>
+      </div>
+      <div class="flow-diagram">
+        <div class="mermaid">
+sequenceDiagram
+    autonumber
+    participant Signer as Signer (build pipeline)
+    participant TSA as Timestamp Authority (optional)
+
+    Signer->>Signer: Load sign.key + sign.crt + ca.crt
+    Signer->>Signer: Compute SHA-256(release-1.0.tar.gz)
+    Signer->>Signer: Sign digest with sign.key (RSA-PSS or ECDSA)
+
+    Signer->>Signer: Build CMS SignedData:
+    Note over Signer:   ContentType: id-data<br/>  DigestAlgorithm: id-sha256<br/>  SignerInfo: issuer+serial, digestAlg, signature<br/>  Certificates: [sign.crt, ca.crt]<br/>  Detached (original file not embedded)
+
+    opt RFC 3161 countersignature (trusted timestamp)
+        Signer->>TSA: POST /tsa [TimeStampReq: nonce + SHA-256(signature)]
+        TSA-->>Signer: TimeStampResp [signed TSTInfo: genTime, policy, hash]
+        Signer->>Signer: Embed TSTInfo as unsigned attr in SignerInfo
+        Note over Signer: Proof: signature existed at TSA genTime
+    end
+
+    Signer->>Signer: Write release-1.0.tar.gz.p7s (DER)
+    Note over Signer: Distribute: artefact + .p7s + ca.crt
+        </div>
+      </div>
+      <div class="flow-explain">
+        <h4>How it works</h4>
+        <ul class="steps">
+          <li><span class="step-num">1</span>Only the SHA-256 digest is signed, not the full file. The signature is placed in a separate <code>.p7s</code> file — a <em>detached</em> signature — so the original artefact is byte-for-byte unchanged.</li>
+          <li><span class="step-num">2</span>The <code>CMS SignedData</code> embeds the signing certificate and CA chain, so verifiers don't need to fetch them separately. The <code>SignerInfo</code> identifies the signer by issuer DN + serial number.</li>
+          <li><span class="step-num">3</span><strong>RFC 3161 timestamp</strong>: the TSA signs a hash of the <em>signature bytes</em>, creating proof that the signature existed at a specific moment. This allows verification to succeed even after the signing cert expires, as long as it was valid at signing time.</li>
+        </ul>
+        <h4 style="margin-top:16px">OpenSSL command</h4>
+        <ul class="steps">
+          <li><span class="step-num">▶</span><code>openssl cms -sign -binary -nodetach -signer sign.crt -inkey sign.key -certfile ca.crt -in release.tar.gz -out release.tar.gz.p7s -outform DER</code></li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="flow-card">
+      <div class="flow-card-head">
+        <h3>Platform-specific signing tools</h3>
+        <span class="op-badge enroll">SIGN</span>
+      </div>
+      <div class="flow-diagram">
+        <div class="mermaid">
+sequenceDiagram
+    autonumber
+    participant Dev as Developer
+    participant Tool as Platform Signing Tool
+
+    rect rgb(20,30,50)
+        Note over Dev,Tool: Windows — Authenticode (signtool.exe)
+        Dev->>Tool: signtool sign /fd SHA256 /f sign.pfx /p pass setup.exe
+        Tool->>Tool: Embed Authenticode in PE header (.exe/.dll/.msi)
+        Note over Tool: Import ca.crt into Windows Trusted Root CAs (GPO)
+    end
+
+    rect rgb(20,30,50)
+        Note over Dev,Tool: macOS — codesign
+        Dev->>Tool: codesign --sign "Release Signing" --timestamp MyApp.app
+        Tool->>Tool: Embed signature in Mach-O / .app bundle
+        Note over Tool: Add ca.crt via Keychain Access → System → Always Trust
+    end
+
+    rect rgb(20,30,50)
+        Note over Dev,Tool: Java / Android — jarsigner
+        Dev->>Tool: jarsigner -keystore sign.p12 -storetype PKCS12 app.jar sign
+        Tool->>Tool: Add META-INF/SIGN.SF + SIGN.RSA to JAR manifest
+        Note over Tool: keytool -importcert -alias pypki -file ca.crt -cacerts
+    end
+
+    rect rgb(20,30,50)
+        Note over Dev,Tool: Container images — Cosign
+        Dev->>Tool: cosign sign --key sign.key registry/image@sha256:…
+        Tool->>Tool: Push OCI signature manifest to registry
+        Note over Tool: Policy engine (Kyverno / OPA) enforces at deploy time
+    end
+        </div>
+      </div>
+      <div class="flow-explain">
+        <h4>Trust store integration per platform</h4>
+        <ul class="steps">
+          <li><span class="step-num">1</span><strong>Windows</strong>: import <code>ca.crt</code> into <em>Trusted Root Certification Authorities</em> via <code>certmgr.msc</code> or GPO. Then <code>signtool verify /pa /v setup.exe</code> returns "Successfully verified".</li>
+          <li><span class="step-num">2</span><strong>macOS</strong>: drag <code>ca.crt</code> into Keychain Access → System → Certificates → Always Trust. The PyPKI Ansible CA import role (<code>ca_import/</code>) automates fleet-wide distribution.</li>
+          <li><span class="step-num">3</span><strong>Java</strong>: <code>keytool -importcert -trustcacerts -alias pypki -file ca.crt -keystore $JAVA_HOME/lib/security/cacerts</code>. For Android, add the CA to the app's <code>network_security_config.xml</code>.</li>
+          <li><span class="step-num">4</span><strong>Containers</strong>: Cosign stores signatures as OCI artefacts in the same registry. Kyverno or OPA Gatekeeper policies can block unsigned images from being scheduled.</li>
+        </ul>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ▸▸▸ SIGN — Verify ◂◂◂ -->
+<div id="sec-sign-verify" class="section-wrapper">
+  <div class="page-header">
+    <h2>Software Signing — Verify a Signature</h2>
+    <p>The verifier checks the cryptographic digest, validates the certificate chain (RFC 5280 §6 path validation), checks revocation status via OCSP, and optionally validates the RFC 3161 timestamp.</p>
+    <span class="rfc-tag">RFC 5652 §5.4 verification</span>
+    <span class="rfc-tag">RFC 5280 §6 path validation</span>
+    <span class="rfc-tag">RFC 6960 OCSP</span>
+  </div>
+  <div class="section-wrapper active">
+    <div class="flow-card">
+      <div class="flow-card-head">
+        <h3>Full verification chain — digest → chain → revocation → timestamp</h3>
+        <span class="op-badge query">VERIFY</span>
+      </div>
+      <div class="flow-diagram">
+        <div class="mermaid">
+sequenceDiagram
+    autonumber
+    participant V as Verifier
+    participant CA as PyPKI CA
+    participant OCSP as PyPKI OCSP Responder
+
+    V->>V: Load artefact + release.tar.gz.p7s + ca.crt
+
+    rect rgb(20,30,50)
+        Note over V: Step 1 — Digest check
+        V->>V: Recompute SHA-256(artefact)
+        V->>V: Decrypt CMS signature with signing cert public key
+        V->>V: Compare digests → MATCH ✓  (any diff = file tampered)
+    end
+
+    rect rgb(20,30,50)
+        Note over V: Step 2 — Certificate chain (RFC 5280 §6)
+        V->>V: signing cert issuer = CA cert subject? ✓
+        V->>CA: GET /ca/cert.pem  (if not already cached)
+        CA-->>V: CA cert PEM
+        V->>V: Verify CA signature on signing cert ✓
+        V->>V: Signing cert notBefore ≤ now ≤ notAfter ✓
+        V->>V: EKU contains id-kp-codeSigning ✓
+        V->>V: KeyUsage has digitalSignature ✓
+    end
+
+    rect rgb(20,30,50)
+        Note over V: Step 3 — Revocation (OCSP)
+        V->>OCSP: GET /ocsp/{base64url(OCSPRequest)}
+        OCSP-->>V: OCSPResponse [status=good, thisUpdate, nextUpdate]
+        V->>V: Verify OCSP response signed by CA ✓
+        V->>V: thisUpdate ≤ now ≤ nextUpdate ✓
+    end
+
+    rect rgb(20,30,50)
+        Note over V: Step 4 — RFC 3161 timestamp (if present)
+        V->>V: Extract TSTInfo countersignature from SignerInfo
+        V->>V: Verify TSA signature on TSTInfo ✓
+        V->>V: TSTInfo.genTime < signing cert notAfter ✓
+        Note over V: Signature valid even after cert expiry
+    end
+
+    V->>V: ALL CHECKS PASSED → artefact authentic ✓
+        </div>
+      </div>
+      <div class="flow-explain">
+        <h4>Each check explained</h4>
+        <ul class="steps">
+          <li><span class="step-num">1</span><strong>Digest check</strong>: independently computes the hash and compares it to the value recovered by decrypting the signature. A single bit difference in the artefact produces a completely different hash — any tampering is immediately detected.</li>
+          <li><span class="step-num">2</span><strong>Chain validation</strong>: RFC 5280 §6 path building verifies every link from the signing cert to the trust anchor, checks validity periods, and confirms the <code>id-kp-codeSigning</code> EKU is present and critical.</li>
+          <li><span class="step-num">3</span><strong>OCSP revocation</strong>: PyPKI's responder reflects revocations instantly — no CRL propagation lag. The <code>thisUpdate</code>/<code>nextUpdate</code> window (default 5 minutes) bounds how stale a cached response can be.</li>
+          <li><span class="step-num">4</span><strong>Timestamp</strong>: if a RFC 3161 countersignature is present, verification succeeds even after the signing cert expires, because the TSA proved the signature existed while the cert was valid.</li>
+        </ul>
+        <h4 style="margin-top:16px">OpenSSL command</h4>
+        <ul class="steps">
+          <li><span class="step-num">▶</span><code>openssl cms -verify -in release.tar.gz.p7s -inform DER -content release.tar.gz -CAfile ca.crt</code></li>
+        </ul>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ▸▸▸ SIGN — Revoke & Re-sign ◂◂◂ -->
+<div id="sec-sign-revoke" class="section-wrapper">
+  <div class="page-header">
+    <h2>Software Signing — Revoke &amp; Re-sign (Key Compromise)</h2>
+    <p>When a signing key is compromised the certificate must be revoked immediately, a new key pair generated, and all previously-signed artefacts re-signed. OCSP propagation is instant; verifiers reject the old signatures within seconds.</p>
+    <span class="rfc-tag">RFC 5280 reason=keyCompromise (1)</span>
+    <span class="rfc-tag">RFC 6960 immediate revocation</span>
+  </div>
+  <div class="section-wrapper active">
+    <div class="flow-card">
+      <div class="flow-card-head">
+        <h3>Key compromise response — revoke → re-key → re-sign</h3>
+        <span class="op-badge revoke">REVOKE</span>
+      </div>
+      <div class="flow-diagram">
+        <div class="mermaid">
+sequenceDiagram
+    autonumber
+    participant Ops as Security / Ops Team
+    participant CA as PyPKI CA
+    participant OCSP as PyPKI OCSP Responder
+    participant Dist as Distribution / CDN
+    participant User as End User
+
+    Note over Ops: Signing key leaked — act immediately
+
+    rect rgb(50,15,15)
+        Note over Ops,OCSP: Phase 1 — Revocation (target: under 5 minutes)
+        Ops->>CA: POST /api/revoke [{serial: 42, reason: 1}]
+        Note over CA: reason 1 = keyCompromise (RFC 5280 §5.3.1)
+        Note over CA: Revocation written to SQLite immediately
+        CA-->>Ops: 200 OK
+
+        User->>OCSP: GET /ocsp/{OCSPRequest for serial 42}
+        OCSP-->>User: OCSPResponse [status=revoked, reason=keyCompromise]
+        Note over User: Verification FAILS → artefact rejected ✓
+    end
+
+    rect rgb(15,40,15)
+        Note over Ops,CA: Phase 2 — Re-key (target: under 30 minutes)
+        Ops->>Ops: Generate NEW key pair
+        Note over Ops: Destroy / quarantine old key immediately
+        Ops->>CA: POST /api/issue [new CSR, profile=code_signing]
+        CA-->>Ops: 200 {new_cert_pem, new_serial=99}
+        Ops->>Ops: Store new key in HSM / vault
+    end
+
+    rect rgb(15,20,50)
+        Note over Ops,Dist: Phase 3 — Re-sign all artefacts
+        loop For each release artefact
+            Ops->>Ops: Sign with new cert + new key
+            Ops->>Dist: Upload new .p7s signature file
+        end
+        Ops->>Dist: Invalidate CDN cache for all .p7s paths
+    end
+
+    User->>OCSP: GET /ocsp/{OCSPRequest for serial 99}
+    OCSP-->>User: OCSPResponse [status=good]
+    User->>User: Verify new signature → PASS ✓
+        </div>
+      </div>
+      <div class="flow-explain">
+        <h4>Response phases</h4>
+        <ul class="steps">
+          <li><span class="step-num">1</span><strong>Revoke with reason=keyCompromise</strong>: this is the most severe revocation reason — it signals that the private key itself was exposed. PyPKI's OCSP responder reflects the revocation immediately; any verifier that contacts it will reject signatures made with serial 42.</li>
+          <li><span class="step-num">2</span><strong>Re-key, never re-use</strong>: generate a completely new key pair. The compromised key must be destroyed (memory-zeroed, HSM slot wiped, cloud KMS key version deleted). Issuing a new certificate to the old key provides no protection.</li>
+          <li><span class="step-num">3</span><strong>Re-sign everything</strong>: every artefact signed with the compromised key must be re-signed. Invalidate CDN caches so stale <code>.p7s</code> files aren't served to users who would then receive a revocation error.</li>
+          <li><span class="step-num">4</span><strong>RFC 3161 timestamps and past releases</strong>: if artefacts were countersigned by a TSA, you have a policy decision — the timestamp proves the signature was made before the compromise was declared, so some policies permit keeping them. Consult your security policy.</li>
+        </ul>
+        <div class="note-box">
+          Wire PyPKI's revocation webhook (<code>--revocation-webhook URL</code>) to trigger your re-sign CI pipeline automatically the moment any code-signing cert is revoked.
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ▸▸▸ WebUI — PAM Auth ◂◂◂ -->
+<div id="sec-webui-auth" class="section-wrapper">
+  <div class="page-header">
+    <h2>Web UI — PAM Authentication</h2>
+    <p>Every access to the PyPKI web dashboard requires a valid system account. Authentication is delegated to the system PAM stack via a ctypes wrapper — no additional dependencies required.</p>
+    <span class="rfc-tag">libpam.so ctypes</span>
+    <span class="rfc-tag">HttpOnly cookie</span>
+    <span class="rfc-tag">SameSite=Strict</span>
+  </div>
+  <div class="section-wrapper active">
+    <div class="flow-card">
+      <div class="flow-card-head">
+        <h3>Login / Session / Logout Flow</h3>
+        <span class="op-badge auth">AUTH</span>
+      </div>
+      <div class="flow-diagram">
+        <div class="mermaid">
+sequenceDiagram
+    autonumber
+    participant B as Browser
+    participant UI as PyPKI Web UI
+    participant PAM as System PAM (libpam.so)
+
+    B->>UI: GET /dashboard
+    Note over UI: No session cookie present
+    UI-->>B: 302  Location: /login
+
+    B->>UI: GET /login
+    UI-->>B: 200  Login form HTML
+
+    B->>UI: POST /login  [username, password]
+    Note over UI: Check IP brute-force lockout
+    UI->>PAM: pam_start("login", username, conv)
+    PAM->>PAM: pam_authenticate (verify password)
+    PAM->>PAM: pam_acct_mgmt (check account status)
+    PAM-->>UI: PAM_SUCCESS
+
+    Note over UI: Generate 256-bit random token
+    Note over UI: Store token → (username, expires+8h)
+    Note over UI: Record web_login in audit log
+    UI-->>B: 302  Set-Cookie: pypki_session=TOKEN (HttpOnly, SameSite=Strict)
+    B->>UI: GET /dashboard  [Cookie: pypki_session=TOKEN]
+    Note over UI: Validate token in SessionStore
+    UI-->>B: 200  Dashboard HTML
+
+    B->>UI: GET /logout
+    Note over UI: Invalidate token, record web_logout
+    UI-->>B: 302  Set-Cookie: pypki_session= (Max-Age=0) → /login
+        </div>
+      </div>
+      <div class="flow-explain">
+        <h4>How it works</h4>
+        <ul class="steps">
+          <li><span class="step-num">1</span>Every request to a protected route calls <code>_check_auth()</code>. Unauthenticated HTML requests get a 302 redirect to <code>/login</code>; unauthenticated API requests get a 401 JSON error.</li>
+          <li><span class="step-num">2</span>PAM authentication calls <code>pam_start</code> → <code>pam_authenticate</code> → <code>pam_acct_mgmt</code> → <code>pam_end</code> via ctypes. This delegates to the system's configured PAM modules (e.g. <code>/etc/pam.d/login</code>) with no pip dependencies.</li>
+          <li><span class="step-num">3</span>On success, a <strong>256-bit token</strong> (<code>secrets.token_hex(32)</code>) is stored in the in-memory <code>SessionStore</code> with an 8-hour TTL. The token is sent as a cookie with <code>HttpOnly</code> (not accessible to JavaScript) and <code>SameSite=Strict</code> (CSRF protection).</li>
+          <li><span class="step-num">4</span><strong>Brute-force protection</strong>: 10 consecutive failures from a single IP trigger a 5-minute lockout. A <code>429 Too Many Requests</code> response is returned with no PAM call made.</li>
+        </ul>
+        <div class="note-box">
+          Sessions are stored in memory only — they are cleared on process restart. Use <code>--web-pam-service pypki</code> with a custom <code>/etc/pam.d/pypki</code> to restrict access to a specific Unix group.
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+</main>
+
+<script>
+  // startOnLoad:false — we control exactly when rendering happens
+  mermaid.initialize({
+    startOnLoad: false,
+    theme: 'dark',
+    themeVariables: {
+      primaryColor: '#1a2340',
+      primaryTextColor: '#e2e8f0',
+      primaryBorderColor: '#2d3f5e',
+      lineColor: '#4a6fa5',
+      secondaryColor: '#243055',
+      tertiaryColor: '#0d1526',
+      background: '#0a1220',
+      mainBkg: '#1a2340',
+      nodeBorder: '#2d3f5e',
+      clusterBkg: '#0f1a2e',
+      titleColor: '#e2e8f0',
+      edgeLabelBackground: '#1a2340',
+      actorBkg: '#1a2340',
+      actorBorder: '#3b82f6',
+      actorTextColor: '#e2e8f0',
+      actorLineColor: '#4a6fa5',
+      signalColor: '#94a3b8',
+      signalTextColor: '#e2e8f0',
+      labelBoxBkgColor: '#1a2340',
+      labelBoxBorderColor: '#2d3f5e',
+      labelTextColor: '#e2e8f0',
+      loopTextColor: '#e2e8f0',
+      noteBorderColor: '#f59e0b',
+      noteBkgColor: '#2a1f00',
+      noteTextColor: '#fcd34d',
+      activationBorderColor: '#3b82f6',
+      activationBkgColor: '#1a2f4e',
+      sequenceNumberColor: '#60a5fa',
+    },
+    sequence: {
+      diagramMarginX: 20,
+      diagramMarginY: 15,
+      actorMargin: 60,
+      width: 160,
+      height: 55,
+      boxMargin: 10,
+      boxTextMargin: 5,
+      noteMargin: 10,
+      messageMargin: 40,
+      mirrorActors: false,
+      useMaxWidth: true,
+    }
+  });
+
+  function show(id) {
+    document.querySelectorAll('#main > .section-wrapper').forEach(s => s.classList.remove('active'));
+    document.querySelectorAll('.sidebar-link').forEach(l => l.classList.remove('active'));
+
+    const sec = document.getElementById('sec-' + id);
+    if (!sec) return;
+    sec.classList.add('active');
+
+    document.querySelectorAll('.sidebar-link').forEach(l => {
+      if (l.getAttribute('onclick') && l.getAttribute('onclick').includes("'" + id + "'")) {
+        l.classList.add('active');
+      }
+    });
+
+    const idx = allIds.indexOf(id);
+    if (idx !== -1) currentIdx = idx;
+  }
+
+  // Keyboard navigation
+  const allIds = [];
+  document.querySelectorAll('.sidebar-link[onclick]').forEach(l => {
+    const m = l.getAttribute('onclick').match(/'([^']+)'/);
+    if (m) allIds.push(m[1]);
+  });
+
+  let currentIdx = 0;
+  document.addEventListener('keydown', e => {
+    if (e.key === 'ArrowDown' || e.key === 'ArrowRight') {
+      currentIdx = (currentIdx + 1) % allIds.length;
+      show(allIds[currentIdx]);
+    } else if (e.key === 'ArrowUp' || e.key === 'ArrowLeft') {
+      currentIdx = (currentIdx - 1 + allIds.length) % allIds.length;
+      show(allIds[currentIdx]);
+    }
+  });
+
+  // Render all diagrams upfront:
+  // 1. Make every section temporarily visible (Mermaid cannot measure/render display:none nodes)
+  // 2. Run mermaid across ALL .mermaid elements in one pass
+  // 3. Restore visibility — only the .active section stays shown
+  document.addEventListener('DOMContentLoaded', async () => {
+    const sections = document.querySelectorAll('#main > .section-wrapper');
+
+    // Step 1 — expose all sections
+    sections.forEach(s => s.style.display = 'block');
+
+    // Step 2 — render every diagram in one pass
+    await mermaid.run({ querySelector: '.mermaid' });
+
+    // Step 3 — remove all inline display overrides; CSS class controls visibility
+    sections.forEach(s => { s.style.display = ''; });
+  });
+</script>
+</body>
+</html>

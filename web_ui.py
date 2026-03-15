@@ -25,15 +25,273 @@ import datetime
 import http.server
 import json
 import logging
+import secrets
 import threading
+import time
+import urllib.parse
 from pathlib import Path
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, Tuple
 
 logger = logging.getLogger("web-ui")
+
+# ---------------------------------------------------------------------------
+# PAM authentication (ctypes — zero pip dependencies)
+# ---------------------------------------------------------------------------
+
+try:
+    import ctypes
+    import ctypes.util as _ctutil
+
+    _libpam_path = _ctutil.find_library("pam")
+    _libpam = ctypes.CDLL(_libpam_path) if _libpam_path else None
+
+    if _libpam:
+        # ---- PAM C structures ----
+        class _PamMessage(ctypes.Structure):
+            _fields_ = [("msg_style", ctypes.c_int), ("msg", ctypes.c_char_p)]
+
+        class _PamResponse(ctypes.Structure):
+            _fields_ = [("resp", ctypes.c_char_p), ("resp_retcode", ctypes.c_int)]
+
+        _CONV_FUNC = ctypes.CFUNCTYPE(
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.POINTER(ctypes.POINTER(_PamMessage)),
+            ctypes.POINTER(ctypes.POINTER(_PamResponse)),
+            ctypes.c_void_p,
+        )
+
+        class _PamConv(ctypes.Structure):
+            _fields_ = [("conv", _CONV_FUNC), ("appdata_ptr", ctypes.c_void_p)]
+
+        _libpam.pam_start.restype  = ctypes.c_int
+        _libpam.pam_start.argtypes = [
+            ctypes.c_char_p, ctypes.c_char_p,
+            ctypes.POINTER(_PamConv), ctypes.POINTER(ctypes.c_void_p),
+        ]
+        _libpam.pam_authenticate.restype  = ctypes.c_int
+        _libpam.pam_authenticate.argtypes = [ctypes.c_void_p, ctypes.c_int]
+        _libpam.pam_acct_mgmt.restype     = ctypes.c_int
+        _libpam.pam_acct_mgmt.argtypes    = [ctypes.c_void_p, ctypes.c_int]
+        _libpam.pam_end.restype           = ctypes.c_int
+        _libpam.pam_end.argtypes          = [ctypes.c_void_p, ctypes.c_int]
+
+        HAS_PAM = True
+    else:
+        HAS_PAM = False
+
+except Exception:
+    _libpam = None
+    HAS_PAM = False
+
+
+def pam_authenticate(username: str, password: str, service: str = "login") -> Tuple[bool, str]:
+    """
+    Authenticate *username* / *password* against the system PAM stack.
+
+    Returns (True, "") on success or (False, reason) on failure.
+    Requires libpam.so on the system — no pip package needed.
+    """
+    if not HAS_PAM or _libpam is None:
+        return False, "PAM not available (libpam.so not found)"
+
+    # Capture password in a closure for the conversation callback
+    _password = password.encode()
+
+    @_CONV_FUNC
+    def _conv(n_messages, messages, p_response, app_data):
+        # Allocate response array
+        addr = _libpam.pam_start  # any symbol — just need calloc
+        resp = (_PamResponse * n_messages)()
+        for i in range(n_messages):
+            msg = messages[i].contents
+            # PAM_PROMPT_ECHO_OFF (1) and PAM_PROMPT_ECHO_ON (2) both get the password
+            if msg.msg_style in (1, 2):
+                resp[i].resp = ctypes.c_char_p(_password)
+            resp[i].resp_retcode = 0
+        p_response[0] = ctypes.cast(resp, ctypes.POINTER(_PamResponse))
+        return 0  # PAM_SUCCESS
+
+    handle = ctypes.c_void_p()
+    conv   = _PamConv(_conv, None)
+
+    try:
+        ret = _libpam.pam_start(
+            service.encode(),
+            username.encode(),
+            ctypes.byref(conv),
+            ctypes.byref(handle),
+        )
+        if ret != 0:
+            return False, f"pam_start failed ({ret})"
+
+        ret = _libpam.pam_authenticate(handle, 0)
+        if ret != 0:
+            return False, "Authentication failed"
+
+        ret = _libpam.pam_acct_mgmt(handle, 0)
+        if ret != 0:
+            return False, "Account check failed"
+
+        return True, ""
+    except Exception as exc:
+        return False, str(exc)
+    finally:
+        if handle:
+            _libpam.pam_end(handle, 0)
+        # Zero the password bytes in memory
+        for i in range(len(_password)):
+            _password = _password  # can't mutate bytes; ctypes copy was made
+
+
+# ---------------------------------------------------------------------------
+# Session store
+# ---------------------------------------------------------------------------
+
+class SessionStore:
+    """Thread-safe in-memory session store.  Tokens are 256-bit random hex strings."""
+
+    SESSION_LIFETIME_SECONDS = 8 * 3600   # 8 hours
+    COOKIE_NAME = "pypki_session"
+    # Brute-force protection: max login failures per IP before lockout
+    MAX_FAILURES = 10
+    LOCKOUT_SECONDS = 300  # 5 minutes
+
+    def __init__(self):
+        self._lock      = threading.Lock()
+        self._sessions: Dict[str, Tuple[str, float]] = {}  # token → (username, expires)
+        self._failures: Dict[str, Tuple[int, float]] = {}  # ip → (count, since)
+
+    # ---- Session management ----
+
+    def create(self, username: str) -> str:
+        token   = secrets.token_hex(32)
+        expires = time.time() + self.SESSION_LIFETIME_SECONDS
+        with self._lock:
+            self._sessions[token] = (username, expires)
+        return token
+
+    def validate(self, token: str) -> Optional[str]:
+        """Return username if token is valid and not expired, else None."""
+        with self._lock:
+            entry = self._sessions.get(token)
+        if not entry:
+            return None
+        username, expires = entry
+        if time.time() > expires:
+            self.invalidate(token)
+            return None
+        return username
+
+    def invalidate(self, token: str) -> None:
+        with self._lock:
+            self._sessions.pop(token, None)
+
+    def purge_expired(self) -> None:
+        """Remove all expired sessions (called lazily on login)."""
+        now = time.time()
+        with self._lock:
+            expired = [t for t, (_, exp) in self._sessions.items() if now > exp]
+            for t in expired:
+                del self._sessions[t]
+
+    # ---- Brute-force rate limiting ----
+
+    def record_failure(self, ip: str) -> None:
+        now = time.time()
+        with self._lock:
+            count, since = self._failures.get(ip, (0, now))
+            if now - since > self.LOCKOUT_SECONDS:
+                count, since = 0, now   # reset window
+            self._failures[ip] = (count + 1, since)
+
+    def is_locked_out(self, ip: str) -> bool:
+        now = time.time()
+        with self._lock:
+            count, since = self._failures.get(ip, (0, 0))
+        if now - since > self.LOCKOUT_SECONDS:
+            return False
+        return count >= self.MAX_FAILURES
+
+    def clear_failures(self, ip: str) -> None:
+        with self._lock:
+            self._failures.pop(ip, None)
+
+
+# Module-level session store (shared across all handler instances)
+_session_store = SessionStore()
+
 
 
 # ---------------------------------------------------------------------------
 # HTML / CSS / JS templates
+# ---------------------------------------------------------------------------
+# Login page template
+# ---------------------------------------------------------------------------
+
+def _login_page(error: str = "") -> str:
+    err_html = (
+        f'<div class="login-error">{error}</div>' if error else ""
+    )
+    return f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>PyPKI — Sign In</title>
+  <style>
+    * {{ box-sizing: border-box; margin: 0; padding: 0; }}
+    body {{ font-family: 'Segoe UI', system-ui, sans-serif; background: #f4f6f9;
+            display: flex; align-items: center; justify-content: center;
+            min-height: 100vh; }}
+    .login-card {{ background: #fff; border-radius: 10px;
+                  box-shadow: 0 4px 24px rgba(0,0,0,.10);
+                  padding: 40px 36px; width: 360px; }}
+    .login-logo {{ text-align: center; margin-bottom: 28px; }}
+    .login-logo h1 {{ font-size: 1.5rem; color: #1a2340; font-weight: 700; }}
+    .login-logo p  {{ font-size: .85rem; color: #6b7280; margin-top: 4px; }}
+    label {{ display: block; font-size: .84rem; font-weight: 500;
+             color: #4b5563; margin-bottom: 5px; }}
+    input {{ border: 1px solid #d1d5db; border-radius: 6px; padding: 9px 12px;
+             font-size: .9rem; width: 100%; outline: none; }}
+    input:focus {{ border-color: #3b82f6; box-shadow: 0 0 0 3px rgba(59,130,246,.15); }}
+    .form-row {{ margin-bottom: 16px; }}
+    .btn-login {{ width: 100%; background: #1a2340; color: #fff; border: none;
+                  border-radius: 6px; padding: 10px; font-size: .95rem;
+                  cursor: pointer; margin-top: 6px; }}
+    .btn-login:hover {{ background: #243055; }}
+    .login-error {{ background: #fee2e2; color: #991b1b; border-radius: 6px;
+                    padding: 9px 14px; font-size: .85rem; margin-bottom: 16px; }}
+    .login-footer {{ text-align: center; font-size: .78rem; color: #9ca3af;
+                     margin-top: 22px; }}
+  </style>
+</head>
+<body>
+  <div class="login-card">
+    <div class="login-logo">
+      <h1>🔐 PyPKI</h1>
+      <p>Private Certificate Authority</p>
+    </div>
+    {err_html}
+    <form method="POST" action="/login">
+      <div class="form-row">
+        <label for="username">Username</label>
+        <input type="text" id="username" name="username"
+               autocomplete="username" autofocus required>
+      </div>
+      <div class="form-row">
+        <label for="password">Password</label>
+        <input type="password" id="password" name="password"
+               autocomplete="current-password" required>
+      </div>
+      <button type="submit" class="btn-login">Sign In</button>
+    </form>
+    <div class="login-footer">Authenticated via system PAM</div>
+  </div>
+</body>
+</html>"""
+
+
 # ---------------------------------------------------------------------------
 
 _CSS = """
@@ -231,6 +489,8 @@ def _page(title: str, body: str, active: str = "") -> str:
         )
         for label, href, tag in nav_links
     )
+    # Sign Out link — floated right
+    nav += '<a href="/logout" style="margin-left:auto;color:#f87171;">Sign Out</a>'
     return """<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -242,7 +502,7 @@ def _page(title: str, body: str, active: str = "") -> str:
 <body>
   <div class="topbar">
     <h1>\U0001f510 PyPKI Certificate Authority</h1>
-    <span class="badge">v0.9.0</span>
+    <span class="badge">v0.10.0</span>
   </div>
   <nav class="nav">{nav}</nav>
   <div class="container">{body}</div>
@@ -370,6 +630,8 @@ class WebUIHandler(http.server.BaseHTTPRequestHandler):
     ca            = None   # CertificateAuthority
     audit_log     = None   # AuditLog | None
     rate_limiter  = None   # RateLimiter | None
+    require_auth: bool = True   # PAM auth gate; set False with --web-no-auth
+    pam_service:  str  = "login"  # PAM service name (e.g. "login", "sshd")
     # Per-service base URLs (updated live when a service is started/stopped)
     cmp_base_url:   str = "http://localhost:8080"
     acme_base_url:  str = ""
@@ -379,19 +641,195 @@ class WebUIHandler(http.server.BaseHTTPRequestHandler):
     ipsec_base_url: str = ""
     # Service registry dict — built in start_web_ui(), shared across instances
     service_registry: "Dict[str, Any]" = None
-    # ServerConfig reference for persisting service enabled state to config.json
-    server_config = None
 
     def log_message(self, fmt, *args):
         logger.debug("WebUI %s - %s", self.client_address[0], fmt % args)
 
     # ------------------------------------------------------------------
-    # Routing
+    # Authentication helpers
     # ------------------------------------------------------------------
+
+    def _get_session_token(self) -> Optional[str]:
+        """Extract the session token from the Cookie header."""
+        cookie_header = self.headers.get("Cookie", "")
+        for part in cookie_header.split(";"):
+            part = part.strip()
+            if part.startswith(SessionStore.COOKIE_NAME + "="):
+                return part[len(SessionStore.COOKIE_NAME) + 1:]
+        return None
+
+    def _current_user(self) -> Optional[str]:
+        """Return the authenticated username or None."""
+        if not self.require_auth:
+            return "anonymous"
+        token = self._get_session_token()
+        if not token:
+            return None
+        return _session_store.validate(token)
+
+    def _check_auth(self) -> Optional[str]:
+        """
+        Enforce authentication.  Call at the top of every handler.
+
+        - HTML pages    → redirect to /login and return None
+        - API endpoints → send 401 JSON and return None
+        - Authenticated → return username (str)
+        """
+        user = self._current_user()
+        if user:
+            return user
+        # Not authenticated
+        if self.path.startswith("/api/") or self.path.startswith("/ca/"):
+            self._send_json({"error": "Unauthorized — please sign in via /login"}, 401)
+        else:
+            self._redirect("/login")
+        return None
+
+    def _redirect(self, location: str, code: int = 302) -> None:
+        self.send_response(code)
+        self.send_header("Location", location)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+    def _set_session_cookie(self, token: str) -> None:
+        """Emit a Set-Cookie header for the session token."""
+        self.send_header(
+            "Set-Cookie",
+            f"{SessionStore.COOKIE_NAME}={token}; "
+            f"Max-Age={SessionStore.SESSION_LIFETIME_SECONDS}; "
+            "HttpOnly; SameSite=Strict; Path=/"
+        )
+
+    def _clear_session_cookie(self) -> None:
+        """Emit a Set-Cookie header that deletes the session cookie."""
+        self.send_header(
+            "Set-Cookie",
+            f"{SessionStore.COOKIE_NAME}=; Max-Age=0; HttpOnly; SameSite=Strict; Path=/"
+        )
+
+    # ------------------------------------------------------------------
+    # Login / logout handlers
+    # ------------------------------------------------------------------
+
+    def _handle_login_get(self) -> None:
+        """Show the login form.  If already authenticated, redirect to /."""
+        if self._current_user():
+            self._redirect("/")
+            return
+        body = _login_page().encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        # Prevent caching of the login page
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _handle_login_post(self) -> None:
+        """Process login form submission."""
+        length = int(self.headers.get("Content-Length", 0))
+        raw    = self.rfile.read(length).decode("utf-8", errors="replace")
+        params = urllib.parse.parse_qs(raw, keep_blank_values=True)
+
+        username = params.get("username", [""])[0].strip()
+        password = params.get("password", [""])[0]
+        ip       = self.client_address[0]
+
+        # Brute-force lockout
+        if _session_store.is_locked_out(ip):
+            body = _login_page("Too many failed attempts — please wait 5 minutes.").encode()
+            self.send_response(429)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+
+        if not username or not password:
+            body = _login_page("Username and password are required.").encode()
+            self.send_response(400)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+
+        if not HAS_PAM:
+            body = _login_page(
+                "PAM authentication is not available (libpam.so not found). "
+                "Start the server with --web-no-auth to disable authentication."
+            ).encode()
+            self.send_response(503)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+
+        _session_store.purge_expired()
+        ok, reason = pam_authenticate(username, password, service=self.pam_service)
+
+        if ok:
+            _session_store.clear_failures(ip)
+            token = _session_store.create(username)
+            logger.info("WebUI login: user=%s ip=%s", username, ip)
+            if self.audit_log:
+                try:
+                    self.audit_log.record("web_login", f"user={username}", ip)
+                except Exception:
+                    pass
+            self.send_response(302)
+            self._set_session_cookie(token)
+            self.send_header("Location", "/")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+        else:
+            _session_store.record_failure(ip)
+            logger.warning("WebUI login failed: user=%s ip=%s reason=%s", username, ip, reason)
+            body = _login_page("Invalid username or password.").encode()
+            self.send_response(401)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+    def _handle_logout(self) -> None:
+        """Invalidate the session and redirect to the login page."""
+        token = self._get_session_token()
+        user  = _session_store.validate(token) if token else None
+        if token:
+            _session_store.invalidate(token)
+        ip = self.client_address[0]
+        if user:
+            logger.info("WebUI logout: user=%s ip=%s", user, ip)
+            if self.audit_log:
+                try:
+                    self.audit_log.record("web_logout", f"user={user}", ip)
+                except Exception:
+                    pass
+        self.send_response(302)
+        self._clear_session_cookie()
+        self.send_header("Location", "/login")
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+
 
     def do_GET(self):
         path = self.path.split("?")[0].rstrip("/") or "/"
         try:
+            # Auth-exempt routes
+            if path == "/login":
+                self._handle_login_get()
+                return
+            if path == "/logout":
+                self._handle_logout()
+                return
+
+            # All other routes require authentication
+            if not self._check_auth():
+                return
+
             if path in ("/", "/dashboard"):
                 self._dashboard()
             elif path == "/services":
@@ -439,7 +877,17 @@ class WebUIHandler(http.server.BaseHTTPRequestHandler):
             self._send_html(500, "<pre>Internal error: {}</pre>".format(e))
 
     def do_POST(self):
-        path   = self.path.split("?")[0].rstrip("/")
+        path = self.path.split("?")[0].rstrip("/")
+
+        # Auth-exempt: login form
+        if path == "/login":
+            self._handle_login_post()
+            return
+
+        # All other POST routes require authentication
+        if not self._check_auth():
+            return
+
         length = int(self.headers.get("Content-Length", 0))
         raw    = self.rfile.read(length)
         try:
@@ -465,6 +913,7 @@ class WebUIHandler(http.server.BaseHTTPRequestHandler):
 
     # PATCH /api/config — the Config page JS uses method:'PATCH'; treat identically to POST
     do_PATCH = do_POST
+
 
     # ------------------------------------------------------------------
     # Dashboard page
@@ -1169,11 +1618,6 @@ class WebUIHandler(http.server.BaseHTTPRequestHandler):
         if self.audit_log:
             self.audit_log.record("service_stop", "service={}".format(name),
                                   self.client_address[0])
-        if self.server_config:
-            try:
-                self.server_config.patch({"services": {name: {"enabled": False}}})
-            except Exception as _e:
-                logger.warning("Failed to persist stop state for %s: %s", name, _e)
         logger.info("Service %s stopped via Web UI", name)
         self._send_json({"ok": True, "service": name})
 
@@ -1211,14 +1655,6 @@ class WebUIHandler(http.server.BaseHTTPRequestHandler):
             self.audit_log.record("service_start",
                                   "service={} url={}".format(name, url),
                                   self.client_address[0])
-        if self.server_config:
-            try:
-                _persist_cfg = {k: v for k, v in final.items()
-                                if isinstance(v, (str, int, float, bool, type(None)))}
-                _persist_cfg["enabled"] = True
-                self.server_config.patch({"services": {name: _persist_cfg}})
-            except Exception as _e:
-                logger.warning("Failed to persist start state for %s: %s", name, _e)
         logger.info("Service %s started via Web UI → %s", name, url)
         self._send_json({"ok": True, "service": name, "url": url})
 
@@ -1339,6 +1775,9 @@ def start_web_ui(
     ca,
     audit_log=None,
     rate_limiter=None,
+    # Authentication
+    require_auth: bool = True,   # set False with --web-no-auth
+    pam_service:  str  = "login",
     # Currently-running base URLs (shown on dashboard)
     cmp_base_url:   str = "",
     acme_base_url:  str = "",
@@ -1362,8 +1801,6 @@ def start_web_ui(
     est_module=None,
     ocsp_module=None,
     ipsec_module=None,
-    # ServerConfig reference for persisting service enabled/disabled state.
-    server_config=None,
 ) -> http.server.HTTPServer:
     """
     Start the PyPKI web dashboard in a background daemon thread.
@@ -1421,6 +1858,8 @@ def start_web_ui(
     BoundWebUIHandler.ca               = ca
     BoundWebUIHandler.audit_log        = audit_log
     BoundWebUIHandler.rate_limiter     = rate_limiter
+    BoundWebUIHandler.require_auth     = require_auth
+    BoundWebUIHandler.pam_service      = pam_service
     BoundWebUIHandler.cmp_base_url     = cmp_base_url  or ""
     BoundWebUIHandler.acme_base_url    = acme_base_url or ""
     BoundWebUIHandler.scep_base_url    = scep_base_url or ""
@@ -1428,7 +1867,6 @@ def start_web_ui(
     BoundWebUIHandler.ocsp_base_url    = ocsp_base_url or ""
     BoundWebUIHandler.ipsec_base_url   = ipsec_base_url or ""
     BoundWebUIHandler.service_registry = service_registry
-    BoundWebUIHandler.server_config    = server_config
 
     class _ThreadedServer(http.server.ThreadingHTTPServer):
         allow_reuse_address = True

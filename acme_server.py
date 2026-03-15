@@ -890,7 +890,7 @@ class ACMEHandler(http.server.BaseHTTPRequestHandler):
 
     def _new_nonce_response(self, method: str = "HEAD"):
         nonce = self.db.create_nonce()
-        self.send_response(200 if method == "GET" else 204)
+        self.send_response(200)
         self.send_header("Replay-Nonce", nonce)
         self.send_header("Cache-Control", "no-store")
         self.end_headers()

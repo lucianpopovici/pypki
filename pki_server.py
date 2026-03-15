@@ -102,9 +102,6 @@ from cryptography.x509.oid import NameOID, ExtendedKeyUsageOID
 OID_NO_REV_AVAIL = x509.ObjectIdentifier("2.5.29.56")
 NO_REV_AVAIL_THRESHOLD_DAYS = 7  # certs valid <=7 days SHOULD carry noRevAvail
 
-# RFC 9480 §4.1 / RFC 6712 §3.6 — well-known CMP path
-CMP_WELL_KNOWN_PATH = "/.well-known/cmp"
-
 # RFC 8398/9598 — SmtpUTF8Mailbox otherName OID for non-ASCII email in SAN
 OID_SMTP_UTF8_MAILBOX = x509.ObjectIdentifier("1.3.6.1.5.5.7.8.9")
 
@@ -163,13 +160,16 @@ try:
 except ImportError:
     HAS_IPSEC = False
 
-# cmp_server is imported at the BOTTOM of this module (after all classes are
-# defined) to break the circular import: cmp_server.py does
-#   from pki_server import CertificateAuthority, AuditLog, …
-# which would fail if pki_server tried to import cmp_server before those
-# classes are defined.  HAS_CMP / _cmp_module are set in the deferred block.
-HAS_CMP = False
-_cmp_module = None
+# CMP server module — CMPv2 (RFC 4210) / CMPv3 (RFC 9480) / HTTP (RFC 6712)
+# Extracted from pki_server.py into cmp_server.py, consistent with the other
+# protocol modules: acme_server.py, scep_server.py, est_server.py, ocsp_server.py.
+try:
+    import cmp_server as _cmp_module
+    HAS_CMP = True
+except ImportError:
+    HAS_CMP = False
+    print("WARNING: cmp_server.py not found — CMPv2/CMPv3 support disabled.")
+    print("         Place cmp_server.py in the same directory as pki_server.py.")
 
 # ASN.1 imports for CMPv2 message parsing
 try:
@@ -2711,34 +2711,6 @@ class CertificateAuthority:
         self._ocsp_cache().pop(serial, None)
 
 
-
-# ===========================================================================
-# Deferred CMP module import — resolves the circular import:
-#   cmp_server.py does  "from pki_server import CertificateAuthority, …"
-# All CMP classes and helpers are re-exported here so callers can use
-#   import pki_server as pki; pki.CMPv2Handler(ca)
-# ===========================================================================
-try:
-    import cmp_server as _cmp_module
-    HAS_CMP = True
-    # Re-export public CMP API
-    from cmp_server import (
-        CMP_WELL_KNOWN_PATH,
-        CMPv2ASN1,
-        CMPv2Handler,
-        CMPv3Handler,
-        CMPv2HTTPHandler,
-        ThreadedHTTPServer,
-        TLSServer,
-        make_handler,
-        make_cmpv3_handler,
-        start_bootstrap_server,
-    )
-except ImportError:
-    HAS_CMP = False
-    print("WARNING: cmp_server.py not found — CMPv2/CMPv3 support disabled.")
-    print("         Place cmp_server.py in the same directory as pki_server.py.")
-
 def main():
     parser = argparse.ArgumentParser(description="PKI Server with CMPv2 Support + mTLS")
     parser.add_argument("--host", default="0.0.0.0", help="Bind address (default: 0.0.0.0)")
@@ -2885,6 +2857,14 @@ def main():
     ops_group.add_argument(
         "--web-port", type=int, default=None, metavar="PORT",
         help="Start web dashboard on this port (e.g. 8090)"
+    )
+    ops_group.add_argument(
+        "--web-no-auth", action="store_true", default=False,
+        help="Disable PAM authentication on the web dashboard (development only)"
+    )
+    ops_group.add_argument(
+        "--web-pam-service", default="login", metavar="SERVICE",
+        help="PAM service name used for web dashboard login (default: login)"
     )
     ops_group.add_argument(
         "--ipsec-port", type=int, default=None, metavar="PORT",
@@ -3144,18 +3124,8 @@ def main():
             _cmp_module.CMPv2Handler(ca),
         )
 
-    # Load persisted service state from config (used when no CLI port flag is given).
-    # On first run the "services" key is absent, so nothing auto-starts.
-    # On subsequent runs services that were enabled via the Web UI are restarted.
-    _svc_cfg = config.get("services") or {}
-
-    # Helper: resolve display hostname for building public-facing base URLs
-    def _display_host(h: str) -> str:
-        return (getattr(args, "tls_hostname", None) or "localhost") if h in ("0.0.0.0", "::") else h
-
     # Start ACME server if requested
-    acme_srv  = None
-    acme_base = ""
+    acme_srv = None
     if args.acme_port:
         if not HAS_ACME:
             print("WARNING: acme_server.py not found — ACME support disabled.")
@@ -3166,7 +3136,9 @@ def main():
             _acme_hostname = (
                 args.acme_base_url.split("://")[1].split(":")[0]
                 if args.acme_base_url
-                else _display_host(args.host)
+                else (getattr(args, "tls_hostname", None) or "localhost")
+                if args.host in ("0.0.0.0", "::")
+                else args.host
             )
             acme_base = args.acme_base_url or f"http://{_acme_hostname}:{args.acme_port}"
             acme_srv = _acme_module.start_acme_server(
@@ -3180,19 +3152,6 @@ def main():
                 short_lived_threshold_days=getattr(args, "acme_short_lived_threshold", 7),
                 dns01_hook=_dns01_hook,  # Feature 5: real dns-01 resolver hook
             )
-    elif _svc_cfg.get("acme", {}).get("enabled") and HAS_ACME:
-        _s = _svc_cfg["acme"]
-        _p = int(_s.get("port", 8888))
-        acme_base = _s.get("base_url") or f"http://{_display_host(args.host)}:{_p}"
-        acme_srv = _acme_module.start_acme_server(
-            host=args.host, port=_p, ca=ca, ca_dir=ca_dir,
-            auto_approve_dns=bool(_s.get("auto_approve_dns", False)),
-            base_url=acme_base,
-            cert_validity_days=int(_s.get("cert_days", 90)),
-            short_lived_threshold_days=int(_s.get("short_lived_threshold_days", 7)),
-            dns01_hook=_dns01_hook,
-        )
-        logger.info("ACME server auto-started from config on port %d", _p)
 
     # Start SCEP server if requested
     scep_srv = None
@@ -3208,14 +3167,6 @@ def main():
                 ca_dir=ca_dir,
                 challenge=args.scep_challenge,
             )
-    elif _svc_cfg.get("scep", {}).get("enabled") and HAS_SCEP:
-        _s = _svc_cfg["scep"]
-        _p = int(_s.get("port", 8889))
-        scep_srv = _scep_module.start_scep_server(
-            host=args.host, port=_p, ca=ca, ca_dir=ca_dir,
-            challenge=_s.get("challenge", ""),
-        )
-        logger.info("SCEP server auto-started from config on port %d", _p)
 
     # Start EST server if requested
     est_srv = None
@@ -3239,18 +3190,6 @@ def main():
                 tls_key_path=args.est_tls_key,
                 tls_reload_interval=getattr(args, "tls_reload_interval", 60),
             )
-    elif _svc_cfg.get("est", {}).get("enabled") and HAS_EST:
-        _s = _svc_cfg["est"]
-        _p = int(_s.get("port", 8443))
-        _req_auth = _s.get("require_auth", "no") in ("yes", "true", True, 1)
-        est_srv = _est_module.start_est_server(
-            host=args.host, port=_p, ca=ca, ca_dir=ca_dir,
-            require_auth=_req_auth,
-            tls_cert_path=_s.get("tls_cert_path") or None,
-            tls_key_path=_s.get("tls_key_path") or None,
-            tls_reload_interval=getattr(args, "tls_reload_interval", 60),
-        )
-        logger.info("EST server auto-started from config on port %d", _p)
 
     # Start OCSP responder if requested
     ocsp_srv = None
@@ -3264,14 +3203,6 @@ def main():
                 ca=ca,
                 cache_seconds=getattr(args, "ocsp_cache_seconds", 300),
             )
-    elif _svc_cfg.get("ocsp", {}).get("enabled") and HAS_OCSP:
-        _s = _svc_cfg["ocsp"]
-        _p = int(_s.get("port", 8082))
-        ocsp_srv = _ocsp_module.start_ocsp_server(
-            host=args.host, port=_p, ca=ca,
-            cache_seconds=int(_s.get("cache_seconds", 300)),
-        )
-        logger.info("OCSP responder auto-started from config on port %d", _p)
 
     # Start IPsec PKI server if requested (RFC 4945 / RFC 4806 / RFC 4809)
     ipsec_srv = None
@@ -3292,15 +3223,6 @@ def main():
                 tls_cert_path=_ipsec_tls_cert,
                 tls_key_path=_ipsec_tls_key,
             )
-    elif _svc_cfg.get("ipsec", {}).get("enabled") and HAS_IPSEC:
-        _s = _svc_cfg["ipsec"]
-        _p = int(_s.get("port", 8085))
-        ipsec_srv = _ipsec_module.start_ipsec_server(
-            host=args.host, port=_p, ca=ca,
-            ocsp_url=_s.get("ocsp_url", "") or None,
-            crl_url=_s.get("crl_url", "") or None,
-        )
-        logger.info("IPsec server auto-started from config on port %d", _p)
 
     # Start Web UI if requested
     web_srv = None
@@ -3308,72 +3230,35 @@ def main():
         if not HAS_WEBUI:
             print("WARNING: web_ui.py not found — Web UI disabled.")
         else:
-            # Build base URLs from whichever services are actually running
-            def _running_port(srv, default_port):
-                """Return port of a running server object, or None."""
-                if srv is None:
-                    return None
-                return getattr(srv, "server_port", None) or default_port
-
-            _acme_p   = _running_port(acme_srv, getattr(args, "acme_port", None))
-            _scep_p   = _running_port(scep_srv, getattr(args, "scep_port", None))
-            _est_p    = _running_port(est_srv,  getattr(args, "est_port",  None))
-            _ocsp_p   = _running_port(ocsp_srv, getattr(args, "ocsp_port", None))
-            _ipsec_p  = _running_port(ipsec_srv, getattr(args, "ipsec_port", None))
-
-            _h = args.host
-            _acme_base_ui  = (acme_base.rstrip("/") + "/acme/directory") if acme_srv and acme_base else (f"http://{_h}:{_acme_p}/acme/directory" if _acme_p else "")
-            _scep_base_ui  = f"http://{_h}:{_scep_p}/scep"                               if _scep_p  else ""
-            _est_base_ui   = f"https://{_h}:{_est_p}/.well-known/est"                    if _est_p   else ""
-            _ocsp_base_ui  = f"http://{_h}:{_ocsp_p}"                                    if _ocsp_p  else ""
-            _ipsec_base_ui = f"https://{_h}:{_ipsec_p}/ipsec"                            if _ipsec_p else ""
-
+            _ocsp_base = f"http://{args.host}:{args.ocsp_port}" if getattr(args, "ocsp_port", None) else ""
+            _acme_base2 = f"http://{args.host}:{args.acme_port}/acme/directory" if getattr(args, "acme_port", None) else ""
+            _scep_base = f"http://{args.host}:{args.scep_port}/scep" if getattr(args, "scep_port", None) else ""
+            _est_base  = f"https://{args.host}:{args.est_port}/.well-known/est" if getattr(args, "est_port", None) else ""
             web_srv = _web_ui_module.start_web_ui(
                 host=args.host,
                 port=args.web_port,
                 ca=ca,
                 audit_log=audit_log,
                 rate_limiter=rate_limiter,
+                require_auth=not getattr(args, "web_no_auth", False),
+                pam_service=getattr(args, "web_pam_service", "login"),
                 cmp_base_url=f"{scheme}://{args.host}:{args.port}",
-                acme_base_url=_acme_base_ui,
-                scep_base_url=_scep_base_ui,
-                est_base_url=_est_base_ui,
-                ocsp_base_url=_ocsp_base_ui,
-                ipsec_base_url=_ipsec_base_ui,
-                # Pass running server objects so the dashboard reflects live state
-                cmp_server=server,
-                acme_server=acme_srv,
-                scep_server=scep_srv,
-                est_server=est_srv,
-                ocsp_server=ocsp_srv,
-                ipsec_server=ipsec_srv,
-                # Pass module references so the Web UI can start stopped services
-                cmp_module=_cmp_module if HAS_CMP else None,
-                acme_module=_acme_module if HAS_ACME else None,
-                scep_module=_scep_module if HAS_SCEP else None,
-                est_module=_est_module if HAS_EST else None,
-                ocsp_module=_ocsp_module if HAS_OCSP else None,
-                ipsec_module=_ipsec_module if HAS_IPSEC else None,
-                # ServerConfig for persisting service enabled/disabled state
-                server_config=config,
+                acme_base_url=_acme_base2,
+                scep_base_url=_scep_base,
+                est_base_url=_est_base,
+                ocsp_base_url=_ocsp_base,
             )
 
     ca_mode_label = (
         f"intermediate ({len(ca._parent_chain)} parent cert(s))"
         if ca.is_intermediate else "root (self-signed)"
     )
-    def _svc_line(srv, url_template, port_val):
-        if srv is None:
-            return "disabled"
-        p = port_val or getattr(srv, "server_port", None)
-        return url_template.format(host=args.host, port=p) if p else "running"
-
-    acme_line  = _svc_line(acme_srv,  "http://{host}:{port}/acme/directory",      getattr(args, "acme_port",  None))
-    scep_line  = _svc_line(scep_srv,  "http://{host}:{port}/scep",               getattr(args, "scep_port",  None))
-    est_line   = _svc_line(est_srv,   "https://{host}:{port}/.well-known/est",   getattr(args, "est_port",   None))
-    ocsp_line  = _svc_line(ocsp_srv,  "http://{host}:{port}/ocsp",               getattr(args, "ocsp_port",  None))
-    ipsec_line = _svc_line(ipsec_srv, "https://{host}:{port}/ipsec",             getattr(args, "ipsec_port", None))
-    web_line   = f"http://{args.host}:{args.web_port}" if getattr(args,"web_port",None) else "disabled"
+    acme_line = f"http://{args.host}:{args.acme_port}/acme/directory" if (args.acme_port and HAS_ACME) else "disabled"
+    scep_line = f"http://{args.host}:{args.scep_port}/scep" if (args.scep_port and HAS_SCEP) else "disabled"
+    est_line  = f"https://{args.host}:{args.est_port}/.well-known/est" if (args.est_port and HAS_EST) else "disabled"
+    ocsp_line = f"http://{args.host}:{args.ocsp_port}/ocsp" if (getattr(args,"ocsp_port",None) and HAS_OCSP) else "disabled"
+    web_line  = f"http://{args.host}:{args.web_port}" if getattr(args,"web_port",None) else "disabled"
+    ipsec_line = f"https://{args.host}:{args.ipsec_port}/ipsec" if (getattr(args,"ipsec_port",None) and HAS_IPSEC) else "disabled"
     cmp_wk    = f"{scheme}://{args.host}:{args.port}/.well-known/cmp"
     rl_info   = f"{args.rate_limit}/min per IP" if getattr(args,"rate_limit",0) > 0 else "disabled"
     _tls_reload_interval = getattr(args, "tls_reload_interval", 60)
