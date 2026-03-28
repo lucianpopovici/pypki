@@ -935,8 +935,8 @@ class IPsecCertIssuer:
             .issuer_name(template.issuer)
             .public_key(pub_key)
             .serial_number(template.serial_number)
-            .not_valid_before(template.not_valid_before_utc)
-            .not_valid_after(template.not_valid_after_utc)
+            .not_valid_before(getattr(template, "not_valid_before_utc", template.not_valid_before))
+            .not_valid_after(getattr(template, "not_valid_after_utc", template.not_valid_after))
             .add_extension(
                 x509.BasicConstraints(ca=False, path_length=None), critical=True
             )
@@ -1067,7 +1067,7 @@ class IPsecCertIssuer:
                     "index":    i,
                     "serial":   cert.serial_number,
                     "subject":  cert.subject.rfc4514_string(),
-                    "not_after": cert.not_valid_after_utc.isoformat(),
+                    "not_after": getattr(cert, "not_valid_after_utc", cert.not_valid_after).isoformat(),
                     "cert_pem": cert.public_bytes(Encoding.PEM).decode(),
                 }
                 if priv_key_pem:
@@ -1803,7 +1803,7 @@ class IPsecHandler(http.server.BaseHTTPRequestHandler):
                 "serial":   cert.serial_number,
                 "subject":  cert.subject.rfc4514_string(),
                 "profile":  profile,
-                "not_after": cert.not_valid_after_utc.isoformat(),
+                "not_after": getattr(cert, "not_valid_after_utc", cert.not_valid_after).isoformat(),
                 "cert_pem": cert.public_bytes(Encoding.PEM).decode(),
                 "rfc": {
                     "4945": "digitalSignature only KU; IPsec EKU; SANs validated",
@@ -1878,7 +1878,7 @@ class IPsecHandler(http.server.BaseHTTPRequestHandler):
                 "old_serial":  int(old_serial),
                 "new_serial":  cert.serial_number,
                 "subject":     cert.subject.rfc4514_string(),
-                "not_after":   cert.not_valid_after_utc.isoformat(),
+                "not_after":   getattr(cert, "not_valid_after_utc", cert.not_valid_after).isoformat(),
                 "cert_pem":    cert.public_bytes(Encoding.PEM).decode(),
                 "rfc4809":     "PKC Update per RFC 4809 §3.3",
                 "note":        "Old certificate NOT automatically revoked — revoke separately if required",
@@ -1918,7 +1918,7 @@ class IPsecHandler(http.server.BaseHTTPRequestHandler):
                 "old_serial": int(old_serial),
                 "new_serial": new_cert.serial_number,
                 "subject":    new_cert.subject.rfc4514_string(),
-                "not_after":  new_cert.not_valid_after_utc.isoformat(),
+                "not_after":  getattr(new_cert, "not_valid_after_utc", new_cert.not_valid_after).isoformat(),
                 "cert_pem":   new_cert.public_bytes(Encoding.PEM).decode(),
                 "rfc4809":    "PKC Renew per RFC 4809 §3.5 — same public key, new validity window",
                 "note":       "Old certificate NOT automatically revoked — revoke separately if required",
@@ -2023,7 +2023,7 @@ class IPsecHandler(http.server.BaseHTTPRequestHandler):
                 "serial":   cert.serial_number,
                 "subject":  cert.subject.rfc4514_string(),
                 "profile":  profile,
-                "not_after": cert.not_valid_after_utc.isoformat(),
+                "not_after": getattr(cert, "not_valid_after_utc", cert.not_valid_after).isoformat(),
                 "cert_pem": cert.public_bytes(Encoding.PEM).decode(),
                 "rfc4809":  "PKCS#10 CSR enrollment per RFC 4809 §3.4.5 — private key not escrowed",
             }
@@ -2077,7 +2077,7 @@ class IPsecHandler(http.server.BaseHTTPRequestHandler):
                 "request_id": request_id,
                 "serial":     cert.serial_number,
                 "subject":    cert.subject.rfc4514_string(),
-                "not_after":  cert.not_valid_after_utc.isoformat(),
+                "not_after":  getattr(cert, "not_valid_after_utc", cert.not_valid_after).isoformat(),
                 "cert_pem":   cert_pem,
                 "rfc4809":    "Approved per RFC 4809 §3.4.4",
             }
@@ -2341,7 +2341,7 @@ def _provision_ipsec_ocsp_cert(ca: "CertificateAuthority"):
         try:
             key  = serialization.load_pem_private_key(key_path.read_bytes(), password=None)
             cert = x509.load_pem_x509_certificate(cert_path.read_bytes())
-            if cert.not_valid_after_utc > (
+            if getattr(cert, "not_valid_after_utc", cert.not_valid_after) > (
                 datetime.datetime.now(_tz.utc) + datetime.timedelta(days=7)
             ):
                 logger.info("Reusing existing IPsec OCSP signing certificate")
@@ -2395,7 +2395,8 @@ def _provision_ipsec_ocsp_cert(ca: "CertificateAuthority"):
         key.private_bytes(Encoding.PEM, PrivateFormat.TraditionalOpenSSL, NoEncryption())
     )
     cert_path.write_bytes(cert.public_bytes(Encoding.PEM))
-    logger.info(f"IPsec OCSP cert issued, valid until {cert.not_valid_after_utc.date()}")
+    _exp = getattr(cert, "not_valid_after_utc", cert.not_valid_after)
+    logger.info(f"IPsec OCSP cert issued, valid until {_exp.date()}")
     return key, cert
 
 
@@ -2419,7 +2420,7 @@ def _provision_ipsec_tls_cert(ca: "CertificateAuthority", hostname: str):
     if cert_path.exists() and key_path.exists():
         try:
             existing = x509.load_pem_x509_certificate(cert_path.read_bytes())
-            if existing.not_valid_after_utc > (
+            if getattr(existing, "not_valid_after_utc", existing.not_valid_after) > (
                 datetime.datetime.now(_tz.utc) + datetime.timedelta(days=1)
             ):
                 logger.info("Reusing existing IPsec TLS server certificate")
@@ -2478,7 +2479,8 @@ def _provision_ipsec_tls_cert(ca: "CertificateAuthority", hostname: str):
         priv.private_bytes(Encoding.PEM, PrivateFormat.TraditionalOpenSSL, NoEncryption())
     )
     cert_path.write_bytes(cert.public_bytes(Encoding.PEM))
-    logger.info(f"IPsec TLS cert issued, valid until {cert.not_valid_after_utc.date()}")
+    _exp2 = getattr(cert, "not_valid_after_utc", cert.not_valid_after)
+    logger.info(f"IPsec TLS cert issued, valid until {_exp2.date()}")
     return cert_path, key_path
 
 
