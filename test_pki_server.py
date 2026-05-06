@@ -848,6 +848,117 @@ class TestAuditLog(unittest.TestCase):
         self.assertTrue(any(e["event"] == "revoke" for e in events))
 
 
+class TestAuditLogDAL(unittest.TestCase):
+    """
+    DAL-aware AuditLog tests. Exercise the new db_url constructor parameter,
+    close() lifecycle, and (when available) Postgres backend.
+    """
+
+    def setUp(self):
+        import tempfile
+        self._tmp = tempfile.mkdtemp(prefix="audit-dal-")
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self._tmp, ignore_errors=True)
+
+    def test_explicit_sqlite_url_is_honored(self):
+        """When db_url is given, it overrides the default <ca_dir>/audit.db path."""
+        from pathlib import Path as _P
+        custom = _P(self._tmp) / "custom_name.sqlite"
+        log = pki.AuditLog(_P(self._tmp), db_url=f"sqlite:///{custom}")
+        try:
+            log.record("custom_path", "data", "")
+            self.assertTrue(custom.exists(),
+                            "AuditLog should write to the custom URL, not <ca>/audit.db")
+            # And NOT to the default name in the same dir.
+            default = _P(self._tmp) / "audit.db"
+            self.assertFalse(default.exists(),
+                             "default audit.db must not be created when db_url overrides")
+            events = log.recent(5)
+            self.assertEqual(len(events), 1)
+            self.assertEqual(events[0]["event"], "custom_path")
+        finally:
+            log.close()
+
+    def test_close_is_idempotent(self):
+        log = pki.AuditLog(Path(self._tmp))
+        log.record("a", "b", "c")
+        log.close()
+        log.close()  # second call must not raise
+
+    def test_default_url_matches_legacy_path(self):
+        """
+        The default db_url=None path must continue to write to
+        <ca_dir>/audit.db so existing deployments are unaffected.
+        """
+        from pathlib import Path as _P
+        log = pki.AuditLog(_P(self._tmp))
+        try:
+            log.record("legacy_path", "", "")
+            self.assertTrue(
+                (_P(self._tmp) / "audit.db").exists(),
+                "default constructor must continue writing to <ca_dir>/audit.db",
+            )
+        finally:
+            log.close()
+
+    def test_migrations_runner_is_invoked(self):
+        """
+        After __init__, the schema_migrations bookkeeping table must exist
+        with version 1 recorded — proves the runner ran, not just inline DDL.
+        """
+        import db as _db
+        log = pki.AuditLog(Path(self._tmp))
+        try:
+            d = _db.make_db(f"sqlite:///{Path(self._tmp) / 'audit.db'}")
+            try:
+                row = d.fetchone(
+                    "SELECT MAX(version) AS v FROM schema_migrations"
+                )
+                self.assertEqual(row["v"], 1,
+                                 "audit/001_initial.sql must be recorded as applied")
+            finally:
+                d.close()
+        finally:
+            log.close()
+
+    @unittest.skipUnless(
+        os.environ.get("PYPKI_TEST_POSTGRES_URL"),
+        "Set PYPKI_TEST_POSTGRES_URL to run AuditLog Postgres tests",
+    )
+    def test_postgres_backend(self):
+        """
+        AuditLog against Postgres: round-trip a record, assert it's
+        retrievable and ISO-8601-formatted.
+        """
+        url = os.environ["PYPKI_TEST_POSTGRES_URL"]
+        # Clean any prior schema in the test DB
+        import db as _db
+        d = _db.make_db(url)
+        try:
+            d.execute("DROP TABLE IF EXISTS audit")
+            d.execute("DROP TABLE IF EXISTS schema_migrations")
+        finally:
+            d.close()
+
+        log = pki.AuditLog(Path(self._tmp), db_url=url)
+        try:
+            log.record("pg_event", "pg_detail", "10.0.0.1")
+            events = log.recent(5)
+            self.assertEqual(len(events), 1)
+            self.assertEqual(events[0]["event"], "pg_event")
+            self.assertEqual(events[0]["detail"], "pg_detail")
+            self.assertEqual(events[0]["ip"], "10.0.0.1")
+            # ISO-8601 with timezone marker
+            self.assertRegex(
+                events[0]["timestamp"],
+                r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}",
+            )
+        finally:
+            log.close()
+
+
 # ===========================================================================
 # 10. RateLimiter
 # ===========================================================================

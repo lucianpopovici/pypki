@@ -1551,25 +1551,95 @@ class WebUIHandler(http.server.BaseHTTPRequestHandler):
             self._send_json({"error": "config not available"}, 500)
 
     def _api_issue_sub_ca(self, data: dict):
-        cn           = data.get("cn", "Intermediate CA")
+        """
+        POST /api/issue-sub-ca
+
+        Request body:
+            {
+              "cn":              "k8s-cluster-ca",           // required
+              "validity_days":   1825,                        // optional (default 1825)
+              "path_length":     0,                           // optional (default 0)
+              "permitted_dns":   ["cluster.local", "svc"],    // optional (RFC 5280 §4.2.1.10)
+              "excluded_dns":    ["internal.example.com"],    // optional
+              "permitted_emails":["@example.com"],            // optional
+              "excluded_ips":    ["0.0.0.0/0"]                // optional
+            }
+
+        When any name-constraints field is present, issues via
+        ``issue_sub_ca_with_name_constraints`` so a rogue cluster cannot mint
+        certs outside its permitted subtrees.
+
+        Response: { ok, serial, subject, cert_pem, key_pem }
+            - cert_pem: PEM X.509 certificate
+            - key_pem:  PEM PKCS#8 private key (RFC 5958)
+        """
+        cn            = data.get("cn", "Intermediate CA")
         validity_days = int(data.get("validity_days", 1825))
+        path_length   = int(data.get("path_length", 0))
+
+        permitted_dns    = data.get("permitted_dns") or []
+        excluded_dns     = data.get("excluded_dns") or []
+        permitted_emails = data.get("permitted_emails") or []
+        excluded_ips     = data.get("excluded_ips") or []
+
+        use_name_constraints = any([
+            permitted_dns, excluded_dns, permitted_emails, excluded_ips,
+        ])
+
         try:
+            from cryptography.hazmat.primitives.asymmetric import rsa as _rsa
             from cryptography.hazmat.primitives.serialization import (
                 Encoding as _Enc, PrivateFormat, NoEncryption,
             )
-            sub_ca_key, sub_ca_cert = self.ca.issue_sub_ca(cn, validity_days)
+
+            if use_name_constraints:
+                # issue_certificate_with_name_constraints takes subject + public key
+                # and accepts **kwargs threaded to issue_certificate.
+                sub_ca_priv = _rsa.generate_private_key(
+                    public_exponent=65537, key_size=4096
+                )
+                subject_str = f"CN={cn},O=PyPKI Subordinate CA"
+                sub_ca_cert = self.ca.issue_certificate_with_name_constraints(
+                    subject_str=subject_str,
+                    public_key=sub_ca_priv.public_key(),
+                    permitted_dns=permitted_dns,
+                    excluded_dns=excluded_dns,
+                    permitted_emails=permitted_emails,
+                    excluded_ips=excluded_ips,
+                    validity_days=validity_days,
+                    path_length=path_length,
+                )
+                sub_ca_key = sub_ca_priv
+            else:
+                sub_ca_key, sub_ca_cert = self.ca.issue_sub_ca(
+                    cn, validity_days, path_length=path_length,
+                )
+
             cert_pem = sub_ca_cert.public_bytes(_Enc.PEM).decode()
-            key_pem  = sub_ca_key.private_bytes(
-                _Enc.PEM, PrivateFormat.TraditionalOpenSSL, NoEncryption(),
+            # RFC 5958 — PKCS#8 PrivateKeyInfo (was TraditionalOpenSSL / PKCS#1)
+            key_pem = sub_ca_key.private_bytes(
+                _Enc.PEM, PrivateFormat.PKCS8, NoEncryption(),
             ).decode()
+
             if self.audit_log:
-                self.audit_log.record("issue_sub_ca",
-                                      "cn={} days={}".format(cn, validity_days),
-                                      self.client_address[0])
+                nc_summary = ""
+                if use_name_constraints:
+                    nc_summary = (
+                        f" permitted_dns={permitted_dns}"
+                        f" excluded_dns={excluded_dns}"
+                        f" permitted_emails={permitted_emails}"
+                        f" excluded_ips={excluded_ips}"
+                    )
+                self.audit_log.record(
+                    "issue_sub_ca",
+                    f"cn={cn} days={validity_days} path_length={path_length}{nc_summary}",
+                    self.client_address[0],
+                )
+
             self._send_json({
-                "ok": True,
-                "serial":  sub_ca_cert.serial_number,
-                "subject": sub_ca_cert.subject.rfc4514_string(),
+                "ok":       True,
+                "serial":   sub_ca_cert.serial_number,
+                "subject":  sub_ca_cert.subject.rfc4514_string(),
                 "cert_pem": cert_pem,
                 "key_pem":  key_pem,
             })

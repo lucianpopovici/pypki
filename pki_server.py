@@ -521,45 +521,74 @@ class ServerConfig:
 
 class AuditLog:
     """
-    Structured audit log stored in SQLite.
-    Every certificate issuance, revocation, auth event and config change is recorded.
+    Structured audit log stored via the DAL (db.py).
+
+    Every certificate issuance, revocation, auth event and config change
+    is recorded. Backend selection is per-instance via ``db_url``; default
+    is SQLite at ``<ca_dir>/audit.db`` for full backward compatibility.
+
+    For multi-node deployments, pass an explicit ``db_url`` pointing at
+    Postgres so all nodes write to the same audit log.
+
+    Public surface preserved against the previous inline-sqlite3 version:
+        - record(event, detail="", ip="")     — append a row + emit log line
+        - recent(n=100)                       — list of {timestamp,event,detail,ip}
+
+    Note on timestamps: the ``ts`` column remains a TEXT ISO-8601 string
+    matching the legacy schema. CLAUDE.md's INTEGER unix-seconds direction
+    applies to future tables and to a future modernization migration on
+    this one — this wiring is behavior-preserving.
     """
 
-    def __init__(self, ca_dir: Path):
-        self._db = ca_dir / "audit.db"
-        self._init()
+    def __init__(self, ca_dir: Path, db_url: Optional[str] = None):
+        from db import make_db
+        from migrations import MigrationRunner
 
-    def _init(self):
-        conn = sqlite3.connect(str(self._db))
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS audit (
-                id      INTEGER PRIMARY KEY AUTOINCREMENT,
-                ts      TEXT NOT NULL,
-                event   TEXT NOT NULL,
-                detail  TEXT,
-                ip      TEXT
-            )
-        """)
-        conn.commit()
-        conn.close()
+        # Default URL preserves the historical file location.
+        if db_url is None:
+            db_url = f"sqlite:///{ca_dir / 'audit.db'}"
+        self._db_url = db_url
+        self._db = make_db(db_url)
 
-    def record(self, event: str, detail: str = "", ip: str = ""):
+        # Apply pending migrations. Locating the migration directory:
+        # use the one shipped alongside this module. Tests override by
+        # constructing AuditLog with their own db_url against a pre-migrated
+        # database, or by setting the env var below.
+        import os
+        mig_root = os.environ.get(
+            "PYPKI_MIGRATIONS_ROOT",
+            str(Path(__file__).resolve().parent / "db_migrations"),
+        )
+        runner = MigrationRunner(
+            self._db,
+            Path(mig_root) / "audit",
+            namespace="audit",
+        )
+        runner.apply_pending()
+
+    def record(self, event: str, detail: str = "", ip: str = "") -> None:
         ts = datetime.datetime.now(datetime.timezone.utc).isoformat()
-        conn = sqlite3.connect(str(self._db))
-        conn.execute("INSERT INTO audit(ts,event,detail,ip) VALUES(?,?,?,?)",
-                     (ts, event, detail, ip))
-        conn.commit()
-        conn.close()
+        self._db.execute(
+            "INSERT INTO audit(ts, event, detail, ip) VALUES (?, ?, ?, ?)",
+            (ts, event, detail, ip),
+        )
         logger.info(f"AUDIT [{event}] {detail}")
 
     def recent(self, n: int = 100) -> List[Dict[str, Any]]:
-        conn = sqlite3.connect(str(self._db))
-        conn.row_factory = sqlite3.Row
-        rows = conn.execute(
-            "SELECT ts AS timestamp,event,detail,ip FROM audit ORDER BY id DESC LIMIT ?", (n,)
-        ).fetchall()
-        conn.close()
+        rows = self._db.fetchall(
+            "SELECT ts AS timestamp, event, detail, ip "
+            "FROM audit ORDER BY id DESC LIMIT ?",
+            (n,),
+        )
+        # Row is a dict subclass; dict(r) yields the plain shape callers expect.
         return [dict(r) for r in rows]
+
+    def close(self) -> None:
+        """Release DB resources. Idempotent. Safe to call from shutdown hooks."""
+        try:
+            self._db.close()
+        except Exception:
+            logger.exception("AuditLog: error closing db")
 
 
 # ---------------------------------------------------------------------------
@@ -1001,6 +1030,7 @@ class CertificateAuthority:
         certificate_policies: Optional[List[dict]] = None,
         audit: Optional["AuditLog"] = None,
         requester_ip: str = "",
+        path_length: Optional[int] = None,
     ) -> x509.Certificate:
         """
         Issue a certificate signed by this CA.
@@ -1086,7 +1116,12 @@ class CertificateAuthority:
         subject = x509.Name(attrs)
         serial = self._next_serial()
         now = datetime.datetime.now(datetime.timezone.utc)
-        path_len = prof.get("path_length", 0) if is_ca else None
+        path_len = (
+            path_length if path_length is not None
+            else (prof.get("path_length", 0) if is_ca else None)
+        )
+        if not is_ca:
+            path_len = None  # non-CA certs MUST NOT carry a pathLenConstraint
 
         ku = prof["key_usage"].copy()
         if is_ca:
@@ -1736,6 +1771,13 @@ class CertificateAuthority:
         Issue a subordinate CA certificate signed by this root CA.
         Returns (private_key, certificate).
         The caller is responsible for securely distributing the private key.
+
+        ``path_length`` constrains how many further intermediates may sit
+        below the issued sub-CA (RFC 5280 §4.2.1.9):
+            0 = issued sub-CA may only sign end-entity certs (default)
+            1 = issued sub-CA may sign one further tier (e.g., a service-mesh
+                intermediate) which in turn signs end-entity certs
+            None = no constraint (not recommended)
         """
         priv_key = rsa.generate_private_key(public_exponent=65537, key_size=4096)
         subject_str = f"CN={cn},O=PyPKI Subordinate CA"
@@ -1745,6 +1787,7 @@ class CertificateAuthority:
             validity_days=validity_days,
             is_ca=True,
             profile="sub_ca",
+            path_length=path_length,
             audit=audit,
         )
         logger.info(f"Sub-CA issued: CN={cn} serial={cert.serial_number} path_length={path_length}")
@@ -2744,6 +2787,15 @@ def main():
     parser.add_argument("--cmp-prefix", default="/cmp", metavar="PREFIX",
                         help="Path prefix for CMP handler (default: /cmp)")
     parser.add_argument("--ca-dir", default="./ca", help="CA data directory (default: ./ca)")
+    parser.add_argument(
+        "--audit-db-url", default=None, metavar="URL",
+        help=(
+            "DAL connection URL for the audit log. Defaults to "
+            "sqlite:///<ca-dir>/audit.db. Use postgresql://user:pass@host/db "
+            "for multi-node deployments with a shared audit log. "
+            "Requires psycopg installed for postgresql:// URLs."
+        ),
+    )
     parser.add_argument("--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"])
     parser.add_argument(
         "--parent-cert", default=None, metavar="PATH",
@@ -3034,8 +3086,12 @@ def main():
     ca_dir.mkdir(parents=True, exist_ok=True)
     config = ServerConfig(ca_dir=ca_dir, cli_overrides=cli_overrides)
 
-    # Audit log
-    audit_log = AuditLog(ca_dir) if getattr(args, "audit", True) else None
+    # Audit log — defaults to sqlite at <ca_dir>/audit.db; overridable via
+    # --audit-db-url for multi-node deployments writing to shared Postgres.
+    audit_log = (
+        AuditLog(ca_dir, db_url=getattr(args, "audit_db_url", None))
+        if getattr(args, "audit", True) else None
+    )
 
     # Feature 10: OpenTelemetry tracing
     global _tracer

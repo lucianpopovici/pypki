@@ -442,10 +442,39 @@ class ESTHandler(http.server.BaseHTTPRequestHandler):
         subject_str = csr.subject.rfc4514_string() or "CN=EST Client"
         pub_key = csr.public_key()
 
+        # Extract SANs from the CSR extensionRequest attribute so the issued
+        # cert matches what the client asked for. Without this, a client
+        # requesting DNS:app.example.com would receive a cert with no SAN at
+        # all (hostname verification would silently fail).
+        # RFC 7030 §4.2.1: the server MAY modify the requested attributes;
+        # PyPKI's policy is "pass through the canonical four SAN types".
+        # Note: URI SANs (including SPIFFE) are not yet threaded — tracked in
+        # CLAUDE.md "EST CSR SAN pass-through + profile-aware csrattrs".
+        san_dns:    list = []
+        san_emails: list = []
+        san_ips:    list = []
+        try:
+            csr_san = csr.extensions.get_extension_for_class(
+                x509.SubjectAlternativeName
+            )
+            for n in csr_san.value:
+                if isinstance(n, x509.DNSName):
+                    san_dns.append(n.value)
+                elif isinstance(n, x509.RFC822Name):
+                    san_emails.append(n.value)
+                elif isinstance(n, x509.IPAddress):
+                    san_ips.append(str(n.value))
+                # URISAN / OtherName intentionally skipped for now
+        except x509.ExtensionNotFound:
+            pass
+
         try:
             cert = self.ca.issue_certificate(
                 subject_str=subject_str,
                 public_key=pub_key,
+                san_dns=san_dns or None,
+                san_emails=san_emails or None,
+                san_ips=san_ips or None,
             )
         except Exception as e:
             logger.error(f"EST issuance failed: {e}")
