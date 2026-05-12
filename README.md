@@ -1722,6 +1722,8 @@ Every issued certificate includes:
 | RFC 9483 | Lightweight CMP Profile (ALPN `cmpc`) | ✅ ALPN |
 | RFC 8555 | ACME — Automatic Certificate Management | ✅ Full |
 | RFC 8737 | ACME `tls-alpn-01` challenge | ✅ Full |
+| RFC 3161 | Time-Stamp Protocol (TSA) | ✅ Full — `--tsa-prefix /tsa`; SHA-256/384/512 accepted; TSTInfo with nonce, serialNumber, accuracy; `--tsa-policy-oid`, `--tsa-accuracy-seconds`, pre-provisioned cert/key support |
+| RFC 5816 | ESSCertIDv2 in TSA SignedData | ✅ Full — `signingCertificateV2` signed attribute with SHA-256 ESSCertIDv2 in every TimeStampToken |
 | RFC 8738 | ACME IP Identifier | ✅ Full — `{type:"ip"}` orders, `http-01` + `tls-alpn-01` only (no `dns-01`), IPv4/IPv6 SANs, `--acme-allow-private-ip` for homelab |
 | RFC 8894 | SCEP — Simple Certificate Enrolment Protocol | ✅ Full |
 | RFC 9480 | CMP Updates — CMPv3 features | ✅ Full |

@@ -60,6 +60,47 @@ This project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **RFC 3161 + RFC 5816 — Time-Stamp Authority (TSA) server.** New
+  `tsa_server.py` implements a complete RFC 3161 TSA with RFC 5816
+  `signingCertificateV2`.
+
+  *Protocol*: POST `<prefix>` accepts `application/timestamp-query` DER,
+  responds with `application/timestamp-reply`. `TimeStampReq` parser
+  handles `version`, `messageImprint`, `nonce`, `certReq`, and `reqPolicy`.
+  `TimeStampResp` contains a CMS `SignedData` (v3) wrapping a `TSTInfo`
+  as `id-ct-TSTInfo` encapsulated content.
+
+  *RFC 5816 compliance*: every `TimeStampToken` carries a
+  `signingCertificateV2` signed attribute containing an `ESSCertIDv2`
+  (SHA-256 hash of the TSA signing cert DER). Signed attributes are
+  DER-canonical SET OF (lexicographically sorted).
+
+  *Hash policy*: SHA-256, SHA-384, and SHA-512 accepted. SHA-1 and MD5
+  rejected with `failInfo=badAlg` per current NIST SP 800-131A guidance.
+
+  *TSA signing cert*: auto-provisioned from the CA on first start
+  (`tsa.key` / `tsa.crt` in the CA directory). Per RFC 3161 §2.3: EKU
+  `id-kp-timeStamping` (1.3.6.1.5.5.7.3.8) is the **only** EKU and is
+  marked **critical**; KU is `digitalSignature` only; valid for 365 days.
+
+  *New CLI flags*: `--tsa-prefix PREFIX` (activates the TSA),
+  `--tsa-policy-oid OID` (default: placeholder — assign a real PEN OID
+  for production), `--tsa-accuracy-seconds N` (declared accuracy, default
+  1), `--tsa-cert PATH` / `--tsa-key PATH` (use pre-provisioned TSA cert).
+
+  *`CertProfile.PROFILES`*: new `tsa_signing` entry with `eku_critical=True`
+  so `issue_certificate(..., profile="tsa_signing")` automatically emits
+  the critical EKU.
+
+  *Serial counter*: monotonic, file-backed `tsa_serial.txt` in the CA
+  directory; thread-safe.
+
+  *25 new tests* in `TestRFC3161TSA`: request parsing, granted response
+  structure, TSTInfo field echoing (messageImprint, nonce, serialNumber),
+  `signingCertificateV2` correctness, CMS signature verification and
+  corruption detection, hash algorithm policy enforcement, serial
+  monotonicity, and TSA cert RFC compliance.
+
 - **Multi-algorithm CA — RFC 4055, RFC 5480 + RFC 5758, RFC 8410.** A
   single refactor lifts PyPKI from RSA-only signing to full support for
   RSASSA-PSS, ECDSA (P-256/384/521), and EdDSA (Ed25519/Ed448) at the CA

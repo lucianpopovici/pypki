@@ -147,6 +147,14 @@ try:
 except ImportError:
     HAS_OCSP = False
 
+# TSA server module (optional — loaded if --tsa-prefix is specified)
+# RFC 3161 (Time-Stamp Protocol) + RFC 5816 (signingCertificateV2)
+try:
+    import tsa_server as _tsa_module
+    HAS_TSA = True
+except ImportError:
+    HAS_TSA = False
+
 # Web UI module (optional — loaded if --web-prefix is specified)
 try:
     import web_ui as _web_ui_module
@@ -964,6 +972,18 @@ class CertProfile:
             "bc_ca": False,
             "ocsp_nocheck": True,
         },
+        # RFC 3161 §2.3: id-kp-timeStamping EKU MUST be critical; cert MUST
+        # contain only this EKU.  eku_critical=True triggers critical=True below.
+        "tsa_signing": {
+            "key_usage": dict(digital_signature=True, content_commitment=False,
+                              key_encipherment=False, data_encipherment=False,
+                              key_agreement=False, key_cert_sign=False,
+                              crl_sign=False, encipher_only=False, decipher_only=False),
+            "eku": [x509.ObjectIdentifier("1.3.6.1.5.5.7.3.8")],  # id-kp-timeStamping
+            "eku_critical": True,  # RFC 3161 §2.3 MUST
+            "san_required": False,
+            "bc_ca": False,
+        },
         "sub_ca": {
             "key_usage": dict(digital_signature=True, content_commitment=False,
                               key_encipherment=False, data_encipherment=False,
@@ -1519,10 +1539,11 @@ class CertificateAuthority:
             .add_extension(x509.KeyUsage(**ku), critical=True)
         )
 
-        # EKU
+        # EKU — RFC 3161 §2.3 requires critical=True for tsa_signing profile
         if prof.get("eku"):
             builder = builder.add_extension(
-                x509.ExtendedKeyUsage(prof["eku"]), critical=False
+                x509.ExtendedKeyUsage(prof["eku"]),
+                critical=prof.get("eku_critical", False),
             )
 
         # OCSP no-check (for OCSP signing certs)
@@ -3411,6 +3432,27 @@ def main():
              "of cached responses by a man-in-the-middle. Default: off "
              "(nonceless requests are accepted, matching RFC 6960 default)."
     )
+    infra_group.add_argument(
+        "--tsa-prefix", default=None, metavar="PREFIX",
+        help="Mount RFC 3161 / RFC 5816 TSA at this path prefix (e.g. /tsa)"
+    )
+    infra_group.add_argument(
+        "--tsa-policy-oid", default="1.3.6.1.4.1.99999.1", metavar="OID",
+        help="TSA policy OID embedded in every TimeStampToken (default: placeholder; "
+             "assign a real OID from your PEN arc for production use)"
+    )
+    infra_group.add_argument(
+        "--tsa-accuracy-seconds", type=int, default=1, metavar="N",
+        help="Declared clock accuracy in seconds embedded in TSTInfo (default: 1)"
+    )
+    infra_group.add_argument(
+        "--tsa-cert", default=None, metavar="PATH",
+        help="PEM TSA signing cert (auto-provisioned from CA if omitted)"
+    )
+    infra_group.add_argument(
+        "--tsa-key", default=None, metavar="PATH",
+        help="PEM TSA signing key (auto-provisioned from CA if omitted)"
+    )
 
     ops_group = parser.add_argument_group("Operational options")
     ops_group.add_argument(
@@ -3796,6 +3838,23 @@ def main():
                 require_nonce=getattr(args, "ocsp_require_nonce", False),
             )
 
+    # Start TSA server if requested (RFC 3161 + RFC 5816)
+    tsa_srv = None
+    if getattr(args, "tsa_prefix", None):
+        if not HAS_TSA:
+            print("WARNING: tsa_server.py not found — TSA disabled.")
+        else:
+            tsa_srv = _tsa_module.start_tsa_server(
+                route_table=route_table,
+                prefix=args.tsa_prefix,
+                ca=ca,
+                policy_oid=getattr(args, "tsa_policy_oid", "1.3.6.1.4.1.99999.1"),
+                accuracy_seconds=getattr(args, "tsa_accuracy_seconds", 1),
+                tsa_cert_path=getattr(args, "tsa_cert", None),
+                tsa_key_path=getattr(args, "tsa_key", None),
+                audit_log=audit_log,
+            )
+
     # Start IPsec PKI server if requested (RFC 4945 / RFC 4806 / RFC 4809)
     ipsec_srv = None
     if getattr(args, "ipsec_prefix", None):
@@ -3863,6 +3922,7 @@ def main():
     scep_line = f"{_base}{args.scep_prefix}" if (getattr(args,"scep_prefix",None) and HAS_SCEP) else "disabled"
     est_line  = f"{_base}{args.est_prefix}/.well-known/est" if (getattr(args,"est_prefix",None) and HAS_EST) else "disabled"
     ocsp_line = f"{_base}{args.ocsp_prefix}" if (getattr(args,"ocsp_prefix",None) and HAS_OCSP) else "disabled"
+    tsa_line  = f"{_base}{args.tsa_prefix}"  if (getattr(args,"tsa_prefix",None)  and HAS_TSA)  else "disabled"
     web_line  = f"{_base}{args.web_prefix}" if getattr(args,"web_prefix",None) else "disabled"
     ipsec_line = f"{_base}{args.ipsec_prefix}" if (getattr(args,"ipsec_prefix",None) and HAS_IPSEC) else "disabled"
     cmp_wk    = f"{_base}/.well-known/cmp"
@@ -3888,6 +3948,7 @@ def main():
 ║  SCEP             : {scep_line:<47}║
 ║  EST              : {est_line:<47}║
 ║  OCSP             : {ocsp_line:<47}║
+║  TSA              : {tsa_line:<47}║
 ║  IPsec PKI        : {ipsec_line:<47}║
 ║  Web Dashboard    : {web_line:<47}║
 ╠══════════════════════════════════════════════════════════════════╣

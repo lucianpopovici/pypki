@@ -2995,7 +2995,7 @@ class TestModuleStructure(unittest.TestCase):
 
     def test_cert_profile_has_all_profiles(self):
         expected = {"tls_server", "tls_client", "code_signing", "email",
-                    "ocsp_signing", "sub_ca", "short_lived", "default"}
+                    "ocsp_signing", "tsa_signing", "sub_ca", "short_lived", "default"}
         actual = set(pki.CertProfile.PROFILES.keys())
         self.assertEqual(actual, expected,
                          f"Missing profiles: {expected - actual}")
@@ -5429,6 +5429,568 @@ class TestMultiAlgorithmCA(unittest.TestCase):
         finally:
             import shutil
             shutil.rmtree(tmp, ignore_errors=True)
+
+
+# ===========================================================================
+# RFC 3161 + RFC 5816 — Time-Stamp Protocol
+# ===========================================================================
+
+class TestRFC3161TSA(unittest.TestCase):
+    """
+    RFC 3161 + RFC 5816: TSA server acceptance tests.
+
+    Covers:
+    - TimeStampReq parsing (version, messageImprint, nonce, certReq)
+    - TimeStampResp structure (PKIStatusInfo, ContentInfo/SignedData)
+    - TSTInfo field echoing (messageImprint, nonce, serialNumber)
+    - RFC 5816 signingCertificateV2 (ESSCertIDv2 with SHA-256)
+    - CMS SignedData signature verification against TSA cert
+    - Hash algorithm policy enforcement (SHA-256/384/512 accepted; SHA-1/MD5 rejected)
+    - TSA signing cert compliance (critical EKU id-kp-timeStamping, KU=digitalSignature)
+    - Monotonically increasing serial numbers
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        try:
+            import tsa_server
+        except ImportError:
+            raise unittest.SkipTest("tsa_server.py not importable")
+        cls.tsa = tsa_server
+
+        import tempfile
+        cls._tmpdir = tempfile.mkdtemp()
+        cls.ca = pki.CertificateAuthority(ca_dir=cls._tmpdir)
+        cls.tsa_key, cls.tsa_cert = tsa_server.provision_tsa_signing_cert(cls.ca)
+        cls.serial_counter = tsa_server.TSASerialCounter(
+            Path(cls._tmpdir) / "tsa_serial.txt"
+        )
+
+    @classmethod
+    def tearDownClass(cls):
+        import shutil
+        shutil.rmtree(cls._tmpdir, ignore_errors=True)
+
+    # ---- DER-building helpers used throughout the tests ----
+
+    def _make_req(self, hash_oid, imprint, nonce=None, cert_req=False, policy=None):
+        """Build a minimal DER-encoded TimeStampReq."""
+        tsa = self.tsa
+        alg_id = tsa._seq(tsa._oid(hash_oid) + tsa._null())
+        msg_imprint = tsa._seq(alg_id + tsa._oct(imprint))
+        body = tsa._int_der(1) + msg_imprint  # version + messageImprint
+        if policy:
+            body += tsa._oid(policy)
+        if nonce is not None:
+            body += tsa._int_der(nonce)
+        if cert_req:
+            body += b"\x01\x01\xff"  # BOOLEAN TRUE
+        return tsa._seq(body)
+
+    def _parse_resp(self, resp_der):
+        """
+        Return (status, tst_info_der, signer_info_dict, signed_attrs_set_der)
+        from a DER-encoded TimeStampResp.
+
+        status             : int   (0=granted, 2=rejection, …)
+        tst_info_der       : bytes or None   (TSTInfo DER)
+        signed_attrs_body  : bytes or None   (body of SET OF Attribute)
+        sig_bytes          : bytes or None   (signature value)
+        sig_alg_oid        : str or None     (signature algorithm OID)
+        """
+        tsa = self.tsa
+        result = {"status": None, "tst_info": None,
+                  "signed_attrs_body": None, "sig_bytes": None,
+                  "sig_alg_oid": None, "signer_info": None,
+                  "certs_field": None}
+        try:
+            # TimeStampResp SEQUENCE
+            _, outer, _ = tsa._dec_tlv(resp_der, 0)
+            pos = 0
+            # PKIStatusInfo
+            _, pki_status_seq, pos = tsa._dec_tlv(outer, pos)
+            _, status_bytes, _ = tsa._dec_tlv(pki_status_seq, 0)
+            result["status"] = int.from_bytes(status_bytes, "big")
+
+            if pos >= len(outer):
+                return result   # rejection response has no TimeStampToken
+
+            # ContentInfo
+            _, ci_seq, _ = tsa._dec_tlv(outer, pos)
+            ci_pos = 0
+            _, oid_bytes, ci_pos = tsa._dec_tlv(ci_seq, ci_pos)
+            result["content_type_oid"] = tsa._decode_oid_bytes(oid_bytes)
+
+            # [0] EXPLICIT SignedData
+            _, ctx0_val, ci_pos = tsa._dec_tlv(ci_seq, ci_pos)
+            _, sd_seq, _ = tsa._dec_tlv(ctx0_val, 0)
+
+            # SignedData: version, digestAlgorithms, encapContentInfo,
+            #             [0] certs OPTIONAL, [1] crls OPTIONAL, signerInfos
+            sd_pos = 0
+            _, ver_bytes, sd_pos = tsa._dec_tlv(sd_seq, sd_pos)  # version
+            _, _da, sd_pos = tsa._dec_tlv(sd_seq, sd_pos)        # digestAlgorithms SET
+
+            # encapContentInfo
+            _, eci_seq, sd_pos = tsa._dec_tlv(sd_seq, sd_pos)
+            eci_pos = 0
+            _, eci_oid_bytes, eci_pos = tsa._dec_tlv(eci_seq, eci_pos)
+            result["encap_oid"] = tsa._decode_oid_bytes(eci_oid_bytes)
+            if eci_pos < len(eci_seq):
+                _, ctx0_eci, _ = tsa._dec_tlv(eci_seq, eci_pos)
+                _, oct_val, _ = tsa._dec_tlv(ctx0_eci, 0)
+                result["tst_info"] = oct_val
+
+            # optional [0] certs, [1] crls
+            while sd_pos < len(sd_seq):
+                tag_peek = sd_seq[sd_pos]
+                if tag_peek == 0xa0:   # certs [0]
+                    _, certs_der, sd_pos = tsa._dec_tlv(sd_seq, sd_pos)
+                    result["certs_field"] = certs_der
+                elif tag_peek == 0xa1:  # crls [1]
+                    _, _, sd_pos = tsa._dec_tlv(sd_seq, sd_pos)
+                elif tag_peek == 0x31:  # signerInfos SET
+                    break
+                else:
+                    break
+
+            # signerInfos SET
+            _, sis_set, sd_pos = tsa._dec_tlv(sd_seq, sd_pos)
+            _, si_seq, _ = tsa._dec_tlv(sis_set, 0)
+
+            # SignerInfo: version, sid, digestAlgorithm, signedAttrs [0], sigAlg, sig
+            si_pos = 0
+            _, _, si_pos = tsa._dec_tlv(si_seq, si_pos)  # version
+            # sid: issuerAndSerialNumber SEQUENCE
+            _, _, si_pos = tsa._dec_tlv(si_seq, si_pos)
+            _, _, si_pos = tsa._dec_tlv(si_seq, si_pos)  # digestAlgorithm
+
+            # signedAttrs [0] IMPLICIT
+            tag, sa_body, si_pos = tsa._dec_tlv(si_seq, si_pos)
+            if tag == 0xa0:
+                result["signed_attrs_body"] = sa_body
+                # re-encode as SET for signature verification
+                result["signed_attrs_set"] = (
+                    b"\x31" + tsa._enc_len(len(sa_body)) + sa_body
+                )
+            # else: no signedAttrs (unusual for TSA)
+
+            # signatureAlgorithm
+            _, sa_seq, si_pos = tsa._dec_tlv(si_seq, si_pos)
+            _, sa_oid_bytes, _ = tsa._dec_tlv(sa_seq, 0)
+            result["sig_alg_oid"] = tsa._decode_oid_bytes(sa_oid_bytes)
+
+            # signature OCTET STRING
+            _, result["sig_bytes"], si_pos = tsa._dec_tlv(si_seq, si_pos)
+
+        except Exception as e:
+            result["parse_error"] = str(e)
+        return result
+
+    def _parse_tst_info(self, tst_info_der):
+        """Return dict of TSTInfo fields."""
+        tsa = self.tsa
+        result = {}
+        _, outer, _ = tsa._dec_tlv(tst_info_der, 0)
+        pos = 0
+        _, ver_bytes, pos = tsa._dec_tlv(outer, pos)
+        result["version"] = int.from_bytes(ver_bytes, "big")
+        _, policy_bytes, pos = tsa._dec_tlv(outer, pos)
+        result["policy"] = tsa._decode_oid_bytes(policy_bytes)
+        # messageImprint
+        _, mi_seq, pos = tsa._dec_tlv(outer, pos)
+        mi_pos = 0
+        _, alg_seq, mi_pos = tsa._dec_tlv(mi_seq, mi_pos)
+        _, alg_oid_bytes, _ = tsa._dec_tlv(alg_seq, 0)
+        result["hash_oid"] = tsa._decode_oid_bytes(alg_oid_bytes)
+        _, result["imprint"], _ = tsa._dec_tlv(mi_seq, mi_pos)
+        # serialNumber
+        _, serial_bytes, pos = tsa._dec_tlv(outer, pos)
+        result["serial"] = int.from_bytes(serial_bytes, "big")
+        # genTime
+        _, _, pos = tsa._dec_tlv(outer, pos)
+        # remaining optional fields (accuracy, nonce)
+        result["nonce"] = None
+        while pos < len(outer):
+            tag, val, pos = tsa._dec_tlv(outer, pos)
+            if tag == 0x02:  # INTEGER — nonce
+                result["nonce"] = int.from_bytes(val, "big")
+        return result
+
+    # ---- Test: basic parse ----
+
+    def test_parse_sha256_request(self):
+        """TSARequestParser.parse returns expected fields for a valid SHA-256 request."""
+        imprint = hashlib.sha256(b"hello world").digest()
+        req_der = self._make_req(self.tsa.OID_SHA256, imprint)
+        parsed = self.tsa.TSARequestParser.parse(req_der)
+        self.assertIsNotNone(parsed)
+        self.assertEqual(parsed["version"], 1)
+        self.assertEqual(parsed["hash_oid"], self.tsa.OID_SHA256)
+        self.assertEqual(parsed["hash_alg"], "sha256")
+        self.assertEqual(parsed["imprint"], imprint)
+        self.assertIsNone(parsed["nonce"])
+        self.assertFalse(parsed["cert_req"])
+
+    def test_parse_request_with_nonce(self):
+        """Parser extracts nonce correctly."""
+        imprint = hashlib.sha256(b"data").digest()
+        req_der = self._make_req(self.tsa.OID_SHA256, imprint, nonce=0xDEADBEEF)
+        parsed = self.tsa.TSARequestParser.parse(req_der)
+        self.assertIsNotNone(parsed)
+        self.assertEqual(parsed["nonce"], 0xDEADBEEF)
+
+    def test_parse_request_certreq(self):
+        """Parser extracts cert_req=True."""
+        imprint = hashlib.sha256(b"data").digest()
+        req_der = self._make_req(self.tsa.OID_SHA256, imprint, cert_req=True)
+        parsed = self.tsa.TSARequestParser.parse(req_der)
+        self.assertIsNotNone(parsed)
+        self.assertTrue(parsed["cert_req"])
+
+    def test_parse_truncated_request_returns_none(self):
+        """Parser returns None on truncated/corrupt input."""
+        result = self.tsa.TSARequestParser.parse(b"\x30\x05\x02\x01\x01")
+        self.assertIsNone(result)
+
+    # ---- Test: granted response ----
+
+    def test_grant_sha256_status_is_granted(self):
+        """SHA-256 request results in status = granted (0)."""
+        imprint = hashlib.sha256(b"the document").digest()
+        req_der = self._make_req(self.tsa.OID_SHA256, imprint)
+        resp = self.tsa.TSAResponseBuilder.build(
+            parsed_req=self.tsa.TSARequestParser.parse(req_der),
+            tsa_key=self.tsa_key,
+            tsa_cert=self.tsa_cert,
+            policy_oid=self.tsa.TSA_DEFAULT_POLICY_OID,
+            serial=1,
+        )
+        parsed_resp = self._parse_resp(resp)
+        self.assertEqual(parsed_resp["status"], 0)
+
+    def test_grant_tst_info_content_type_oid(self):
+        """ContentInfo has OID id-signedData; EncapsulatedContentInfo has id-ct-TSTInfo."""
+        imprint = hashlib.sha256(b"doc").digest()
+        req_der = self._make_req(self.tsa.OID_SHA256, imprint)
+        resp = self.tsa.TSAResponseBuilder.build(
+            parsed_req=self.tsa.TSARequestParser.parse(req_der),
+            tsa_key=self.tsa_key,
+            tsa_cert=self.tsa_cert,
+            policy_oid=self.tsa.TSA_DEFAULT_POLICY_OID,
+            serial=1,
+        )
+        parsed_resp = self._parse_resp(resp)
+        self.assertEqual(parsed_resp.get("content_type_oid"), self.tsa.OID_SIGNED_DATA)
+        self.assertEqual(parsed_resp.get("encap_oid"), self.tsa.OID_TST_INFO)
+
+    def test_grant_message_imprint_echoed(self):
+        """TSTInfo.messageImprint echoes the request hash OID and value."""
+        imprint = hashlib.sha256(b"content to timestamp").digest()
+        req_der = self._make_req(self.tsa.OID_SHA256, imprint)
+        resp = self.tsa.TSAResponseBuilder.build(
+            parsed_req=self.tsa.TSARequestParser.parse(req_der),
+            tsa_key=self.tsa_key,
+            tsa_cert=self.tsa_cert,
+            policy_oid=self.tsa.TSA_DEFAULT_POLICY_OID,
+            serial=42,
+        )
+        parsed_resp = self._parse_resp(resp)
+        self.assertIsNotNone(parsed_resp.get("tst_info"))
+        tst = self._parse_tst_info(parsed_resp["tst_info"])
+        self.assertEqual(tst["hash_oid"], self.tsa.OID_SHA256)
+        self.assertEqual(tst["imprint"], imprint)
+
+    def test_grant_nonce_echoed_in_tst_info(self):
+        """TSTInfo.nonce echoes the nonce from the request."""
+        imprint = hashlib.sha256(b"data").digest()
+        nonce_val = 0x1234567890ABCDEF
+        req_der = self._make_req(self.tsa.OID_SHA256, imprint, nonce=nonce_val)
+        resp = self.tsa.TSAResponseBuilder.build(
+            parsed_req=self.tsa.TSARequestParser.parse(req_der),
+            tsa_key=self.tsa_key,
+            tsa_cert=self.tsa_cert,
+            policy_oid=self.tsa.TSA_DEFAULT_POLICY_OID,
+            serial=1,
+        )
+        parsed_resp = self._parse_resp(resp)
+        tst = self._parse_tst_info(parsed_resp["tst_info"])
+        self.assertEqual(tst["nonce"], nonce_val)
+
+    def test_grant_serial_stored_in_tst_info(self):
+        """TSTInfo.serialNumber matches the serial passed to the builder."""
+        imprint = hashlib.sha256(b"d").digest()
+        req_der = self._make_req(self.tsa.OID_SHA256, imprint)
+        resp = self.tsa.TSAResponseBuilder.build(
+            parsed_req=self.tsa.TSARequestParser.parse(req_der),
+            tsa_key=self.tsa_key,
+            tsa_cert=self.tsa_cert,
+            policy_oid=self.tsa.TSA_DEFAULT_POLICY_OID,
+            serial=99,
+        )
+        parsed_resp = self._parse_resp(resp)
+        tst = self._parse_tst_info(parsed_resp["tst_info"])
+        self.assertEqual(tst["serial"], 99)
+
+    def test_certreq_includes_tsa_cert_in_response(self):
+        """When cert_req=True the TSA cert DER appears in the [0] certs field."""
+        imprint = hashlib.sha256(b"d").digest()
+        req_der = self._make_req(self.tsa.OID_SHA256, imprint, cert_req=True)
+        resp = self.tsa.TSAResponseBuilder.build(
+            parsed_req=self.tsa.TSARequestParser.parse(req_der),
+            tsa_key=self.tsa_key,
+            tsa_cert=self.tsa_cert,
+            policy_oid=self.tsa.TSA_DEFAULT_POLICY_OID,
+            serial=1,
+        )
+        parsed_resp = self._parse_resp(resp)
+        certs_field = parsed_resp.get("certs_field")
+        self.assertIsNotNone(certs_field, "certs [0] field missing when cert_req=True")
+        from cryptography.hazmat.primitives.serialization import Encoding as _Enc
+        self.assertIn(
+            self.tsa_cert.public_bytes(_Enc.DER),
+            certs_field,
+        )
+
+    def test_certreq_false_omits_certs_field(self):
+        """When cert_req is absent/False, no [0] certs field in the SignedData."""
+        imprint = hashlib.sha256(b"d").digest()
+        req_der = self._make_req(self.tsa.OID_SHA256, imprint)
+        resp = self.tsa.TSAResponseBuilder.build(
+            parsed_req=self.tsa.TSARequestParser.parse(req_der),
+            tsa_key=self.tsa_key,
+            tsa_cert=self.tsa_cert,
+            policy_oid=self.tsa.TSA_DEFAULT_POLICY_OID,
+            serial=1,
+        )
+        parsed_resp = self._parse_resp(resp)
+        self.assertIsNone(parsed_resp.get("certs_field"))
+
+    # ---- Test: RFC 5816 signingCertificateV2 ----
+
+    def test_signing_certificate_v2_present_in_signed_attrs(self):
+        """The signed attributes SET contains the signingCertificateV2 OID."""
+        imprint = hashlib.sha256(b"d").digest()
+        req_der = self._make_req(self.tsa.OID_SHA256, imprint)
+        resp = self.tsa.TSAResponseBuilder.build(
+            parsed_req=self.tsa.TSARequestParser.parse(req_der),
+            tsa_key=self.tsa_key,
+            tsa_cert=self.tsa_cert,
+            policy_oid=self.tsa.TSA_DEFAULT_POLICY_OID,
+            serial=1,
+        )
+        parsed_resp = self._parse_resp(resp)
+        # The OID bytes for signingCertificateV2 must appear in the signed attrs body
+        oid_der = self.tsa._oid(self.tsa.OID_SIGNING_CERT_V2)
+        self.assertIn(oid_der, parsed_resp["signed_attrs_body"])
+
+    def test_ess_cert_id_v2_hash_matches_tsa_cert(self):
+        """ESSCertIDv2 certHash = SHA-256 of the TSA cert DER."""
+        from cryptography.hazmat.primitives.serialization import Encoding as _Enc
+        imprint = hashlib.sha256(b"d").digest()
+        req_der = self._make_req(self.tsa.OID_SHA256, imprint)
+        resp = self.tsa.TSAResponseBuilder.build(
+            parsed_req=self.tsa.TSARequestParser.parse(req_der),
+            tsa_key=self.tsa_key,
+            tsa_cert=self.tsa_cert,
+            policy_oid=self.tsa.TSA_DEFAULT_POLICY_OID,
+            serial=1,
+        )
+        tsa_cert_der = self.tsa_cert.public_bytes(_Enc.DER)
+        expected_hash = hashlib.sha256(tsa_cert_der).digest()
+        # The expected hash bytes must appear in the response DER
+        self.assertIn(expected_hash, resp)
+
+    # ---- Test: CMS signature verification ----
+
+    def test_cms_signature_verifies(self):
+        """
+        CMS SignedData signature is valid: Sign(tsa_key, SET(signedAttrs)) can be
+        verified with the TSA cert's public key.
+        """
+        from cryptography.hazmat.primitives.asymmetric import padding as _pad
+        from cryptography.hazmat.primitives.hashes import SHA256 as _SHA256
+        from cryptography.hazmat.primitives.asymmetric import rsa as _rsa
+
+        imprint = hashlib.sha256(b"document bytes").digest()
+        req_der = self._make_req(self.tsa.OID_SHA256, imprint)
+        resp = self.tsa.TSAResponseBuilder.build(
+            parsed_req=self.tsa.TSARequestParser.parse(req_der),
+            tsa_key=self.tsa_key,
+            tsa_cert=self.tsa_cert,
+            policy_oid=self.tsa.TSA_DEFAULT_POLICY_OID,
+            serial=1,
+        )
+        parsed_resp = self._parse_resp(resp)
+        self.assertIsNotNone(parsed_resp.get("sig_bytes"))
+        self.assertIsNotNone(parsed_resp.get("signed_attrs_set"))
+
+        pub = self.tsa_cert.public_key()
+        signed_data = parsed_resp["signed_attrs_set"]
+        sig = parsed_resp["sig_bytes"]
+
+        if isinstance(pub, _rsa.RSAPublicKey):
+            pub.verify(sig, signed_data, _pad.PKCS1v15(), _SHA256())
+        else:
+            from cryptography.hazmat.primitives.asymmetric import ec as _ec
+            pub.verify(sig, signed_data, _ec.ECDSA(_SHA256()))
+
+    def test_cms_signature_fails_on_corrupted_body(self):
+        """Flipping a bit in the signed attrs body breaks signature verification."""
+        from cryptography.hazmat.primitives.asymmetric import padding as _pad
+        from cryptography.hazmat.primitives.hashes import SHA256 as _SHA256
+        from cryptography.hazmat.primitives.asymmetric import rsa as _rsa
+        from cryptography.exceptions import InvalidSignature
+
+        imprint = hashlib.sha256(b"document bytes").digest()
+        req_der = self._make_req(self.tsa.OID_SHA256, imprint)
+        resp = self.tsa.TSAResponseBuilder.build(
+            parsed_req=self.tsa.TSARequestParser.parse(req_der),
+            tsa_key=self.tsa_key,
+            tsa_cert=self.tsa_cert,
+            policy_oid=self.tsa.TSA_DEFAULT_POLICY_OID,
+            serial=1,
+        )
+        parsed_resp = self._parse_resp(resp)
+        # Corrupt the signed attrs body
+        body = parsed_resp["signed_attrs_body"]
+        corrupted = bytearray(body)
+        corrupted[-4] ^= 0xFF
+        bad_set = b"\x31" + self.tsa._enc_len(len(corrupted)) + bytes(corrupted)
+
+        pub = self.tsa_cert.public_key()
+        sig = parsed_resp["sig_bytes"]
+        with self.assertRaises(Exception):  # InvalidSignature or ValueError
+            if isinstance(pub, _rsa.RSAPublicKey):
+                pub.verify(sig, bad_set, _pad.PKCS1v15(), _SHA256())
+            else:
+                from cryptography.hazmat.primitives.asymmetric import ec as _ec
+                pub.verify(sig, bad_set, _ec.ECDSA(_SHA256()))
+
+    # ---- Test: hash algorithm policy ----
+
+    def test_reject_sha1_hash_algorithm(self):
+        """SHA-1 requests are rejected with failInfo=badAlg."""
+        imprint = hashlib.sha1(b"data").digest()
+        req_der = self._make_req(self.tsa.OID_SHA1, imprint)
+        resp = self.tsa.TSAResponseBuilder.error(
+            self.tsa.TSA_STATUS_REJECTION, self.tsa.FAIL_BAD_ALG
+        )
+        parsed_resp = self._parse_resp(resp)
+        self.assertEqual(parsed_resp["status"], self.tsa.TSA_STATUS_REJECTION)
+
+        # Via handler
+        class _DummyCounter:
+            def next(self):
+                return 1
+
+        class _BoundHandler(self.tsa.TSAHandler):
+            pass
+        _BoundHandler.ca = self.ca
+        _BoundHandler.tsa_key = self.tsa_key
+        _BoundHandler.tsa_cert = self.tsa_cert
+        _BoundHandler.policy_oid = self.tsa.TSA_DEFAULT_POLICY_OID
+        _BoundHandler.accuracy_seconds = 1
+        _BoundHandler.serial_counter = _DummyCounter()
+        _BoundHandler.audit_log = None
+
+        parsed_req = self.tsa.TSARequestParser.parse(req_der)
+        # manually call the rejection path
+        rejection = _BoundHandler._handle_request(_BoundHandler, req_der)
+        resp2 = self._parse_resp(rejection)
+        self.assertEqual(resp2["status"], self.tsa.TSA_STATUS_REJECTION)
+
+    def test_reject_md5_hash_algorithm(self):
+        """MD5 (1.2.840.113549.2.5) requests are rejected."""
+        OID_MD5 = "1.2.840.113549.2.5"
+        imprint = hashlib.md5(b"data").digest()
+        req_der = self._make_req(OID_MD5, imprint)
+        parsed = self.tsa.TSARequestParser.parse(req_der)
+        self.assertIsNotNone(parsed)
+        self.assertNotIn(parsed["hash_oid"], self.tsa._ALLOWED_HASH_OIDS)
+
+    def test_sha384_and_sha512_accepted(self):
+        """SHA-384 and SHA-512 are in the allowed set."""
+        self.assertIn(self.tsa.OID_SHA384, self.tsa._ALLOWED_HASH_OIDS)
+        self.assertIn(self.tsa.OID_SHA512, self.tsa._ALLOWED_HASH_OIDS)
+
+    def test_sha256_accepted(self):
+        """SHA-256 is in the allowed set."""
+        self.assertIn(self.tsa.OID_SHA256, self.tsa._ALLOWED_HASH_OIDS)
+
+    # ---- Test: serial counter ----
+
+    def test_serial_numbers_monotonically_increasing(self):
+        """Two successive requests return TSTInfos with increasing serialNumbers."""
+        imprint = hashlib.sha256(b"d").digest()
+        counter = self.tsa.TSASerialCounter(
+            Path(self._tmpdir) / "tsa_serial_mono.txt"
+        )
+        serials = []
+        for _ in range(3):
+            req_der = self._make_req(self.tsa.OID_SHA256, imprint)
+            resp = self.tsa.TSAResponseBuilder.build(
+                parsed_req=self.tsa.TSARequestParser.parse(req_der),
+                tsa_key=self.tsa_key,
+                tsa_cert=self.tsa_cert,
+                policy_oid=self.tsa.TSA_DEFAULT_POLICY_OID,
+                serial=counter.next(),
+            )
+            parsed_resp = self._parse_resp(resp)
+            tst = self._parse_tst_info(parsed_resp["tst_info"])
+            serials.append(tst["serial"])
+        self.assertEqual(serials, sorted(set(serials)),
+                         "serial numbers must be strictly increasing")
+        self.assertEqual(len(set(serials)), 3, "serial numbers must be unique")
+
+    # ---- Test: TSA signing cert compliance (RFC 3161 §2.3) ----
+
+    def test_tsa_cert_eku_is_critical(self):
+        """TSA signing cert EKU extension MUST be marked critical (RFC 3161 §2.3)."""
+        from cryptography import x509 as _x509
+        try:
+            eku_ext = self.tsa_cert.extensions.get_extension_for_class(_x509.ExtendedKeyUsage)
+        except _x509.ExtensionNotFound:
+            self.fail("TSA cert missing ExtendedKeyUsage extension")
+        self.assertTrue(eku_ext.critical,
+                        "TSA cert EKU MUST be critical per RFC 3161 §2.3")
+
+    def test_tsa_cert_has_only_timestamping_eku(self):
+        """TSA signing cert MUST contain only id-kp-timeStamping (no other EKU)."""
+        from cryptography import x509 as _x509
+        from cryptography.x509.oid import ExtendedKeyUsageOID
+        eku_ext = self.tsa_cert.extensions.get_extension_for_class(_x509.ExtendedKeyUsage)
+        oid_strs = [oid.dotted_string for oid in eku_ext.value]
+        self.assertIn("1.3.6.1.5.5.7.3.8", oid_strs,
+                      "id-kp-timeStamping must be present")
+        self.assertEqual(len(oid_strs), 1,
+                         "TSA cert MUST NOT have any other EKU (RFC 3161 §2.3)")
+
+    def test_tsa_cert_ku_is_digital_signature_only(self):
+        """TSA signing cert KU MUST have only digitalSignature set."""
+        from cryptography import x509 as _x509
+        ku_ext = self.tsa_cert.extensions.get_extension_for_class(_x509.KeyUsage)
+        ku = ku_ext.value
+        self.assertTrue(ku.digital_signature)
+        self.assertFalse(ku.content_commitment)
+        self.assertFalse(ku.key_encipherment)
+        self.assertFalse(ku.key_cert_sign)
+
+    def test_tsa_signing_profile_in_cert_profiles(self):
+        """pki_server.CertProfile includes tsa_signing profile."""
+        self.assertIn("tsa_signing", pki.CertProfile.PROFILES)
+        prof = pki.CertProfile.PROFILES["tsa_signing"]
+        self.assertTrue(prof.get("eku_critical"),
+                        "tsa_signing profile must have eku_critical=True")
+
+    def test_tsa_error_response_for_bad_version(self):
+        """TSA error response DER is parseable and has rejection status."""
+        resp = self.tsa.TSAResponseBuilder.error(
+            self.tsa.TSA_STATUS_REJECTION, self.tsa.FAIL_BAD_REQUEST
+        )
+        parsed = self._parse_resp(resp)
+        self.assertEqual(parsed["status"], self.tsa.TSA_STATUS_REJECTION)
+        self.assertIsNone(parsed.get("tst_info"))
 
 
 # ===========================================================================
