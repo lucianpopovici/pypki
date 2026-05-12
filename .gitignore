@@ -20,3 +20,6 @@ htmlcov/
 
 # CA data directories (generated at runtime)
 ca/
+
+# IDE metadata
+.idea/
