@@ -255,10 +255,33 @@ class CMPv2ASN1:
         recip_nonce: bytes = b"",
         status_code: int = 0,
         pvno: int = 2,
+        *,
+        signer_key: Optional[RSAPrivateKey] = None,
+        signer_cert: Optional[x509.Certificate] = None,
+        extra_certs: Optional[List[x509.Certificate]] = None,
     ) -> bytes:
         """Build a minimal DER-encoded PKIMessage response.
 
         pvno=2 for CMPv2 (RFC 4210), pvno=3 for CMPv3 (RFC 9480).
+
+        RFC 4210 §5.1.3 — response signature protection
+        ------------------------------------------------
+        When ``signer_key`` is provided, the message carries the
+        ``[0] EXPLICIT PKIProtection`` BIT STRING signature over
+        ``ProtectedPart ::= SEQUENCE { header, body }`` per
+        RFC 4210 §5.1.3.3 (signature-based protection). When
+        ``signer_cert`` is also provided, it (and any ``extra_certs``)
+        is included in ``[1] EXPLICIT extraCerts`` so a relying client
+        can build the trust chain without out-of-band lookup.
+
+        Without ``signer_key`` the function preserves the legacy
+        unprotected behavior — useful for early bootstrap responses
+        and for tests that don't need signature verification.
+
+        Strict CMP clients (EJBCA, some strongSwan pki builds, RFC 9482
+        Lightweight CMP Profile validators) reject unprotected
+        responses, so production handlers should always pass
+        ``signer_key`` + ``signer_cert``.
         """
 
         def seq(content: bytes) -> bytes:
@@ -322,8 +345,56 @@ class CMPv2ASN1:
         # Build PKIBody
         body = ctx(body_type, body_content)
 
+        # ------------------------------------------------------------------
+        # RFC 4210 §5.1.3 — signature-based protection
+        # ------------------------------------------------------------------
+        # PKIMessage ::= SEQUENCE {
+        #     header       PKIHeader,
+        #     body         PKIBody,
+        #     protection   [0] PKIProtection OPTIONAL,
+        #     extraCerts   [1] SEQUENCE SIZE (1..MAX) OF
+        #                      CMPCertificate OPTIONAL }
+        # PKIProtection ::= BIT STRING
+        #
+        # ProtectedPart ::= SEQUENCE { header, body }   -- DER, then signed.
+        # ------------------------------------------------------------------
+        inner = header + body
+
+        if signer_key is not None:
+            protected_part = seq(inner)
+            signature = signer_key.sign(
+                protected_part,
+                padding.PKCS1v15(),
+                SHA256(),
+            )
+            # PKIProtection is BIT STRING. BIT STRING TLV:
+            #   tag 0x03, length, unused-bits-byte (0x00), then content.
+            bit_string_tlv = (
+                b"\x03"
+                + cls._encode_length(len(signature) + 1)
+                + b"\x00"
+                + signature
+            )
+            # [0] EXPLICIT wraps the BIT STRING TLV.
+            protection_field = ctx(0, bit_string_tlv, constructed=True)
+            inner += protection_field
+
+            # [1] EXPLICIT SEQUENCE SIZE(1..MAX) OF CMPCertificate
+            certs_for_chain: List[x509.Certificate] = []
+            if signer_cert is not None:
+                certs_for_chain.append(signer_cert)
+            if extra_certs:
+                certs_for_chain.extend(extra_certs)
+            if certs_for_chain:
+                cert_der_blob = b"".join(
+                    c.public_bytes(serialization.Encoding.DER)
+                    for c in certs_for_chain
+                )
+                extra_certs_field = ctx(1, seq(cert_der_blob), constructed=True)
+                inner += extra_certs_field
+
         # Combine into PKIMessage
-        pki_msg = seq(header + body)
+        pki_msg = seq(inner)
         return pki_msg
 
     @classmethod
@@ -398,43 +469,84 @@ class CMPv2ASN1:
         """
         Walk the CRMF body to extract the subject DN string and subjectPublicKeyInfo DER.
         Returns (subject_str, spki_der) or (None, None).
+
+        Backward-compatible wrapper. New code should use ``parse_crmf``
+        which also returns the certRequest DER and POPO bytes needed for
+        RFC 4211 §4 proof-of-possession verification.
         """
-        # We'll do a best-effort DER walk looking for known OIDs
-        subject_str = "CN=CMPv2 Client"
-        spki_der = None
+        parsed = cls.parse_crmf(body_raw)
+        return parsed.get("subject", "CN=CMPv2 Client"), parsed.get("spki")
+
+    @classmethod
+    def parse_crmf(cls, body_raw: bytes) -> Dict[str, Any]:
+        """
+        Parse the first CertReqMsg in a CRMF body. Returns a dict with:
+
+            subject      str — DN, falls back to "CN=CMPv2 Client"
+            spki         bytes or None — subjectPublicKeyInfo DER
+            certreq_der  bytes or None — DER of the CertRequest SEQUENCE,
+                                         needed as the signed-bytes input
+                                         for POPO verification per RFC
+                                         4211 §4.1 case 2.
+            popo_raw     bytes or None — the popo CHOICE TLV bytes (e.g.
+                                         starts with 0xA1 for signature POP).
+
+        Best-effort: any parse failure yields the partial dict observed so far.
+        """
+        result: Dict[str, Any] = {
+            "subject":     "CN=CMPv2 Client",
+            "spki":        None,
+            "certreq_der": None,
+            "popo_raw":    None,
+        }
 
         try:
-            # body_raw is CertReqMessages = SEQUENCE OF CertReqMsg
-            # Each CertReqMsg: SEQUENCE { certReq CertRequest, ... }
-            # CertRequest: SEQUENCE { certReqId INTEGER, certTemplate, ... }
-            # certTemplate: SEQUENCE with optional fields tagged [0]..[8]
-
-            pos = 0
-            # Unwrap CertReqMessages SEQUENCE
-            if body_raw[pos] != 0x30:
-                return subject_str, spki_der
+            # CertReqMessages = SEQUENCE OF CertReqMsg
+            if not body_raw or body_raw[0] != 0x30:
+                return result
             msg_len, pos = cls._decode_length(body_raw, 1)
             inner = body_raw[pos:pos + msg_len]
 
             # First CertReqMsg
             if not inner or inner[0] != 0x30:
-                return subject_str, spki_der
+                return result
             crm_len, p2 = cls._decode_length(inner, 1)
             crm = inner[p2:p2 + crm_len]
 
-            # CertRequest
+            # CertReqMsg ::= SEQUENCE { certReq, popo OPTIONAL, regInfo OPTIONAL }
+            # certReq is the first element — capture its full DER (tag+len+content)
+            # for POPO verification per RFC 4211 §4.1 case 2.
             if not crm or crm[0] != 0x30:
-                return subject_str, spki_der
+                return result
             cr_len, p3 = cls._decode_length(crm, 1)
-            cr = crm[p3:p3 + cr_len]
+            cr_end = p3 + cr_len
+            certreq_der = crm[0:cr_end]   # full TLV
+            result["certreq_der"] = certreq_der
 
-            # skip certReqId INTEGER
+            cr = crm[p3:cr_end]
+
+            # popo (next element after certReq), if present.
+            # ProofOfPossession is a CHOICE — wire-encoded as a context-
+            # specific tag [0] raVerified / [1] signature / [2] keyEnc /
+            # [3] keyAgree. Capture the entire TLV.
+            after_cr = cr_end
+            if after_cr < len(crm):
+                popo_tag = crm[after_cr]
+                # Accept any context-specific constructed/primitive tag
+                # 0xA0..0xA3 / 0x80..0x83 — we're permissive about which.
+                if popo_tag & 0xC0 == 0x80:
+                    popo_len, popo_pos = cls._decode_length(crm, after_cr + 1)
+                    popo_end = popo_pos + popo_len
+                    if popo_end <= len(crm):
+                        result["popo_raw"] = crm[after_cr:popo_end]
+
+            # CertRequest internals: certReqId INTEGER, certTemplate
             id_len, p4 = cls._decode_length(cr, 1)
             p4 += id_len
 
             # certTemplate SEQUENCE
             if p4 >= len(cr) or cr[p4] != 0x30:
-                return subject_str, spki_der
+                return result
             tmpl_len, p5 = cls._decode_length(cr, p4 + 1)
             tmpl = cr[p5:p5 + tmpl_len]
 
@@ -447,16 +559,215 @@ class CMPv2ASN1:
                 field_num = ftag & 0x1F
 
                 if field_num == 5:  # [5] subject
-                    subject_str = cls._parse_dn(fval) or subject_str
+                    parsed_dn = cls._parse_dn(fval)
+                    if parsed_dn:
+                        result["subject"] = parsed_dn
                 elif field_num == 6:  # [6] publicKey
-                    spki_der = fval
+                    result["spki"] = fval
 
                 tpos = fnext + flen
 
         except Exception as e:
             logger.debug(f"CRMF parse error: {e}")
 
-        return subject_str, spki_der
+        return result
+
+    # OIDs of supported POPO signature algorithms
+    _POPO_ALG_RSA_SHA256 = "1.2.840.113549.1.1.11"
+    _POPO_ALG_RSA_SHA384 = "1.2.840.113549.1.1.12"
+    _POPO_ALG_RSA_SHA512 = "1.2.840.113549.1.1.13"
+    _POPO_ALG_ECDSA_SHA256 = "1.2.840.10045.4.3.2"
+    _POPO_ALG_ECDSA_SHA384 = "1.2.840.10045.4.3.3"
+    _POPO_ALG_ECDSA_SHA512 = "1.2.840.10045.4.3.4"
+    _POPO_ALG_ED25519     = "1.3.101.112"
+
+    @classmethod
+    def verify_popo(
+        cls,
+        certreq_der: bytes,
+        spki_der: bytes,
+        popo_raw: bytes,
+    ) -> Tuple[bool, str]:
+        """
+        Verify a CRMF Proof-of-Possession per RFC 4211 §4.1 case 2.
+
+        Returns (ok, reason). On failure the reason string is suitable
+        for audit logging; the caller should respond with PKIStatusInfo
+        rejection + failInfo bit 9 (badPOP).
+
+        Only signature-based POPO ([1] POPOSigningKey) without
+        POPOSigningKeyInput is supported (RFC 4211 §4.1 case 2). Other
+        POPO variants (raVerified, keyEncipherment/keyAgreement) are
+        rejected — strict-mode policy fits PyPKI's threat model where
+        the channel is already CMP-protected and the requester therefore
+        must hold the requested key.
+        """
+        if not popo_raw or not certreq_der or not spki_der:
+            return False, "missing POPO, certRequest, or SPKI"
+
+        # ProofOfPossession CHOICE — accept only [1] POPOSigningKey.
+        # Constructed context tag for [1] is 0xA1; some implementations
+        # incorrectly emit primitive-tagged 0x81 — accept both.
+        if popo_raw[0] not in (0xA1, 0x81):
+            return False, (
+                f"only signature-based POPO is accepted "
+                f"(got tag 0x{popo_raw[0]:02x}; raVerified, keyEnc, "
+                f"keyAgree are not supported by this server)"
+            )
+
+        try:
+            popo_len, p = cls._decode_length(popo_raw, 1)
+            popo_inner = popo_raw[p:p + popo_len]
+        except Exception as e:
+            return False, f"malformed POPO TLV: {e}"
+
+        # popo_inner is now the content of [1] EXPLICIT — that's the
+        # POPOSigningKey itself, which is a SEQUENCE. Unwrap it.
+        if not popo_inner or popo_inner[0] != 0x30:
+            return False, "POPOSigningKey is not a SEQUENCE"
+        try:
+            sk_len, sk_p = cls._decode_length(popo_inner, 1)
+            popo_inner = popo_inner[sk_p:sk_p + sk_len]
+        except Exception as e:
+            return False, f"malformed POPOSigningKey SEQUENCE: {e}"
+
+        # POPOSigningKey ::= SEQUENCE {
+        #     poposkInput      [0] POPOSigningKeyInput OPTIONAL,
+        #     algorithmIdentifier  AlgorithmIdentifier,
+        #     signature            BIT STRING
+        # }
+        # If [0] poposkInput is present, RFC 4211 §4.1 case 1/3 applies
+        # (signed-bytes is the encoded POPOSigningKeyInput, not certReq).
+        # PyPKI rejects that variant — see docstring.
+        i = 0
+        if i < len(popo_inner) and (popo_inner[i] & 0xC0) == 0x80 \
+                                and (popo_inner[i] & 0x1F) == 0:
+            return False, (
+                "POPOSigningKeyInput present — RFC 4211 §4.1 case 2 "
+                "(no input) is the only accepted variant"
+            )
+
+        # algorithmIdentifier SEQUENCE
+        try:
+            if popo_inner[i] != 0x30:
+                return False, "expected AlgorithmIdentifier SEQUENCE in POPO"
+            alg_len, p_alg = cls._decode_length(popo_inner, i + 1)
+            alg_block = popo_inner[p_alg:p_alg + alg_len]
+            i = p_alg + alg_len
+
+            # First element of AlgorithmIdentifier is the OID
+            if not alg_block or alg_block[0] != 0x06:
+                return False, "AlgorithmIdentifier missing OID"
+            oid_len, oid_p = cls._decode_length(alg_block, 1)
+            oid_bytes = alg_block[oid_p:oid_p + oid_len]
+            alg_oid = cls._decode_oid(oid_bytes)
+        except Exception as e:
+            return False, f"malformed AlgorithmIdentifier: {e}"
+
+        # signature BIT STRING
+        try:
+            if popo_inner[i] != 0x03:
+                return False, "expected BIT STRING for POPO signature"
+            sig_len, p_sig = cls._decode_length(popo_inner, i + 1)
+            sig_block = popo_inner[p_sig:p_sig + sig_len]
+            if not sig_block:
+                return False, "empty signature BIT STRING"
+            unused_bits = sig_block[0]
+            if unused_bits != 0:
+                return False, f"unsupported BIT STRING unused-bits: {unused_bits}"
+            signature = bytes(sig_block[1:])
+        except Exception as e:
+            return False, f"malformed signature TLV: {e}"
+
+        # Reconstruct the public key from the SPKI bytes ([6] publicKey
+        # context tag is stripped — but cryptography expects the full
+        # SubjectPublicKeyInfo SEQUENCE. The captured fval IS the
+        # *content* of [6], which is the SPKI SEQUENCE bytes — so we
+        # need to wrap with 0x30 + length to reconstruct the SPKI TLV.)
+        spki_tlv = b"\x30" + cls._encode_length(len(spki_der)) + spki_der
+        try:
+            from cryptography.hazmat.primitives.serialization import load_der_public_key
+            pubkey = load_der_public_key(spki_tlv)
+        except Exception as e:
+            return False, f"could not load public key from SPKI: {e}"
+
+        # Verify per algorithm
+        try:
+            from cryptography.hazmat.primitives import hashes as _h
+            from cryptography.hazmat.primitives.asymmetric import (
+                padding as _pad,
+                ec as _ec,
+                ed25519 as _ed25519,
+                rsa as _rsa,
+            )
+            from cryptography.exceptions import InvalidSignature
+
+            rsa_map = {
+                cls._POPO_ALG_RSA_SHA256: _h.SHA256,
+                cls._POPO_ALG_RSA_SHA384: _h.SHA384,
+                cls._POPO_ALG_RSA_SHA512: _h.SHA512,
+            }
+            ecdsa_map = {
+                cls._POPO_ALG_ECDSA_SHA256: _h.SHA256,
+                cls._POPO_ALG_ECDSA_SHA384: _h.SHA384,
+                cls._POPO_ALG_ECDSA_SHA512: _h.SHA512,
+            }
+
+            if alg_oid in rsa_map:
+                if not isinstance(pubkey, _rsa.RSAPublicKey):
+                    return False, (
+                        f"alg OID {alg_oid} declares RSA, but key in "
+                        f"certTemplate is {type(pubkey).__name__}"
+                    )
+                pubkey.verify(
+                    signature, certreq_der,
+                    _pad.PKCS1v15(),
+                    rsa_map[alg_oid](),
+                )
+                return True, "ok"
+
+            if alg_oid in ecdsa_map:
+                if not isinstance(pubkey, _ec.EllipticCurvePublicKey):
+                    return False, (
+                        f"alg OID {alg_oid} declares ECDSA, but key in "
+                        f"certTemplate is {type(pubkey).__name__}"
+                    )
+                pubkey.verify(
+                    signature, certreq_der,
+                    _ec.ECDSA(ecdsa_map[alg_oid]()),
+                )
+                return True, "ok"
+
+            if alg_oid == cls._POPO_ALG_ED25519:
+                if not isinstance(pubkey, _ed25519.Ed25519PublicKey):
+                    return False, (
+                        f"alg OID 1.3.101.112 declares Ed25519, but key in "
+                        f"certTemplate is {type(pubkey).__name__}"
+                    )
+                pubkey.verify(signature, certreq_der)
+                return True, "ok"
+
+            return False, f"unsupported POPO signature algorithm: {alg_oid}"
+
+        except InvalidSignature:
+            return False, "POPO signature invalid (key mismatch or corruption)"
+        except Exception as e:
+            return False, f"POPO verification error: {e}"
+
+    @classmethod
+    def _decode_oid(cls, raw: bytes) -> str:
+        """Decode a DER OID body (after tag+length stripped) to dotted form."""
+        if not raw:
+            return ""
+        first = raw[0]
+        out = [str(first // 40), str(first % 40)]
+        v = 0
+        for b in raw[1:]:
+            v = (v << 7) | (b & 0x7F)
+            if not (b & 0x80):
+                out.append(str(v))
+                v = 0
+        return ".".join(out)
 
     @classmethod
     def _parse_dn(cls, data: bytes) -> Optional[str]:
@@ -518,6 +829,27 @@ class CMPv2Handler:
         self._pending_confirmations: Dict[bytes, bytes] = {}  # txid -> cert_der
         self._lock = threading.Lock()
 
+    # -----------------------------------------------------------------
+    # RFC 4210 §5.1.3 — every response carries signature protection.
+    # This shim wraps CMPv2ASN1.build_pki_message and always supplies
+    # the CA key + cert. Using it instead of the raw classmethod ensures
+    # no response leaks unprotected — strict CMP clients (EJBCA, RFC 9482
+    # Lightweight CMP Profile validators) will reject anything missing
+    # the [0] protection BIT STRING and [1] extraCerts chain.
+    #
+    # Also includes any intermediate CA certs from self.ca._parent_chain
+    # so a cold relying party can build the full chain to the root
+    # without out-of-band lookup.
+    # -----------------------------------------------------------------
+    def _protected_response(self, *args, **kwargs) -> bytes:
+        kwargs.setdefault("signer_key", self.ca.ca_key)
+        kwargs.setdefault("signer_cert", self.ca.ca_cert)
+        if "extra_certs" not in kwargs:
+            chain = getattr(self.ca, "_parent_chain", None) or []
+            if chain:
+                kwargs["extra_certs"] = chain
+        return CMPv2ASN1.build_pki_message(*args, **kwargs)
+
     def handle(self, der_data: bytes) -> bytes:
         """Main entry point. Returns DER-encoded PKIMessage response."""
         try:
@@ -566,23 +898,81 @@ class CMPv2Handler:
         resp_body_type = 1 if req_type == "ir" else 3  # ip=1, cp=3
 
         try:
-            subject_str, spki_der = CMPv2ASN1.extract_subject_and_pubkey_from_crmf(body_raw)
+            parsed = CMPv2ASN1.parse_crmf(body_raw)
+            subject_str = parsed.get("subject") or "CN=CMPv2 Client"
+            spki_der    = parsed.get("spki")
+            certreq_der = parsed.get("certreq_der")
+            popo_raw    = parsed.get("popo_raw")
+
+            # RFC 4211 §4 — Proof-of-Possession verification.
+            # Required when the requester supplied a public key. If the
+            # CSR carries no SPKI we'll generate a key server-side, and
+            # POPO is moot (the CA holds the key).
+            if spki_der and popo_raw:
+                ok, reason = CMPv2ASN1.verify_popo(certreq_der, spki_der, popo_raw)
+                if not ok:
+                    logger.warning(
+                        f"CRMF POPO verification failed: {reason} "
+                        f"(subject={subject_str!r}, txid={txid.hex()})"
+                    )
+                    audit = getattr(self, "audit_log", None)
+                    if audit:
+                        audit.record(
+                            "popo_failed",
+                            f"subject={subject_str} reason={reason}",
+                            "",
+                        )
+                    # PKIStatusInfo rejection + failInfo badPOP (bit 9)
+                    body = CMPv2ASN1.build_ip_cp_body(
+                        b"", status=2, fail_info=(1 << 9), request_id=0
+                    )
+                    return self._protected_response(
+                        resp_body_type, body, txid, os.urandom(16), snonce
+                    )
+            elif spki_der and not popo_raw:
+                # POPO is OPTIONAL on the wire but RFC 4211 §4 makes it
+                # MANDATORY when the requester holds the private key.
+                # PyPKI requires it: a CMP session with no POPO + a
+                # client-supplied key cannot prove possession. Reject
+                # with badPOP so the client knows what to fix.
+                logger.warning(
+                    f"CRMF rejected: no POPO present but SPKI supplied "
+                    f"(subject={subject_str!r}, txid={txid.hex()})"
+                )
+                audit = getattr(self, "audit_log", None)
+                if audit:
+                    audit.record(
+                        "popo_missing",
+                        f"subject={subject_str}",
+                        "",
+                    )
+                body = CMPv2ASN1.build_ip_cp_body(
+                    b"", status=2, fail_info=(1 << 9), request_id=0
+                )
+                return self._protected_response(
+                    resp_body_type, body, txid, os.urandom(16), snonce
+                )
 
             if spki_der:
-                # Parse the SubjectPublicKeyInfo to get a public key
-                pub_key = serialization.load_der_public_key(spki_der)
-                cert = self.ca.issue_certificate(subject_str or "CN=CMPv2 Client", pub_key)
+                # Parse the SubjectPublicKeyInfo to get a public key.
+                # Note: spki_der as captured by parse_crmf is the *content*
+                # of the [6] context-tagged field — the SPKI SEQUENCE bytes.
+                # cryptography's load_der_public_key wants the full TLV.
+                spki_tlv = b"\x30" + CMPv2ASN1._encode_length(len(spki_der)) + spki_der
+                pub_key = serialization.load_der_public_key(spki_tlv)
+                cert = self.ca.issue_certificate(subject_str, pub_key)
                 cert_der = cert.public_bytes(Encoding.DER)
                 private_key_pem = None
             else:
                 # No public key provided — generate one server-side
                 logger.info("No public key in request, generating key pair server-side.")
                 priv_key, cert = self.ca.generate_ephemeral_key_and_cert(
-                    subject_str or "CN=CMPv2 Client"
+                    subject_str
                 )
                 cert_der = cert.public_bytes(Encoding.DER)
+                # RFC 5958: emit PKCS#8 PrivateKeyInfo, not legacy PKCS#1.
                 private_key_pem = priv_key.private_bytes(
-                    Encoding.PEM, PrivateFormat.TraditionalOpenSSL, NoEncryption()
+                    Encoding.PEM, PrivateFormat.PKCS8, NoEncryption()
                 )
 
             # Store pending for certConf
@@ -590,7 +980,7 @@ class CMPv2Handler:
                 self._pending_confirmations[txid] = cert_der
 
             body = CMPv2ASN1.build_ip_cp_body(cert_der, status=0, request_id=0)
-            resp = CMPv2ASN1.build_pki_message(resp_body_type, body, txid, os.urandom(16), snonce)
+            resp = self._protected_response(resp_body_type, body, txid, os.urandom(16), snonce)
 
             logger.info(f"Certificate issued for '{subject_str}', serial={cert.serial_number}")
             return resp
@@ -598,7 +988,7 @@ class CMPv2Handler:
         except Exception as e:
             logger.error(f"Certificate issuance failed: {e}")
             body = CMPv2ASN1.build_ip_cp_body(b"", status=2)
-            return CMPv2ASN1.build_pki_message(resp_body_type, body, txid, os.urandom(16), snonce)
+            return self._protected_response(resp_body_type, body, txid, os.urandom(16), snonce)
 
     def _handle_p10cr(self, msg: dict, txid: bytes, snonce: bytes) -> bytes:
         """Handle PKCS#10 Certificate Request."""
@@ -615,11 +1005,11 @@ class CMPv2Handler:
                 self._pending_confirmations[txid] = cert_der
 
             body = CMPv2ASN1.build_ip_cp_body(cert_der, status=0, request_id=0)
-            return CMPv2ASN1.build_pki_message(3, body, txid, os.urandom(16), snonce)
+            return self._protected_response(3, body, txid, os.urandom(16), snonce)
         except Exception as e:
             logger.error(f"p10cr failed: {e}")
             body = CMPv2ASN1.build_error_body(2, str(e))
-            return CMPv2ASN1.build_pki_message(23, body, txid, os.urandom(16), snonce)
+            return self._protected_response(23, body, txid, os.urandom(16), snonce)
 
     def _handle_key_update(self, msg: dict, txid: bytes, snonce: bytes) -> bytes:
         """Handle Key Update Request (kur -> kup)."""
@@ -658,7 +1048,7 @@ class CMPv2Handler:
             logger.warning(f"Revocation: serial {serial} not found or already revoked")
             body = CMPv2ASN1.build_rp_body(2)
 
-        return CMPv2ASN1.build_pki_message(12, body, txid, os.urandom(16), snonce)
+        return self._protected_response(12, body, txid, os.urandom(16), snonce)
 
     def _handle_cert_confirm(self, msg: dict, txid: bytes, snonce: bytes) -> bytes:
         """Handle Certificate Confirmation (certConf -> pkiconf)."""
@@ -671,7 +1061,7 @@ class CMPv2Handler:
             logger.warning(f"CertConf for unknown txid={txid.hex()}")
 
         body = CMPv2ASN1.build_pkiconf_body()
-        return CMPv2ASN1.build_pki_message(19, body, txid, os.urandom(16), snonce)
+        return self._protected_response(19, body, txid, os.urandom(16), snonce)
 
     def _handle_genm(self, msg: dict, txid: bytes, snonce: bytes) -> bytes:
         """Handle General Message — respond with CA cert info."""
@@ -699,11 +1089,11 @@ class CMPv2Handler:
         info_value = seq(oid("1.3.6.1.5.5.7.4.2") + octet_string(ca_der))
         genp_body = seq(info_value)
 
-        return CMPv2ASN1.build_pki_message(22, genp_body, txid, os.urandom(16), snonce)
+        return self._protected_response(22, genp_body, txid, os.urandom(16), snonce)
 
     def _build_error(self, txid: bytes, snonce: bytes, recip_nonce: bytes, status: int, text: str) -> bytes:
         body = CMPv2ASN1.build_error_body(status, text)
-        return CMPv2ASN1.build_pki_message(23, body, txid, os.urandom(16), snonce)
+        return self._protected_response(23, body, txid, os.urandom(16), snonce)
 
 
 # ---------------------------------------------------------------------------
@@ -788,7 +1178,7 @@ class CMPv3Handler(CMPv2Handler):
                 # RFC 9480: client may send error — acknowledge it
                 logger.warning(f"Client sent error message txid={txid.hex()}")
                 body = CMPv2ASN1.build_pkiconf_body()
-                resp = CMPv2ASN1.build_pki_message(
+                resp = self._protected_response(
                     19, body, txid, os.urandom(16), snonce, pvno=response_pvno
                 )
             else:
@@ -824,7 +1214,7 @@ class CMPv3Handler(CMPv2Handler):
         def _build_genp(info_value_der: bytes) -> bytes:
             def seq(c): return b"\x30" + CMPv2ASN1._encode_length(len(c)) + c
             genp_body = seq(info_value_der)
-            return CMPv2ASN1.build_pki_message(
+            return self._protected_response(
                 22, genp_body, txid, os.urandom(16), snonce, pvno=pvno
             )
 
@@ -1001,7 +1391,7 @@ class CMPv3Handler(CMPv2Handler):
         )
         poll_rep_body = _seq(poll_entry)
         logger.info(f"pollReq: txid={txid.hex()!r} — still waiting, checkAfter={check_after}s")
-        return CMPv2ASN1.build_pki_message(
+        return self._protected_response(
             26, poll_rep_body, txid, os.urandom(16), snonce, pvno=pvno
         )
 
@@ -1010,7 +1400,7 @@ class CMPv3Handler(CMPv2Handler):
         status: int, text: str, pvno: int
     ) -> bytes:
         body = CMPv2ASN1.build_error_body(status, text)
-        return CMPv2ASN1.build_pki_message(
+        return self._protected_response(
             23, body, txid, os.urandom(16), snonce, pvno=pvno
         )
 
@@ -1064,8 +1454,9 @@ class CMPv2HTTPHandler(http.server.BaseHTTPRequestHandler):
                     cn=cn, validity_days=validity_days, audit=self.audit_log
                 )
                 cert_pem = cert.public_bytes(Encoding.PEM).decode()
+                # RFC 5958: emit PKCS#8 PrivateKeyInfo, not legacy PKCS#1.
                 key_pem = key.private_bytes(Encoding.PEM,
-                                            PrivateFormat.TraditionalOpenSSL,
+                                            PrivateFormat.PKCS8,
                                             NoEncryption()).decode()
                 if self.audit_log:
                     self.audit_log.record("issue_sub_ca",
@@ -1168,7 +1559,8 @@ class CMPv2HTTPHandler(http.server.BaseHTTPRequestHandler):
                     "serial": cert.serial_number,
                     "subject": cert.subject.rfc4514_string(),
                     "cert_pem": cert.public_bytes(Encoding.PEM).decode(),
-                    "key_pem": priv_key.private_bytes(Encoding.PEM, PrivateFormat.TraditionalOpenSSL, NoEncryption()).decode(),
+                    # RFC 5958: emit PKCS#8 PrivateKeyInfo, not legacy PKCS#1.
+                    "key_pem": priv_key.private_bytes(Encoding.PEM, PrivateFormat.PKCS8, NoEncryption()).decode(),
                 })
             except Exception as e:
                 self._send_json({"error": str(e)}, 500)
@@ -1191,8 +1583,9 @@ class CMPv2HTTPHandler(http.server.BaseHTTPRequestHandler):
                 else:
                     priv = rsa.generate_private_key(public_exponent=65537, key_size=2048)
                     pub_key = priv.public_key()
+                    # RFC 5958: emit PKCS#8 PrivateKeyInfo, not legacy PKCS#1.
                     priv_key_pem = priv.private_bytes(
-                        Encoding.PEM, PrivateFormat.TraditionalOpenSSL, NoEncryption()
+                        Encoding.PEM, PrivateFormat.PKCS8, NoEncryption()
                     ).decode()
 
                 kwargs = {

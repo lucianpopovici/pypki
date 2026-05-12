@@ -87,6 +87,14 @@ A self-contained, production-grade private Certificate Authority with support fo
 | Well-known URI | `POST/GET /.well-known/cmp[/p/<label>]` (RFC 9811) |
 | Client error ack | Server acknowledges client `error` messages with `pkiconf` |
 
+**Security profile**
+
+| Mechanism | RFC | Description |
+|---|---|---|
+| Response signature protection | RFC 4210 §5.1.3 | Every CMPv2/v3 response carries a `[0] PKIProtection` BIT STRING signed by the CA over the `ProtectedPart` (header ‖ body), plus the full `[1] extraCerts` chain. Algorithm: `sha256WithRSAEncryption`. |
+| CRMF Proof-of-Possession | RFC 4211 §4.1 case 2 | `POPOSigningKey` signature verified before issuance. The signed bytes are the `CertRequest` DER; the algorithm OID is taken from the POPO itself and cross-checked against the public key type, defeating algorithm-substitution. Supports RSA-PKCS1v15 (SHA-256/384/512), ECDSA (SHA-256/384/512), Ed25519. `raVerified` / `POPOSigningKeyInput` variants are explicitly rejected; failure returns `badPOP` (RFC 4210 §3.1.4) and audit-logs the event. |
+| PKCS#8 private-key output | RFC 5958 | `ir`/`cr`/`kur` responses carrying a server-generated key encode it as `PrivateKeyInfo` (PKCS#8), not legacy `RSAPrivateKey`/`ECPrivateKey`. |
+
 ### ACME Protocol (RFC 8555)
 | Challenge type | Description |
 |---|---|
@@ -605,6 +613,12 @@ python pki_server.py --port 8080 --ocsp-port 8082 \
 |---|---|---|
 | `POST` | `/ocsp` | RFC 6960 HTTP POST binding |
 | `GET` | `/ocsp/<base64-req>` | RFC 5019 GET binding (CDN-cacheable) |
+
+### Nonce handling (RFC 8954)
+
+The nonce extension is profiled to a 1–32 byte OCTET STRING per RFC 8954 §2.1. Requests carrying a nonce outside that range are rejected with `malformedRequest` (status 1) at parse time. Valid nonces are echoed verbatim in the signed response per RFC 6960 §4.4.1.
+
+`--ocsp-require-nonce` enables strict mode: nonceless requests are rejected with `unauthorized` (status 6). Useful against MITM replay of cached responses. Off by default to match the RFC 6960 default.
 
 ### Testing with OpenSSL
 
@@ -1640,7 +1654,7 @@ openssl x509 -in short-lived.crt -text -noout | grep -A2 "2.5.29.56"
 
 | RFC | Title | Status |
 |---|---|---|
-| **RFC 6818** | General Clarifications to RFC 5280 | ✅ `explicitText` uses UTF8String; self-signed root exempt from AKI |
+| **RFC 6818** | General Clarifications to RFC 5280 | ✅ Full — `explicitText` uses UTF8String; self-signed root exempt from AKI; CRLs carry mandatory `cRLNumber` (§5.2.3) and `authorityKeyIdentifier` (§5.2.1) extensions across base, DER, and delta CRL builders |
 | **RFC 9608** | No Revocation Available Extension | ✅ Full §4 compliance (see above) |
 | **RFC 8398 / RFC 9598** | Internationalized Email Addresses | ✅ ASCII-local + IDN host → `rfc822Name` (A-label); non-ASCII local → `SmtpUTF8Mailbox` `otherName` (OID `1.3.6.1.5.5.7.8.9`) |
 | **RFC 8399 / RFC 9549** | IDN in DNS SANs and Subject DN | ✅ U-labels auto-converted to A-labels in `dNSName` and `domainComponent`; wildcards preserved |
@@ -1684,9 +1698,12 @@ Every issued certificate includes:
 | RFC 7301 | TLS ALPN Extension | ✅ Full |
 | RFC 6960 | OCSP — Online Certificate Status Protocol | ✅ Full |
 | RFC 5019 | Lightweight OCSP Profile (GET binding) | ✅ Full |
+| RFC 8954 | OCSP Nonce Extension Update | ✅ Full — 1–32 byte bounds enforced at parse time; `--ocsp-require-nonce` strict mode |
 | RFC 7292 | PKCS#12 — Personal Information Exchange | ✅ Export only |
+| RFC 5958 | Asymmetric Key Package (PKCS#8) | ✅ Full — CMP `ir`/`cr`/`kur` private-key responses and Web UI sub-CA export emit PKCS#8 `PrivateKeyInfo` |
+| RFC 7468 | Textual Encodings of PKIX Structures | ✅ Full — strict PEM parser for chain/CRL/PKCS#7 imports rejects lowercase markers, label mismatch, trailing data, invalid base64, and unknown labels |
 | RFC 9608 | No Revocation Available Extension | ✅ Full |
-| RFC 6818 | General Clarifications to RFC 5280 | ✅ Applicable provisions |
+| RFC 6818 | General Clarifications to RFC 5280 | ✅ Full — `explicitText` UTF8String; CRL `cRLNumber` + `authorityKeyIdentifier` mandatory extensions (§5.2.1, §5.2.3) |
 | RFC 8399/9549 | IDN in DNS SANs, domainComponent | ✅ Full IDNA U-label → A-label |
 | RFC 8398/9598 | Internationalized email addresses | ✅ `rfc822Name` A-label + `SmtpUTF8Mailbox` |
 | RFC 7638 | JWK Thumbprint | ✅ Full |

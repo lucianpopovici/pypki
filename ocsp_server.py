@@ -228,6 +228,7 @@ class OCSPRequestParser:
 
             # requestExtensions [2] — look for nonce
             result["nonce"] = None
+            result["nonce_length_violation"] = False  # RFC 8954 enforcement signal
             if tbs_pos < len(tbs_val) and tbs_val[tbs_pos] == 0xA2:
                 _, ext_seq, _ = _dec_tlv(tbs_val, tbs_pos)
                 tag2, exts_val, _ = _dec_tlv(ext_seq, 0)
@@ -240,7 +241,15 @@ class OCSPRequestParser:
                         oid_str = _decode_oid_bytes(oid_val)
                         if oid_str == OID_OCSP_NONCE:
                             _, nonce_oct, _ = _dec_tlv(ext_val, einner)
-                            _, result["nonce"], _ = _dec_tlv(nonce_oct, 0)
+                            _, nonce_value, _ = _dec_tlv(nonce_oct, 0)
+                            # RFC 8954 §2.1: the Nonce extension value MUST
+                            # be at minimum 1 byte and at maximum 32 bytes.
+                            # An out-of-bounds nonce is a malformed request.
+                            if not (1 <= len(nonce_value) <= 32):
+                                result["nonce_length_violation"] = True
+                                result["nonce"] = nonce_value  # keep for logging
+                            else:
+                                result["nonce"] = nonce_value
                     except Exception:
                         pass
 
@@ -522,6 +531,7 @@ class OCSPHandler(http.server.BaseHTTPRequestHandler):
     ocsp_cert: x509.Certificate = None
     cache: OCSPResponseCache = None
     cache_max_age: int = 300   # seconds for Cache-Control header
+    require_nonce: bool = False  # RFC 8954 strict-mode toggle (--ocsp-require-nonce)
 
     def log_message(self, fmt, *args):
         logger.debug(f"OCSP {self.client_address[0]} - {fmt % args}")
@@ -558,8 +568,26 @@ class OCSPHandler(http.server.BaseHTTPRequestHandler):
         if parsed is None:
             return OCSPResponseBuilder.error(RESP_MALFORMED_REQUEST)
 
+        # RFC 8954 §2.1 enforcement: a nonce extension whose value is not
+        # 1..32 bytes MUST cause the request to be treated as malformed.
+        if parsed.get("nonce_length_violation"):
+            bad_len = len(parsed.get("nonce") or b"")
+            logger.info(
+                f"OCSP nonce length violation: {bad_len} bytes "
+                f"(RFC 8954 §2.1 requires 1..32)"
+            )
+            return OCSPResponseBuilder.error(RESP_MALFORMED_REQUEST)
+
         serial = parsed["serial"]
         nonce  = parsed.get("nonce")
+
+        # RFC 8954 strict-mode: reject nonceless requests with `unauthorized`
+        # so a man-in-the-middle cannot replay cached responses.
+        if self.require_nonce and nonce is None:
+            logger.info(
+                "OCSP request rejected: nonce required by --ocsp-require-nonce"
+            )
+            return OCSPResponseBuilder.error(RESP_UNAUTHORIZED)
 
         # Check cache (only for GET / no nonce — nonce responses can't be cached)
         if cacheable and nonce is None:
@@ -643,11 +671,16 @@ def start_ocsp_server(
     prefix: str,
     ca: "CertificateAuthority",
     cache_seconds: int = 300,
+    require_nonce: bool = False,
 ):
     """
     Register the OCSP handler with *route_table* under *prefix*.
 
     Returns a _RouteProxy whose .shutdown() unregisters the OCSP routes.
+
+    ``require_nonce`` enables RFC 8954 strict mode: requests without a
+    nonce extension are rejected with status 'unauthorized'. Default is
+    off, matching RFC 6960 default behavior.
     """
     from dispatcher_server import _RouteProxy
 
@@ -662,9 +695,13 @@ def start_ocsp_server(
     BoundOCSPHandler.ocsp_cert = ocsp_cert
     BoundOCSPHandler.cache = cache
     BoundOCSPHandler.cache_max_age = cache_seconds
+    BoundOCSPHandler.require_nonce = require_nonce
 
     route_table.register(prefix, BoundOCSPHandler)
-    logger.info(f"OCSP handler registered at prefix {prefix!r}")
+    logger.info(
+        f"OCSP handler registered at prefix {prefix!r} "
+        f"(require_nonce={require_nonce})"
+    )
     return _RouteProxy(route_table, prefix, label="ocsp")
 
 

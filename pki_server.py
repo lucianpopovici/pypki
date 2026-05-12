@@ -382,6 +382,141 @@ def _build_policy_information(policy_oid: str,
     )
 
 
+# ---------------------------------------------------------------------------
+# RFC 7468 — Textual Encodings of PKIX, PKCS, and CMS Structures
+# ---------------------------------------------------------------------------
+
+# Labels we accept from external PEM bundles (chain imports, PKCS#7 imports,
+# CRL imports). Anything outside this set fails fast.
+_RFC7468_DEFAULT_LABELS = frozenset({"CERTIFICATE", "X509 CRL", "PKCS7"})
+
+_RFC7468_BEGIN_RE = re.compile(r"-----BEGIN ([A-Z][A-Z0-9 ]*)-----")
+# Case-insensitive scan over every marker-looking sequence; any keyword
+# that is not exactly "BEGIN"/"END" or any label that is not uppercase
+# fails the strict-case check.
+_RFC7468_ANY_MARKER_RE = re.compile(
+    r"-----(BEGIN|END)\s+([A-Za-z0-9 ]+?)-----", re.IGNORECASE,
+)
+_RFC7468_B64_BODY_RE = re.compile(r"[A-Za-z0-9+/]+={0,2}")
+
+
+def _parse_pem_bundle(
+    data,
+    allowed_labels=None,
+):
+    """
+    Tokenize a PEM bundle into ``[(label, der_bytes), ...]`` per RFC 7468.
+
+    Strict mode — fails on any deviation from RFC 7468 §3:
+
+      * Boundary markers must be uppercase ASCII (``-----BEGIN <LABEL>-----``,
+        ``-----END <LABEL>-----``). Lowercase or mixed-case is rejected.
+      * The BEGIN label must equal the matching END label.
+      * Only whitespace is permitted outside encapsulation boundaries
+        (no explanatory text between or after blocks).
+      * The base64 body must use the standard alphabet (``A–Za–z0–9+/`` with
+        at most two trailing ``=`` padding chars) and must decode cleanly.
+
+    Both canonical (64-column wrapped) and unwrapped base64 are accepted —
+    RFC 7468 §3 explicitly permits either as long as the alphabet is valid.
+
+    Args:
+      data: PEM bundle as ``bytes`` or ``str``.
+      allowed_labels: optional iterable of permitted labels. When supplied,
+        any block whose label is not in the set raises ``ValueError``.
+        Defaults to ``None`` (any well-formed label is accepted). For chain
+        and CRL imports, pass ``_RFC7468_DEFAULT_LABELS``.
+
+    Returns:
+      List of ``(label, der_bytes)`` tuples in file order.
+
+    Raises:
+      ValueError: on any framing, alphabet, or label deviation.
+    """
+    if isinstance(data, bytes):
+        try:
+            text = data.decode("ascii")
+        except UnicodeDecodeError as exc:
+            raise ValueError(
+                f"RFC 7468: PEM data contains non-ASCII bytes ({exc})"
+            ) from exc
+    else:
+        text = data
+
+    for m in _RFC7468_ANY_MARKER_RE.finditer(text):
+        keyword = m.group(1)
+        label = m.group(2)
+        if keyword not in ("BEGIN", "END") or label != label.upper():
+            raise ValueError(
+                "RFC 7468: PEM boundary markers must be uppercase "
+                f"(saw '-----{keyword} {label}-----')"
+            )
+
+    allowed = frozenset(allowed_labels) if allowed_labels is not None else None
+
+    pos = 0
+    blocks = []
+    while True:
+        m = _RFC7468_BEGIN_RE.search(text, pos)
+        if m is None:
+            tail = text[pos:]
+            if tail.strip():
+                raise ValueError(
+                    "RFC 7468: trailing non-whitespace data after PEM blocks: "
+                    f"{tail.strip()[:60]!r}"
+                )
+            return blocks
+
+        between = text[pos:m.start()]
+        if between.strip():
+            raise ValueError(
+                "RFC 7468: non-whitespace text outside PEM blocks: "
+                f"{between.strip()[:60]!r}"
+            )
+
+        label = m.group(1)
+        end_marker = f"-----END {label}-----"
+        end_idx = text.find(end_marker, m.end())
+        if end_idx < 0:
+            # If an END marker for a different label appears before the
+            # matching one, that's a label mismatch — surface it cleanly.
+            stray = re.search(r"-----END ([A-Z][A-Z0-9 ]*)-----", text[m.end():])
+            if stray is not None:
+                raise ValueError(
+                    f"RFC 7468: label mismatch — BEGIN {label!r} "
+                    f"vs END {stray.group(1)!r}"
+                )
+            raise ValueError(
+                f"RFC 7468: missing matching END marker for label {label!r}"
+            )
+
+        body = text[m.end():end_idx]
+        b64 = "".join(body.split())
+        if not b64:
+            raise ValueError(
+                f"RFC 7468: empty body in PEM block {label!r}"
+            )
+        if not _RFC7468_B64_BODY_RE.fullmatch(b64):
+            raise ValueError(
+                f"RFC 7468: invalid base64 alphabet in PEM block {label!r}"
+            )
+        try:
+            der = base64.b64decode(b64, validate=True)
+        except Exception as exc:
+            raise ValueError(
+                f"RFC 7468: base64 decode failed for label {label!r}: {exc}"
+            ) from exc
+
+        if allowed is not None and label not in allowed:
+            raise ValueError(
+                f"RFC 7468: PEM label {label!r} is not permitted here "
+                f"(allowed: {sorted(allowed)!r})"
+            )
+
+        blocks.append((label, der))
+        pos = end_idx + len(end_marker)
+
+
 class ServerConfig:
     """
     Thread-safe, hot-reloadable server configuration.
@@ -817,6 +952,28 @@ class CertificateAuthority:
         conn.commit()
         conn.close()
 
+        # Apply pending pki-namespace migrations (versioned schema files
+        # under db_migrations/pki/). The 001 file is a no-op against an
+        # existing DB because all CREATE TABLEs use IF NOT EXISTS;
+        # subsequent migrations (e.g. 002_crl_number.sql for RFC 5280
+        # §5.2.3 compliance) are applied here.
+        try:
+            from db import make_db
+            from migrations import MigrationRunner
+            mig_root = os.environ.get(
+                "PYPKI_MIGRATIONS_ROOT",
+                str(Path(__file__).resolve().parent / "db_migrations"),
+            )
+            mig_dir = Path(mig_root) / "pki"
+            if mig_dir.is_dir():
+                d = make_db(f"sqlite:///{self.db_path}")
+                try:
+                    MigrationRunner(d, mig_dir, namespace="pki").apply_pending()
+                finally:
+                    d.close()
+        except Exception as e:
+            logger.warning(f"pki-namespace migrations skipped: {e}")
+
     def _next_serial(self) -> int:
         conn = sqlite3.connect(str(self.db_path))
         try:
@@ -825,6 +982,50 @@ class CertificateAuthority:
             conn.execute("UPDATE serial_counter SET value=? WHERE id=1", (serial + 1,))
             conn.commit()
             return serial
+        finally:
+            conn.close()
+
+    def _next_crl_number(self) -> int:
+        """
+        Atomically allocate the next CRL number (RFC 5280 §5.2.3).
+
+        Both base and delta CRLs share this counter. BEGIN IMMEDIATE
+        acquires the database write lock for the duration of the
+        increment, preventing concurrent CRL generation from assigning
+        the same number twice. Falls back to 1 if the table is missing
+        (e.g., migration not yet applied — defensive behavior).
+        """
+        conn = sqlite3.connect(str(self.db_path))
+        try:
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                row = conn.execute(
+                    "SELECT value FROM crl_number WHERE id=1"
+                ).fetchone()
+                if row is None:
+                    # Migration not applied; seed defensively.
+                    conn.execute(
+                        "INSERT OR IGNORE INTO crl_number(id, value) VALUES (1, 0)"
+                    )
+                    current = 0
+                else:
+                    current = row[0]
+                next_num = current + 1
+                conn.execute(
+                    "UPDATE crl_number SET value=? WHERE id=1", (next_num,)
+                )
+                conn.commit()
+                return next_num
+            except sqlite3.OperationalError as e:
+                # Table doesn't exist (very old DB without migration).
+                # Without persistence, the best we can do is return 1
+                # and log loudly so the operator notices.
+                logger.warning(
+                    f"crl_number table missing; CRL will use number 1 "
+                    f"(reapply migrations to fix): {e}"
+                )
+                conn.rollback()
+                return 1
         finally:
             conn.close()
 
@@ -925,19 +1126,21 @@ class CertificateAuthority:
             )
 
         pem_data = candidate.read_bytes()
-        # Parse all PEM blocks in the file
-        import re as _re
-        pem_blocks = _re.findall(
-            rb"-----BEGIN CERTIFICATE-----.*?-----END CERTIFICATE-----",
-            pem_data, _re.DOTALL,
-        )
-        if not pem_blocks:
+        # RFC 7468 strict parse — chain files may carry only CERTIFICATE blocks.
+        try:
+            blocks = _parse_pem_bundle(pem_data, allowed_labels={"CERTIFICATE"})
+        except ValueError as exc:
+            raise ValueError(
+                f"parent_chain_path '{candidate}': {exc}"
+            ) from exc
+
+        if not blocks:
             raise ValueError(
                 f"parent_chain_path '{candidate}' contains no PEM certificates."
             )
 
-        for block in pem_blocks:
-            cert = x509.load_pem_x509_certificate(block)
+        for _label, der in blocks:
+            cert = x509.load_der_x509_certificate(der)
             self._parent_chain.append(cert)
 
         # Validate: the first cert in the chain must have signed ca.crt
@@ -1266,8 +1469,14 @@ class CertificateAuthority:
             )
 
         # CertificatePolicies (RFC 5280 §4.2.1.4 / RFC 6818 §3)
-        # certificate_policies parameter OR profile default
-        pol_list = certificate_policies or prof.get("certificate_policies")
+        # certificate_policies parameter OR profile default OR deployment-wide
+        # default (set via --cps-uri / --cps-policy-oid on the command line,
+        # or via 'certificate_policies_default' in config.json).
+        pol_list = (
+            certificate_policies
+            or prof.get("certificate_policies")
+            or (self.config.get("certificate_policies_default") if self.config else None)
+        )
         if pol_list:
             policy_infos = []
             for pol in pol_list:
@@ -1349,18 +1558,36 @@ class CertificateAuthority:
             conn.close()
 
     def generate_crl(self) -> bytes:
-        """Generate a DER-encoded CRL."""
+        """
+        Generate a DER-encoded CRL.
+
+        Per RFC 5280 §5.2.1 + §5.2.3 / RFC 6818, the CRL carries:
+          - cRLNumber                 (monotonically increasing serial)
+          - authorityKeyIdentifier    (matches the CA cert's SKI)
+        Both are non-critical.
+        """
         conn = sqlite3.connect(str(self.db_path))
         revoked = conn.execute(
             "SELECT serial, revoked_at, reason FROM certificates WHERE revoked=1"
         ).fetchall()
         conn.close()
 
+        crl_number = self._next_crl_number()
+
         builder = (
             x509.CertificateRevocationListBuilder()
             .issuer_name(self.ca_cert.subject)
             .last_update(datetime.datetime.now(datetime.timezone.utc))
             .next_update(datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(days=1))
+            # RFC 5280 §5.2.3 — cRLNumber MUST be present.
+            .add_extension(x509.CRLNumber(crl_number), critical=False)
+            # RFC 5280 §5.2.1 — authorityKeyIdentifier MUST be present.
+            .add_extension(
+                x509.AuthorityKeyIdentifier.from_issuer_public_key(
+                    self.ca_cert.public_key()
+                ),
+                critical=False,
+            )
         )
 
         for serial, revoked_at, reason in revoked:
@@ -1725,13 +1952,26 @@ class CertificateAuthority:
             conn.close()
 
     def generate_crl_der(self) -> bytes:
-        """Generate and return the current CRL in DER format."""
+        """
+        Generate and return the current CRL in DER format.
+
+        Per RFC 5280 §5.2.1 + §5.2.3 / RFC 6818 the CRL carries cRLNumber
+        and authorityKeyIdentifier extensions.
+        """
+        crl_number = self._next_crl_number()
         # Build a real CRL from the revoked serials in the DB
         builder = (
             x509.CertificateRevocationListBuilder()
             .issuer_name(self.ca_cert.subject)
             .last_update(datetime.datetime.now(datetime.timezone.utc))
             .next_update(datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(days=7))
+            .add_extension(x509.CRLNumber(crl_number), critical=False)
+            .add_extension(
+                x509.AuthorityKeyIdentifier.from_issuer_public_key(
+                    self.ca_cert.public_key()
+                ),
+                critical=False,
+            )
         )
         conn = sqlite3.connect(str(self.db_path))
         conn.row_factory = sqlite3.Row
@@ -1744,7 +1984,11 @@ class CertificateAuthority:
                     x509.RevokedCertificateBuilder()
                     .serial_number(row["serial"])
                     .revocation_date(
-                        datetime.datetime.fromtimestamp(row["revoked_at"], tz=datetime.timezone.utc)
+                        # NB: revoked_at is ISO-8601 TEXT (see revoke_certificate()),
+                        # not a unix timestamp. Pre-existing bug surfaced by RFC
+                        # 6818 test work — fromisoformat matches generate_crl()
+                        # which used the same column correctly.
+                        datetime.datetime.fromisoformat(row["revoked_at"])
                         if row["revoked_at"]
                         else datetime.datetime.now(datetime.timezone.utc)
                     )
@@ -1847,13 +2091,25 @@ class CertificateAuthority:
 
         now = datetime.datetime.now(datetime.timezone.utc)
         next_update = now + datetime.timedelta(hours=6)
+        crl_number = self._next_crl_number()
 
         builder = (
             x509.CertificateRevocationListBuilder()
             .issuer_name(self.ca_cert.subject)
             .last_update(now)
             .next_update(next_update)
-            # Delta CRL indicator extension (id-ce-deltaCRLIndicator)
+            # RFC 5280 §5.2.3 — cRLNumber. For a delta CRL this MUST be
+            # greater than the cRLNumber of the base CRL it supplements;
+            # the monotonic counter trivially satisfies that.
+            .add_extension(x509.CRLNumber(crl_number), critical=False)
+            # RFC 5280 §5.2.1 — authorityKeyIdentifier.
+            .add_extension(
+                x509.AuthorityKeyIdentifier.from_issuer_public_key(
+                    self.ca_cert.public_key()
+                ),
+                critical=False,
+            )
+            # RFC 5280 §5.2.4 — deltaCRLIndicator points at the base.
             .add_extension(
                 x509.DeltaCRLIndicator(base_crl_number), critical=True
             )
@@ -2798,6 +3054,28 @@ def main():
     )
     parser.add_argument("--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"])
     parser.add_argument(
+        "--cps-uri", default=None, metavar="URL",
+        help=(
+            "URL where this CA's Certification Practice Statement is "
+            "published. When set, every issued certificate gets a "
+            "CertificatePolicies extension carrying this URI as a "
+            "CPS qualifier (RFC 5280 §4.2.1.4 / id-qt-cps). PyPKI "
+            "ships a CPS template at docs/CPS.md — host that on a "
+            "URL of your choosing and point this flag at it. "
+            "Default: omit the CertificatePolicies extension entirely."
+        ),
+    )
+    parser.add_argument(
+        "--cps-policy-oid", default=None, metavar="OID",
+        help=(
+            "Policy OID asserted by issued certificates' "
+            "CertificatePolicies extension. Required if --cps-uri is "
+            "set. Use a sub-arc of your IANA Private Enterprise Number "
+            "(e.g. 1.3.6.1.4.1.<PEN>.1.1). Free PEN registration: "
+            "https://pen.iana.org/pen/PenApplication.page"
+        ),
+    )
+    parser.add_argument(
         "--parent-cert", default=None, metavar="PATH",
         help=(
             "PEM file containing the certificate(s) that signed ca.crt, enabling "
@@ -2931,6 +3209,13 @@ def main():
     infra_group.add_argument(
         "--ocsp-cache-seconds", type=int, default=300,
         help="OCSP response cache TTL in seconds (default: 300)"
+    )
+    infra_group.add_argument(
+        "--ocsp-require-nonce", action="store_true", default=False,
+        help="RFC 8954 strict mode: reject OCSP requests that lack a "
+             "nonce extension with status 'unauthorized'. Prevents replay "
+             "of cached responses by a man-in-the-middle. Default: off "
+             "(nonceless requests are accepted, matching RFC 6960 default)."
     )
 
     ops_group = parser.add_argument_group("Operational options")
@@ -3081,6 +3366,22 @@ def main():
     if args.tls_server_days:  cli_validity["tls_server_days"]  = args.tls_server_days
     if args.ca_days:          cli_validity["ca_days"]          = args.ca_days
     cli_overrides = {"validity": cli_validity} if cli_validity else {}
+
+    # CPS / certificate policy wiring (RFC 5280 §4.2.1.4):
+    # When the operator sets --cps-uri, every issued cert carries a
+    # CertificatePolicies extension with that URI as a CPS qualifier.
+    # Requires a paired --cps-policy-oid so the policy actually has an
+    # identifier — the URI alone is just a qualifier.
+    if getattr(args, "cps_uri", None):
+        if not getattr(args, "cps_policy_oid", None):
+            raise SystemExit(
+                "--cps-uri requires --cps-policy-oid (the policy needs an "
+                "identifier — the URI is just a qualifier per RFC 5280 §4.2.1.4)"
+            )
+        cli_overrides.setdefault("certificate_policies_default", []).append({
+            "oid":     args.cps_policy_oid,
+            "cps_uri": args.cps_uri,
+        })
 
     ca_dir = Path(args.ca_dir)
     ca_dir.mkdir(parents=True, exist_ok=True)
@@ -3295,6 +3596,7 @@ def main():
                 prefix=args.ocsp_prefix,
                 ca=ca,
                 cache_seconds=getattr(args, "ocsp_cache_seconds", 300),
+                require_nonce=getattr(args, "ocsp_require_nonce", False),
             )
 
     # Start IPsec PKI server if requested (RFC 4945 / RFC 4806 / RFC 4809)

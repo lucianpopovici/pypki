@@ -266,18 +266,27 @@ class TestPyPKIInitialMigrations(unittest.TestCase):
             self.ca_dir, migrations_root=migrations_root
         )
 
-        # Every namespace should have applied 001_initial.sql
-        for ns in ("pki", "audit", "acme", "scep"):
+        # Every namespace should have applied at least 001_initial.sql.
+        # The pki namespace additionally applies 002_crl_number.sql for
+        # RFC 5280 §5.2.3 / RFC 6818 cRLNumber compliance.
+        EXPECTED_APPLIED = {
+            "pki":   ["001_initial.sql", "002_crl_number.sql"],
+            "audit": ["001_initial.sql"],
+            "acme":  ["001_initial.sql"],
+            "scep":  ["001_initial.sql"],
+        }
+        for ns, expected in EXPECTED_APPLIED.items():
             self.assertEqual(
-                results[ns], ["001_initial.sql"],
-                f"namespace {ns} did not apply 001_initial.sql"
+                results[ns], expected,
+                f"namespace {ns} migration list mismatch"
             )
 
         # Verify the expected tables exist in each DB
         EXPECTED = {
-            "pki.db":   {"certificates", "serial_counter", "crl_base",
-                         "key_archive", "ipsec_pending_requests",
-                         "ipsec_cert_confirmations", "schema_migrations"},
+            "certificates.db":   {"certificates", "serial_counter", "crl_base",
+                                  "crl_number", "key_archive",
+                                  "ipsec_pending_requests",
+                                  "ipsec_cert_confirmations", "schema_migrations"},
             "audit.db": {"audit", "schema_migrations"},
             "acme.db":  {"nonces", "accounts", "orders", "authorizations",
                          "challenges", "certificates", "schema_migrations"},
@@ -303,7 +312,7 @@ class TestPyPKIInitialMigrations(unittest.TestCase):
         migrations_root = repo_root / "db_migrations"
         migrations.apply_all(self.ca_dir, migrations_root=migrations_root)
 
-        d = db.make_db(f"sqlite:///{self.ca_dir / 'pki.db'}")
+        d = db.make_db(f"sqlite:///{self.ca_dir / 'certificates.db'}")
         try:
             row = d.fetchone(
                 "SELECT value FROM serial_counter WHERE id = 1"
@@ -317,9 +326,13 @@ class TestPyPKIInitialMigrations(unittest.TestCase):
         migrations_root = repo_root / "db_migrations"
         first = migrations.apply_all(self.ca_dir, migrations_root=migrations_root)
         second = migrations.apply_all(self.ca_dir, migrations_root=migrations_root)
+        # Counts: pki has 001 + 002 (2 files), others have just 001.
+        self.assertEqual(len(first["pki"]),   2)
+        self.assertEqual(len(first["audit"]), 1)
+        self.assertEqual(len(first["acme"]),  1)
+        self.assertEqual(len(first["scep"]),  1)
         for ns in ("pki", "audit", "acme", "scep"):
-            self.assertEqual(len(first[ns]), 1)
-            self.assertEqual(second[ns], [])  # nothing pending
+            self.assertEqual(second[ns], [], f"{ns}: nothing should be pending")
 
 
 if __name__ == "__main__":

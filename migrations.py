@@ -258,10 +258,10 @@ class MigrationRunner:
 
 # Default mapping: (namespace, default-relative-filename, migrations subdir)
 PYPKI_NAMESPACES: List[Tuple[str, str, str]] = [
-    ("pki",   "pki.db",   "db_migrations/pki"),
-    ("audit", "audit.db", "db_migrations/audit"),
-    ("acme",  "acme.db",  "db_migrations/acme"),
-    ("scep",  "scep.db",  "db_migrations/scep"),
+    ("pki",   "certificates.db", "db_migrations/pki"),
+    ("audit", "audit.db",        "db_migrations/audit"),
+    ("acme",  "acme.db",         "db_migrations/acme"),
+    ("scep",  "scep.db",         "db_migrations/scep"),
 ]
 
 

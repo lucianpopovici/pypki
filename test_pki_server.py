@@ -1549,6 +1549,1076 @@ class TestCMPMessageStructure(unittest.TestCase):
 
 
 # ===========================================================================
+# 15a. RFC 4210 §5.1.3 — CMP response signature protection
+# ===========================================================================
+
+class TestRFC4210Protection(unittest.TestCase):
+    """
+    RFC 4210 §5.1.3: every PKIMessage carries a [0] PKIProtection
+    BIT STRING signature over ProtectedPart = SEQUENCE { header, body }.
+    [1] extraCerts carries the signer's chain so the relying party can
+    build a trust path without out-of-band lookup.
+
+    These tests exercise the builder directly with a real CA key + cert
+    rather than going through HTTP — much faster, much easier to assert
+    on the resulting DER.
+    """
+
+    def setUp(self):
+        self._tmp = tempfile.mkdtemp(prefix="rfc4210-")
+        self.ca = _make_ca(self._tmp)
+        self.signer_key = self.ca.ca_key
+        self.signer_cert = self.ca.ca_cert
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self._tmp, ignore_errors=True)
+
+    def _build(self, **kw):
+        """Build a small genp-like response with the given kwargs."""
+        from cmp_server import CMPv2ASN1
+        body = CMPv2ASN1.build_pkiconf_body() if hasattr(CMPv2ASN1, "build_pkiconf_body") \
+               else b"\x05\x00"
+        return CMPv2ASN1.build_pki_message(
+            19, body,
+            transaction_id=b"\xaa" * 16,
+            sender_nonce=b"\xbb" * 16,
+            **kw,
+        )
+
+    # ---- DER-walk helpers ---- #
+
+    @staticmethod
+    def _read_tlv(buf, pos):
+        """Return (tag, body_start, body_end). Decoder for our short forms."""
+        tag = buf[pos]
+        length = buf[pos + 1]
+        if length & 0x80:
+            n = length & 0x7F
+            length = int.from_bytes(buf[pos + 2:pos + 2 + n], "big")
+            body_start = pos + 2 + n
+        else:
+            body_start = pos + 2
+        body_end = body_start + length
+        return tag, body_start, body_end
+
+    def _walk_pki_message(self, der: bytes):
+        """
+        Return a dict describing the structure of a PKIMessage DER:
+        keys: header_tlv, body_tlv, protection_tlv (or None),
+              extra_certs_tlv (or None), and protected_part (the
+              SEQUENCE TLV that protection signs over).
+        """
+        # Outer SEQUENCE
+        self.assertEqual(der[0], 0x30, "PKIMessage must be SEQUENCE")
+        outer_tag, body_start, body_end = self._read_tlv(der, 0)
+
+        pos = body_start
+        # header
+        h_tag, h_inner, h_end = self._read_tlv(der, pos)
+        self.assertEqual(h_tag, 0x30, "header must be SEQUENCE")
+        header_tlv = der[pos:h_end]
+        pos = h_end
+
+        # body — context-tagged
+        b_tag, b_inner, b_end = self._read_tlv(der, pos)
+        self.assertEqual(b_tag & 0xC0, 0x80, "body must be context-tagged")
+        body_tlv = der[pos:b_end]
+        pos = b_end
+
+        protection_tlv = None
+        extra_certs_tlv = None
+
+        if pos < body_end and der[pos] == 0xA0:
+            p_tag, p_inner, p_end = self._read_tlv(der, pos)
+            protection_tlv = der[pos:p_end]
+            pos = p_end
+
+        if pos < body_end and der[pos] == 0xA1:
+            e_tag, e_inner, e_end = self._read_tlv(der, pos)
+            extra_certs_tlv = der[pos:e_end]
+            pos = e_end
+
+        # ProtectedPart = SEQUENCE { header, body }
+        protected_part = b"\x30" + self._enc_len(len(header_tlv) + len(body_tlv)) \
+                       + header_tlv + body_tlv
+
+        return {
+            "header_tlv":      header_tlv,
+            "body_tlv":        body_tlv,
+            "protection_tlv":  protection_tlv,
+            "extra_certs_tlv": extra_certs_tlv,
+            "protected_part":  protected_part,
+        }
+
+    @staticmethod
+    def _enc_len(n: int) -> bytes:
+        if n < 0x80:
+            return bytes([n])
+        b = n.to_bytes((n.bit_length() + 7) // 8, "big")
+        return bytes([0x80 | len(b)]) + b
+
+    # ---- tests ---- #
+
+    def test_legacy_unprotected_path_still_works(self):
+        """No signer_key → no [0] protection, no [1] extraCerts (back-compat)."""
+        msg = self._build()
+        s = self._walk_pki_message(msg)
+        self.assertIsNone(s["protection_tlv"],
+                          "unprotected message must have no [0] protection")
+        self.assertIsNone(s["extra_certs_tlv"],
+                          "unprotected message must have no [1] extraCerts")
+
+    def test_protected_message_has_protection_field(self):
+        msg = self._build(signer_key=self.signer_key, signer_cert=self.signer_cert)
+        s = self._walk_pki_message(msg)
+        self.assertIsNotNone(s["protection_tlv"])
+        self.assertEqual(s["protection_tlv"][0], 0xA0,
+                         "protection field must be [0] EXPLICIT (tag 0xA0)")
+
+    def test_protected_message_has_extra_certs_field(self):
+        msg = self._build(signer_key=self.signer_key, signer_cert=self.signer_cert)
+        s = self._walk_pki_message(msg)
+        self.assertIsNotNone(s["extra_certs_tlv"])
+        self.assertEqual(s["extra_certs_tlv"][0], 0xA1,
+                         "extraCerts field must be [1] EXPLICIT (tag 0xA1)")
+
+    def test_protection_signature_verifies(self):
+        from cryptography.hazmat.primitives import hashes as _h
+        from cryptography.hazmat.primitives.asymmetric import padding as _pad
+
+        msg = self._build(signer_key=self.signer_key, signer_cert=self.signer_cert)
+        s = self._walk_pki_message(msg)
+
+        # Extract the BIT STRING from inside [0] EXPLICIT
+        prot = s["protection_tlv"]
+        # [0] EXPLICIT layout: 0xA0 LEN (tag-len-content of inner BIT STRING)
+        _, body_start, body_end = self._read_tlv(prot, 0)
+        bit_string_tlv = prot[body_start:body_end]
+        self.assertEqual(bit_string_tlv[0], 0x03, "inner must be BIT STRING")
+        bs_len = bit_string_tlv[1]
+        # Skip BIT STRING header (0x03 + len byte + unused-bits byte)
+        if bs_len & 0x80:
+            n = bs_len & 0x7F
+            bs_content_start = 2 + n
+            bs_content_len = int.from_bytes(bit_string_tlv[2:2+n], "big")
+        else:
+            bs_content_start = 2
+            bs_content_len = bs_len
+        unused_bits = bit_string_tlv[bs_content_start]
+        self.assertEqual(unused_bits, 0, "BIT STRING unused-bits MUST be 0")
+        signature = bit_string_tlv[bs_content_start + 1:
+                                   bs_content_start + bs_content_len]
+
+        # Verify using the CA pubkey over the ProtectedPart
+        self.signer_cert.public_key().verify(
+            signature, s["protected_part"],
+            _pad.PKCS1v15(),
+            _h.SHA256(),
+        )  # raises InvalidSignature on failure
+
+    def test_protection_fails_against_corrupted_body(self):
+        from cryptography.exceptions import InvalidSignature
+        from cryptography.hazmat.primitives import hashes as _h
+        from cryptography.hazmat.primitives.asymmetric import padding as _pad
+
+        msg = self._build(signer_key=self.signer_key, signer_cert=self.signer_cert)
+        s = self._walk_pki_message(msg)
+
+        # Corrupt one byte deep inside the body and rebuild ProtectedPart.
+        bad_body = bytearray(s["body_tlv"])
+        bad_body[-1] ^= 0xFF
+        bad_protected = b"\x30" + self._enc_len(
+            len(s["header_tlv"]) + len(bad_body)
+        ) + s["header_tlv"] + bytes(bad_body)
+
+        # Re-extract the actual signature (ok)
+        prot = s["protection_tlv"]
+        _, body_start, body_end = self._read_tlv(prot, 0)
+        bit_string_tlv = prot[body_start:body_end]
+        # Skip 0x03 + length + unused-bits
+        bs_len = bit_string_tlv[1]
+        if bs_len & 0x80:
+            n = bs_len & 0x7F
+            content_start = 2 + n
+        else:
+            content_start = 2
+        signature = bit_string_tlv[content_start + 1:]
+
+        with self.assertRaises(InvalidSignature):
+            self.signer_cert.public_key().verify(
+                signature, bad_protected,
+                _pad.PKCS1v15(), _h.SHA256(),
+            )
+
+    def test_extra_certs_includes_ca_cert(self):
+        msg = self._build(signer_key=self.signer_key, signer_cert=self.signer_cert)
+        s = self._walk_pki_message(msg)
+        # The CA cert DER must appear inside [1] extraCerts
+        ca_der = self.signer_cert.public_bytes(
+            __import__("cryptography").hazmat.primitives.serialization.Encoding.DER
+        )
+        self.assertIn(
+            ca_der, s["extra_certs_tlv"],
+            "extraCerts must contain the signer cert DER"
+        )
+
+
+# ===========================================================================
+# 15b. RFC 4211 §4 — CRMF Proof-of-Possession verification
+# ===========================================================================
+
+class TestRFC4211POPO(unittest.TestCase):
+    """
+    RFC 4211 §4.1 case 2: when a CRMF carries a POPOSigningKey without
+    POPOSigningKeyInput, the signature is computed over the certRequest
+    DER itself. PyPKI's verifier accepts only this case (the simplest
+    and most common) and rejects raVerified, keyEnc, keyAgree variants.
+
+    These tests build CRMFs by hand using the cmp_server ASN.1 helpers.
+    """
+
+    def setUp(self):
+        from cryptography.hazmat.primitives.asymmetric import rsa, ec
+        self.rsa_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        self.other_rsa_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        self.ec_key = ec.generate_private_key(ec.SECP256R1())
+
+    # ---- helpers to build CRMF bytes ---- #
+
+    @staticmethod
+    def _enc_len(n):
+        if n < 0x80:
+            return bytes([n])
+        b = n.to_bytes((n.bit_length() + 7) // 8, "big")
+        return bytes([0x80 | len(b)]) + b
+
+    @classmethod
+    def _seq(cls, content):
+        return b"\x30" + cls._enc_len(len(content)) + content
+
+    @classmethod
+    def _ctx(cls, n, content, constructed=True):
+        tag = (0xA0 | n) if constructed else (0x80 | n)
+        return bytes([tag]) + cls._enc_len(len(content)) + content
+
+    @classmethod
+    def _int(cls, v):
+        if v == 0:
+            return b"\x02\x01\x00"
+        b = v.to_bytes((v.bit_length() + 7) // 8 or 1, "big")
+        if b[0] & 0x80:
+            b = b"\x00" + b
+        return b"\x02" + cls._enc_len(len(b)) + b
+
+    @classmethod
+    def _oid(cls, dotted: str) -> bytes:
+        parts = list(map(int, dotted.split(".")))
+        encoded = bytes([40 * parts[0] + parts[1]])
+        for p in parts[2:]:
+            if p == 0:
+                encoded += b"\x00"
+            else:
+                buf = []
+                while p:
+                    buf.append(p & 0x7F)
+                    p >>= 7
+                buf.reverse()
+                for i, bb in enumerate(buf):
+                    encoded += bytes([bb | (0x80 if i < len(buf) - 1 else 0)])
+        return b"\x06" + cls._enc_len(len(encoded)) + encoded
+
+    def _spki_content_of(self, pubkey) -> bytes:
+        """
+        Return the *content* bytes of the SPKI SEQUENCE — i.e., the bytes
+        that go inside the [6] publicKey context-tagged field of certTemplate.
+        That's what parse_crmf captures in its 'spki' field.
+        """
+        from cryptography.hazmat.primitives.serialization import (
+            Encoding, PublicFormat,
+        )
+        spki_tlv = pubkey.public_bytes(
+            Encoding.DER, PublicFormat.SubjectPublicKeyInfo
+        )
+        # Strip outer SEQUENCE TLV header.
+        # 0x30 LEN [content...]
+        if spki_tlv[1] & 0x80:
+            n = spki_tlv[1] & 0x7F
+            content_start = 2 + n
+        else:
+            content_start = 2
+        return spki_tlv[content_start:]
+
+    def _build_certreq(self, pubkey) -> bytes:
+        """
+        Build a minimal CertRequest DER:
+            SEQUENCE { certReqId INTEGER 0, certTemplate SEQUENCE { [6] publicKey } }
+        Used both as input to parse_crmf and as the signed-bytes for POPO.
+        """
+        spki_content = self._spki_content_of(pubkey)
+        # certTemplate is a SEQUENCE — its public-key field is [6] EXPLICIT
+        # SubjectPublicKeyInfo. parse_crmf treats the [6] body as the SPKI
+        # bytes (the SEQUENCE content), so we wrap accordingly.
+        public_key_field = self._ctx(6, spki_content, constructed=True)
+        cert_template = self._seq(public_key_field)
+        cert_request = self._seq(self._int(0) + cert_template)
+        return cert_request
+
+    def _build_crmf(self, pubkey, signing_key, alg_oid="1.2.840.113549.1.1.11"):
+        """
+        Build a full CertReqMessages with a valid POPO signing
+        ``certreq_der`` with ``signing_key``.
+        """
+        from cryptography.hazmat.primitives import hashes
+        from cryptography.hazmat.primitives.asymmetric import (
+            padding as _pad, ec as _ec, ed25519 as _ed25519,
+        )
+
+        cert_request = self._build_certreq(pubkey)
+
+        # Sign cert_request bytes with signing_key
+        if alg_oid in (
+            "1.2.840.113549.1.1.11", "1.2.840.113549.1.1.12", "1.2.840.113549.1.1.13"
+        ):
+            hashes_map = {
+                "1.2.840.113549.1.1.11": hashes.SHA256,
+                "1.2.840.113549.1.1.12": hashes.SHA384,
+                "1.2.840.113549.1.1.13": hashes.SHA512,
+            }
+            sig = signing_key.sign(
+                cert_request, _pad.PKCS1v15(), hashes_map[alg_oid](),
+            )
+        elif alg_oid == "1.2.840.10045.4.3.2":
+            sig = signing_key.sign(cert_request, _ec.ECDSA(hashes.SHA256()))
+        elif alg_oid == "1.3.101.112":
+            sig = signing_key.sign(cert_request)
+        else:
+            raise NotImplementedError(alg_oid)
+
+        # AlgorithmIdentifier ::= SEQUENCE { OID, parameters NULL }
+        alg_id = self._seq(self._oid(alg_oid) + b"\x05\x00")
+
+        # signature BIT STRING
+        bit_string = b"\x03" + self._enc_len(len(sig) + 1) + b"\x00" + sig
+
+        # POPOSigningKey ::= SEQUENCE { algId, signature }   (no poposkInput)
+        popo_signing_key = self._seq(alg_id + bit_string)
+
+        # ProofOfPossession ::= [1] POPOSigningKey
+        popo = self._ctx(1, popo_signing_key, constructed=True)
+
+        # CertReqMsg ::= SEQUENCE { certReq, popo OPTIONAL }
+        cert_req_msg = self._seq(cert_request + popo)
+
+        # CertReqMessages ::= SEQUENCE OF CertReqMsg
+        return self._seq(cert_req_msg)
+
+    # ---- parser tests ---- #
+
+    def test_parse_crmf_returns_richer_dict(self):
+        from cmp_server import CMPv2ASN1
+        crmf = self._build_crmf(self.rsa_key.public_key(), self.rsa_key)
+        parsed = CMPv2ASN1.parse_crmf(crmf)
+        self.assertIsNotNone(parsed.get("spki"))
+        self.assertIsNotNone(parsed.get("certreq_der"))
+        self.assertIsNotNone(parsed.get("popo_raw"))
+        # popo_raw must start with 0xA1 ([1] EXPLICIT)
+        self.assertEqual(parsed["popo_raw"][0], 0xA1)
+
+    def test_legacy_extractor_still_works(self):
+        """Backward compat: the old API still returns (subject, spki)."""
+        from cmp_server import CMPv2ASN1
+        crmf = self._build_crmf(self.rsa_key.public_key(), self.rsa_key)
+        subject, spki = CMPv2ASN1.extract_subject_and_pubkey_from_crmf(crmf)
+        self.assertIsNotNone(spki)
+        # Default subject when not supplied
+        self.assertTrue(isinstance(subject, str))
+
+    # ---- POPO verification: positive cases ---- #
+
+    def test_popo_valid_rsa_sha256_accepted(self):
+        from cmp_server import CMPv2ASN1
+        crmf = self._build_crmf(self.rsa_key.public_key(), self.rsa_key)
+        parsed = CMPv2ASN1.parse_crmf(crmf)
+        ok, reason = CMPv2ASN1.verify_popo(
+            parsed["certreq_der"], parsed["spki"], parsed["popo_raw"],
+        )
+        self.assertTrue(ok, f"valid RSA POPO must verify: {reason}")
+
+    def test_popo_valid_ecdsa_p256_accepted(self):
+        from cmp_server import CMPv2ASN1
+        crmf = self._build_crmf(
+            self.ec_key.public_key(), self.ec_key,
+            alg_oid="1.2.840.10045.4.3.2",
+        )
+        parsed = CMPv2ASN1.parse_crmf(crmf)
+        ok, reason = CMPv2ASN1.verify_popo(
+            parsed["certreq_der"], parsed["spki"], parsed["popo_raw"],
+        )
+        self.assertTrue(ok, f"valid ECDSA POPO must verify: {reason}")
+
+    def test_popo_valid_ed25519_accepted(self):
+        from cryptography.hazmat.primitives.asymmetric import ed25519
+        from cmp_server import CMPv2ASN1
+        ed = ed25519.Ed25519PrivateKey.generate()
+        crmf = self._build_crmf(ed.public_key(), ed, alg_oid="1.3.101.112")
+        parsed = CMPv2ASN1.parse_crmf(crmf)
+        ok, reason = CMPv2ASN1.verify_popo(
+            parsed["certreq_der"], parsed["spki"], parsed["popo_raw"],
+        )
+        self.assertTrue(ok, f"valid Ed25519 POPO must verify: {reason}")
+
+    # ---- POPO verification: negative cases ---- #
+
+    def test_popo_signed_by_other_key_rejected(self):
+        """The classic attack: requester proves possession of someone else's key."""
+        from cmp_server import CMPv2ASN1
+        # certTemplate carries rsa_key.public_key(), but POPO is signed
+        # with other_rsa_key. A correctly-implemented verifier must reject.
+        crmf = self._build_crmf(self.rsa_key.public_key(), self.other_rsa_key)
+        parsed = CMPv2ASN1.parse_crmf(crmf)
+        ok, reason = CMPv2ASN1.verify_popo(
+            parsed["certreq_der"], parsed["spki"], parsed["popo_raw"],
+        )
+        self.assertFalse(ok)
+        self.assertIn("invalid", reason.lower())
+
+    def test_popo_with_corrupted_signature_rejected(self):
+        from cmp_server import CMPv2ASN1
+        crmf = self._build_crmf(self.rsa_key.public_key(), self.rsa_key)
+        # Flip a byte deep inside the request — last byte is part of the
+        # signature BIT STRING content.
+        crmf = crmf[:-1] + bytes([crmf[-1] ^ 0xFF])
+        parsed = CMPv2ASN1.parse_crmf(crmf)
+        ok, reason = CMPv2ASN1.verify_popo(
+            parsed["certreq_der"], parsed["spki"], parsed["popo_raw"],
+        )
+        self.assertFalse(ok)
+
+    def test_popo_with_unsupported_choice_rejected(self):
+        """raVerified ([0] NULL) must not be accepted."""
+        from cmp_server import CMPv2ASN1
+        cert_request = self._build_certreq(self.rsa_key.public_key())
+        # ProofOfPossession ::= [0] raVerified NULL
+        ra_verified_popo = self._ctx(0, b"\x05\x00", constructed=True)
+        cert_req_msg = self._seq(cert_request + ra_verified_popo)
+        crmf = self._seq(cert_req_msg)
+
+        parsed = CMPv2ASN1.parse_crmf(crmf)
+        # Force-call verify_popo (handler logic skips when popo absent;
+        # we want to test the verifier itself for the raVerified case).
+        ok, reason = CMPv2ASN1.verify_popo(
+            parsed["certreq_der"] or cert_request,
+            parsed["spki"], parsed["popo_raw"] or ra_verified_popo,
+        )
+        self.assertFalse(ok)
+        self.assertIn("signature-based", reason)
+
+    def test_verify_popo_with_missing_inputs_returns_false(self):
+        from cmp_server import CMPv2ASN1
+        ok, reason = CMPv2ASN1.verify_popo(b"", b"", b"")
+        self.assertFalse(ok)
+
+
+# ===========================================================================
+# 15c. CPS — RFC 5280 §4.2.1.4 deployment-wide CertificatePolicies default
+# ===========================================================================
+
+class TestCPSWiring(unittest.TestCase):
+    """
+    The CPS document at docs/CPS.md is only useful if certs actually point
+    at it. This class verifies that --cps-uri / --cps-policy-oid (folded
+    into config as 'certificate_policies_default') causes every issued
+    cert to carry a CertificatePolicies extension with the configured
+    OID and a CPS URI qualifier.
+    """
+
+    def setUp(self):
+        self._tmp = tempfile.mkdtemp(prefix="cps-wiring-")
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self._tmp, ignore_errors=True)
+
+    def _ca_with_default(self, oid: str, uri: str):
+        """Build a CA whose ServerConfig has a deployment-wide CPS default."""
+        ca_dir = Path(self._tmp)
+        ca_dir.mkdir(parents=True, exist_ok=True)
+        config = pki.ServerConfig(
+            ca_dir=ca_dir,
+            cli_overrides={
+                "certificate_policies_default": [
+                    {"oid": oid, "cps_uri": uri},
+                ],
+            },
+        )
+        return _make_ca(self._tmp, config=config) if "config" in \
+               _make_ca.__code__.co_varnames else \
+               pki.CertificateAuthority(ca_dir=str(ca_dir), config=config)
+
+    def test_no_default_means_no_extension(self):
+        ca = _make_ca(self._tmp)
+        key = _gen_key()
+        cert = ca.issue_certificate("CN=plain-no-cps", key.public_key())
+        with self.assertRaises(x509.ExtensionNotFound):
+            cert.extensions.get_extension_for_class(x509.CertificatePolicies)
+
+    def test_deployment_default_adds_policy_with_cps_uri(self):
+        oid = "1.3.6.1.4.1.99999.1.1"   # placeholder PEN
+        uri = "https://pki.example.internal/cps.txt"
+        ca = self._ca_with_default(oid, uri)
+        key = _gen_key()
+        cert = ca.issue_certificate("CN=cps-cert", key.public_key())
+        ext = cert.extensions.get_extension_for_class(x509.CertificatePolicies)
+        self.assertFalse(ext.critical, "CertificatePolicies MUST be non-critical")
+
+        policies = list(ext.value)
+        self.assertEqual(len(policies), 1)
+        self.assertEqual(policies[0].policy_identifier.dotted_string, oid)
+
+        # CPS URI must appear among qualifiers
+        qualifiers = list(policies[0].policy_qualifiers or [])
+        cps_uris = [q for q in qualifiers if isinstance(q, str)]
+        self.assertIn(uri, cps_uris,
+                      f"CPS URI {uri!r} must appear in policy qualifiers")
+
+    def test_explicit_argument_overrides_default(self):
+        """A per-issuance certificate_policies arg should win over the default."""
+        ca = self._ca_with_default(
+            "1.3.6.1.4.1.99999.1.1",
+            "https://pki.example.internal/cps.txt",
+        )
+        key = _gen_key()
+        override_oid = "1.3.6.1.4.1.99999.2.2"
+        override_uri = "https://override.example.internal/cps.txt"
+        cert = ca.issue_certificate(
+            "CN=override-cps", key.public_key(),
+            certificate_policies=[
+                {"oid": override_oid, "cps_uri": override_uri},
+            ],
+        )
+        ext = cert.extensions.get_extension_for_class(x509.CertificatePolicies)
+        policies = list(ext.value)
+        self.assertEqual(policies[0].policy_identifier.dotted_string, override_oid)
+        qualifiers = list(policies[0].policy_qualifiers or [])
+        self.assertIn(override_uri, qualifiers)
+
+
+# ===========================================================================
+# 15b. RFC 5958 — PKCS#8 Asymmetric Key Package format on CMP outputs
+# ===========================================================================
+
+class TestRFC5958PKCS8(unittest.TestCase):
+    """
+    Per RFC 5958, private keys delivered to clients should be encoded as
+    PKCS#8 PrivateKeyInfo, not legacy PKCS#1 RSAPrivateKey. CLAUDE.md
+    Tier 1 §RFC 5958 closed four sites in cmp_server.py and one in
+    web_ui.py. These tests assert each output path emits PKCS#8.
+
+    Detection: a PKCS#8 PEM key starts with '-----BEGIN PRIVATE KEY-----'
+    (or '-----BEGIN ENCRYPTED PRIVATE KEY-----' for encrypted variants).
+    A PKCS#1 PEM key starts with '-----BEGIN RSA PRIVATE KEY-----'.
+    A SEC1 PEM EC key starts with '-----BEGIN EC PRIVATE KEY-----'.
+    """
+
+    PKCS8_HEADER = b"-----BEGIN PRIVATE KEY-----"
+    PKCS1_HEADER = b"-----BEGIN RSA PRIVATE KEY-----"
+    SEC1_HEADER  = b"-----BEGIN EC PRIVATE KEY-----"
+
+    def _assert_pkcs8(self, key_pem: bytes, where: str):
+        if isinstance(key_pem, str):
+            key_pem = key_pem.encode()
+        self.assertTrue(
+            key_pem.startswith(self.PKCS8_HEADER),
+            f"{where}: expected PKCS#8 header, got: {key_pem[:60]!r}"
+        )
+        self.assertNotIn(
+            self.PKCS1_HEADER, key_pem,
+            f"{where}: PKCS#1 RSA header must not appear in output"
+        )
+        self.assertNotIn(
+            self.SEC1_HEADER, key_pem,
+            f"{where}: SEC1 EC header must not appear in output"
+        )
+
+    def test_cmp_server_uses_pkcs8_at_all_sites(self):
+        """
+        Static check: every PrivateFormat reference in cmp_server.py is
+        PKCS8, never TraditionalOpenSSL. This catches future regressions
+        where someone copies a PKCS#1 line from another module.
+        """
+        import cmp_server
+        src = open(cmp_server.__file__).read()
+        # Must appear at least once (sanity).
+        self.assertIn("PrivateFormat.PKCS8", src,
+                      "cmp_server.py must use PrivateFormat.PKCS8")
+        # Must not appear anywhere — even in comments or strings.
+        self.assertNotIn(
+            "PrivateFormat.TraditionalOpenSSL", src,
+            "cmp_server.py must not use legacy PKCS#1 PrivateFormat.TraditionalOpenSSL"
+        )
+
+    def test_web_ui_subca_export_uses_pkcs8(self):
+        """Confirms the earlier sub-CA ergonomics fix is still in place."""
+        import web_ui
+        src = open(web_ui.__file__).read()
+        # The sub-CA export site comment confirms the fix; the actual
+        # serialization call must be PKCS#8.
+        idx = src.find("def _api_issue_sub_ca")
+        self.assertGreater(idx, 0, "_api_issue_sub_ca handler not found")
+        # Find the end of the handler (next 'def ' at the same indent).
+        # Scan ~6000 chars; that comfortably covers the entire handler.
+        block = src[idx:idx + 6000]
+        self.assertIn("PrivateFormat.PKCS8", block,
+                      "sub-CA key export must serialize as PKCS#8")
+        self.assertNotIn("PrivateFormat.TraditionalOpenSSL", block,
+                         "sub-CA key export must not use PKCS#1 PrivateFormat")
+
+
+# ===========================================================================
+# 15c. RFC 5280 §5.2.1 + §5.2.3 / RFC 6818 — CRL extensions
+# ===========================================================================
+
+class TestRFC6818CRLExtensions(unittest.TestCase):
+    """
+    Per RFC 5280, every CRL MUST include:
+      - cRLNumber (non-critical, §5.2.3) — strictly increasing across
+        every CRL issued by this issuer
+      - authorityKeyIdentifier (non-critical, §5.2.1) — matches the CA
+        cert's subjectKeyIdentifier so verifiers can locate the issuer
+
+    Delta CRLs additionally carry deltaCRLIndicator (critical, §5.2.4).
+    """
+
+    def setUp(self):
+        self._tmp = tempfile.mkdtemp(prefix="rfc6818-")
+        self.ca = _make_ca(self._tmp)
+        # Need a non-empty revoked set for some assertions
+        key = _gen_key()
+        cert = self.ca.issue_certificate("CN=victim", key.public_key())
+        self.ca.revoke_certificate(cert.serial_number, reason=1)
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self._tmp, ignore_errors=True)
+
+    def _parse(self, der: bytes):
+        return x509.load_der_x509_crl(der)
+
+    def test_generate_crl_includes_crl_number_extension(self):
+        crl = self._parse(self.ca.generate_crl())
+        ext = crl.extensions.get_extension_for_class(x509.CRLNumber)
+        self.assertFalse(ext.critical, "cRLNumber MUST be non-critical")
+        self.assertGreaterEqual(ext.value.crl_number, 1)
+
+    def test_generate_crl_includes_authority_key_identifier(self):
+        crl = self._parse(self.ca.generate_crl())
+        ext = crl.extensions.get_extension_for_class(
+            x509.AuthorityKeyIdentifier
+        )
+        self.assertFalse(ext.critical, "authorityKeyIdentifier MUST be non-critical")
+        # The AKI key identifier must equal the CA cert's SKI when present,
+        # otherwise SHA-1 of the CA's public key BIT STRING.
+        ca_pub = self.ca.ca_cert.public_key()
+        expected = x509.AuthorityKeyIdentifier.from_issuer_public_key(ca_pub)
+        self.assertEqual(
+            ext.value.key_identifier, expected.key_identifier,
+            "AKI key_identifier must match CA pubkey hash"
+        )
+
+    def test_generate_crl_der_includes_both_extensions(self):
+        """The alternate CRL builder path must also be compliant."""
+        crl = self._parse(self.ca.generate_crl_der())
+        crl.extensions.get_extension_for_class(x509.CRLNumber)
+        crl.extensions.get_extension_for_class(x509.AuthorityKeyIdentifier)
+
+    def test_crl_number_is_monotonically_increasing(self):
+        n1 = self._parse(self.ca.generate_crl()).extensions.get_extension_for_class(
+            x509.CRLNumber).value.crl_number
+        n2 = self._parse(self.ca.generate_crl()).extensions.get_extension_for_class(
+            x509.CRLNumber).value.crl_number
+        n3 = self._parse(self.ca.generate_crl_der()).extensions.get_extension_for_class(
+            x509.CRLNumber).value.crl_number
+        self.assertLess(n1, n2)
+        self.assertLess(n2, n3)
+
+    def test_crl_number_persists_across_ca_instances(self):
+        """A restart must not reset the CRL number to 1."""
+        n_first = self._parse(self.ca.generate_crl()).extensions.get_extension_for_class(
+            x509.CRLNumber).value.crl_number
+        # Simulate a restart: re-instantiate the CA against the same dir.
+        ca2 = _make_ca(self._tmp)
+        n_after = self._parse(ca2.generate_crl()).extensions.get_extension_for_class(
+            x509.CRLNumber).value.crl_number
+        self.assertGreater(
+            n_after, n_first,
+            "CRL number must persist across CA restarts (RFC 5280 §5.2.3)"
+        )
+
+    def test_delta_crl_includes_all_three_extensions(self):
+        """Delta CRLs add deltaCRLIndicator on top of cRLNumber + AKI."""
+        delta = self._parse(self.ca.generate_delta_crl(base_crl_number=1))
+        delta.extensions.get_extension_for_class(x509.CRLNumber)
+        delta.extensions.get_extension_for_class(x509.AuthorityKeyIdentifier)
+        dci = delta.extensions.get_extension_for_class(x509.DeltaCRLIndicator)
+        self.assertTrue(dci.critical, "deltaCRLIndicator MUST be critical")
+
+    def test_delta_crl_number_greater_than_base(self):
+        """RFC 5280 §5.2.4: delta CRL number > base CRL number."""
+        base_n = self._parse(self.ca.generate_crl()).extensions.get_extension_for_class(
+            x509.CRLNumber).value.crl_number
+        delta_n = self._parse(
+            self.ca.generate_delta_crl(base_crl_number=base_n)
+        ).extensions.get_extension_for_class(x509.CRLNumber).value.crl_number
+        self.assertGreater(delta_n, base_n)
+
+    def test_crl_signature_still_verifies(self):
+        """Sanity: the new extensions don't break CRL signing."""
+        crl = self._parse(self.ca.generate_crl())
+        # Will raise if signature doesn't verify against the CA pubkey
+        self.assertTrue(crl.is_signature_valid(self.ca.ca_cert.public_key()))
+
+
+# ===========================================================================
+# 15d. RFC 8954 — OCSP Nonce extension update
+# ===========================================================================
+
+class TestRFC8954OCSPNonce(unittest.TestCase):
+    """
+    RFC 8954 §2.1: the OCSP nonce extension value MUST be 1..32 bytes.
+    Out-of-bounds nonces MUST cause the request to be treated as
+    malformed. This class also covers the strict-mode toggle that
+    rejects nonceless requests with status 'unauthorized'.
+    """
+
+    HASH_ALG_SHA1 = "1.3.14.3.2.26"
+
+    def _build_request(self, nonce: Optional[bytes]) -> bytes:
+        """
+        Build a minimal valid OCSPRequest DER with an optional nonce
+        extension. The CertID's hash values are zero — that's fine,
+        we're testing the parser's nonce handling, not real cert lookup.
+        """
+        try:
+            from ocsp_server import (
+                _seq, _oid, _oct, _int, _ctx, OID_OCSP_NONCE,
+            )
+        except ImportError:
+            self.skipTest("ocsp_server.py not importable")
+
+        # CertID := SEQUENCE { hashAlgorithm, issuerNameHash, issuerKeyHash, serial }
+        hash_alg = _seq(_oid(self.HASH_ALG_SHA1))
+        cert_id = _seq(
+            hash_alg
+            + _oct(b"\x00" * 20)         # issuerNameHash
+            + _oct(b"\x00" * 20)         # issuerKeyHash
+            + _int(1234)                 # serialNumber
+        )
+        request = _seq(cert_id)
+        request_list = _seq(request)
+
+        # Optional requestExtensions [2] EXPLICIT Extensions
+        ext_block = b""
+        if nonce is not None:
+            # Extension := SEQUENCE { OID, OCTET STRING wrapping OCTET STRING }
+            nonce_ext = _seq(
+                _oid(OID_OCSP_NONCE)
+                + _oct(_oct(nonce))      # double-wrapped per RFC 6960 §4.4.1
+            )
+            ext_block = _ctx(2, _seq(nonce_ext))
+
+        tbs_request = _seq(request_list + ext_block)
+        ocsp_request = _seq(tbs_request)
+        return ocsp_request
+
+    def test_valid_nonce_within_bounds_is_accepted(self):
+        from ocsp_server import OCSPRequestParser
+        for n_bytes in (1, 8, 16, 32):
+            req = self._build_request(b"\xab" * n_bytes)
+            parsed = OCSPRequestParser.parse(req)
+            self.assertIsNotNone(parsed, f"{n_bytes}-byte nonce parse failed")
+            self.assertFalse(
+                parsed.get("nonce_length_violation"),
+                f"{n_bytes}-byte nonce wrongly flagged as violation",
+            )
+            self.assertEqual(parsed["nonce"], b"\xab" * n_bytes)
+
+    def test_oversize_nonce_flagged_as_violation(self):
+        from ocsp_server import OCSPRequestParser
+        # 33 bytes is just over the limit; 64 well over.
+        for n_bytes in (33, 64, 128):
+            req = self._build_request(b"\xcd" * n_bytes)
+            parsed = OCSPRequestParser.parse(req)
+            self.assertIsNotNone(parsed)
+            self.assertTrue(
+                parsed.get("nonce_length_violation"),
+                f"{n_bytes}-byte nonce should violate RFC 8954 §2.1",
+            )
+
+    def test_zero_byte_nonce_flagged_as_violation(self):
+        from ocsp_server import OCSPRequestParser
+        # Empty OCTET STRING — RFC 8954 requires ≥1 byte.
+        req = self._build_request(b"")
+        parsed = OCSPRequestParser.parse(req)
+        self.assertIsNotNone(parsed)
+        self.assertTrue(
+            parsed.get("nonce_length_violation"),
+            "empty nonce should violate RFC 8954 §2.1",
+        )
+
+    def test_nonceless_request_is_accepted_in_default_mode(self):
+        from ocsp_server import OCSPRequestParser
+        req = self._build_request(nonce=None)
+        parsed = OCSPRequestParser.parse(req)
+        self.assertIsNotNone(parsed)
+        self.assertIsNone(parsed.get("nonce"))
+        self.assertFalse(parsed.get("nonce_length_violation"))
+
+    def test_oversize_nonce_returns_malformed_in_handler(self):
+        """End-to-end: handler must respond with malformedRequest (status 1)."""
+        try:
+            from ocsp_server import OCSPHandler, OCSPResponseBuilder, RESP_MALFORMED_REQUEST
+        except ImportError:
+            self.skipTest("ocsp_server.py not importable")
+
+        req = self._build_request(b"\xff" * 33)
+
+        # Build a free-standing handler instance without going through HTTP —
+        # call _handle_request directly. Use object.__new__ to skip the
+        # BaseHTTPRequestHandler __init__ which expects a socket.
+        h = object.__new__(OCSPHandler)
+        h.cache = None
+        h.require_nonce = False
+        # Stub out client_address for log_message paths if hit
+        h.client_address = ("127.0.0.1", 0)
+
+        response = h._handle_request(req)
+        # Compare against the canonical malformed-request response
+        expected_error = OCSPResponseBuilder.error(RESP_MALFORMED_REQUEST)
+        self.assertEqual(response, expected_error)
+
+    def test_strict_mode_rejects_nonceless_request(self):
+        """--ocsp-require-nonce: handler returns 'unauthorized' (status 6)."""
+        try:
+            from ocsp_server import OCSPHandler, OCSPResponseBuilder, RESP_UNAUTHORIZED
+        except ImportError:
+            self.skipTest("ocsp_server.py not importable")
+
+        req = self._build_request(nonce=None)
+        h = object.__new__(OCSPHandler)
+        h.cache = None
+        h.require_nonce = True            # strict mode ON
+        h.client_address = ("127.0.0.1", 0)
+
+        response = h._handle_request(req)
+        expected = OCSPResponseBuilder.error(RESP_UNAUTHORIZED)
+        self.assertEqual(response, expected)
+
+    def test_strict_mode_accepts_request_with_valid_nonce(self):
+        """Strict mode must NOT reject requests that DO carry a nonce."""
+        try:
+            from ocsp_server import OCSPHandler, OCSPResponseBuilder, RESP_UNAUTHORIZED
+        except ImportError:
+            self.skipTest("ocsp_server.py not importable")
+
+        req = self._build_request(nonce=b"\x42" * 16)
+        h = object.__new__(OCSPHandler)
+        h.cache = None
+        h.require_nonce = True
+        h.client_address = ("127.0.0.1", 0)
+        # Stub out CA path — request will fail later on serial lookup,
+        # but we only care that it does NOT short-circuit on missing-nonce.
+        try:
+            response = h._handle_request(req)
+        except AttributeError:
+            # No CA wired, internal lookup fails — acceptable, the early
+            # rejection path is what we're testing.
+            return
+        unauthorized = OCSPResponseBuilder.error(RESP_UNAUTHORIZED)
+        self.assertNotEqual(
+            response, unauthorized,
+            "strict mode must accept requests that carry a valid nonce",
+        )
+
+
+# ===========================================================================
+# 15a. RFC 7468 — strict textual encoding of PKIX structures
+# ===========================================================================
+
+class TestRFC7468PEM(unittest.TestCase):
+    """
+    RFC 7468 §3 — strict textual encoding parser.
+
+    Verifies the ``_parse_pem_bundle`` helper enforces every framing rule
+    used when ingesting external PEM bundles (chain imports, CRL imports,
+    PKCS#7 bundles). The helper backs ``CertificateAuthority._load_parent_chain``
+    so any deviation here would let a malformed chain file ride through.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        # Mint one real self-signed cert so the tests can exercise both
+        # the parser and round-trip with x509.load_der_x509_certificate.
+        key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        subject = issuer = x509.Name([
+            x509.NameAttribute(NameOID.COMMON_NAME, "rfc7468-test"),
+        ])
+        cert = (
+            x509.CertificateBuilder()
+            .subject_name(subject)
+            .issuer_name(issuer)
+            .public_key(key.public_key())
+            .serial_number(x509.random_serial_number())
+            .not_valid_before(datetime.datetime.now(datetime.timezone.utc))
+            .not_valid_after(
+                datetime.datetime.now(datetime.timezone.utc)
+                + datetime.timedelta(days=1)
+            )
+            .sign(key, SHA256())
+        )
+        cls.cert = cert
+        cls.cert_der = cert.public_bytes(Encoding.DER)
+        cls.cert_pem = cert.public_bytes(Encoding.PEM)  # canonical 64-col
+
+    # ---- canonical / lenient acceptance ----
+
+    def test_canonical_64col_pem_accepted(self):
+        blocks = pki._parse_pem_bundle(self.cert_pem)
+        self.assertEqual(len(blocks), 1)
+        label, der = blocks[0]
+        self.assertEqual(label, "CERTIFICATE")
+        self.assertEqual(der, self.cert_der)
+
+    def test_unwrapped_base64_accepted(self):
+        """RFC 7468 §3 permits non-wrapped base64 if the alphabet is valid."""
+        b64 = base64.b64encode(self.cert_der).decode("ascii")  # no line breaks
+        pem = (
+            "-----BEGIN CERTIFICATE-----\n"
+            + b64
+            + "\n-----END CERTIFICATE-----\n"
+        ).encode("ascii")
+        blocks = pki._parse_pem_bundle(pem)
+        self.assertEqual(len(blocks), 1)
+        self.assertEqual(blocks[0][1], self.cert_der)
+
+    def test_multiple_blocks_concatenated(self):
+        bundle = self.cert_pem + self.cert_pem
+        blocks = pki._parse_pem_bundle(bundle)
+        self.assertEqual(len(blocks), 2)
+        for label, der in blocks:
+            self.assertEqual(label, "CERTIFICATE")
+            self.assertEqual(der, self.cert_der)
+
+    def test_round_trip_via_load_der_x509(self):
+        blocks = pki._parse_pem_bundle(self.cert_pem)
+        roundtrip = x509.load_der_x509_certificate(blocks[0][1])
+        self.assertEqual(roundtrip.subject, self.cert.subject)
+
+    # ---- strict rejection ----
+
+    def test_rejects_lowercase_begin_marker(self):
+        pem = self.cert_pem.replace(b"-----BEGIN", b"-----begin")
+        with self.assertRaises(ValueError) as cm:
+            pki._parse_pem_bundle(pem)
+        self.assertIn("uppercase", str(cm.exception))
+
+    def test_rejects_lowercase_end_marker(self):
+        pem = self.cert_pem.replace(b"-----END", b"-----end")
+        with self.assertRaises(ValueError) as cm:
+            pki._parse_pem_bundle(pem)
+        self.assertIn("uppercase", str(cm.exception))
+
+    def test_rejects_trailing_non_whitespace_data(self):
+        pem = self.cert_pem + b"GARBAGE TRAILING DATA\n"
+        with self.assertRaises(ValueError) as cm:
+            pki._parse_pem_bundle(pem)
+        self.assertIn("trailing", str(cm.exception).lower())
+
+    def test_rejects_data_between_blocks(self):
+        pem = self.cert_pem + b"a stray sentence here\n" + self.cert_pem
+        with self.assertRaises(ValueError):
+            pki._parse_pem_bundle(pem)
+
+    def test_rejects_label_mismatch(self):
+        pem = self.cert_pem.replace(b"END CERTIFICATE", b"END X509 CRL")
+        with self.assertRaises(ValueError) as cm:
+            pki._parse_pem_bundle(pem)
+        self.assertIn("mismatch", str(cm.exception).lower())
+
+    def test_rejects_invalid_base64_alphabet(self):
+        # Inject a stray non-base64 character into the body.
+        b64 = base64.b64encode(self.cert_der).decode("ascii")
+        bad = b64[:10] + "@" + b64[11:]
+        pem = (
+            "-----BEGIN CERTIFICATE-----\n"
+            + bad
+            + "\n-----END CERTIFICATE-----\n"
+        ).encode("ascii")
+        with self.assertRaises(ValueError) as cm:
+            pki._parse_pem_bundle(pem)
+        self.assertIn("base64", str(cm.exception).lower())
+
+    def test_rejects_empty_body(self):
+        pem = b"-----BEGIN CERTIFICATE-----\n\n-----END CERTIFICATE-----\n"
+        with self.assertRaises(ValueError) as cm:
+            pki._parse_pem_bundle(pem)
+        self.assertIn("empty", str(cm.exception).lower())
+
+    def test_rejects_missing_end_marker(self):
+        pem = (
+            b"-----BEGIN CERTIFICATE-----\n"
+            + base64.b64encode(self.cert_der)
+            + b"\n"
+        )
+        with self.assertRaises(ValueError) as cm:
+            pki._parse_pem_bundle(pem)
+        self.assertIn("END", str(cm.exception))
+
+    # ---- allowed_labels ----
+
+    def test_unknown_label_rejected_when_allowlist_set(self):
+        # Build a fake "PRIVATE KEY" block; payload doesn't matter for
+        # the parser — only the label gating.
+        pem = (
+            "-----BEGIN PRIVATE KEY-----\n"
+            + base64.b64encode(b"\x30\x00").decode("ascii")
+            + "\n-----END PRIVATE KEY-----\n"
+        ).encode("ascii")
+        with self.assertRaises(ValueError) as cm:
+            pki._parse_pem_bundle(pem, allowed_labels={"CERTIFICATE"})
+        self.assertIn("not permitted", str(cm.exception))
+
+    def test_default_allowlist_accepts_x509_crl_and_pkcs7(self):
+        for label in ("CERTIFICATE", "X509 CRL", "PKCS7"):
+            pem = (
+                f"-----BEGIN {label}-----\n"
+                + base64.b64encode(b"\x30\x00").decode("ascii")
+                + f"\n-----END {label}-----\n"
+            ).encode("ascii")
+            blocks = pki._parse_pem_bundle(
+                pem,
+                allowed_labels=pki._RFC7468_DEFAULT_LABELS,
+            )
+            self.assertEqual(blocks[0][0], label)
+
+    def test_load_parent_chain_rejects_lowercase_marker(self):
+        """Integration: _load_parent_chain must surface the strict-parse error."""
+        ca_dir = tempfile.mkdtemp()
+        try:
+            ca = pki.CertificateAuthority(ca_dir=ca_dir)
+            # Tamper a freshly written chain file: lowercase BEGIN
+            bad = self.cert_pem.replace(b"-----BEGIN", b"-----begin")
+            chain_path = Path(ca_dir) / "bad-chain.pem"
+            chain_path.write_bytes(bad)
+            with self.assertRaises(ValueError) as cm:
+                ca._load_parent_chain(str(chain_path))
+            self.assertIn("uppercase", str(cm.exception))
+        finally:
+            import shutil
+            shutil.rmtree(ca_dir, ignore_errors=True)
+
+
+# ===========================================================================
 # 16. ACME RFC 9608 integration
 # ===========================================================================
 

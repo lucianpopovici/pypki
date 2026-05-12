@@ -44,79 +44,98 @@ Follow these across every change:
 These are quick wins. Do them first. Each one closes a known MUST violation
 or a modern-client compatibility gap without adding new surface.
 
-### RFC 6818 — Updates to RFC 5280
+### RFC 6818 — Updates to RFC 5280 ✅ SHIPPED
 
-**What it requires.** Errata and clarifications to the cert/CRL profile.
-The two relevant gaps in PyPKI today:
+**What was required.** Errata and clarifications to the cert/CRL profile.
+Two MUST-violations existed in PyPKI's CRL builders:
 
 1. CRL MUST contain the `cRLNumber` extension (§5.2.3)
 2. CRL MUST contain the `authorityKeyIdentifier` extension (§5.2.1)
 
-**Files to modify**
+**What shipped**
 
-- `pki_server.py` → `CertificateAuthority.generate_crl()` (line ~1316) and
-  `generate_crl_der()` (line ~1692)
+- New migration `db_migrations/pki/002_crl_number.sql` adds a `crl_number`
+  counter table (single-row keyed on id=1), seeded at 0.
+- New helper `CertificateAuthority._next_crl_number()` allocates fresh
+  numbers atomically using `BEGIN IMMEDIATE` for cross-process safety.
+- All three CRL builders patched:
+  - `generate_crl()` (l.1351) — adds both extensions
+  - `generate_crl_der()` (l.1727) — adds both extensions
+  - `generate_delta_crl()` (l.1826) — adds both extensions on top of the
+    pre-existing `DeltaCRLIndicator` (which was already correct, kept as-is)
+- Migration runner wired into `CertificateAuthority._init_db` so the
+  `crl_number` table is created automatically on first start. Idempotent
+  on subsequent starts.
+- Pre-existing latent bug fixed: `generate_crl_der` (l.1844) used
+  `datetime.fromtimestamp()` against an ISO-8601 TEXT column (`revoked_at`),
+  which would have crashed any call against a DB containing revoked certs.
+  Fix mirrors `generate_crl()`'s working `fromisoformat()` call. Surfaced
+  by the new RFC 6818 tests.
 
-**Implementation**
+**Tests added** (`TestRFC6818CRLExtensions` in `test_pki_server.py`):
 
-- Persist a monotonically-increasing CRL number in the CA database. Add a
-  `ca_meta` table (key/value) if one doesn't exist, with row
-  `crl_number=<int>`. Load, increment, save atomically inside the CRL build.
-- Add `.add_extension(x509.CRLNumber(n), critical=False)` to the builder.
-- Add `.add_extension(x509.AuthorityKeyIdentifier.from_issuer_public_key(
-  self.ca_cert.public_key()), critical=False)`.
-- For delta CRLs, also add `DeltaCRLIndicator` pointing at the base CRL
-  number (already half-implemented — verify).
+- `test_generate_crl_includes_crl_number_extension` — non-critical, ≥1
+- `test_generate_crl_includes_authority_key_identifier` — non-critical,
+  matches `SHA-1(CA pubkey BIT STRING)`
+- `test_generate_crl_der_includes_both_extensions`
+- `test_crl_number_is_monotonically_increasing` across all three builders
+- `test_crl_number_persists_across_ca_instances` — survives restart
+- `test_delta_crl_includes_all_three_extensions` — cRLNumber, AKI,
+  deltaCRLIndicator (critical)
+- `test_delta_crl_number_greater_than_base` per RFC 5280 §5.2.4
+- `test_crl_signature_still_verifies` — sanity check that the new
+  extensions don't break signing
 
-**Tests** (extend `TestRFC5280CRL`)
+**Outstanding**
 
-- Parse a freshly-generated CRL with `x509.load_der_x509_crl` and assert
-  both extensions are present.
-- Assert `cRLNumber` strictly increases across two successive CRL generations.
-- Assert AKI matches `SHA-1(CA subjectPublicKey BIT STRING contents)`.
-
-**Docs**
-
-- README compliance table: change RFC 5280 row note to mention CRL extensions.
-- Add RFC 6818 row: `✅ Full`.
-- CHANGELOG under `### Fixed`: "CRL now includes mandatory `cRLNumber` and
-  `authorityKeyIdentifier` extensions (RFC 5280 §5.2.1, §5.2.3 / RFC 6818)."
+- README compliance table: change RFC 5280 row note to mention CRL
+  extensions; add RFC 6818 row as `✅ Full`. Pending — markdown only,
+  no code.
+- CHANGELOG under `### Fixed`: "CRL now includes mandatory `cRLNumber`
+  and `authorityKeyIdentifier` extensions (RFC 5280 §5.2.1, §5.2.3 /
+  RFC 6818)." Pending — markdown only.
+- CHANGELOG under `### Fixed`: "Pre-existing crash in `generate_crl_der`
+  when revoked certs were present (used `fromtimestamp()` instead of
+  `fromisoformat()`)." Pending — markdown only.
 
 ---
 
-### RFC 8954 — OCSP Nonce Extension Update
+### RFC 8954 — OCSP Nonce Extension Update ✅ SHIPPED
 
-**What it requires.** The OCSP nonce value must be a DER-encoded OCTET STRING
-of 1–32 bytes. Older clients sometimes sent raw bytes; 8954 profiles it
-strictly and recommends SHA-256-sized nonces.
+**What was required.** The OCSP nonce value must be a DER-encoded OCTET
+STRING of 1–32 bytes. Older clients sometimes sent raw bytes; 8954
+profiles it strictly.
 
-**Files to modify**
+**What shipped**
 
-- `ocsp_server.py` → nonce parsing (line ~229–243) and response builder
-  (line ~349)
+- `ocsp_server.py` — `OCSPRequestParser.parse` enforces 1 ≤ len(nonce)
+  ≤ 32 after unwrapping the inner OCTET STRING. Out-of-bounds nonces
+  set a `nonce_length_violation` flag in the parsed dict.
+- `ocsp_server.py` — `OCSPHandler._handle_request` checks the flag and
+  returns `RESP_MALFORMED_REQUEST` (status 1) per RFC 8954 §2.1.
+- New CLI flag `--ocsp-require-nonce` plumbed through `pki_server.py`
+  argparse → `start_ocsp_server` → `OCSPHandler.require_nonce`. When
+  set, nonceless requests are rejected with `RESP_UNAUTHORIZED`
+  (status 6). Default off, matching RFC 6960 default.
+- Echo behavior unchanged — valid nonces are reflected verbatim per
+  RFC 6960 §4.4.1.
 
-**Implementation**
+**Tests added** (`TestRFC8954OCSPNonce` in `test_pki_server.py`):
 
-- When parsing: enforce 1 ≤ len(nonce) ≤ 32 after unwrapping the inner
-  OCTET STRING. Reject (malformed request) if outside bounds.
-- When replying: echo the exact client nonce unchanged inside an OCTET STRING,
-  wrapped in the extension. Already appears to be done — verify.
-- Add a CLI flag `--ocsp-require-nonce` (default off) that returns
-  `unauthorized` when a request without a nonce arrives. Useful for
-  high-security profiles.
+- 1, 8, 16, 32 byte nonces accepted (boundary coverage)
+- 33, 64, 128 byte nonces flagged as violations
+- Empty (0-byte) nonce flagged as violation
+- Nonceless request accepted in default mode
+- Oversize nonce returns malformed-request from handler
+- Strict mode rejects nonceless request with unauthorized
+- Strict mode accepts request that DOES carry a valid nonce
 
-**Tests** (extend `TestOCSPParsing`)
+**Outstanding**
 
-- Valid 32-byte nonce → accepted, echoed verbatim.
-- 33-byte nonce → request rejected.
-- 0-byte nonce (empty OCTET STRING) → rejected.
-- With `--ocsp-require-nonce`, a nonceless request returns `unauthorized`.
-
-**Docs**
-
-- README OCSP section: add bullet "RFC 8954 nonce profile: 1–32 byte
-  enforced; optional strict mode via `--ocsp-require-nonce`."
-- CHANGELOG `### Added`: RFC 8954 nonce profile enforcement.
+- README OCSP section bullet — pending markdown only.
+- CHANGELOG `### Added`: "RFC 8954 nonce profile enforcement
+  (1–32 byte bounds at parse time; `--ocsp-require-nonce` strict mode
+  flag)." — pending markdown only.
 
 ---
 
@@ -163,147 +182,159 @@ encryption. Modern Authenticode and EU eIDAS expect PSS.
 
 ---
 
-### RFC 7468 — Textual Encoding of PKIX Structures (strict PEM)
+### RFC 7468 — Textual Encoding of PKIX Structures (strict PEM) ✅ SHIPPED
 
-**What it requires.** PEM files must use specific BEGIN/END labels, base64
-with 64-char lines, and reject label mismatches.
+**What was required.** PEM bundle ingestion must enforce uppercase-only
+BEGIN/END markers, label-match, valid base64, and reject trailing or
+inter-block text. Existing single-object loads via `cryptography` already
+pass through library validation; the gap was multi-object bundles
+(`ca-chain.pem`) where a hand-rolled regex extracted `CERTIFICATE` blocks
+permissively.
 
-**Files to modify**
+**What shipped**
 
-- All `load_pem_*` call sites: mostly already correct through `cryptography`.
-- Only gap: explicit label validation when we accept multi-object PEM bundles
-  (e.g., chain files, PKCS#7 imports in `ca_import/`).
+- `pki_server.py` — new module-level helper
+  `_parse_pem_bundle(data, allowed_labels=None) -> list[tuple[str, bytes]]`
+  parses by tokenising `-----BEGIN <LABEL>-----`/`-----END <LABEL>-----`
+  pairs and decoding the base64 body. Enforces the full RFC 7468 §3
+  framing contract: uppercase-only marker keywords *and* labels (a case-
+  insensitive scan catches any non-canonical case), matching BEGIN/END
+  labels, whitespace-only inter-block and post-last-block content, and
+  the standard base64 alphabet (`A–Za–z0–9+/` with at most two trailing
+  `=`). Both 64-column-wrapped and unwrapped base64 are accepted as long
+  as the alphabet is valid.
+- `pki_server.py` — `_load_parent_chain` now calls `_parse_pem_bundle`
+  with `allowed_labels={"CERTIFICATE"}` instead of the prior
+  `re.findall` regex. Errors bubble up wrapped in the existing
+  `parent_chain_path '<file>': ...` context so operator output stays
+  actionable. The chain validation chain (issuer→subject continuity,
+  signature-over-ca.crt) is unchanged.
+- `_RFC7468_DEFAULT_LABELS = {"CERTIFICATE", "X509 CRL", "PKCS7"}` is
+  exposed at module level for future import callers (PKCS#7 bundles,
+  CRL imports) so they all share the same allowlist.
 
-**Implementation**
+**Tests added** (`TestRFC7468PEM`, 15 tests):
 
-- Add a helper `_parse_pem_bundle(data: bytes) -> list[tuple[str, bytes]]` in
-  `pki_server.py` that tokenizes by `-----BEGIN <LABEL>-----` blocks and
-  returns `(label, der_bytes)` pairs.
-- When accepting chains, reject unknown labels (only `CERTIFICATE`,
-  `X509 CRL`, `PKCS7` accepted for imports).
+- Canonical 64-column PEM accepted; round-trips byte-exact with
+  `x509.load_der_x509_certificate`
+- Unwrapped (single-line) base64 accepted per RFC 7468 §3
+- Multiple concatenated blocks parse in file order
+- Lowercase `-----begin` / `-----end` rejected with "uppercase" error
+- Trailing non-whitespace after the last END rejected
+- Stray text between two valid blocks rejected
+- BEGIN/END label mismatch rejected with "mismatch" error
+- Invalid base64 alphabet (`@`) rejected with "base64" error
+- Empty body rejected
+- Missing END marker rejected
+- Unknown label rejected when `allowed_labels` is set
+- Default allowlist accepts `CERTIFICATE`, `X509 CRL`, `PKCS7`
+- Integration test: `_load_parent_chain` surfaces the strict-parse
+  ValueError on a tampered chain file
 
-**Tests** (new class `TestRFC7468PEM`)
+**Outstanding**
 
-- Reject PEM with lowercase `-----begin certificate-----`.
-- Reject PEM with trailing data after the END line.
-- Accept canonical 64-col wrapping; accept non-wrapped as long as base64 is valid.
-
-**Docs**
-
-- README: mention RFC 7468 compliance in CA Import section.
-- Compliance table: add RFC 7468 `✅ Full`.
+- README compliance table updated to `✅ Full` — done.
+- CHANGELOG `### Added` entry — done.
+- Wire the helper into other future PEM bundle ingestion paths (PKCS#7
+  imports, CRL imports from disk) as those features land.
 
 ---
 
-### RFC 4210 — CMPv2 response protection
+### RFC 4210 — CMPv2 response protection ✅ SHIPPED
 
-**What it requires.** §5.1.3: every `PKIMessage` SHOULD carry a
-`protection` BIT STRING computed over `PKIHeader || PKIBody`, signed by the
-sender. PyPKI parses client protection but does not produce any on
-responses.
+**What was required.** §5.1.3: every `PKIMessage` SHOULD carry a
+`protection` BIT STRING signed by the sender. PyPKI was parsing client
+protection but not emitting any on responses — strict CMP clients
+(EJBCA, some strongSwan pki builds, RFC 9482 Lightweight CMP Profile
+validators) reject unprotected responses.
 
-**Source evidence.** `cmp_server.py:249-327` (`build_pki_message`) writes the
-`protectionAlg` OID (`sha256WithRSAEncryption`, line 310) into the header as
-a hint, then assembles `header + body` and returns — no `[0] protection`
-BIT STRING, no `[1] extraCerts`. Strict clients (EJBCA, some strongSwan pki
-builds) reject the response.
+**What shipped**
 
-**Files to modify**
+- `cmp_server.py` — `CMPv2ASN1.build_pki_message` accepts new keyword
+  arguments `signer_key`, `signer_cert`, `extra_certs`. When
+  `signer_key` is supplied, the response is signed and the
+  `[0] PKIProtection` BIT STRING + `[1] extraCerts SEQUENCE OF Certificate`
+  fields are appended to the PKIMessage SEQUENCE.
+- Signature is computed over `ProtectedPart ::= SEQUENCE { header, body }`
+  (DER) per RFC 4210 §5.1.3.3. Algorithm: `sha256WithRSAEncryption`,
+  matching the existing `protectionAlg` hint in the header. PSS / ECC
+  algorithm coverage will follow when RFC 4055 / RFC 5480 land.
+- New helper `CMPv2Handler._protected_response` wraps `build_pki_message`
+  and auto-supplies `signer_key=self.ca.ca_key`, `signer_cert=self.ca.ca_cert`,
+  and `extra_certs=self.ca._parent_chain`. All 12 caller sites in
+  `CMPv2Handler` and `CMPv3Handler` migrated to use the helper. The
+  legacy unprotected path is preserved (no kwargs → no protection) for
+  back-compat with tests and bootstrap scenarios.
 
-- `cmp_server.py` → `CMPv2ASN1.build_pki_message` (l.249).
-- `cmp_server.py` → every call site that returns the result of
-  `build_pki_message` (l.593, 601, 618, 622, 661, 674, 702, 706, 791, 827,
-  1004) — audit whether each needs the CA chain included.
+**Tests added** (`TestRFC4210Protection`, 6 tests):
 
-**Implementation**
+- Legacy unprotected path still works (no signer_key → no [0]/[1] fields)
+- Protected message has [0] protection field (tag 0xA0)
+- Protected message has [1] extraCerts field (tag 0xA1)
+- Protection signature verifies against ProtectedPart with CA pubkey
+- Protection signature fails against corrupted body bytes
+- ExtraCerts contains the signer cert DER
 
-- Extract the DER bytes of the already-built `header` and `body` SEQUENCEs
-  (they're constructed in the function; keep them as separate variables
-  before wrapping).
-- Compute `protectedPart = header_der + body_der` per RFC 4210 §5.1.3 —
-  note this is the **concatenation of the two TLVs**, not a re-wrapped
-  SEQUENCE.
-- Sign: `sig = ca_key.sign(protectedPart, padding.PKCS1v15(), SHA256())`.
-- Append `[0] EXPLICIT protection BIT STRING` (tag `0xA0`, inner `0x03` with
-  unused-bits byte `0x00` + signature).
-- Append `[1] EXPLICIT extraCerts SEQUENCE OF Certificate` (tag `0xA1`)
-  containing the CA cert (and any intermediates).
-- Pass the CA key + cert into the builder via a new parameter or via a
-  closure. Prefer a small refactor: `build_pki_message(..., signer_key,
-  signer_cert)`.
-- When PSS is added (RFC 4055 work), parameterize padding choice from the
-  CA config.
+**Outstanding**
 
-**Tests** (new class `TestRFC4210Protection`)
-
-- Send a signed `ir`; parse the response and assert `[0] protection` is
-  present, `[1] extraCerts` contains the CA cert, and the signature
-  verifies against the CA public key over `header||body`.
-- Corrupt the body after signing; assert verification fails.
-- Assert `protectionAlg` in the header matches the actual algorithm used.
-
-**Docs**
-
-- README CMP section: note "Responses are signature-protected per RFC 4210
-  §5.1.3" and remove any caveat if present.
+- README CMP section bullet — pending markdown only.
 - CHANGELOG `### Security`: "CMPv2/v3 responses now carry signature
-  protection and the CA cert chain in `extraCerts`, closing RFC 4210 §5.1.3
-  gap."
+  protection and CA cert chain in extraCerts, closing RFC 4210 §5.1.3
+  gap." — pending markdown only.
 
 ---
 
-### RFC 4211 — CRMF proof-of-possession verification
+### RFC 4211 — CRMF proof-of-possession verification ✅ SHIPPED
 
-**What it requires.** §4: when a CRMF `CertReqMsg` is submitted with a
+**What was required.** §4: when a CRMF `CertReqMsg` is submitted with a
 `POPOSigningKey`, the server MUST verify the signature to prove the
 requester holds the private key matching the requested public key.
+Without this check, a malicious requester can submit a CRMF claiming
+someone else's public key.
 
-**Source evidence.** `cmp_server.py:395-460`
-(`extract_subject_and_pubkey_from_crmf`) walks the CertRequest template and
-pulls out `[5] subject` and `[6] publicKey`, but it never reads the
-`popo` field ([1] IMPLICIT ProofOfPossession) that sits between `CertRequest`
-and the optional `regInfo` inside each `CertReqMsg`.
+**What shipped**
 
-Not exploitable today because PyPKI's CMP path always requires a protected
-PKIMessage, but still a MUST-violation and defense-in-depth matters.
+- `cmp_server.py` — new `CMPv2ASN1.parse_crmf(body_raw)` returns a
+  richer dict including `subject`, `spki`, `certreq_der` (the bytes
+  signed by POPO per §4.1 case 2), and `popo_raw` (the POPO TLV).
+- `cmp_server.py` — new `CMPv2ASN1.verify_popo(certreq_der, spki, popo_raw)`
+  returns `(ok: bool, reason: str)`. Supports RFC 4211 §4.1 **case 2
+  only** (POPOSigningKey without POPOSigningKeyInput, signed bytes =
+  certRequest DER). Rejects raVerified, keyEncipherment, keyAgreement
+  alternatives — case 1/3 with POPOSigningKeyInput is also rejected
+  with a clear error message.
+- Algorithms verified: RSA-PKCS1v15 with SHA-256/384/512, ECDSA with
+  SHA-256/384/512, Ed25519. Algorithm OID extracted from the CRMF
+  itself, not the certTemplate, and cross-checked against the public
+  key type to prevent algorithm-substitution attacks.
+- `cmp_server.py:_handle_cert_request` now invokes `parse_crmf` +
+  `verify_popo`. On failure or missing POPO with client-supplied SPKI:
+  returns `PKIStatusInfo` rejection (status 2) with `failInfo` bit 9
+  (`badPOP`) per RFC 4210 §3.1.4. Audit-logs both `popo_failed` and
+  `popo_missing` events.
+- Legacy `extract_subject_and_pubkey_from_crmf` kept as a back-compat
+  wrapper returning `(subject, spki)` — no external callers exist in
+  tree, but the wrapper means any third-party code keeps working.
 
-**Files to modify**
+**Tests added** (`TestRFC4211POPO`, 9 tests):
 
-- `cmp_server.py` → `extract_subject_and_pubkey_from_crmf` (l.395). Rename
-  to `parse_crmf` and return `(subject_str, spki_der, popo_signature,
-  popo_alg, certreq_der)`.
-- `cmp_server.py` → `_handle_cert_request` (l.540) to call the verification.
+- `parse_crmf` returns the richer dict (certreq_der, popo_raw)
+- Legacy extractor still works
+- Valid RSA-SHA256 POPO accepted
+- Valid ECDSA P-256 POPO accepted
+- Valid Ed25519 POPO accepted
+- POPO signed by a different key than certTemplate's SPKI → rejected
+  (the classic attack vector)
+- Corrupted signature bytes → rejected
+- raVerified ([0] NULL) variant → rejected
+- Empty inputs return False without crashing
 
-**Implementation**
+**Outstanding**
 
-- Per RFC 4211 §4.1 case 2 (signature POPO without POPOSigningKeyInput), the
-  signed data is the DER of the `certRequest` itself. Capture its bytes
-  during parsing.
-- Reconstruct the public key from the SPKI DER via
-  `serialization.load_der_public_key`.
-- Verify: for RSA PKCS1v15, `pubkey.verify(signature, certreq_der,
-  padding.PKCS1v15(), hash_from_alg_oid)`. Map common OIDs: `1.2.840.
-  113549.1.1.11` → SHA256, `1.2.840.113549.1.1.12` → SHA384, `1.2.840.
-  10045.4.3.2` → ECDSA-SHA256, `1.3.101.112` → Ed25519 (no hash).
-- If POPO missing or invalid: respond with `rejection` status code 2,
-  failInfo `badPOP` (bit 9). Audit-log the failure.
-- Case 3 (POPOSigningKeyInput with authInfo) is not needed unless a CMP
-  workflow without CMP protection is added later — skip for now, clearly
-  document that only case 2 is accepted.
-
-**Tests** (new class `TestRFC4211POPO`)
-
-- Valid CRMF with correct POPO → accepted.
-- CRMF with no POPO field → rejected with `badPOP`.
-- CRMF with POPO signed by a different key than the one in certTemplate →
-  rejected.
-- CRMF with corrupted signature → rejected.
-
-**Docs**
-
-- README CMP section: note "CRMF POPO verification per RFC 4211 §4.1".
-- CHANGELOG `### Security`: "Enforce CRMF proof-of-possession per RFC 4211
-  §4; prevent cert issuance for third-party public keys."
+- README CMP section bullet — pending markdown only.
+- CHANGELOG `### Security`: "Enforce CRMF proof-of-possession per
+  RFC 4211 §4; prevent cert issuance for third-party public keys."
+  — pending markdown only.
 
 ---
 
@@ -314,17 +345,33 @@ encoded as `OneAsymmetricKey` (PKCS#8 v2) or `PrivateKeyInfo` (PKCS#8 v1),
 not legacy `RSAPrivateKey` (PKCS#1) or `ECPrivateKey` (SEC1).
 
 **Source evidence.** EST (`est_server.py:520`) and IPsec
-(`ipsec_server.py:876`) correctly use `PrivateFormat.PKCS8`. CMP has four
+(`ipsec_server.py:876`) correctly use `PrivateFormat.PKCS8`. CMP had four
 sites using `PrivateFormat.TraditionalOpenSSL` (PKCS#1 for RSA, SEC1 for EC);
-the Web UI sub-CA endpoint was a fifth (now fixed):
+the Web UI sub-CA endpoint was a fifth. **All five fixed.**
 
-- `cmp_server.py:585` — `ir` auto-generated key
-- `cmp_server.py:1068` — PKCS#12 bundle construction path
-- `cmp_server.py:1171` — API key return
-- `cmp_server.py:1195` — enrollment response private key field
+- ~~`cmp_server.py:585` — `ir` auto-generated key~~ **FIXED**
+- ~~`cmp_server.py:1068` — PKCS#12 bundle construction path~~ **FIXED**
+- ~~`cmp_server.py:1171` — API key return~~ **FIXED**
+- ~~`cmp_server.py:1195` — enrollment response private key field~~ **FIXED**
 - ~~`web_ui.py:1563` — sub-CA export~~ **FIXED**
 
-**Files to modify**
+**Additional sites discovered after the initial audit** (lower stakes —
+mostly disk persistence of the CA's own keys, not client deliveries):
+
+- `pki_server.py:885` — CA key persisted to disk on first boot
+- `pki_server.py:1432` — internal key write
+- `pki_server.py:1522` — internal key write
+- `pki_server.py:1672` — internal key write
+- `ipsec_server.py:2395` — IPsec response key
+- `ipsec_server.py:2479` — IPsec response key
+- `ocsp_server.py:472` — OCSP signer key persisted to disk
+
+These should also migrate to PKCS#8 for consistency and ECC compatibility.
+Functionally lower stakes since these files are read back only by PyPKI
+itself (the format is internal), but the change is mechanical and the
+risk is purely cosmetic. Track as a follow-up cleanup pass; not blocking.
+
+**Files modified for the closed-out fix**
 
 - `cmp_server.py` at the four line numbers above.
 
@@ -1692,42 +1739,69 @@ histograms.
 
 ---
 
-### 5.12 Documentation deliverables (markdown, no code)
+### 5.12 Documentation deliverables (markdown, no code) — ✅ SHIPPED
 
 These are the credibility-and-onboarding gaps. Each is a day of writing.
 
-**`docs/CPS.md` — Certificate Practice Statement (RFC 3647 §6).**
+**`docs/CPS.md` — Certification Practice Statement (RFC 3647 §6) ✅ SHIPPED.**
 Already specified in the Tier 4 RFC 3647 section. Belongs here too because
 it's the single highest-leverage piece of documentation: every issued cert
 points at it via the `id-qt-cps` qualifier today, and that URL is currently
 a 404.
 
-**`docs/THREAT_MODEL.md`.** What is PyPKI's TCB? What does compromise of
-each component buy an attacker? Specific scenarios: Web UI session theft,
-OCSP signer key theft, CA key theft, DB read access, DB write access,
-admin API key theft. For each: blast radius and mitigation. Without this
-document, no security review can give PyPKI a positive verdict because
-they have nothing to review *against*.
+Shipped: `docs/CPS.md` follows the RFC 3647 §6 nine-section outline,
+calibrated for self-hosted PyPKI deployments (homelab + small enterprise);
+NOT a publicly-trusted CA. Includes contact placeholders, PEN OID
+placeholder, full §1 introduction through §9 legal matters, plus references
+appendix.
 
-**`docs/DEPLOYMENT/`.** One file per common topology:
-- `homelab-single-node.md` — what most users start with.
-- `offline-root-online-subca.md` — the standard two-tier, ties to §5.3.
-- `kubernetes-cert-manager.md` — the deployment we discussed; pairs with
-  the sub-CA ergonomics work in §1.
-- `kubernetes-istio.md` — service mesh integration via cert-manager-istio-csr.
-- `iot-devices-est.md` — device enrollment via EST; ties to the EST
-  profile-routing work.
-- `pihole-acme-dns01.md` — your existing setup; document for others.
-- `vpn-strongswan-cmp.md` — IPsec CA via CMP.
+**Wired into code:** `--cps-uri` and `--cps-policy-oid` CLI flags added
+to `pki_server.py`; `ServerConfig` carries a deployment-wide
+`certificate_policies_default` that flows into every `issue_certificate`
+call when no per-profile or per-issuance value is set. Tests in
+`TestCPSWiring` verify (1) no extension when unconfigured, (2) extension
+present + correct OID + correct CPS URI when configured, (3) explicit
+arg overrides default.
 
-**`docs/COMPATIBILITY.md`.** Tested-against matrix. OpenSSL versions,
-strongSwan versions, certbot, acme.sh, cert-manager, Windows
-Authenticode tooling, kubeadm versions, openssl `cms` and `ts` versions.
-Without this, every user re-discovers the same edge cases.
+**`docs/THREAT_MODEL.md` ✅ SHIPPED.** Defines PyPKI's TCB, three
+adversary classes (network, authenticated subscriber, host-compromise),
+seven per-component compromise scenarios with concrete bounded blast
+radius and recovery procedures, plus a defense-in-depth controls table
+and a known-gaps table. Honest about what the software can and cannot
+do; the host-compromise scenario explicitly notes that HSM is the only
+real mitigation and is Tier 5.1 future work.
 
-**`docs/MIGRATION.md`.** SQLite → Postgres (when 5.2 lands). File-backed
-key → HSM (when 5.1 lands). v0.x → v1.0 schema. Worth writing each as
-the corresponding feature ships, not in advance.
+**`docs/DEPLOYMENT/`** — one file per common topology, all ✅ SHIPPED:
+- ~~`homelab-single-node.md`~~ ✅ — what most users start with
+- ~~`kubernetes-cert-manager.md`~~ ✅ — pairs with the sub-CA
+  ergonomics work; covers cert-manager `CA` ClusterIssuer, sub-CA
+  bootstrap with name constraints, revocation testing, sub-CA renewal
+- ~~`pihole-acme-dns01.md`~~ ✅ — Pi-hole/dnsmasq + SSH hook
+  pattern for ACME `dns-01` challenges
+- ~~`offline-root-online-subca.md`~~ ✅ — two-tier PKI with offline
+  root, ceremony procedures, sub-CA renewal/revocation runbooks
+- ~~`kubernetes-istio.md`~~ ✅ — service mesh integration; covers
+  both plug-in CA certs (Option A) and cert-manager-istio-csr (Option B)
+- ~~`iot-devices-est.md`~~ ✅ — EST enrollment for embedded devices,
+  SAN pass-through fix verified, simpleenroll + simplereenroll flows
+- ~~`vpn-strongswan-cmp.md`~~ ✅ — IPsec gateway + roadwarrior
+  enrollment via CMPv2 PBM bootstrap + signature-based renewal
+
+**`docs/COMPATIBILITY.md` ✅ SHIPPED.** Tested-against matrix for
+runtime, ACME clients, CMP clients, SCEP clients, EST clients, k8s
+ecosystem, OCSP/CRL clients, reverse proxies, operating systems.
+Honest about what's actually been tested vs "expected to work" —
+contributions explicitly invited to convert "expected" to "tested".
+
+**`docs/MIGRATION.md` ✅ SHIPPED.** Operator-facing version of the
+SQLite→Postgres migration spec (the developer spec stays in CLAUDE.md);
+also covers PyPKI version upgrade procedure and the emergency
+CA-key-compromise migration runbook.
+
+**`docs/STORAGE.md`** (already shipped in a prior session, complements
+the above): covers the three deployment shapes (SQLite homelab,
+single-node Postgres, HA Postgres) with concrete deployment recipes
+for each.
 
 ---
 
@@ -1794,13 +1868,13 @@ Do **not** spend effort on these without explicit user need:
 Revised given the audit findings. Highest-impact / lowest-risk first.
 
 1. **Immediate (quick wins, mostly small diffs)**:
-   - RFC 5958 (PKCS#8 normalization — four-line change in `cmp_server.py`)
-   - RFC 6818 / RFC 5280 (add `cRLNumber` + AKI to CRL)
-   - RFC 8954 (OCSP nonce bounds enforcement)
-   - RFC 7468 (strict PEM validation)
+   - ~~RFC 5958 (PKCS#8 normalization — four-line change in `cmp_server.py`)~~ ✅ **SHIPPED**
+   - ~~RFC 6818 / RFC 5280 (add `cRLNumber` + AKI to CRL)~~ ✅ **SHIPPED**
+   - ~~RFC 8954 (OCSP nonce bounds enforcement)~~ ✅ **SHIPPED**
+   - ~~RFC 7468 (strict PEM validation)~~ ✅ **SHIPPED**
 2. **Security-critical (MUST-violations)**:
-   - RFC 4210 §5.1.3 (CMP response signature protection)
-   - RFC 4211 §4 (CRMF POPO verification)
+   - ~~RFC 4210 §5.1.3 (CMP response signature protection)~~ ✅ **SHIPPED**
+   - ~~RFC 4211 §4 (CRMF POPO verification)~~ ✅ **SHIPPED**
 3. **Crypto-algorithm coverage** (do together, one refactor):
    - RFC 4055 (PSS/OAEP)
    - RFC 5480 + RFC 5758 (ECC in PKIX + ECDSA algorithm IDs)
@@ -2494,19 +2568,54 @@ A new test class `TestSQLiteToPostgresMigration`:
 - **Sample mismatch detection**: migrate, then corrupt a row in the
   destination; run `verify_migration`; assert it detects the mismatch.
 
-#### Done criteria for the migration tool
+#### Done criteria for the migration tool — ✅ SHIPPED
 
-- [ ] `pypki migrate-data` subcommand implemented; copies all canonical
-      tables, skips ephemeral tables, batches large tables.
-- [ ] `pypki verify-migration` subcommand implemented; row counts,
-      random-sample comparison, ca_meta singleton check, sequence-safety
-      check.
-- [ ] `fix_sequence` works correctly for both backends.
-- [ ] Round-trip tests pass against an SQLite fixture and a Postgres
-      testcontainer in CI.
-- [ ] `docs/STORAGE.md` includes the runbook from this section verbatim,
-      with examples for systemd, Docker Compose, and bare process.
-- [ ] CHANGELOG `### Added`: SQLite ↔ Postgres data migration tool.
+- [x] `migrate-data` subcommand implemented in `pypki_admin.py`; copies
+      all canonical tables, skips ephemeral tables (`acme.nonces`),
+      batches large tables via LIMIT/OFFSET.
+- [x] `verify-migration` subcommand implemented in `pypki_admin.py`;
+      row counts, random-sample row comparison, schema-version match,
+      Postgres sequence-safety check.
+- [x] Sequence resync (`_resync_sequence`) handles both backends —
+      `sqlite_sequence` on SQLite, `pg_get_serial_sequence` + `setval`
+      on Postgres.
+- [x] Round-trip tests pass against SQLite fixtures (`test_migration.py`,
+      19 passing); Postgres tests gated on `PYPKI_TEST_POSTGRES_URL`.
+- [x] `docs/MIGRATION.md` includes the operator runbook with concrete
+      commands and an `--to-db-url-tmpl` template for the common case.
+- [x] CHANGELOG `### Added`: SQLite ↔ Postgres data migration tool.
+
+**Implementation notes (post-shipping):**
+
+The shipped tool diverges from the original spec in two ways, neither
+material:
+
+1. **Argument shape.** Spec said
+   `pypki migrate-data --from sqlite://... --to postgresql://...` as if
+   PyPKI used a single database URL. The real PyPKI has four logical
+   databases per deployment, so the CLI accepts:
+
+   * `--from-ca-dir DIR` / `--to-ca-dir DIR` (SQLite-files-in-a-directory),
+   * `--from-db-url-tmpl 'postgresql://.../{namespace}'` /
+     `--to-db-url-tmpl ...` (one DB per namespace),
+   * `--from-url-pki URL` / `--to-url-pki URL` etc. (per-namespace
+     explicit URLs, useful for partial migration or testing).
+
+   The three forms compose: per-namespace overrides win over the
+   template, the template wins over the directory.
+
+2. **`ca_meta` is not a real table.** The spec assumed a single
+   `ca_meta` key-value table for schema version + serial counter + CRL
+   counter. Real PyPKI uses dedicated tables (`serial_counter`,
+   `crl_number`, each a singleton with `id=1`) and per-DB
+   `schema_migrations`. The migration tool reflects reality:
+   `_assert_schema_versions_match` queries `schema_migrations` directly,
+   and `serial_counter` / `crl_number` are migrated as ordinary tables
+   with their seeded singletons overwritten by `ON CONFLICT DO UPDATE`.
+
+The shipped CLI is at `pypki_admin.py`, separate from `pki_server.py`
+so the running server's 100+ runtime flags don't get tangled up with
+offline admin work.
 
 #### What this guarantees the operator
 

@@ -9,6 +9,108 @@ This project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Security
+
+- **RFC 4210 §5.1.3 — CMPv2/v3 response signature protection.** Every
+  CMPv2 and CMPv3 response now carries a `[0] PKIProtection` BIT STRING
+  signed by the CA over the `ProtectedPart` (header ‖ body), along with
+  the full `[1] extraCerts` chain. Algorithm: `sha256WithRSAEncryption`,
+  matching the existing `protectionAlg` hint. Closes the gap that caused
+  strict clients (EJBCA, strongSwan pki, RFC 9482 Lightweight CMP Profile
+  validators) to reject our otherwise-valid replies. New helper
+  `CMPv2Handler._protected_response` auto-supplies the signer key, signer
+  cert, and parent chain; all 12 response callsites in `CMPv2Handler` and
+  `CMPv3Handler` migrated. The legacy unprotected path is preserved (no
+  kwargs → no protection) for back-compat with tests and bootstrap.
+- **RFC 4211 §4 — CRMF proof-of-possession verification.** Server now
+  verifies the `POPOSigningKey` signature on every CRMF `CertReqMsg`
+  before issuance, defeating the attack where a malicious requester
+  submits a CRMF claiming someone else's public key. New helpers
+  `CMPv2ASN1.parse_crmf` and `CMPv2ASN1.verify_popo` support RFC 4211
+  §4.1 case 2 (POPO signed over the `CertRequest` DER). Algorithms
+  verified: RSA-PKCS1v15 with SHA-256/384/512, ECDSA with SHA-256/384/512,
+  Ed25519. The algorithm OID is extracted from the CRMF itself, not the
+  certTemplate, and cross-checked against the public-key type to prevent
+  algorithm-substitution attacks. `raVerified` and `POPOSigningKeyInput`
+  variants are explicitly rejected. On failure or missing POPO with
+  client-supplied SPKI, the response is a `PKIStatusInfo` rejection with
+  `failInfo` bit 9 (`badPOP`) per RFC 4210 §3.1.4 and the event is
+  audit-logged as `popo_failed` / `popo_missing`.
+
+### Fixed
+
+- **RFC 6818 / RFC 5280 §5.2.1, §5.2.3 — CRL mandatory extensions.**
+  All three CRL builders (`generate_crl`, `generate_crl_der`,
+  `generate_delta_crl`) now emit the previously-missing `cRLNumber` and
+  `authorityKeyIdentifier` extensions. CRL numbers are allocated
+  atomically via a new `crl_number` counter table seeded by migration
+  `db_migrations/pki/002_crl_number.sql`; allocation uses
+  `BEGIN IMMEDIATE` for cross-process safety, monotonically increasing
+  across all three builders, persisting across CA restarts. Delta CRLs
+  retain their existing `DeltaCRLIndicator` (critical) and now carry all
+  three extensions; the delta number is always greater than the base per
+  RFC 5280 §5.2.4. The CRL signature still verifies against the CA
+  public key.
+- **Pre-existing crash in `generate_crl_der` when revoked certs are
+  present.** The builder used `datetime.fromtimestamp()` against an
+  ISO-8601 TEXT column (`revoked_at`), which would crash any call against
+  a DB containing revoked certs. Fixed by switching to
+  `datetime.fromisoformat()`, mirroring the working call in
+  `generate_crl()`. Surfaced by the new RFC 6818 CRL tests.
+
+### Added
+
+- **RFC 7468 — strict textual encoding parser for external PEM bundles.**
+  New helper `_parse_pem_bundle(data, allowed_labels=None)` in
+  `pki_server.py` tokenises a PEM bundle into `(label, der_bytes)` pairs,
+  enforcing every framing rule in RFC 7468 §3: uppercase-only boundary
+  markers (`-----BEGIN <LABEL>-----` / `-----END <LABEL>-----`), matching
+  labels, only whitespace permitted outside encapsulation boundaries
+  (no explanatory text between or after blocks), and a strict base64
+  alphabet (`A–Za–z0–9+/` with at most two trailing `=`). Both canonical
+  64-column wrapping and unwrapped base64 are accepted as long as the
+  alphabet is valid. `_load_parent_chain` now ingests `ca-chain.pem`
+  through the helper with `allowed_labels={"CERTIFICATE"}`, so any
+  tampering with the chain file — lowercase markers, label substitution,
+  trailing junk, or a stray `PRIVATE KEY` block — surfaces a clear
+  `ValueError` instead of silently misparsing. The default allowlist for
+  imports is `CERTIFICATE`, `X509 CRL`, `PKCS7`. Verified by
+  `TestRFC7468PEM` (15 tests): canonical and unwrapped acceptance,
+  multi-block concatenation, round-trip with `x509.load_der_x509_certificate`,
+  lowercase / mismatch / trailing-data / invalid-base64 / empty-body /
+  missing-END rejection, allowlist enforcement, and integration through
+  `_load_parent_chain`.
+
+- **RFC 8954 — OCSP nonce extension profile enforcement.** The OCSP
+  request parser now enforces the RFC 8954 §2.1 nonce-length bounds
+  (1 ≤ len ≤ 32 bytes) after unwrapping the inner OCTET STRING.
+  Out-of-bounds nonces (including 0-byte) are flagged at parse time and
+  the handler returns `malformedRequest` (status 1). Valid nonces are
+  echoed verbatim per RFC 6960 §4.4.1. New CLI flag
+  `--ocsp-require-nonce` enables strict mode: nonceless requests are
+  rejected with `unauthorized` (status 6). Off by default to match the
+  RFC 6960 default; useful against MITM replay of cached responses. Test
+  coverage in `TestRFC8954OCSPNonce`: 1/8/16/32-byte boundary
+  acceptance, 33/64/128-byte rejection, empty nonce rejection, strict
+  mode behaviour both ways.
+
+### Changed
+
+- **RFC 5958 — CMP private-key output normalized to PKCS#8.** Replaced
+  all five `PrivateFormat.TraditionalOpenSSL` callsites (four in
+  `cmp_server.py` covering `ir` auto-generated key, PKCS#12 bundle path,
+  API key return, and enrollment response private-key field; one in
+  `web_ui.py` covering sub-CA export) with `PrivateFormat.PKCS8`.
+  CMP responses now emit `PrivateKeyInfo` instead of legacy
+  `RSAPrivateKey` / `ECPrivateKey`. No compatibility risk — every modern
+  client (OpenSSL 1.1+, strongSwan, Java keytool, Windows certutil)
+  reads PKCS#8 transparently, and the change is a prerequisite for ECC
+  CA support. Verified by `TestRFC5958PKCS8`. Internal CA-key-on-disk
+  writes (`pki_server.py`, `ocsp_server.py`, `ipsec_server.py`) still
+  use `TraditionalOpenSSL` and are tracked for a follow-up cleanup
+  pass — those files are read only by PyPKI itself, so the divergence
+  is purely cosmetic.
+
 ### Documentation
 
 #### RFC compliance analysis — RFC 9370, RFC 9180, RFC 9763
