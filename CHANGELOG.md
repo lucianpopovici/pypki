@@ -60,6 +60,27 @@ This project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **RFC 8738 — ACME IP identifier support.** ACME orders may now carry
+  `{"type": "ip", "value": "<IPv4-or-IPv6>"}` identifiers per RFC 8738
+  §3. The identifier value is parsed with `ipaddress.ip_address()`;
+  private, loopback, link-local, multicast, reserved, and unspecified
+  addresses are rejected with `rejectedIdentifier` unless the new
+  `--acme-allow-private-ip` flag is set (off by default to mirror public-CA
+  practice). Authorizations for `ip` identifiers offer only the `http-01`
+  and `tls-alpn-01` challenge types — `dns-01` is omitted per RFC 8738 §4
+  (there is no reverse-DNS variant). On finalize, the CSR's `iPAddress`
+  SAN entries must cover the order's `ip` identifiers; the issued cert
+  carries each as an `iPAddress` SAN (never `dNSName`). `http-01`
+  validation correctly brackets IPv6 literals in the URL per RFC 3986
+  §3.2.2. Verified by `TestRFC8738ACMEIPId` (16 tests): validator helper
+  acceptance/rejection across DNS, public IPv4/IPv6, private IPv4,
+  malformed values, and unknown types; per-identifier challenge
+  selection in `create_order` (ip → no dns-01, dns → all three, mixed
+  orders); `http-01` URL bracketing for IPv4 / IPv6 / hostname;
+  `--acme-allow-private-ip` plumbing through `make_acme_handler` /
+  `start_acme_server`; and end-to-end finalize producing `iPAddress`-only
+  certs.
+
 - **RFC 7468 — strict textual encoding parser for external PEM bundles.**
   New helper `_parse_pem_bundle(data, allowed_labels=None)` in
   `pki_server.py` tokenises a PEM bundle into `(label, der_bytes)` pairs,

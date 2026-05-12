@@ -738,39 +738,66 @@ implement both together.**
 
 ---
 
-### RFC 8738 — ACME IP Identifier
+### RFC 8738 — ACME IP Identifier ✅ SHIPPED
 
-**What it requires.** Support `type: "ip"` identifiers in ACME orders,
-enabling cert issuance for IP SANs. Big win for homelab.
+**What was required.** Accept `{"type": "ip", "value": "<IPv4/IPv6>"}`
+identifiers in ACME orders, omit `dns-01` for them, validate via
+`http-01` / `tls-alpn-01` against the literal IP, and emit `iPAddress`
+SAN entries on the issued certificate.
 
-**Files to modify**
+**What shipped**
 
-- `acme_server.py` → order creation, authorization issuance, challenge
-  selection, finalize.
+- `acme_server.py` — new module-level `_validate_acme_identifier(ident,
+  *, allow_private_ip)` helper parses ip values via
+  `ipaddress.ip_address()` and gates private/loopback/link-local/
+  multicast/reserved/unspecified addresses behind the new flag. Returns
+  `(ok, error_detail)` for clean ACME problem-detail mapping
+  (`unsupportedIdentifier` vs `rejectedIdentifier`).
+- `acme_server.py` — `_ACME_CHALLENGE_TYPES_BY_IDENTIFIER` constant maps
+  identifier type to challenge set. `ACMEDatabase.create_order` reads
+  the per-identifier challenge tuple instead of always creating all
+  three — RFC 8738 §4 compliance.
+- `acme_server.py` — `_handle_new_order` calls the validator for every
+  identifier; rejected identifiers produce 400 with the correct ACME
+  problem type.
+- `acme_server.py` — `_handle_finalize` computes `order_ips` set from
+  `ip`-type identifiers, extracts `IPAddress` SANs from the CSR, asserts
+  `csr_ips >= order_ips`, and threads `san_ips=...` into
+  `issue_certificate` so the leaf carries `iPAddress` SANs (not
+  `dNSName`). Primary subject CN falls back to the first IP literal for
+  ip-only orders.
+- `acme_server.py` — `ChallengeValidator.validate_http01` brackets IPv6
+  literals in the URL per RFC 3986 §3.2.2; IPv4 and DNS hostnames are
+  left untouched.
+- `acme_server.py` — `make_acme_handler` and `start_acme_server` gained
+  an `allow_private_ip: bool = False` parameter.
+- `pki_server.py` — new `--acme-allow-private-ip` CLI flag (default off);
+  threaded into `start_acme_server`.
 
-**Implementation**
+**Tests added** (`TestRFC8738ACMEIPId`, 16 tests):
 
-- Accept `{"type": "ip", "value": "192.0.2.1"}` identifiers in
-  `new-order`. Parse with `ipaddress.ip_address()`; reject reserved/
-  multicast/loopback unless explicitly allowed via
-  `--acme-allow-private-ip`.
-- Authorization: only `http-01` and `tls-alpn-01` challenges are valid for
-  IP identifiers per RFC 8738 §4 (**no `dns-01`**). Enforce this.
-- Challenge verification uses the literal IP (no DNS resolution).
-- On finalize, the issued cert's SAN must contain `iPAddress`, not `dNSName`.
-  Validate the CSR's SAN matches the authorized identifiers exactly.
+- Validator: dns accepted; public IPv4 (`8.8.8.8`) and public IPv6
+  (`2606:4700:4700::1111`) accepted; private IPv4 rejected (10/8,
+  192.168/16, 127/8, 169.254/16) with `private` in the detail; private
+  IPv4 accepted when flag is on; malformed IP rejected; unknown
+  identifier type rejected.
+- Database: `create_order` for `ip` produces only `http-01` +
+  `tls-alpn-01` challenges; for `dns` all three; mixed-identifier orders
+  produce the correct set per authorization independently.
+- `validate_http01`: IPv6 → `http://[v6]/...`; IPv4 → no brackets;
+  hostname → no brackets (mocking `urllib.request.urlopen` to capture
+  the URL).
+- CLI plumbing: `start_acme_server` accepts `allow_private_ip` with
+  default `False`; `make_acme_handler` propagates it to the class
+  attribute.
+- End-to-end finalize: an ip-only issuance produces a cert with
+  exactly one `iPAddress` SAN and zero `dNSName` SANs.
 
-**Tests** (new class `TestRFC8738ACMEIPId`)
+**Outstanding**
 
-- Full order for `192.0.2.1` via `tls-alpn-01`; verify issued cert has
-  `iPAddress` SAN only.
-- Reject `dns-01` challenge for an IP identifier.
-- Reject order for `10.0.0.1` when `--acme-allow-private-ip` is not set.
-
-**Docs**
-
-- README ACME section: add "IP SAN issuance via RFC 8738".
-- Compliance table: RFC 8738 `✅ Full`.
+- README compliance table — done (✅ Full).
+- README ACME section bullet — done.
+- CHANGELOG `### Added` — done.
 
 ---
 

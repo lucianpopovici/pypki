@@ -104,6 +104,16 @@ A self-contained, production-grade private Certificate Authority with support fo
 
 Full key rollover support (RFC 8555 §7.3.5) — compatible with **acme.sh**, **certbot**, and any standard ACME client.
 
+**IP-address identifiers (RFC 8738).** Orders may submit
+`{"type": "ip", "value": "<IPv4-or-IPv6>"}` alongside (or instead of) `dns`
+identifiers. Authorizations for `ip` identifiers offer only `http-01` and
+`tls-alpn-01` (RFC 8738 §4 — there is no reverse-DNS challenge). The issued
+certificate carries the requested addresses as `iPAddress` SAN entries, and
+the CSR's IP SANs must match the order. Private, loopback, link-local,
+multicast, reserved, and unspecified addresses are refused by default;
+pass `--acme-allow-private-ip` to permit them in homelab / internal-only
+deployments.
+
 ### SCEP Protocol (RFC 8894)
 | Operation | Description |
 |---|---|
@@ -1691,6 +1701,7 @@ Every issued certificate includes:
 | RFC 9483 | Lightweight CMP Profile (ALPN `cmpc`) | ✅ ALPN |
 | RFC 8555 | ACME — Automatic Certificate Management | ✅ Full |
 | RFC 8737 | ACME `tls-alpn-01` challenge | ✅ Full |
+| RFC 8738 | ACME IP Identifier | ✅ Full — `{type:"ip"}` orders, `http-01` + `tls-alpn-01` only (no `dns-01`), IPv4/IPv6 SANs, `--acme-allow-private-ip` for homelab |
 | RFC 8894 | SCEP — Simple Certificate Enrolment Protocol | ✅ Full |
 | RFC 9480 | CMP Updates — CMPv3 features | ✅ Full |
 | RFC 9811 | CMP well-known URI paths | ✅ Full |

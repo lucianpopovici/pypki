@@ -64,6 +64,7 @@ import base64
 import datetime
 import hashlib
 import http.server
+import ipaddress
 import json
 import logging
 import os
@@ -101,6 +102,72 @@ def b64url_decode(s: str) -> bytes:
     if pad != 4:
         s += "=" * pad
     return base64.b64decode(s)
+
+
+# ---------------------------------------------------------------------------
+# RFC 8738 — IP identifier validation
+# ---------------------------------------------------------------------------
+
+def _validate_acme_identifier(
+    ident: dict,
+    *,
+    allow_private_ip: bool = False,
+) -> Tuple[bool, Optional[str]]:
+    """
+    Validate one element of a `new-order` ``identifiers`` array.
+
+    Supports two identifier types:
+
+      * ``dns`` — accepted as-is; downstream IDN handling lives in the CA.
+      * ``ip``  — must parse via :func:`ipaddress.ip_address`. RFC 8738 §3
+                  defines this identifier; clients submit the literal
+                  textual form. Reserved, loopback, link-local, multicast,
+                  unspecified, and private IPs are rejected by default
+                  (RFC 8738 §6 — public CAs SHOULD refuse them); enable
+                  ``allow_private_ip`` for homelab / internal use.
+
+    Returns ``(ok, error_detail)``. ``error_detail`` is the ACME problem
+    detail string when ``ok`` is False; ``None`` when ``ok`` is True.
+    """
+    itype = ident.get("type")
+    value = ident.get("value", "")
+
+    if itype == "dns":
+        if not isinstance(value, str) or not value:
+            return False, "dns identifier requires a non-empty 'value'"
+        return True, None
+
+    if itype == "ip":
+        if not isinstance(value, str) or not value:
+            return False, "ip identifier requires a non-empty 'value'"
+        try:
+            addr = ipaddress.ip_address(value)
+        except ValueError as exc:
+            return False, f"ip identifier {value!r} is not a valid IP: {exc}"
+        if not allow_private_ip and (
+            addr.is_loopback
+            or addr.is_private
+            or addr.is_link_local
+            or addr.is_multicast
+            or addr.is_reserved
+            or addr.is_unspecified
+        ):
+            return False, (
+                f"ip identifier {value!r} is private/reserved; enable "
+                "--acme-allow-private-ip to permit it on this server"
+            )
+        return True, None
+
+    return False, f"Unsupported identifier type: {itype!r}"
+
+
+# RFC 8738 §4: only http-01 and tls-alpn-01 are valid for ip identifiers.
+# dns-01 is explicitly excluded — there is no reverse-DNS challenge in this
+# profile.
+_ACME_CHALLENGE_TYPES_BY_IDENTIFIER = {
+    "dns": ("http-01", "dns-01", "tls-alpn-01"),
+    "ip":  ("http-01", "tls-alpn-01"),
+}
 
 
 # ---------------------------------------------------------------------------
@@ -387,7 +454,9 @@ class ACMEDatabase:
         )
         conn.commit()
 
-        # Create authorizations for each identifier
+        # Create authorizations for each identifier. Challenge set varies
+        # by identifier type per RFC 8738 §4: ip identifiers MUST NOT offer
+        # dns-01 (there is no reverse-DNS variant of that challenge).
         auth_ids = []
         for ident in identifiers:
             auth_id = b64url_encode(os.urandom(12))
@@ -395,8 +464,11 @@ class ACMEDatabase:
                 "INSERT INTO authorizations VALUES (?,?,?,?,?,?)",
                 (auth_id, order_id, json.dumps(ident), "pending", now, expires)
             )
-            # Create http-01, dns-01, and tls-alpn-01 challenges for each authorization
-            for ctype in ("http-01", "dns-01", "tls-alpn-01"):
+            challenge_types = _ACME_CHALLENGE_TYPES_BY_IDENTIFIER.get(
+                ident.get("type"),
+                ("http-01", "dns-01", "tls-alpn-01"),
+            )
+            for ctype in challenge_types:
                 chall_id = b64url_encode(os.urandom(12))
                 token = b64url_encode(os.urandom(32))
                 conn.execute(
@@ -531,8 +603,19 @@ class ChallengeValidator:
         return f"{token}.{jwk_thumbprint_str}"
 
     def validate_http01(self, domain: str, token: str, key_auth: str) -> Tuple[bool, str]:
-        """Fetch /.well-known/acme-challenge/<token> and verify key authorization."""
-        url = f"http://{domain}/.well-known/acme-challenge/{token}"
+        """Fetch /.well-known/acme-challenge/<token> and verify key authorization.
+
+        RFC 8738 §4 — for ip identifiers the literal is used as the URL host.
+        IPv6 literals must be bracketed per RFC 3986 §3.2.2; bare IPv6 in a URL
+        would parse the colons as a port separator.
+        """
+        host = domain
+        try:
+            if isinstance(ipaddress.ip_address(domain), ipaddress.IPv6Address):
+                host = f"[{domain}]"
+        except ValueError:
+            pass  # not an IP literal — keep the hostname as-is
+        url = f"http://{host}/.well-known/acme-challenge/{token}"
         try:
             req = urllib.request.Request(url, headers={"User-Agent": "PyPKI-ACME/1.0"})
             with urllib.request.urlopen(req, timeout=self.http_timeout) as resp:
@@ -726,6 +809,7 @@ class ACMEHandler(http.server.BaseHTTPRequestHandler):
     base_url: str = ""    # e.g. "http://localhost:8888"
     cert_validity_days: int = 90        # validity for ACME-issued certs
     short_lived_threshold_days: int = 7 # certs valid <= this get noRevAvail (RFC 9608)
+    allow_private_ip: bool = False      # RFC 8738: permit private/reserved IPs in ip identifiers
 
     def log_message(self, format, *args):
         logger.info(f"ACME {self.address_string()} - {format % args}")
@@ -951,11 +1035,20 @@ class ACMEHandler(http.server.BaseHTTPRequestHandler):
                              "No identifiers provided")
             return
 
-        # Validate identifier types
+        # Validate identifier types. RFC 8555 §7.4 + RFC 8738 §3 — accept
+        # `dns` and `ip`; everything else is unsupportedIdentifier. Private
+        # / reserved IPs are gated by --acme-allow-private-ip.
         for ident in identifiers:
-            if ident.get("type") not in ("dns",):
-                self._send_error(400, "urn:ietf:params:acme:error:unsupportedIdentifier",
-                                 f"Unsupported identifier type: {ident.get('type')}")
+            ok, detail = _validate_acme_identifier(
+                ident, allow_private_ip=self.allow_private_ip,
+            )
+            if not ok:
+                err_type = (
+                    "urn:ietf:params:acme:error:unsupportedIdentifier"
+                    if ident.get("type") not in ("dns", "ip")
+                    else "urn:ietf:params:acme:error:rejectedIdentifier"
+                )
+                self._send_error(400, err_type, detail)
                 return
 
         order = self.db.create_order(account["kid"], identifiers)
@@ -1196,14 +1289,21 @@ class ACMEHandler(http.server.BaseHTTPRequestHandler):
                              "CSR signature is invalid")
             return
 
-        # Check CSR identifiers match order identifiers
+        # Check CSR identifiers match order identifiers. RFC 8738 §5 — for
+        # ip identifiers the CSR MUST encode an iPAddress SAN (not dNSName).
         identifiers = json.loads(order["identifiers"])
         order_domains = {i["value"] for i in identifiers if i["type"] == "dns"}
+        order_ips_text = {i["value"] for i in identifiers if i["type"] == "ip"}
+        # Normalize order IPs to ipaddress objects for comparison; clients may
+        # round-trip an IPv6 in non-canonical case (e.g. 2001:DB8::1).
+        order_ips = {ipaddress.ip_address(v) for v in order_ips_text}
 
         csr_domains = set()
+        csr_ips = set()
         try:
             san_ext = csr.extensions.get_extension_for_class(x509.SubjectAlternativeName)
             csr_domains = {n.value for n in san_ext.value.get_values_for_type(x509.DNSName)}
+            csr_ips = set(san_ext.value.get_values_for_type(x509.IPAddress))
         except x509.ExtensionNotFound:
             # Fall back to CN
             try:
@@ -1216,13 +1316,24 @@ class ACMEHandler(http.server.BaseHTTPRequestHandler):
                              f"CSR domains {csr_domains} don't cover order domains {order_domains}")
             return
 
+        if not csr_ips >= order_ips:
+            csr_ip_strs = sorted(str(i) for i in csr_ips)
+            order_ip_strs = sorted(str(i) for i in order_ips)
+            self._send_error(400, "urn:ietf:params:acme:error:badCSR",
+                             f"CSR IP SANs {csr_ip_strs} don't cover order "
+                             f"IP identifiers {order_ip_strs}")
+            return
+
         # Issue the certificate
         # RFC 9608: if validity <= short_lived_threshold_days, use short_lived profile
         # which adds id-ce-noRevAvail and suppresses CDP + AIA-OCSP
         try:
             domains = sorted(csr_domains)
-            primary_domain = domains[0] if domains else "acme-client"
-            subject_str = f"CN={primary_domain}"
+            csr_ip_strs = sorted(str(i) for i in csr_ips)
+            # Primary subject CN: prefer the first DNS name; fall back to the
+            # first IP literal for ip-only orders (RFC 8738 §6).
+            primary = domains[0] if domains else (csr_ip_strs[0] if csr_ip_strs else "acme-client")
+            subject_str = f"CN={primary}"
 
             validity = self.cert_validity_days
             if validity <= self.short_lived_threshold_days:
@@ -1237,7 +1348,8 @@ class ACMEHandler(http.server.BaseHTTPRequestHandler):
             cert = self.ca.issue_certificate(
                 subject_str=subject_str,
                 public_key=csr.public_key(),
-                san_dns=list(csr_domains),
+                san_dns=list(csr_domains) if csr_domains else None,
+                san_ips=csr_ip_strs if csr_ip_strs else None,
                 validity_days=validity,
                 profile=profile,
             )
@@ -1250,7 +1362,8 @@ class ACMEHandler(http.server.BaseHTTPRequestHandler):
             self.db.update_order(order_id, status="valid", cert_id=cert_id)
 
             logger.info(
-                f"ACME cert issued: serial={cert.serial_number} domains={domains} "
+                f"ACME cert issued: serial={cert.serial_number} "
+                f"domains={domains} ips={csr_ip_strs} "
                 f"profile={profile} validity={validity}d"
             )
         except Exception as e:
@@ -1564,6 +1677,7 @@ def make_acme_handler(
     base_url: str,
     cert_validity_days: int = 90,
     short_lived_threshold_days: int = 7,
+    allow_private_ip: bool = False,
 ):
     class BoundACMEHandler(ACMEHandler):
         pass
@@ -1573,6 +1687,7 @@ def make_acme_handler(
     BoundACMEHandler.base_url                 = base_url
     BoundACMEHandler.cert_validity_days       = cert_validity_days
     BoundACMEHandler.short_lived_threshold_days = short_lived_threshold_days
+    BoundACMEHandler.allow_private_ip         = allow_private_ip
     return BoundACMEHandler
 
 
@@ -1587,6 +1702,7 @@ def start_acme_server(
     cert_validity_days: int = 90,
     short_lived_threshold_days: int = 7,
     dns01_hook=None,
+    allow_private_ip: bool = False,
 ):
     """
     Register the ACME handler with *route_table* under *prefix*.
@@ -1624,6 +1740,7 @@ def start_acme_server(
         db, ca, validator, base_url or "",
         cert_validity_days=cert_validity_days,
         short_lived_threshold_days=short_lived_threshold_days,
+        allow_private_ip=allow_private_ip,
     )
 
     route_table.register(prefix, handler_cls)

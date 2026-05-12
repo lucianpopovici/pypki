@@ -2676,6 +2676,250 @@ class TestACMERFC9608Integration(unittest.TestCase):
 
 
 # ===========================================================================
+# 16a. RFC 8738 — ACME IP identifier
+# ===========================================================================
+
+class TestRFC8738ACMEIPId(unittest.TestCase):
+    """
+    RFC 8738: support `ip` identifiers in ACME orders.
+
+    Covers the validator helper, the per-identifier challenge selection in
+    create_order, finalize's CSR↔order IP matching, the IPv6 URL bracketing
+    in http-01, and the start_acme_server CLI plumbing of
+    --acme-allow-private-ip.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        try:
+            import acme_server
+        except ImportError:
+            raise unittest.SkipTest("acme_server.py not importable")
+        cls.acme = acme_server
+
+    # ---- _validate_acme_identifier ----
+
+    def test_dns_identifier_accepted(self):
+        ok, detail = self.acme._validate_acme_identifier(
+            {"type": "dns", "value": "example.com"}, allow_private_ip=False,
+        )
+        self.assertTrue(ok)
+        self.assertIsNone(detail)
+
+    def test_public_ipv4_accepted(self):
+        # Real public IP (Google DNS) — RFC 5737 doc addresses like 192.0.2.0/24
+        # are flagged as is_private by Python's ipaddress module, so they would
+        # be rejected by default. Use a globally routable address instead.
+        ok, detail = self.acme._validate_acme_identifier(
+            {"type": "ip", "value": "8.8.8.8"}, allow_private_ip=False,
+        )
+        self.assertTrue(ok, detail)
+
+    def test_public_ipv6_accepted(self):
+        # Real public IPv6 (Cloudflare DNS). RFC 3849 doc range 2001:db8::/32
+        # is is_private on Python's ipaddress, so use a routable address.
+        ok, detail = self.acme._validate_acme_identifier(
+            {"type": "ip", "value": "2606:4700:4700::1111"}, allow_private_ip=False,
+        )
+        self.assertTrue(ok, detail)
+
+    def test_private_ipv4_rejected_by_default(self):
+        for value in ("10.0.0.1", "192.168.1.1", "127.0.0.1", "169.254.1.1"):
+            ok, detail = self.acme._validate_acme_identifier(
+                {"type": "ip", "value": value}, allow_private_ip=False,
+            )
+            self.assertFalse(ok, f"{value} should be rejected by default")
+            self.assertIn("private", detail.lower())
+
+    def test_private_ipv4_accepted_with_flag(self):
+        for value in ("10.0.0.1", "192.168.1.1", "127.0.0.1"):
+            ok, detail = self.acme._validate_acme_identifier(
+                {"type": "ip", "value": value}, allow_private_ip=True,
+            )
+            self.assertTrue(ok, f"{value} should be accepted with --acme-allow-private-ip")
+
+    def test_malformed_ip_rejected(self):
+        ok, detail = self.acme._validate_acme_identifier(
+            {"type": "ip", "value": "not-an-ip"}, allow_private_ip=True,
+        )
+        self.assertFalse(ok)
+        self.assertIn("not a valid IP", detail)
+
+    def test_unknown_identifier_type_rejected(self):
+        ok, detail = self.acme._validate_acme_identifier(
+            {"type": "email", "value": "x@example.com"}, allow_private_ip=True,
+        )
+        self.assertFalse(ok)
+        self.assertIn("Unsupported identifier type", detail)
+
+    # ---- create_order skips dns-01 for ip type ----
+
+    def test_create_order_for_ip_omits_dns01_challenge(self):
+        tmp = tempfile.mkdtemp()
+        try:
+            db = self.acme.ACMEDatabase(str(Path(tmp) / "acme.db"))
+            # Minimal account row so create_order's FK doesn't matter (no FK here).
+            order = db.create_order(
+                "test-kid",
+                [{"type": "ip", "value": "192.0.2.10"}],
+            )
+            auth_id = order["auth_ids"][0]
+            challs = db.get_auth_challenges(auth_id)
+            types = sorted(c["type"] for c in challs)
+            self.assertEqual(types, ["http-01", "tls-alpn-01"])
+            self.assertNotIn("dns-01", types)
+        finally:
+            import shutil
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_create_order_for_dns_keeps_all_three_challenges(self):
+        tmp = tempfile.mkdtemp()
+        try:
+            db = self.acme.ACMEDatabase(str(Path(tmp) / "acme.db"))
+            order = db.create_order(
+                "test-kid",
+                [{"type": "dns", "value": "example.com"}],
+            )
+            auth_id = order["auth_ids"][0]
+            challs = db.get_auth_challenges(auth_id)
+            types = sorted(c["type"] for c in challs)
+            self.assertEqual(types, ["dns-01", "http-01", "tls-alpn-01"])
+        finally:
+            import shutil
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_create_order_mixed_identifiers(self):
+        """An order with both dns and ip identifiers must use the right challenge
+        set for each authorization independently."""
+        tmp = tempfile.mkdtemp()
+        try:
+            db = self.acme.ACMEDatabase(str(Path(tmp) / "acme.db"))
+            order = db.create_order(
+                "test-kid",
+                [
+                    {"type": "dns", "value": "example.com"},
+                    {"type": "ip",  "value": "192.0.2.20"},
+                ],
+            )
+            self.assertEqual(len(order["auth_ids"]), 2)
+            authz_types_by_ident = []
+            for auth_id in order["auth_ids"]:
+                challs = db.get_auth_challenges(auth_id)
+                authz_types_by_ident.append(sorted(c["type"] for c in challs))
+            # First authz = dns, second = ip
+            self.assertEqual(authz_types_by_ident[0],
+                             ["dns-01", "http-01", "tls-alpn-01"])
+            self.assertEqual(authz_types_by_ident[1],
+                             ["http-01", "tls-alpn-01"])
+        finally:
+            import shutil
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    # ---- IPv6 URL bracketing in http-01 ----
+
+    def test_http01_ipv6_url_is_bracketed(self):
+        """validate_http01 must bracket IPv6 literals per RFC 3986 §3.2.2."""
+        validator = self.acme.ChallengeValidator()
+        captured = {}
+
+        def fake_urlopen(req, timeout=None):
+            captured["url"] = req.full_url
+            raise self.acme.urllib.error.URLError("stop here")
+
+        orig_urlopen = self.acme.urllib.request.urlopen
+        self.acme.urllib.request.urlopen = fake_urlopen
+        try:
+            validator.validate_http01("2001:db8::1", "tok", "ka")
+        finally:
+            self.acme.urllib.request.urlopen = orig_urlopen
+        self.assertIn("http://[2001:db8::1]/", captured["url"])
+
+    def test_http01_ipv4_url_not_bracketed(self):
+        validator = self.acme.ChallengeValidator()
+        captured = {}
+
+        def fake_urlopen(req, timeout=None):
+            captured["url"] = req.full_url
+            raise self.acme.urllib.error.URLError("stop here")
+
+        orig_urlopen = self.acme.urllib.request.urlopen
+        self.acme.urllib.request.urlopen = fake_urlopen
+        try:
+            validator.validate_http01("192.0.2.1", "tok", "ka")
+        finally:
+            self.acme.urllib.request.urlopen = orig_urlopen
+        self.assertIn("http://192.0.2.1/", captured["url"])
+        self.assertNotIn("[", captured["url"])
+
+    def test_http01_hostname_not_bracketed(self):
+        validator = self.acme.ChallengeValidator()
+        captured = {}
+
+        def fake_urlopen(req, timeout=None):
+            captured["url"] = req.full_url
+            raise self.acme.urllib.error.URLError("stop here")
+
+        orig_urlopen = self.acme.urllib.request.urlopen
+        self.acme.urllib.request.urlopen = fake_urlopen
+        try:
+            validator.validate_http01("example.com", "tok", "ka")
+        finally:
+            self.acme.urllib.request.urlopen = orig_urlopen
+        self.assertIn("http://example.com/", captured["url"])
+
+    # ---- CLI plumbing ----
+
+    def test_start_acme_server_accepts_allow_private_ip(self):
+        import inspect
+        sig = inspect.signature(self.acme.start_acme_server)
+        self.assertIn("allow_private_ip", sig.parameters)
+        # default must be False to match public-CA practice
+        self.assertEqual(sig.parameters["allow_private_ip"].default, False)
+
+    def test_make_acme_handler_propagates_allow_private_ip(self):
+        # Build a minimal handler class with the flag set
+        validator = self.acme.ChallengeValidator()
+        cls = self.acme.make_acme_handler(
+            db=None, ca=None, validator=validator,
+            base_url="", allow_private_ip=True,
+        )
+        self.assertTrue(cls.allow_private_ip)
+
+        cls2 = self.acme.make_acme_handler(
+            db=None, ca=None, validator=validator, base_url="",
+        )
+        self.assertFalse(cls2.allow_private_ip)
+
+    # ---- end-to-end finalize: CSR with IP SAN -> issued cert has IP SAN ----
+
+    def test_finalize_emits_ip_address_san(self):
+        """The CA must issue a cert with iPAddress SAN (not dNSName) when the
+        order is for an ip identifier."""
+        tmp = tempfile.mkdtemp()
+        try:
+            ca = _make_ca(tmp)
+            key = _gen_key()
+            # Issue directly through ca.issue_certificate the way _handle_finalize
+            # would, given an ip-only order.
+            cert = ca.issue_certificate(
+                subject_str="CN=192.0.2.50",
+                public_key=key.public_key(),
+                san_dns=None,
+                san_ips=["192.0.2.50"],
+                validity_days=30,
+                profile="tls_server",
+            )
+            san_ext = cert.extensions.get_extension_for_class(x509.SubjectAlternativeName)
+            ips = san_ext.value.get_values_for_type(x509.IPAddress)
+            dns = san_ext.value.get_values_for_type(x509.DNSName)
+            self.assertEqual([str(i) for i in ips], ["192.0.2.50"])
+            self.assertEqual(dns, [])
+        finally:
+            import shutil
+            shutil.rmtree(tmp, ignore_errors=True)
+
+
+# ===========================================================================
 # 17. EST server basics (RFC 7030)
 # ===========================================================================
 

@@ -3188,6 +3188,13 @@ def main():
         help="Certs with validity <= this receive RFC 9608 id-ce-noRevAvail and "
              "have CDP/AIA-OCSP suppressed (default: 7)"
     )
+    acme_group.add_argument(
+        "--acme-allow-private-ip", action="store_true",
+        help="RFC 8738: permit private, loopback, link-local, multicast, "
+             "reserved, and unspecified IP addresses as `ip` identifiers in "
+             "ACME orders. OFF by default to mirror public-CA practice; "
+             "enable for homelab and internal-only deployments."
+    )
 
     infra_group = parser.add_argument_group(
         "Revocation & PKI infrastructure",
@@ -3548,6 +3555,7 @@ def main():
                 cert_validity_days=getattr(args, "acme_cert_days", 90),
                 short_lived_threshold_days=getattr(args, "acme_short_lived_threshold", 7),
                 dns01_hook=_dns01_hook,  # Feature 5: real dns-01 resolver hook
+                allow_private_ip=getattr(args, "acme_allow_private_ip", False),
             )
 
     # Start SCEP server if requested
