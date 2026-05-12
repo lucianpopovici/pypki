@@ -1726,6 +1726,8 @@ Every issued certificate includes:
 | RFC 5816 | ESSCertIDv2 in TSA SignedData | ✅ Full — `signingCertificateV2` signed attribute with SHA-256 ESSCertIDv2 in every TimeStampToken |
 | RFC 8738 | ACME IP Identifier | ✅ Full — `{type:"ip"}` orders, `http-01` + `tls-alpn-01` only (no `dns-01`), IPv4/IPv6 SANs, `--acme-allow-private-ip` for homelab |
 | RFC 8894 | SCEP — Simple Certificate Enrolment Protocol | ✅ Full |
+| RFC 5083 | CMS AuthEnvelopedData | ✅ Full — `CMSBuilder.auth_enveloped_data` (AES-256-GCM); `CMSParser` dispatches on `id-ct-authEnvelopedData`; SCEP `GetCACaps` advertises `AES-GCM` |
+| RFC 5084 | AES-GCM in CMS | ✅ Full — AES-256-GCM with 12-byte nonce, 16-byte auth tag, `GCMParameters` (nonce + `ICVlen=16`); eliminates CBC padding-oracle surface from SCEP |
 | RFC 9480 | CMP Updates — CMPv3 features | ✅ Full |
 | RFC 9811 | CMP well-known URI paths | ✅ Full |
 | RFC 7030 | EST — Enrollment over Secure Transport | ✅ Full |

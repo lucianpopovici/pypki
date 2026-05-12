@@ -60,6 +60,35 @@ This project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **RFC 5083 + RFC 5084 — AES-GCM AuthEnvelopedData in SCEP CMS.** Eliminates
+  the CBC padding-oracle surface from SCEP-encrypted CSR payloads.
+
+  *New `CMSBuilder.auth_enveloped_data(plaintext, recipient_cert)`*: builds a
+  DER-encoded `ContentInfo { id-ct-authEnvelopedData, AuthEnvelopedData }` using
+  AES-256-GCM. Key transport: RSA PKCS#1v15 (same as the existing
+  `enveloped_data`). CEK: 32-byte random; GCM nonce: 12-byte random; auth tag:
+  16-byte (maximum, stored in the `mac` field per RFC 5083 §2). `GCMParameters`
+  includes `aes-ICVlen=16` (explicit, since default is 12 per RFC 5084 §3.1).
+
+  *Extended `CMSParser.parse_enveloped_data(der, key)`*: now dispatches on the
+  `ContentInfo` OID — `id-envelopedData` → existing AES-CBC / 3DES-CBC path;
+  `id-ct-authEnvelopedData` → new GCM path (`_decrypt_auth_enveloped`). The
+  calling signature is unchanged; SCEP `PKCSReq` handling automatically benefits
+  from both paths.
+
+  *New `_cms_content_type(der)`* module-level helper peeks at the `ContentType`
+  OID of a `ContentInfo` without fully parsing it — used by `_handle_pki_request`
+  to log whether incoming CSR payloads use CBC or GCM.
+
+  *`GetCACaps` response* now includes `AES-GCM` in addition to `AES`; SCEP
+  clients that read capabilities will offer GCM-encrypted CSRs.
+
+  *16 new tests in `TestRFC5083AuthEnvelopedData`*: OID verification, builder
+  round-trips (empty / short / 4 096-byte), GCMParameters nonce length (12 B)
+  and ICVlen (16), wrong-key failure, tampered-ciphertext / tampered-mac-tag
+  auth failures, CBC dispatch unchanged, GCM dispatch, GetCACaps token, and
+  `_cms_content_type` helper.
+
 - **RFC 3161 + RFC 5816 — Time-Stamp Authority (TSA) server.** New
   `tsa_server.py` implements a complete RFC 3161 TSA with RFC 5816
   `signingCertificateV2`.

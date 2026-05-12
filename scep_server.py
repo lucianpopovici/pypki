@@ -65,6 +65,7 @@ from cryptography.hazmat.primitives import hashes, hmac as crypto_hmac, serializ
 from cryptography.hazmat.primitives.asymmetric import rsa, padding as asym_padding
 from cryptography.hazmat.primitives.asymmetric.rsa import RSAPrivateKey, RSAPublicKey
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.primitives import padding as sym_padding
 from cryptography.hazmat.primitives.hashes import SHA1, SHA256
 from cryptography.hazmat.primitives.serialization import Encoding, PrivateFormat, NoEncryption
@@ -191,7 +192,12 @@ OID_MESSAGE_TYPE          = "2.16.840.1.113733.1.9.2"
 OID_CHALLENGE_PASSWORD    = "1.2.840.113549.1.9.7"
 OID_DES_CBC               = "1.3.14.3.2.7"
 OID_DES_EDE3_CBC          = "1.2.840.113549.3.7"
+OID_AES_128_CBC           = "2.16.840.1.101.3.4.1.2"
+OID_AES_192_CBC           = "2.16.840.1.101.3.4.1.22"
 OID_AES_256_CBC           = "2.16.840.1.101.3.4.1.42"
+OID_AES_128_GCM           = "2.16.840.1.101.3.4.1.6"   # RFC 5084
+OID_AES_256_GCM           = "2.16.840.1.101.3.4.1.46"  # RFC 5084
+OID_AUTH_ENVELOPED_DATA   = "1.2.840.113549.1.9.16.1.23"  # id-ct-authEnvelopedData (RFC 5083)
 OID_SHA1                  = "1.3.14.3.2.26"
 OID_SHA256                = "2.16.840.1.101.3.4.2.1"
 OID_COMMON_NAME           = "2.5.4.3"
@@ -370,86 +376,75 @@ class CMSParser:
         return attrs
 
     @staticmethod
-    def parse_enveloped_data(der: bytes, private_key: RSAPrivateKey) -> bytes:
+    def parse_enveloped_data(der: bytes, private_key) -> bytes:
         """
-        Parse a CMS EnvelopedData and decrypt the inner content.
-        Supports RSA + AES-256-CBC and RSA + 3DES-EDE-CBC.
+        Parse a CMS ContentInfo wrapping either EnvelopedData (CBC, RFC 5652)
+        or AuthEnvelopedData (AES-GCM, RFC 5083 / RFC 5084) and return the
+        decrypted plaintext.
+
+        Dispatches on the content-type OID:
+          id-envelopedData     (1.2.840.113549.1.7.3) → AES-CBC / 3DES-CBC
+          id-ct-authEnvelopedData (1.2.840.113549.1.9.16.1.23) → AES-GCM
         """
-        # ContentInfo wrapper
+        # ContentInfo: SEQUENCE { contentType OID, content [0] }
         tag, ci_val, _ = _decode_tlv(der, 0)
-        # contentType OID
         ci_pos = 0
         tag, oid_val, ci_pos = _decode_tlv(ci_val, ci_pos)
-        # content [0]
+        content_type = _decode_oid_bytes(oid_val)
         tag, ev_outer, ci_pos = _decode_tlv(ci_val, ci_pos)
+
+        if content_type == OID_AUTH_ENVELOPED_DATA:
+            return CMSParser._decrypt_auth_enveloped(ev_outer, private_key)
+        return CMSParser._decrypt_enveloped(ev_outer, private_key)
+
+    @staticmethod
+    def _decrypt_enveloped(ev_outer: bytes, private_key) -> bytes:
+        """Decrypt a CMS EnvelopedData value (AES-CBC or 3DES-CBC)."""
         # EnvelopedData SEQUENCE
         tag, ev_val, _ = _decode_tlv(ev_outer, 0)
 
         ev_pos = 0
-        # version
-        tag, ver, ev_pos = _decode_tlv(ev_val, ev_pos)
+        tag, _ver, ev_pos = _decode_tlv(ev_val, ev_pos)          # version
+        tag, ri_set, ev_pos = _decode_tlv(ev_val, ev_pos)        # recipientInfos SET
+        tag, eci_val, ev_pos = _decode_tlv(ev_val, ev_pos)       # encryptedContentInfo
 
-        # recipientInfos SET
-        tag, ri_set, ev_pos = _decode_tlv(ev_val, ev_pos)
-
-        # encryptedContentInfo
-        tag, eci_val, ev_pos = _decode_tlv(ev_val, ev_pos)
-
-        # Parse recipientInfo to get encrypted key
         encrypted_key = None
-        enc_alg_oid = None
-
         ri_pos = 0
         while ri_pos < len(ri_set):
             tag, ri_val, ri_pos = _decode_tlv(ri_set, ri_pos)
             if tag != 0x30:
                 continue
             r_pos = 0
-            tag, ri_ver, r_pos = _decode_tlv(ri_val, r_pos)
-            # sid (IssuerAndSerialNumber)
-            tag, ri_sid, r_pos = _decode_tlv(ri_val, r_pos)
-            # keyEncryptionAlgorithm
-            tag, ri_kea, r_pos = _decode_tlv(ri_val, r_pos)
-            # encryptedKey OCTET STRING
+            _, _, r_pos = _decode_tlv(ri_val, r_pos)  # version
+            _, _, r_pos = _decode_tlv(ri_val, r_pos)  # sid
+            _, _, r_pos = _decode_tlv(ri_val, r_pos)  # keyEncryptionAlgorithm
             if r_pos < len(ri_val):
-                tag, ri_ek, r_pos = _decode_tlv(ri_val, r_pos)
+                _, ri_ek, _ = _decode_tlv(ri_val, r_pos)
                 encrypted_key = ri_ek
-                break  # use first recipient
+                break
 
         if encrypted_key is None:
             raise ValueError("No usable RecipientInfo found")
 
-        # Decrypt the content encryption key with the CA's private key
         try:
-            cek = private_key.decrypt(
-                encrypted_key,
-                asym_padding.PKCS1v15()
-            )
+            cek = private_key.decrypt(encrypted_key, asym_padding.PKCS1v15())
         except Exception as e:
             raise ValueError(f"Could not decrypt content encryption key: {e}")
 
-        # Parse encryptedContentInfo for content algorithm and IV
         eci_pos = 0
-        tag, ct_oid_val, eci_pos = _decode_tlv(eci_val, eci_pos)   # contentType OID
-        tag, ca_seq, eci_pos = _decode_tlv(eci_val, eci_pos)       # contentEncryptionAlgorithm
+        _, _, eci_pos = _decode_tlv(eci_val, eci_pos)        # contentType OID
+        tag, ca_seq, eci_pos = _decode_tlv(eci_val, eci_pos) # contentEncryptionAlgorithm
         ca_pos = 0
-        tag, ce_oid_val, ca_pos = _decode_tlv(ca_seq, ca_pos)      # algorithm OID
+        tag, ce_oid_val, ca_pos = _decode_tlv(ca_seq, ca_pos)
         enc_alg_oid = _decode_oid_bytes(ce_oid_val)
-        tag, iv_val, ca_pos = _decode_tlv(ca_seq, ca_pos)          # IV (OCTET STRING)
-        tag, ec_val, eci_pos = _decode_tlv(eci_val, eci_pos)       # encryptedContent [0]
+        tag, iv_val, _ = _decode_tlv(ca_seq, ca_pos)
+        tag, ec_val, _ = _decode_tlv(eci_val, eci_pos)
 
-        # The encryptedContent may be wrapped in [0] implicit OCTET STRING
         if ec_val and ec_val[0] == 0x80:
             _, ec_val, _ = _decode_tlv(ec_val, 0)
 
-        # Decrypt
-        if enc_alg_oid in (OID_AES_256_CBC, "2.16.840.1.101.3.4.1.22",  # AES-192-CBC
-                            "2.16.840.1.101.3.4.1.2"):                   # AES-128-CBC
-            key_size = {
-                "2.16.840.1.101.3.4.1.2":  16,
-                "2.16.840.1.101.3.4.1.22": 24,
-                OID_AES_256_CBC:            32,
-            }[enc_alg_oid]
+        if enc_alg_oid in (OID_AES_256_CBC, OID_AES_192_CBC, OID_AES_128_CBC):
+            key_size = {OID_AES_128_CBC: 16, OID_AES_192_CBC: 24, OID_AES_256_CBC: 32}[enc_alg_oid]
             cipher = Cipher(algorithms.AES(cek[:key_size]), modes.CBC(iv_val))
         elif enc_alg_oid == OID_DES_EDE3_CBC:
             cipher = Cipher(algorithms.TripleDES(cek[:24]), modes.CBC(iv_val))
@@ -462,6 +457,88 @@ class CMSParser:
         padded = decryptor.update(ec_val) + decryptor.finalize()
         unpadder = sym_padding.PKCS7(cipher.algorithm.block_size).unpadder()
         return unpadder.update(padded) + unpadder.finalize()
+
+    @staticmethod
+    def _decrypt_auth_enveloped(ev_outer: bytes, private_key) -> bytes:
+        """
+        Decrypt a CMS AuthEnvelopedData value (AES-256-GCM).
+
+        RFC 5083 §2 / RFC 5084 §3.1.  The MAC (auth tag) is a separate
+        ``mac`` field at the end of the AuthEnvelopedData SEQUENCE; the
+        cryptography library expects ciphertext || tag when decrypting.
+        """
+        # AuthEnvelopedData SEQUENCE
+        tag, ev_val, _ = _decode_tlv(ev_outer, 0)
+        ev_pos = 0
+        _, _ver,     ev_pos = _decode_tlv(ev_val, ev_pos)   # version
+
+        # optional originatorInfo [0]
+        if ev_pos < len(ev_val) and ev_val[ev_pos] == 0xA0:
+            _, _, ev_pos = _decode_tlv(ev_val, ev_pos)
+
+        _, ri_set,   ev_pos = _decode_tlv(ev_val, ev_pos)   # recipientInfos SET
+        _, aci_val,  ev_pos = _decode_tlv(ev_val, ev_pos)   # authEncryptedContentInfo
+
+        # optional authAttrs [1] IMPLICIT
+        if ev_pos < len(ev_val) and ev_val[ev_pos] == 0xA1:
+            _, _, ev_pos = _decode_tlv(ev_val, ev_pos)
+
+        # mac OCTET STRING — auth tag (16 bytes for AES-256-GCM)
+        _, mac_tag, _ = _decode_tlv(ev_val, ev_pos)
+
+        # Decrypt CEK using RSA PKCS#1v15
+        encrypted_key = None
+        ri_pos = 0
+        while ri_pos < len(ri_set):
+            tag, ri_val, ri_pos = _decode_tlv(ri_set, ri_pos)
+            if tag != 0x30:
+                continue
+            r_pos = 0
+            _, _, r_pos = _decode_tlv(ri_val, r_pos)  # version
+            _, _, r_pos = _decode_tlv(ri_val, r_pos)  # sid
+            _, _, r_pos = _decode_tlv(ri_val, r_pos)  # keyEncryptionAlgorithm
+            if r_pos < len(ri_val):
+                _, ri_ek, _ = _decode_tlv(ri_val, r_pos)
+                encrypted_key = ri_ek
+                break
+
+        if encrypted_key is None:
+            raise ValueError("No usable RecipientInfo in AuthEnvelopedData")
+
+        try:
+            cek = private_key.decrypt(encrypted_key, asym_padding.PKCS1v15())
+        except Exception as e:
+            raise ValueError(f"AuthEnvelopedData: could not decrypt CEK: {e}")
+
+        # Parse authEncryptedContentInfo: { contentType, contentEncAlg, [0] encryptedContent }
+        aci_pos = 0
+        _, _, aci_pos = _decode_tlv(aci_val, aci_pos)          # contentType OID
+        _, ca_seq, aci_pos = _decode_tlv(aci_val, aci_pos)     # contentEncryptionAlgorithm
+
+        ca_pos = 0
+        _, ce_oid_val, ca_pos = _decode_tlv(ca_seq, ca_pos)
+        enc_alg_oid = _decode_oid_bytes(ce_oid_val)
+
+        if enc_alg_oid not in (OID_AES_256_GCM, OID_AES_128_GCM):
+            raise ValueError(
+                f"AuthEnvelopedData: unsupported algorithm {enc_alg_oid}; "
+                "only AES-128-GCM and AES-256-GCM are supported"
+            )
+
+        # GCMParameters ::= SEQUENCE { aes-nonce OCTET STRING, aes-ICVlen INTEGER DEFAULT 12 }
+        _, gcm_params, _ = _decode_tlv(ca_seq, ca_pos)
+        gp_pos = 0
+        _, nonce, gp_pos = _decode_tlv(gcm_params, gp_pos)
+
+        # encryptedContent [0] IMPLICIT — raw ciphertext (no tag, tag follows separately)
+        _, ec_val, _ = _decode_tlv(aci_val, aci_pos)
+        if ec_val and ec_val[0] == 0x80:
+            _, ec_val, _ = _decode_tlv(ec_val, 0)
+
+        key_size = 32 if enc_alg_oid == OID_AES_256_GCM else 16
+        aesgcm = AESGCM(cek[:key_size])
+        # Reassemble ciphertext + auth tag for library decryption
+        return aesgcm.decrypt(nonce, ec_val + mac_tag, None)
 
 
 def _decode_oid_bytes(data: bytes) -> str:
@@ -476,6 +553,22 @@ def _decode_oid_bytes(data: bytes) -> str:
             cur = 0
         i += 1
     return ".".join(map(str, parts))
+
+
+def _cms_content_type(der: bytes) -> str:
+    """
+    Return the contentType OID dotted string from a DER-encoded ContentInfo,
+    or an empty string if the structure cannot be parsed.
+
+    Used to detect whether an incoming inner CMS payload is ``EnvelopedData``
+    (classic CBC) or ``AuthEnvelopedData`` (AES-GCM) without fully parsing it.
+    """
+    try:
+        _, ci_val, _ = _decode_tlv(der, 0)
+        _, oid_val, _ = _decode_tlv(ci_val, 0)
+        return _decode_oid_bytes(oid_val)
+    except Exception:
+        return ""
 
 
 # ---------------------------------------------------------------------------
@@ -667,6 +760,90 @@ class CMSBuilder:
         return _seq(
             _oid(OID_ENVELOPED_DATA)
             + _ctx(0, ev)
+        )
+
+    @staticmethod
+    def auth_enveloped_data(plaintext: bytes, recipient_cert: x509.Certificate) -> bytes:
+        """
+        Encrypt *plaintext* for *recipient_cert* using RSA PKCS#1v15 key transport
+        and AES-256-GCM content encryption.  Returns DER-encoded CMS
+        ``AuthEnvelopedData`` wrapped in ``ContentInfo``.
+
+        RFC 5083 §2 / RFC 5084 §3.1.
+
+        Structure::
+
+          ContentInfo {
+            id-ct-authEnvelopedData
+            AuthEnvelopedData {
+              version v0
+              recipientInfos { KeyTransRecipientInfo (RSA-PKCS1v15, encrypted CEK) }
+              authEncryptedContentInfo {
+                id-data
+                GCM AlgorithmIdentifier { id-aes256-GCM, GCMParameters { nonce, ICVlen=16 } }
+                [0] ciphertext        -- without the 16-byte auth tag
+              }
+              mac = 16-byte GCM auth tag
+            }
+          }
+
+        Compared to :meth:`enveloped_data` (AES-256-CBC):
+
+        - No PKCS#7 padding — GCM is a stream mode.
+        - 12-byte random nonce instead of 16-byte IV.
+        - 16-byte auth tag provides integrity; stored in the ``mac`` field.
+        - Eliminates CBC padding-oracle surface (RFC 5083 motivation).
+        """
+        # CEK + GCM nonce
+        cek   = os.urandom(32)   # 256-bit key
+        nonce = os.urandom(12)   # 96-bit nonce (GCM recommended)
+
+        # Encrypt — output is ciphertext || 16-byte tag
+        ct_with_tag = AESGCM(cek).encrypt(nonce, plaintext, None)
+        ciphertext  = ct_with_tag[:-16]
+        mac_tag     = ct_with_tag[-16:]
+
+        # Encrypt CEK with recipient's RSA public key
+        encrypted_key = recipient_cert.public_key().encrypt(cek, asym_padding.PKCS1v15())
+
+        # KeyTransRecipientInfo
+        ian = _seq(
+            recipient_cert.issuer.public_bytes()
+            + _integer(recipient_cert.serial_number)
+        )
+        ri = _seq(
+            _integer(0)
+            + ian
+            + _seq(_oid(OID_RSA_ENCRYPTION) + _null())
+            + _octet_string(encrypted_key)
+        )
+
+        # GCMParameters ::= SEQUENCE { aes-nonce OCTET STRING, aes-ICVlen INTEGER DEFAULT 12 }
+        # We use 16-byte tag (not the default 12), so ICVlen must be explicit.
+        gcm_params = _seq(_octet_string(nonce) + _integer(16))
+
+        # authEncryptedContentInfo
+        # encryptedContent as [0] IMPLICIT (primitive, context 0)
+        ec_tag = b"\x80" + _encode_length(len(ciphertext)) + ciphertext
+        auth_eci = _seq(
+            _oid(OID_DATA)
+            + _seq(_oid(OID_AES_256_GCM) + gcm_params)
+            + ec_tag
+        )
+
+        # AuthEnvelopedData (version v0: no originator info, RSAES recipient)
+        auth_ev = _seq(
+            _integer(0)           # version
+            + _set(ri)            # recipientInfos
+            + auth_eci            # authEncryptedContentInfo
+            # no authAttrs [1]
+            + _octet_string(mac_tag)  # mac (GCM auth tag)
+        )
+
+        # ContentInfo
+        return _seq(
+            _oid(OID_AUTH_ENVELOPED_DATA)
+            + _ctx(0, auth_ev)
         )
 
 
@@ -877,11 +1054,12 @@ class SCEPHandler(http.server.BaseHTTPRequestHandler):
         RFC 8894 §4.1.
         """
         caps = "\n".join([
-            "AES",           # supports AES encryption
-            "SHA-256",       # supports SHA-256 digest
-            "SHA-512",       # supports SHA-512 digest
-            "Renewal",       # supports renewal without challenge
-            "POSTPKIOperation",  # supports HTTP POST for PKI operations
+            "AES",              # AES-CBC content encryption (RFC 8894)
+            "AES-GCM",          # AES-GCM AuthEnvelopedData (RFC 5083 / RFC 5084)
+            "SHA-256",
+            "SHA-512",
+            "Renewal",
+            "POSTPKIOperation",
         ])
         body = caps.encode()
         self.send_response(200)
@@ -934,7 +1112,11 @@ class SCEPHandler(http.server.BaseHTTPRequestHandler):
                              transaction_id, sender_nonce, recipient_nonce)
             return
 
-        # Decrypt EnvelopedData to get the PKCS#10 CSR
+        # Detect encryption scheme: EnvelopedData (CBC) or AuthEnvelopedData (GCM)
+        enc_scheme = "gcm" if _cms_content_type(inner_cms) == OID_AUTH_ENVELOPED_DATA else "cbc"
+        logger.info(f"PKCSReq txid={transaction_id} encryption={enc_scheme.upper()}")
+
+        # Decrypt EnvelopedData / AuthEnvelopedData to get the PKCS#10 CSR
         try:
             csr_der = CMSParser.parse_enveloped_data(inner_cms, self.ca.ca_key)
         except Exception as e:

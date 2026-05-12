@@ -552,5 +552,247 @@ class TestCMSRoundTrip(unittest.TestCase):
             self.assertNotIn("parse_error", parsed, f"Parse failed for msg_type={msg_type}")
 
 
+# ---------------------------------------------------------------------------
+# RFC 5083 + RFC 5084 — AuthEnvelopedData (AES-GCM)
+# ---------------------------------------------------------------------------
+
+class TestRFC5083AuthEnvelopedData(unittest.TestCase):
+    """
+    RFC 5083 (CMS AuthEnvelopedData) + RFC 5084 (AES-GCM in CMS).
+
+    Covers:
+    - CMSBuilder.auth_enveloped_data: content type OID, round-trip,
+      GCMParameters (nonce + ICVlen), recipient info
+    - CMSParser.parse_enveloped_data dispatches on AuthEnvelopedData OID
+    - Tampered ciphertext or auth tag → decryption failure
+    - Wrong private key → decryption failure
+    - GetCACaps advertises AES-GCM
+    - _cms_content_type helper returns correct OID
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls._tmpdir = tempfile.mkdtemp()
+        cls.ca = _make_ca(cls._tmpdir)
+        cls.key = _gen_key()
+        cls.cert = cls._issue_cert(cls.ca, cls.key.public_key())
+
+    @classmethod
+    def tearDownClass(cls):
+        import shutil
+        shutil.rmtree(cls._tmpdir, ignore_errors=True)
+
+    @staticmethod
+    def _issue_cert(ca, pubkey):
+        """Issue a minimal test cert from the CA."""
+        import datetime
+        from cryptography.x509.oid import NameOID
+        from cryptography.hazmat.primitives.hashes import SHA256 as _SHA256
+        now = datetime.datetime.now(datetime.timezone.utc)
+        return (
+            x509.CertificateBuilder()
+            .subject_name(x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "test")]))
+            .issuer_name(ca.ca_cert.subject)
+            .public_key(pubkey)
+            .serial_number(x509.random_serial_number())
+            .not_valid_before(now)
+            .not_valid_after(now + datetime.timedelta(days=30))
+            .add_extension(x509.BasicConstraints(ca=False, path_length=None), critical=True)
+            .sign(ca.ca_key, _SHA256())
+        )
+
+    # ---- builder: content type OID ----
+
+    def test_content_type_oid_is_auth_enveloped(self):
+        """ContentInfo OID must be id-ct-authEnvelopedData (1.2.840.113549.1.9.16.1.23)."""
+        der = scep.CMSBuilder.auth_enveloped_data(b"hello", self.cert)
+        self.assertEqual(scep._cms_content_type(der), scep.OID_AUTH_ENVELOPED_DATA)
+
+    def test_classic_enveloped_data_oid(self):
+        """Existing enveloped_data still yields OID_ENVELOPED_DATA."""
+        der = scep.CMSBuilder.enveloped_data(b"hello", self.cert)
+        self.assertEqual(scep._cms_content_type(der), scep.OID_ENVELOPED_DATA)
+
+    # ---- round-trip: builder → parser ----
+
+    def test_auth_enveloped_roundtrip_short(self):
+        """Short plaintext round-trips through auth_enveloped_data/parse_enveloped_data."""
+        plaintext = b"SCEP test payload"
+        der = scep.CMSBuilder.auth_enveloped_data(plaintext, self.cert)
+        result = scep.CMSParser.parse_enveloped_data(der, self.key)
+        self.assertEqual(result, plaintext)
+
+    def test_auth_enveloped_roundtrip_empty(self):
+        """Empty plaintext round-trips (edge case: zero-length GCM input)."""
+        der = scep.CMSBuilder.auth_enveloped_data(b"", self.cert)
+        result = scep.CMSParser.parse_enveloped_data(der, self.key)
+        self.assertEqual(result, b"")
+
+    def test_auth_enveloped_roundtrip_large(self):
+        """4096-byte payload round-trips correctly."""
+        plaintext = os.urandom(4096)
+        der = scep.CMSBuilder.auth_enveloped_data(plaintext, self.cert)
+        result = scep.CMSParser.parse_enveloped_data(der, self.key)
+        self.assertEqual(result, plaintext)
+
+    # ---- GCMParameters structure ----
+
+    def test_gcm_nonce_is_12_bytes(self):
+        """GCMParameters nonce MUST be 12 bytes (96-bit, recommended for GCM)."""
+        der = scep.CMSBuilder.auth_enveloped_data(b"data", self.cert)
+        # Locate GCMParameters: parse ContentInfo → AuthEnvelopedData → authEncryptedContentInfo
+        # → contentEncryptionAlgorithm → GCMParameters
+        _, ci_val, _ = scep._decode_tlv(der, 0)
+        ci_pos = 0
+        _, _, ci_pos = scep._decode_tlv(ci_val, ci_pos)   # contentType OID
+        _, ev_outer, _ = scep._decode_tlv(ci_val, ci_pos) # [0]
+        _, ev_val, _ = scep._decode_tlv(ev_outer, 0)      # AuthEnvelopedData SEQUENCE
+        ev_pos = 0
+        _, _, ev_pos = scep._decode_tlv(ev_val, ev_pos)   # version
+        _, _, ev_pos = scep._decode_tlv(ev_val, ev_pos)   # recipientInfos
+        _, aci_val, _ = scep._decode_tlv(ev_val, ev_pos)  # authEncryptedContentInfo
+        aci_pos = 0
+        _, _, aci_pos = scep._decode_tlv(aci_val, aci_pos)  # contentType OID
+        _, ca_seq, _ = scep._decode_tlv(aci_val, aci_pos)   # contentEncAlg SEQUENCE
+        _, _, ca_pos = scep._decode_tlv(ca_seq, 0)           # algorithm OID
+        _, gcm_params, _ = scep._decode_tlv(ca_seq, ca_pos)  # GCMParameters SEQUENCE
+        _, nonce, _ = scep._decode_tlv(gcm_params, 0)        # aes-nonce OCTET STRING
+        self.assertEqual(len(nonce), 12, "GCM nonce must be 12 bytes")
+
+    def test_gcm_icv_len_is_16(self):
+        """GCMParameters aes-ICVlen MUST be 16 (128-bit tag, max security)."""
+        der = scep.CMSBuilder.auth_enveloped_data(b"data", self.cert)
+        _, ci_val, _ = scep._decode_tlv(der, 0)
+        ci_pos = 0
+        _, _, ci_pos = scep._decode_tlv(ci_val, ci_pos)
+        _, ev_outer, _ = scep._decode_tlv(ci_val, ci_pos)
+        _, ev_val, _ = scep._decode_tlv(ev_outer, 0)
+        ev_pos = 0
+        _, _, ev_pos = scep._decode_tlv(ev_val, ev_pos)
+        _, _, ev_pos = scep._decode_tlv(ev_val, ev_pos)
+        _, aci_val, _ = scep._decode_tlv(ev_val, ev_pos)
+        aci_pos = 0
+        _, _, aci_pos = scep._decode_tlv(aci_val, aci_pos)
+        _, ca_seq, _ = scep._decode_tlv(aci_val, aci_pos)
+        _, _, ca_pos = scep._decode_tlv(ca_seq, 0)
+        _, gcm_params, _ = scep._decode_tlv(ca_seq, ca_pos)
+        gp_pos = 0
+        _, _, gp_pos = scep._decode_tlv(gcm_params, gp_pos)  # skip nonce
+        _, icvlen_bytes, _ = scep._decode_tlv(gcm_params, gp_pos)
+        self.assertEqual(int.from_bytes(icvlen_bytes, "big"), 16)
+
+    # ---- security: wrong key / tampered data ----
+
+    def test_wrong_private_key_raises(self):
+        """Decryption with a different private key must raise (CEK decrypt fails)."""
+        wrong_key = _gen_key()
+        der = scep.CMSBuilder.auth_enveloped_data(b"secret", self.cert)
+        with self.assertRaises(Exception):
+            scep.CMSParser.parse_enveloped_data(der, wrong_key)
+
+    def test_tampered_ciphertext_raises(self):
+        """Flipping a bit in the ciphertext must raise (GCM auth tag mismatch)."""
+        plaintext = b"integrity-protected payload"
+        der = scep.CMSBuilder.auth_enveloped_data(plaintext, self.cert)
+        # Flip a byte near the end of the DER (in the ciphertext region)
+        bad = bytearray(der)
+        bad[-30] ^= 0xFF
+        with self.assertRaises(Exception):
+            scep.CMSParser.parse_enveloped_data(bytes(bad), self.key)
+
+    def test_tampered_mac_tag_raises(self):
+        """Flipping a byte in the trailing 16-byte mac tag must raise."""
+        plaintext = b"mac-protected"
+        der = scep.CMSBuilder.auth_enveloped_data(plaintext, self.cert)
+        # The mac tag is the last 18 bytes: 0x04 + 0x10 + 16 bytes
+        bad = bytearray(der)
+        bad[-5] ^= 0xFF  # inside the 16-byte tag
+        with self.assertRaises(Exception):
+            scep.CMSParser.parse_enveloped_data(bytes(bad), self.key)
+
+    # ---- dispatcher: parse_enveloped_data selects correct path ----
+
+    def test_parse_dispatch_cbc_unchanged(self):
+        """CBC EnvelopedData still decrypts correctly after the refactor."""
+        plaintext = b"classic CBC payload"
+        der = scep.CMSBuilder.enveloped_data(plaintext, self.cert)
+        result = scep.CMSParser.parse_enveloped_data(der, self.key)
+        self.assertEqual(result, plaintext)
+
+    def test_parse_dispatch_gcm_path(self):
+        """parse_enveloped_data selects GCM path when OID matches."""
+        plaintext = b"gcm dispatch"
+        der = scep.CMSBuilder.auth_enveloped_data(plaintext, self.cert)
+        result = scep.CMSParser.parse_enveloped_data(der, self.key)
+        self.assertEqual(result, plaintext)
+
+    # ---- GetCACaps ----
+
+    def test_get_ca_caps_includes_aes_gcm(self):
+        """GetCACaps response MUST include the 'AES-GCM' capability token."""
+        import tempfile, http.server, threading, urllib.request
+        from dispatcher_server import RouteTable
+        from pathlib import Path
+
+        tmpdir = tempfile.mkdtemp()
+        try:
+            ca = _make_ca(tmpdir)
+            from dispatcher_server import RouteTable
+            rt = RouteTable()
+            proxy = scep.start_scep_server(
+                route_table=rt, prefix="/scep", ca=ca,
+                ca_dir=Path(tmpdir),
+            )
+            # Build a handler and call _handle_get_ca_caps directly
+            class _FakeRequest:
+                def makefile(self, *a, **kw):
+                    import io
+                    return io.BytesIO(b"")
+            class _BoundHandler(scep.SCEPHandler):
+                pass
+            _BoundHandler.ca = ca
+            _BoundHandler.db = scep.SCEPDatabase(str(Path(tmpdir) / "s.db"))
+            _BoundHandler.challenge = ""
+
+            captured = {}
+            class _Recorder:
+                def __init__(self): self._headers = []; self._body = b""
+                def write(self, b): self._body += b
+                def flush(self): pass
+
+            import io
+            rec = _Recorder()
+            handler = object.__new__(_BoundHandler)
+            handler.wfile = rec
+
+            def _fake_send_response(code): pass
+            def _fake_send_header(k, v): pass
+            def _fake_end_headers(): pass
+            handler.send_response = _fake_send_response
+            handler.send_header   = _fake_send_header
+            handler.end_headers   = _fake_end_headers
+            handler.client_address = ("127.0.0.1", 0)
+            _BoundHandler._handle_get_ca_caps(handler)
+            caps_text = rec._body.decode()
+            self.assertIn("AES-GCM", caps_text,
+                          f"GetCACaps must include AES-GCM; got: {caps_text!r}")
+        finally:
+            import shutil
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+    # ---- _cms_content_type helper ----
+
+    def test_cms_content_type_enveloped(self):
+        der = scep.CMSBuilder.enveloped_data(b"x", self.cert)
+        self.assertEqual(scep._cms_content_type(der), scep.OID_ENVELOPED_DATA)
+
+    def test_cms_content_type_auth_enveloped(self):
+        der = scep.CMSBuilder.auth_enveloped_data(b"x", self.cert)
+        self.assertEqual(scep._cms_content_type(der), scep.OID_AUTH_ENVELOPED_DATA)
+
+    def test_cms_content_type_garbage_returns_empty(self):
+        self.assertEqual(scep._cms_content_type(b"\x00\x01\x02"), "")
+
+
 if __name__ == "__main__":
     unittest.main()
