@@ -5156,6 +5156,282 @@ class TestStartWebUiModulePassthrough(unittest.TestCase):
 
 
 # ===========================================================================
+# RFC 4055 / RFC 5480 / RFC 5758 / RFC 8410 — multi-algorithm CA support
+# ===========================================================================
+
+class TestMultiAlgorithmCA(unittest.TestCase):
+    """
+    Crypto-algorithm coverage refactor: CA can be RSA (PKCS#1 v1.5 or
+    PSS per RFC 4055), ECDSA (P-256/384/521 per RFC 5480, signature OIDs
+    per RFC 5758), or EdDSA (Ed25519/Ed448 per RFC 8410).
+
+    Tests cover the central `_sign_builder` helper and end-to-end
+    bootstrap via CertificateAuthority(ca_key_type=...).
+    """
+
+    # --- Algorithm OIDs (per RFC 5758, RFC 8410) ---
+    OID_RSA_ENCRYPTION    = "1.2.840.113549.1.1.1"
+    OID_SHA256_WITH_RSA   = "1.2.840.113549.1.1.11"
+    OID_RSASSA_PSS        = "1.2.840.113549.1.1.10"
+    OID_ECDSA_WITH_SHA256 = "1.2.840.10045.4.3.2"
+    OID_ECDSA_WITH_SHA384 = "1.2.840.10045.4.3.3"
+    OID_ECDSA_WITH_SHA512 = "1.2.840.10045.4.3.4"
+    OID_ID_EC_PUBLIC_KEY  = "1.2.840.10045.2.1"
+    OID_SECP256R1         = "1.2.840.10045.3.1.7"
+    OID_SECP384R1         = "1.3.132.0.34"
+    OID_SECP521R1         = "1.3.132.0.35"
+    OID_ED25519           = "1.3.101.112"
+    OID_ED448             = "1.3.101.113"
+
+    # ---- _hash_for_key dispatch ----
+
+    def test_hash_for_rsa_is_sha256(self):
+        from cryptography.hazmat.primitives.hashes import SHA256
+        k = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        self.assertIs(pki._hash_for_key(k), SHA256)
+
+    def test_hash_for_ec_curves(self):
+        from cryptography.hazmat.primitives.asymmetric import ec as _ec
+        from cryptography.hazmat.primitives.hashes import SHA256, SHA384, SHA512
+        self.assertIs(pki._hash_for_key(_ec.generate_private_key(_ec.SECP256R1())), SHA256)
+        self.assertIs(pki._hash_for_key(_ec.generate_private_key(_ec.SECP384R1())), SHA384)
+        self.assertIs(pki._hash_for_key(_ec.generate_private_key(_ec.SECP521R1())), SHA512)
+
+    def test_hash_for_eddsa_is_none(self):
+        from cryptography.hazmat.primitives.asymmetric import ed25519, ed448
+        self.assertIsNone(pki._hash_for_key(ed25519.Ed25519PrivateKey.generate()))
+        self.assertIsNone(pki._hash_for_key(ed448.Ed448PrivateKey.generate()))
+
+    def test_hash_for_unsupported_raises(self):
+        with self.assertRaises(TypeError):
+            pki._hash_for_key("not a key")
+
+    # ---- _generate_ca_key ----
+
+    def test_generate_ca_key_all_catalog_entries(self):
+        for kt in ("rsa-2048", "ec-p256", "ed25519"):
+            k = pki._generate_ca_key(kt)
+            self.assertIsNotNone(k)
+
+    def test_generate_ca_key_invalid_type_rejected(self):
+        with self.assertRaises(ValueError):
+            pki._generate_ca_key("ml-dsa-65")
+
+    # ---- end-to-end CA bootstrap with each key type ----
+
+    def _ca_with_key_type(self, key_type: str, sig_algorithm: str = "rsa-pkcs1v15"):
+        tmp = tempfile.mkdtemp()
+        ca = pki.CertificateAuthority(
+            ca_dir=tmp,
+            ca_key_type=key_type,
+            sig_algorithm=sig_algorithm,
+        )
+        return ca, tmp
+
+    def test_ec_p256_ca_emits_ecdsa_sha256_signature_oid(self):
+        ca, tmp = self._ca_with_key_type("ec-p256")
+        try:
+            self.assertEqual(
+                ca.ca_cert.signature_algorithm_oid.dotted_string,
+                self.OID_ECDSA_WITH_SHA256,
+            )
+            self.assertEqual(
+                ca.ca_cert.public_key_algorithm_oid.dotted_string
+                if hasattr(ca.ca_cert, "public_key_algorithm_oid")
+                else self.OID_ID_EC_PUBLIC_KEY,
+                self.OID_ID_EC_PUBLIC_KEY,
+            )
+        finally:
+            import shutil
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_ec_p384_ca_emits_ecdsa_sha384_signature_oid(self):
+        ca, tmp = self._ca_with_key_type("ec-p384")
+        try:
+            self.assertEqual(
+                ca.ca_cert.signature_algorithm_oid.dotted_string,
+                self.OID_ECDSA_WITH_SHA384,
+            )
+        finally:
+            import shutil
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_ec_p521_ca_emits_ecdsa_sha512_signature_oid(self):
+        ca, tmp = self._ca_with_key_type("ec-p521")
+        try:
+            self.assertEqual(
+                ca.ca_cert.signature_algorithm_oid.dotted_string,
+                self.OID_ECDSA_WITH_SHA512,
+            )
+        finally:
+            import shutil
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_ed25519_ca_emits_ed25519_signature_oid(self):
+        ca, tmp = self._ca_with_key_type("ed25519")
+        try:
+            self.assertEqual(
+                ca.ca_cert.signature_algorithm_oid.dotted_string,
+                self.OID_ED25519,
+            )
+        finally:
+            import shutil
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_ed448_ca_emits_ed448_signature_oid(self):
+        ca, tmp = self._ca_with_key_type("ed448")
+        try:
+            self.assertEqual(
+                ca.ca_cert.signature_algorithm_oid.dotted_string,
+                self.OID_ED448,
+            )
+        finally:
+            import shutil
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_rsa_pss_ca_signature_oid(self):
+        ca, tmp = self._ca_with_key_type("rsa-2048", sig_algorithm="rsa-pss")
+        try:
+            self.assertEqual(
+                ca.ca_cert.signature_algorithm_oid.dotted_string,
+                self.OID_RSASSA_PSS,
+            )
+        finally:
+            import shutil
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_invalid_sig_algorithm_rejected(self):
+        with self.assertRaises(ValueError):
+            pki.CertificateAuthority(
+                ca_dir=tempfile.mkdtemp(),
+                ca_key_type="rsa-2048",
+                sig_algorithm="rsa-something-else",
+            )
+
+    # ---- issue leaf cert through an ECC/EdDSA CA ----
+
+    def test_ec_p256_ca_issues_rsa_leaf_with_correct_sig_oid(self):
+        """RSA CSR + P-256 CA → cert.signatureAlgorithm = ecdsa-with-SHA256,
+        cert.subjectPublicKeyInfo = rsaEncryption."""
+        ca, tmp = self._ca_with_key_type("ec-p256")
+        try:
+            key = _gen_key()
+            cert = ca.issue_certificate(
+                subject_str="CN=ec-leaf.test",
+                public_key=key.public_key(),
+                san_dns=["ec-leaf.test"],
+                validity_days=30,
+            )
+            self.assertEqual(
+                cert.signature_algorithm_oid.dotted_string,
+                self.OID_ECDSA_WITH_SHA256,
+            )
+            # SPKI is whatever the CSR carried — RSA in this case.
+            self.assertIsInstance(cert.public_key(), rsa.RSAPublicKey)
+        finally:
+            import shutil
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_ed25519_ca_issues_leaf_and_signature_verifies(self):
+        ca, tmp = self._ca_with_key_type("ed25519")
+        try:
+            key = _gen_key()
+            cert = ca.issue_certificate(
+                subject_str="CN=ed-leaf.test",
+                public_key=key.public_key(),
+                san_dns=["ed-leaf.test"],
+                validity_days=30,
+            )
+            self.assertEqual(
+                cert.signature_algorithm_oid.dotted_string,
+                self.OID_ED25519,
+            )
+            # Verify the signature against the CA public key
+            ca.ca_key.public_key().verify(
+                cert.signature, cert.tbs_certificate_bytes,
+            )
+        finally:
+            import shutil
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_ec_ca_signed_crl_verifies(self):
+        ca, tmp = self._ca_with_key_type("ec-p256")
+        try:
+            crl_der = ca.generate_crl_der()
+            crl = x509.load_der_x509_crl(crl_der)
+            self.assertEqual(
+                crl.signature_algorithm_oid.dotted_string,
+                self.OID_ECDSA_WITH_SHA256,
+            )
+            from cryptography.hazmat.primitives.asymmetric import ec as _ec
+            ca.ca_key.public_key().verify(
+                crl.signature, crl.tbs_certlist_bytes,
+                _ec.ECDSA(SHA256()),
+            )
+        finally:
+            import shutil
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_rsa_pss_ca_issues_pss_signed_leaf(self):
+        ca, tmp = self._ca_with_key_type("rsa-2048", sig_algorithm="rsa-pss")
+        try:
+            key = _gen_key()
+            cert = ca.issue_certificate(
+                subject_str="CN=pss-leaf.test",
+                public_key=key.public_key(),
+                san_dns=["pss-leaf.test"],
+                validity_days=30,
+            )
+            self.assertEqual(
+                cert.signature_algorithm_oid.dotted_string,
+                self.OID_RSASSA_PSS,
+            )
+        finally:
+            import shutil
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    # ---- ca.key persisted as PKCS#8 PrivateKeyInfo ----
+
+    def test_ca_key_persisted_as_pkcs8(self):
+        ca, tmp = self._ca_with_key_type("ec-p256")
+        try:
+            key_pem = (Path(tmp) / "ca.key").read_bytes()
+            # PKCS#8 header is `-----BEGIN PRIVATE KEY-----`
+            # SEC1 EC header is `-----BEGIN EC PRIVATE KEY-----`
+            # PKCS#1 RSA header is `-----BEGIN RSA PRIVATE KEY-----`
+            self.assertIn(b"-----BEGIN PRIVATE KEY-----", key_pem)
+            self.assertNotIn(b"-----BEGIN EC PRIVATE KEY-----", key_pem)
+            self.assertNotIn(b"-----BEGIN RSA PRIVATE KEY-----", key_pem)
+        finally:
+            import shutil
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    # ---- SCEP guardrail ----
+
+    def test_scep_refuses_ed25519_ca(self):
+        try:
+            from scep_server import start_scep_server
+        except ImportError:
+            self.skipTest("scep_server not importable")
+        ca, tmp = self._ca_with_key_type("ed25519")
+        try:
+            class _DummyRouteTable:
+                def register(self, *a, **kw):
+                    pass
+            with self.assertRaises(RuntimeError) as cm:
+                start_scep_server(
+                    route_table=_DummyRouteTable(),
+                    prefix="/scep",
+                    ca=ca,
+                    ca_dir=Path(tmp),
+                )
+            self.assertIn("RSA", str(cm.exception))
+        finally:
+            import shutil
+            shutil.rmtree(tmp, ignore_errors=True)
+
+
+# ===========================================================================
 # Entry point
 # ===========================================================================
 

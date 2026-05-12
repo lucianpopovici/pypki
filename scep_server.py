@@ -1330,8 +1330,29 @@ def start_scep_server(
     Register the SCEP handler with *route_table* under *prefix*.
 
     Returns a _RouteProxy whose .shutdown() unregisters the SCEP routes.
+
+    SCEP is CMS-based (RFC 8894 §3 cites RFC 5652). CMS SignerInfo carries
+    a named digestAlgorithm; EdDSA (RFC 8410) signs internally with no
+    separate hash and is therefore incompatible with this code path.
+    ECDSA support is not yet wired here either — the signer below
+    hardcodes RSA-PKCS1v15. Fail fast at startup so the operator sees the
+    incompatibility before any client enrolls.
     """
     from dispatcher_server import _RouteProxy
+
+    # RFC compatibility guardrail. PSS-capable RSA keys still work because
+    # this signer issues PKCS#1 v1.5 specifically (which RFC 8894 allows).
+    try:
+        from cryptography.hazmat.primitives.asymmetric import rsa as _rsa
+        if not isinstance(ca.ca_key, _rsa.RSAPrivateKey):
+            raise RuntimeError(
+                "SCEP requires an RSA CA key. The current CA key is "
+                f"{type(ca.ca_key).__name__}; SCEP CMS SignedData (RFC 5652) "
+                "cannot use ECDSA or EdDSA in this server. Either run with "
+                "--ca-key-type rsa-... or disable SCEP."
+            )
+    except ImportError:
+        pass
 
     db_path = str(ca_dir / "scep.db")
     db = SCEPDatabase(db_path)

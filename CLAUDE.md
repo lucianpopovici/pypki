@@ -139,7 +139,14 @@ profiles it strictly.
 
 ---
 
-### RFC 4055 — RSASSA-PSS and RSAES-OAEP
+### RFC 4055 — RSASSA-PSS and RSAES-OAEP ✅ SHIPPED (PSS for CA signing)
+
+PSS is now an opt-in CA signing mode via `--sig-algorithm rsa-pss`. The
+shipped surface covers RSASSA-PSS with MGF1+SHA-256 and salt length 32
+(matches NIST SP 800-131A guidance). OAEP for key transport is not yet
+wired and remains TODO if a CMS / SCEP path needs it.
+
+— Original plan retained below for reference —
 
 **What it requires.** Algorithm identifiers for PSS signatures and OAEP
 encryption. Modern Authenticode and EU eIDAS expect PSS.
@@ -801,7 +808,16 @@ SAN entries on the issued certificate.
 
 ---
 
-### RFC 8410 — Ed25519 and Ed448 in X.509
+### RFC 8410 — Ed25519 and Ed448 in X.509 ✅ SHIPPED
+
+CA bootstrap supports `--ca-key-type ed25519` and `ed448`. Issued certs
+and CRLs carry the correct EdDSA signature OID (`1.3.101.112` /
+`1.3.101.113`). `_sign_builder` returns `builder.sign(key, None)` for
+EdDSA. SCEP rejects EdDSA CAs at startup because CMS `SignerInfo`
+requires a named digest algorithm (RFC 5652) — operator gets a clear
+error pointing at `--ca-key-type rsa-...`.
+
+— Original plan retained below for reference —
 
 **What it requires.** Algorithm identifiers and subjectPublicKeyInfo encoding
 for Ed25519/Ed448. Fast, small, no parameters.
@@ -846,7 +862,18 @@ for Ed25519/Ed448. Fast, small, no parameters.
 
 ---
 
-### RFC 5480 + RFC 5758 — ECDSA and EC keys in PKIX
+### RFC 5480 + RFC 5758 — ECDSA and EC keys in PKIX ✅ SHIPPED (CA-side)
+
+Full multi-curve coverage at the CA level: `--ca-key-type ec-p256`,
+`ec-p384`, `ec-p521`. Matched-curve hash per RFC 5758 §3.2; signature
+OIDs `1.2.840.10045.4.3.2/3/4` (ecdsa-with-SHA-256/384/512) appear in
+issued certs and CRLs. SPKI is `id-ecPublicKey` (`1.2.840.10045.2.1`)
+with the named-curve OID parameter.
+
+Client / CSR-driven EC keys already worked through the library; this
+ships the CA-side counterpart so the *CA itself* can be ECC.
+
+— Original plan retained below for reference —
 
 **What it requires.** RFC 5480 defines SPKI encoding, named curves
 (P-256/384/521), and algorithm identifiers for ECC. RFC 5758 defines the
@@ -1903,12 +1930,12 @@ Revised given the audit findings. Highest-impact / lowest-risk first.
    - ~~RFC 4210 §5.1.3 (CMP response signature protection)~~ ✅ **SHIPPED**
    - ~~RFC 4211 §4 (CRMF POPO verification)~~ ✅ **SHIPPED**
 3. **Crypto-algorithm coverage** (do together, one refactor):
-   - RFC 4055 (PSS/OAEP)
-   - RFC 5480 + RFC 5758 (ECC in PKIX + ECDSA algorithm IDs)
-   - RFC 8410 (Ed25519/Ed448)
+   - ~~RFC 4055 (PSS for CA signing)~~ ✅ **SHIPPED** (`--sig-algorithm rsa-pss`; OAEP key transport still TODO if CMS path needs it)
+   - ~~RFC 5480 + RFC 5758 (ECC in PKIX + ECDSA algorithm IDs)~~ ✅ **SHIPPED** (`--ca-key-type ec-p256/p384/p521`)
+   - ~~RFC 8410 (Ed25519/Ed448)~~ ✅ **SHIPPED** (`--ca-key-type ed25519/ed448`; SCEP guardrail in place)
 4. **New protocols** (biggest user-visible additions):
    - RFC 3161 + RFC 5816 (TSA server)
-   - RFC 8738 (ACME IP identifier)
+   - ~~RFC 8738 (ACME IP identifier)~~ ✅ **SHIPPED**
 5. **Hardening**:
    - RFC 5083 + RFC 5084 (AES-GCM / AuthEnvelopedData in CMS)
    - RFC 8933 (CMS content-type attribute protection)

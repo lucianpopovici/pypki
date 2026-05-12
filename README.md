@@ -220,6 +220,27 @@ Python 3.9 or later. No other runtime dependencies.
 python pki_server.py
 ```
 
+### 1b. CA key algorithm selection (first-run only)
+
+`--ca-key-type` picks the algorithm and parameters for the CA private key
+generated on first boot. Ignored once `ca.key` exists — to switch algorithms
+later, start from a fresh `--ca-dir`.
+
+```bash
+# ECC P-256 CA — small certificates, ECDSA-with-SHA-256 signatures (RFC 5480/5758)
+python pki_server.py --ca-key-type ec-p256
+
+# Ed25519 CA — fastest, smallest signatures; SCEP unavailable (RFC 8410)
+python pki_server.py --ca-key-type ed25519 --scep-prefix ''
+
+# RSA-PSS CA — modern signature padding (RFC 4055), e.g. for EU eIDAS / Authenticode
+python pki_server.py --ca-key-type rsa-3072 --sig-algorithm rsa-pss
+```
+
+Choices: `rsa-2048`, `rsa-3072`, `rsa-4096` (default), `ec-p256`,
+`ec-p384`, `ec-p521`, `ed25519`, `ed448`. The CA private key is persisted
+as PKCS#8 `PrivateKeyInfo` (RFC 5958) regardless of algorithm.
+
 ### 2. TLS + ACME + SCEP + EST (staging/production)
 
 ```bash
@@ -1713,6 +1734,9 @@ Every issued certificate includes:
 | RFC 7292 | PKCS#12 — Personal Information Exchange | ✅ Export only |
 | RFC 5958 | Asymmetric Key Package (PKCS#8) | ✅ Full — CMP `ir`/`cr`/`kur` private-key responses and Web UI sub-CA export emit PKCS#8 `PrivateKeyInfo` |
 | RFC 7468 | Textual Encodings of PKIX Structures | ✅ Full — strict PEM parser for chain/CRL/PKCS#7 imports rejects lowercase markers, label mismatch, trailing data, invalid base64, and unknown labels |
+| RFC 4055 | RSASSA-PSS and RSAES-OAEP in PKIX | ✅ Full — CA signing with PSS (MGF1+SHA-256, salt length 32) via `--sig-algorithm rsa-pss` |
+| RFC 5480 / RFC 5758 | ECDSA in PKIX (P-256/384/521 + algorithm IDs) | ✅ Full — `--ca-key-type ec-p256\|ec-p384\|ec-p521`; matched-curve hash per §3.2; CRL and OCSP signer cert all flow through `_sign_builder` |
+| RFC 8410 | Ed25519 / Ed448 in X.509 | ✅ Full — `--ca-key-type ed25519\|ed448`; CRL signing supported; SCEP rejects EdDSA CAs (CMS requires a named digest algorithm) |
 | RFC 9608 | No Revocation Available Extension | ✅ Full |
 | RFC 6818 | General Clarifications to RFC 5280 | ✅ Full — `explicitText` UTF8String; CRL `cRLNumber` + `authorityKeyIdentifier` mandatory extensions (§5.2.1, §5.2.3) |
 | RFC 8399/9549 | IDN in DNS SANs, domainComponent | ✅ Full IDNA U-label → A-label |

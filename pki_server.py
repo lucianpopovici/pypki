@@ -90,9 +90,11 @@ from typing import Optional, Tuple, Dict, Any, List
 # Cryptography imports
 from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
-from cryptography.hazmat.primitives.asymmetric import rsa, padding
+from cryptography.hazmat.primitives.asymmetric import (
+    rsa, padding, ec, ed25519, ed448,
+)
 from cryptography.hazmat.primitives.asymmetric.rsa import RSAPrivateKey, RSAPublicKey
-from cryptography.hazmat.primitives.hashes import SHA256
+from cryptography.hazmat.primitives.hashes import SHA256, SHA384, SHA512
 from cryptography.hazmat.primitives.serialization import (
     Encoding, PrivateFormat, PublicFormat, NoEncryption
 )
@@ -517,6 +519,142 @@ def _parse_pem_bundle(
         pos = end_idx + len(end_marker)
 
 
+# ---------------------------------------------------------------------------
+# Multi-algorithm CA support — RFC 4055 (RSA-PSS), RFC 5480 + 5758 (ECDSA),
+# RFC 8410 (Ed25519/Ed448)
+# ---------------------------------------------------------------------------
+
+# Map curve type to its companion hash per RFC 5758 §3.2.
+# This is the "matched curve" guidance: SHA-256 for P-256, SHA-384 for P-384,
+# SHA-512 for P-521. The cryptography library encodes the right
+# ecdsa-with-SHAxxx OID into the signatureAlgorithm field automatically.
+_ECDSA_CURVE_TO_HASH = {
+    ec.SECP256R1: SHA256,
+    ec.SECP384R1: SHA384,
+    ec.SECP521R1: SHA512,
+}
+
+
+def _hash_for_key(key):
+    """
+    Return the hash class appropriate for signing with *key*, or ``None``
+    for EdDSA (Ed25519 / Ed448 sign internally without an external hash).
+
+    Raises ``TypeError`` for unsupported key types.
+    """
+    if isinstance(key, rsa.RSAPrivateKey):
+        return SHA256
+    if isinstance(key, ec.EllipticCurvePrivateKey):
+        for curve_cls, hash_cls in _ECDSA_CURVE_TO_HASH.items():
+            if isinstance(key.curve, curve_cls):
+                return hash_cls
+        # Unknown curve — fall back to SHA-256 but the library may reject
+        return SHA256
+    if isinstance(key, (ed25519.Ed25519PrivateKey, ed448.Ed448PrivateKey)):
+        return None
+    raise TypeError(f"Unsupported private-key type for signing: {type(key).__name__}")
+
+
+def _sign_builder(builder, key, *, rsa_pss: bool = False):
+    """
+    Sign an X.509 builder with the correct (hash, padding) for the key type.
+
+    Supports:
+      * RSA — defaults to PKCS#1 v1.5 (RFC 8017). Pass ``rsa_pss=True`` to
+        sign with RSASSA-PSS (RFC 4055), MGF1+SHA-256, salt length 32.
+      * ECDSA — matched-curve hash per RFC 5758 §3.2 (P-256/SHA-256,
+        P-384/SHA-384, P-521/SHA-512). The cryptography library writes
+        the right ecdsa-with-SHAxxx OID into ``signatureAlgorithm``.
+      * Ed25519 / Ed448 — no external hash (RFC 8032 / RFC 8410).
+
+    ``builder`` may be any of ``CertificateBuilder``,
+    ``CertificateRevocationListBuilder``, etc.; they share the same
+    ``sign(key, algorithm[, rsa_padding=...])`` shape.
+    """
+    hash_cls = _hash_for_key(key)
+    algorithm = hash_cls() if hash_cls is not None else None
+    if isinstance(key, rsa.RSAPrivateKey) and rsa_pss:
+        pss = padding.PSS(
+            mgf=padding.MGF1(hash_cls()),
+            salt_length=hash_cls.digest_size,
+        )
+        return builder.sign(key, algorithm, rsa_padding=pss)
+    return builder.sign(key, algorithm)
+
+
+def _sign_data(key, data: bytes, *, rsa_pss: bool = False) -> bytes:
+    """
+    Sign raw bytes with the correct (padding, hash) for the key type.
+
+    Used by CMS-building code (SCEP, CMP protection) where the signature
+    is computed over canonical ASN.1 bytes rather than a builder object.
+
+    Returns the raw signature bytes. For Ed25519/Ed448 callers, the SCEP /
+    CMS protocols cannot accept the signature directly (CMS requires a
+    named digest algorithm); callers that rely on CMS MUST gate on
+    :func:`_eddsa_compatible_with_cms` first.
+    """
+    if isinstance(key, rsa.RSAPrivateKey):
+        if rsa_pss:
+            return key.sign(
+                data,
+                padding.PSS(
+                    mgf=padding.MGF1(SHA256()),
+                    salt_length=SHA256.digest_size,
+                ),
+                SHA256(),
+            )
+        return key.sign(data, padding.PKCS1v15(), SHA256())
+    if isinstance(key, ec.EllipticCurvePrivateKey):
+        hash_cls = _hash_for_key(key)
+        return key.sign(data, ec.ECDSA(hash_cls()))
+    if isinstance(key, (ed25519.Ed25519PrivateKey, ed448.Ed448PrivateKey)):
+        return key.sign(data)
+    raise TypeError(f"Unsupported private-key type for signing: {type(key).__name__}")
+
+
+# CA key-type catalog. Maps the operator-facing CLI string to a generator
+# closure. Default remains RSA-4096 to preserve out-of-the-box behaviour.
+_CA_KEY_FACTORIES = {
+    "rsa-2048":  lambda: rsa.generate_private_key(public_exponent=65537, key_size=2048),
+    "rsa-3072":  lambda: rsa.generate_private_key(public_exponent=65537, key_size=3072),
+    "rsa-4096":  lambda: rsa.generate_private_key(public_exponent=65537, key_size=4096),
+    "ec-p256":   lambda: ec.generate_private_key(ec.SECP256R1()),
+    "ec-p384":   lambda: ec.generate_private_key(ec.SECP384R1()),
+    "ec-p521":   lambda: ec.generate_private_key(ec.SECP521R1()),
+    "ed25519":   lambda: ed25519.Ed25519PrivateKey.generate(),
+    "ed448":     lambda: ed448.Ed448PrivateKey.generate(),
+}
+
+
+def _generate_ca_key(key_type: str):
+    """
+    Generate a CA private key for the given catalog name.
+
+    Raises ``ValueError`` for unknown types — surfaced cleanly to the
+    operator at startup, before the CA dir is touched.
+    """
+    factory = _CA_KEY_FACTORIES.get(key_type)
+    if factory is None:
+        raise ValueError(
+            f"Unsupported --ca-key-type {key_type!r}; "
+            f"valid choices: {sorted(_CA_KEY_FACTORIES)}"
+        )
+    return factory()
+
+
+def _eddsa_compatible_with_cms(key) -> bool:
+    """
+    Return False when *key* cannot be used to sign CMS SignedData (RFC 5652).
+
+    CMS requires a named digest algorithm in ``SignerInfo`` (``digestAlgorithm``
+    + ``signatureAlgorithm``); Ed25519 / Ed448 sign their input internally
+    and have no separate hash to advertise, so SCEP (which is CMS-based)
+    cannot interoperate with EdDSA CAs.
+    """
+    return not isinstance(key, (ed25519.Ed25519PrivateKey, ed448.Ed448PrivateKey))
+
+
 class ServerConfig:
     """
     Thread-safe, hot-reloadable server configuration.
@@ -890,7 +1028,9 @@ class CertificateAuthority:
 
     def __init__(self, ca_dir: str = "./ca", config: Optional["ServerConfig"] = None,
                  ocsp_url: str = "", crl_url: str = "",
-                 parent_chain_path: Optional[str] = None):
+                 parent_chain_path: Optional[str] = None,
+                 ca_key_type: str = "rsa-4096",
+                 sig_algorithm: str = "rsa-pkcs1v15"):
         """
         Parameters
         ----------
@@ -902,6 +1042,14 @@ class CertificateAuthority:
                             (parent → … → root, *not* including ca.crt itself).
                             If omitted, <ca_dir>/ca-chain.pem is loaded automatically
                             when it exists.  Required for intermediate CA operation.
+        ca_key_type       : Key algorithm for first-run CA bootstrap. One of
+                            ``rsa-2048``/``rsa-3072``/``rsa-4096`` (default),
+                            ``ec-p256``/``ec-p384``/``ec-p521`` (RFC 5480),
+                            ``ed25519``/``ed448`` (RFC 8410). Ignored once
+                            ``ca.key`` exists on disk.
+        sig_algorithm     : Signature padding for RSA CA keys — one of
+                            ``rsa-pkcs1v15`` (default) or ``rsa-pss`` (RFC 4055).
+                            No-op for ECDSA / EdDSA keys.
         """
         self.ca_dir = Path(ca_dir)
         self.ca_dir.mkdir(parents=True, exist_ok=True)
@@ -909,6 +1057,16 @@ class CertificateAuthority:
         self.config  = config  # may be None (uses hardcoded defaults as fallback)
         self._ocsp_url = ocsp_url   # embedded in every issued cert AIA extension
         self._crl_url  = crl_url    # embedded in every issued cert CDP extension
+        self._ca_key_type = ca_key_type
+        # Normalize the signature-algorithm choice once at init so every
+        # _sign_builder call can read self._rsa_pss as a plain bool.
+        if sig_algorithm not in ("rsa-pkcs1v15", "rsa-pss"):
+            raise ValueError(
+                f"Unsupported sig_algorithm {sig_algorithm!r}; "
+                "valid: rsa-pkcs1v15, rsa-pss"
+            )
+        self._sig_algorithm = sig_algorithm
+        self._rsa_pss = (sig_algorithm == "rsa-pss")
         self._init_db()
         self._load_or_create_ca()
         self._load_parent_chain(parent_chain_path)
@@ -1046,8 +1204,11 @@ class CertificateAuthority:
             with open(ca_cert_path, "rb") as f:
                 self.ca_cert = x509.load_pem_x509_certificate(f.read())
         else:
-            logger.info("Generating new CA key and self-signed certificate...")
-            self.ca_key = rsa.generate_private_key(public_exponent=65537, key_size=4096)
+            logger.info(
+                "Generating new CA key (%s) and self-signed certificate...",
+                self._ca_key_type,
+            )
+            self.ca_key = _generate_ca_key(self._ca_key_type)
 
             subject = issuer = x509.Name([
                 x509.NameAttribute(NameOID.COUNTRY_NAME, "US"),
@@ -1057,7 +1218,7 @@ class CertificateAuthority:
 
             now = datetime.datetime.now(datetime.timezone.utc)
             ca_days = self._cfg("ca_days", 3650)
-            self.ca_cert = (
+            builder = (
                 x509.CertificateBuilder()
                 .subject_name(subject)
                 .issuer_name(issuer)
@@ -1079,11 +1240,15 @@ class CertificateAuthority:
                     x509.SubjectKeyIdentifier.from_public_key(self.ca_key.public_key()),
                     critical=False,
                 )
-                .sign(self.ca_key, SHA256())
             )
+            self.ca_cert = _sign_builder(builder, self.ca_key, rsa_pss=self._rsa_pss)
 
+            # RFC 5958: persist as PKCS#8 PrivateKeyInfo so EC / EdDSA keys
+            # also round-trip cleanly. RSA keys remain readable everywhere.
             with open(ca_key_path, "wb") as f:
-                f.write(self.ca_key.private_bytes(Encoding.PEM, PrivateFormat.TraditionalOpenSSL, NoEncryption()))
+                f.write(self.ca_key.private_bytes(
+                    Encoding.PEM, PrivateFormat.PKCS8, NoEncryption(),
+                ))
             with open(ca_cert_path, "wb") as f:
                 f.write(self.ca_cert.public_bytes(Encoding.PEM))
 
@@ -1501,7 +1666,7 @@ class CertificateAuthority:
             _span.set_attribute("cert.subject", subject_str)
             _span.set_attribute("cert.profile", profile)
             _span.set_attribute("cert.validity_days", validity_days or 0)
-            cert = builder.sign(self.ca_key, SHA256())
+            cert = _sign_builder(builder, self.ca_key, rsa_pss=self._rsa_pss)
 
         # Store in DB (including profile)
         conn = sqlite3.connect(str(self.db_path))
@@ -1603,7 +1768,7 @@ class CertificateAuthority:
             )
             builder = builder.add_revoked_certificate(rev_cert)
 
-        crl = builder.sign(self.ca_key, SHA256())
+        crl = _sign_builder(builder, self.ca_key, rsa_pss=self._rsa_pss)
         return crl.public_bytes(Encoding.DER)
 
     def get_cert_by_serial(self, serial: int) -> Optional[bytes]:
@@ -1698,7 +1863,7 @@ class CertificateAuthority:
             x509.NameAttribute(NameOID.ORGANIZATION_NAME, org),
         ])
 
-        cert = (
+        client_builder = (
             x509.CertificateBuilder()
             .subject_name(subject)
             .issuer_name(self.ca_cert.subject)
@@ -1728,8 +1893,8 @@ class CertificateAuthority:
                 x509.AuthorityKeyIdentifier.from_issuer_public_key(self.ca_key.public_key()),
                 critical=False,
             )
-            .sign(self.ca_key, SHA256())
         )
+        cert = _sign_builder(client_builder, self.ca_key, rsa_pss=self._rsa_pss)
 
         # Persist in DB
         conn = sqlite3.connect(str(self.db_path))
@@ -1997,7 +2162,7 @@ class CertificateAuthority:
                 builder = builder.add_revoked_certificate(revoked_cert)
         finally:
             conn.close()
-        crl = builder.sign(private_key=self.ca_key, algorithm=SHA256())
+        crl = _sign_builder(builder, self.ca_key, rsa_pss=self._rsa_pss)
         return crl.public_bytes(Encoding.DER)
 
     # ------------------------------------------------------------------
@@ -2127,7 +2292,7 @@ class CertificateAuthority:
             )
             builder = builder.add_revoked_certificate(rev)
 
-        crl = builder.sign(self.ca_key, SHA256())
+        crl = _sign_builder(builder, self.ca_key, rsa_pss=self._rsa_pss)
         delta_der = crl.public_bytes(Encoding.DER)
 
         # Store current full-CRL as new base
@@ -2362,7 +2527,7 @@ class CertificateAuthority:
         for ext in cert.extensions:
             nc_cert = nc_cert.add_extension(ext.value, critical=ext.critical)
         nc_cert = nc_cert.add_extension(nc_ext, critical=True)
-        return nc_cert.sign(self.ca_key, SHA256())
+        return _sign_builder(nc_cert, self.ca_key, rsa_pss=self._rsa_pss)
 
     # ------------------------------------------------------------------
     # Feature 8 — Expiry monitoring
@@ -2885,7 +3050,7 @@ class CertificateAuthority:
             x509.UnrecognizedExtension(self.OID_SCT_LIST, ext_value),
             critical=False,
         )
-        return builder.sign(self.ca_key, SHA256())
+        return _sign_builder(builder, self.ca_key, rsa_pss=self._rsa_pss)
 
     def issue_certificate_with_ct(
         self,
@@ -3084,6 +3249,28 @@ def main():
             "EST /cacerts serves the full chain, SCEP GetCACert returns a p7c, "
             "CMP GetCACerts lists all CA certs, and PKCS#12 bundles include the chain. "
             "You may also place this file at <ca-dir>/ca-chain.pem and omit this flag."
+        ),
+    )
+    parser.add_argument(
+        "--ca-key-type", default="rsa-4096",
+        choices=["rsa-2048", "rsa-3072", "rsa-4096",
+                 "ec-p256", "ec-p384", "ec-p521",
+                 "ed25519", "ed448"],
+        help=(
+            "Algorithm and parameters for the CA private key on first-run "
+            "bootstrap. Ignored once ca.key exists on disk. "
+            "RSA = PKCS#1 v1.5 / PSS (RFC 4055), ECDSA = matched-curve "
+            "SHA-2 (RFC 5480/5758), EdDSA = Ed25519 / Ed448 (RFC 8410). "
+            "SCEP requires an RSA CA key. Default: rsa-4096."
+        ),
+    )
+    parser.add_argument(
+        "--sig-algorithm", default="rsa-pkcs1v15",
+        choices=["rsa-pkcs1v15", "rsa-pss"],
+        help=(
+            "Signature padding for RSA CA keys: PKCS#1 v1.5 (default) or "
+            "RSASSA-PSS per RFC 4055 §3.1 (MGF1+SHA-256, salt length 32). "
+            "No-op for ECDSA / EdDSA keys, which have a single signature scheme."
         ),
     )
     tls_group = parser.add_argument_group(
@@ -3422,6 +3609,8 @@ def main():
         ocsp_url=ocsp_url,
         crl_url=crl_url,
         parent_chain_path=getattr(args, "parent_cert", None),
+        ca_key_type=getattr(args, "ca_key_type", "rsa-4096"),
+        sig_algorithm=getattr(args, "sig_algorithm", "rsa-pkcs1v15"),
     )
     # Store reload interval on ca so sub-modules (ipsec_server) can read it
     ca._tls_reload_interval = getattr(args, "tls_reload_interval", 60)

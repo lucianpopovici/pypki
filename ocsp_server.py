@@ -433,7 +433,7 @@ def provision_ocsp_signing_cert(ca: "CertificateAuthority") -> Tuple[Any, x509.C
     # id-pkix-ocsp-nocheck OID
     ocsp_nocheck_oid = x509.ObjectIdentifier("1.3.6.1.5.5.7.48.1.5")
 
-    cert = (
+    ocsp_builder = (
         x509.CertificateBuilder()
         .subject_name(x509.Name([
             x509.NameAttribute(NameOID.COMMON_NAME, "PyPKI OCSP Responder"),
@@ -474,11 +474,21 @@ def provision_ocsp_signing_cert(ca: "CertificateAuthority") -> Tuple[Any, x509.C
             ),
             critical=False,
         )
-        .sign(ca.ca_key, SHA256())
     )
+    # Signed via pki_server._sign_builder so the right (hash, padding) is
+    # picked for RSA / ECDSA / EdDSA CAs (RFC 5758, RFC 8410, RFC 4055).
+    try:
+        from pki_server import _sign_builder as _pki_sign_builder
+        cert = _pki_sign_builder(
+            ocsp_builder, ca.ca_key,
+            rsa_pss=getattr(ca, "_rsa_pss", False),
+        )
+    except ImportError:
+        cert = ocsp_builder.sign(ca.ca_key, SHA256())
 
+    # RFC 5958 PKCS#8 — works for RSA, EC, and EdDSA OCSP signer keys.
     with open(ocsp_key_path, "wb") as f:
-        f.write(key.private_bytes(Encoding.PEM, PrivateFormat.TraditionalOpenSSL, NoEncryption()))
+        f.write(key.private_bytes(Encoding.PEM, PrivateFormat.PKCS8, NoEncryption()))
     with open(ocsp_cert_path, "wb") as f:
         f.write(cert.public_bytes(Encoding.PEM))
 

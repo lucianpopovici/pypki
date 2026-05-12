@@ -60,6 +60,61 @@ This project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Multi-algorithm CA — RFC 4055, RFC 5480 + RFC 5758, RFC 8410.** A
+  single refactor lifts PyPKI from RSA-only signing to full support for
+  RSASSA-PSS, ECDSA (P-256/384/521), and EdDSA (Ed25519/Ed448) at the CA
+  level.
+
+  *New module-level helpers in `pki_server.py`*: `_hash_for_key(key)`
+  picks the right hash class per key type (SHA-256 for RSA, matched-curve
+  SHA-2 for ECDSA per RFC 5758 §3.2, `None` for EdDSA). `_sign_builder(
+  builder, key, *, rsa_pss=False)` and `_sign_data(key, data, *,
+  rsa_pss=False)` dispatch to the correct `sign()` shape for each key
+  type. `_generate_ca_key(key_type)` reads from `_CA_KEY_FACTORIES`, a
+  catalog covering rsa-2048/3072/4096, ec-p256/p384/p521, ed25519, and
+  ed448. `_eddsa_compatible_with_cms(key)` powers the SCEP guardrail.
+
+  *`CertificateAuthority` constructor* accepts `ca_key_type` and
+  `sig_algorithm`. `_load_or_create_ca` calls `_generate_ca_key`;
+  `ca.key` is persisted as PKCS#8 `PrivateKeyInfo` (RFC 5958) so EC and
+  EdDSA keys round-trip cleanly. Once `ca.key` exists on disk, the flag
+  is ignored — switching algorithms requires a fresh CA dir.
+
+  *All CA-key-signing call sites migrated.* `issue_certificate`, sub-CA
+  issuance, `issue_client_cert`, three CRL builders (`generate_crl`,
+  `generate_crl_der`, `generate_delta_crl`), name-constraints cert,
+  CT-embedded cert, and the OCSP / IPsec signer-cert provisioners in
+  `ocsp_server.py` and `ipsec_server.py` all go through `_sign_builder`
+  with the CA's signature padding choice. Signature algorithm OIDs in
+  issued certs and CRLs are now correct per RFC 5758 §3.2
+  (`ecdsa-with-SHA256`/384/512) or RFC 8410 (`1.3.101.112` Ed25519,
+  `1.3.101.113` Ed448).
+
+  *New CLI flags in `pki_server.py`*: `--ca-key-type` (default
+  `rsa-4096`) with choices `rsa-2048`, `rsa-3072`, `rsa-4096`,
+  `ec-p256`, `ec-p384`, `ec-p521`, `ed25519`, `ed448`; and
+  `--sig-algorithm` (default `rsa-pkcs1v15`) with choices
+  `rsa-pkcs1v15`, `rsa-pss` for RSA CAs. ECDSA / EdDSA keys ignore
+  `--sig-algorithm` (each has a single signature scheme).
+
+  *SCEP guardrail.* SCEP is CMS-based (RFC 8894 §3 ⇒ RFC 5652) and
+  requires a named digest algorithm in `SignerInfo`. The existing signer
+  hardcodes RSA-PKCS1v15. `start_scep_server` now refuses to register
+  the handler when the CA key is not RSA, with a clear actionable error
+  pointing at `--ca-key-type rsa-...`. ECDSA support inside CMS is a
+  separate work item.
+
+  *Verified by `TestMultiAlgorithmCA` (19 tests)*: hash-for-key dispatch
+  across RSA/ECC/EdDSA; key-factory catalog enumeration; per-curve
+  signature OID assertions (P-256→ecdsa-with-SHA256, P-384→SHA384,
+  P-521→SHA512); Ed25519 / Ed448 SPKI OIDs; PSS signature OID
+  (`1.2.840.113549.1.1.10`); invalid sig-algorithm rejection; end-to-end
+  leaf issuance through an EC-P256 CA producing the right signature OID
+  on the leaf and preserving the RSA SPKI from the CSR; Ed25519 CA
+  signature verification against the CA public key; EC CA CRL signed and
+  verified; CA key persisted as PKCS#8 (not SEC1 / PKCS#1); SCEP
+  guardrail refuses Ed25519 CA at startup with a clear error.
+
 - **RFC 8738 — ACME IP identifier support.** ACME orders may now carry
   `{"type": "ip", "value": "<IPv4-or-IPv6>"}` identifiers per RFC 8738
   §3. The identifier value is parsed with `ipaddress.ip_address()`;

@@ -1015,7 +1015,14 @@ class IPsecCertIssuer:
                 critical=False,
             )
 
-        cert = builder.sign(self.ca.ca_key, SHA256())
+        try:
+            from pki_server import _sign_builder as _pki_sign_builder
+            cert = _pki_sign_builder(
+                builder, self.ca.ca_key,
+                rsa_pss=getattr(self.ca, "_rsa_pss", False),
+            )
+        except ImportError:
+            cert = builder.sign(self.ca.ca_key, SHA256())
 
         # Update the DER stored in the CA's DB to reflect the rebuilt cert
         try:
@@ -2353,7 +2360,7 @@ def _provision_ipsec_ocsp_cert(ca: "CertificateAuthority"):
     key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
     now = datetime.datetime.now(_tz.utc)
 
-    cert = (
+    ipsec_ocsp_builder = (
         x509.CertificateBuilder()
         .subject_name(x509.Name([
             x509.NameAttribute(NameOID.COMMON_NAME, "PyPKI IPsec OCSP Responder"),
@@ -2388,11 +2395,18 @@ def _provision_ipsec_ocsp_cert(ca: "CertificateAuthority"):
             ),
             critical=False,
         )
-        .sign(ca.ca_key, SHA256())
     )
+    try:
+        from pki_server import _sign_builder as _pki_sign_builder
+        cert = _pki_sign_builder(
+            ipsec_ocsp_builder, ca.ca_key,
+            rsa_pss=getattr(ca, "_rsa_pss", False),
+        )
+    except ImportError:
+        cert = ipsec_ocsp_builder.sign(ca.ca_key, SHA256())
 
     key_path.write_bytes(
-        key.private_bytes(Encoding.PEM, PrivateFormat.TraditionalOpenSSL, NoEncryption())
+        key.private_bytes(Encoding.PEM, PrivateFormat.PKCS8, NoEncryption())
     )
     cert_path.write_bytes(cert.public_bytes(Encoding.PEM))
     _exp = getattr(cert, "not_valid_after_utc", cert.not_valid_after)
@@ -2441,7 +2455,7 @@ def _provision_ipsec_tls_cert(ca: "CertificateAuthority", hostname: str):
         san_names.insert(0, x509.DNSName(hostname))
     san_names.append(x509.IPAddress(ipaddress.ip_address("127.0.0.1")))
 
-    cert = (
+    ipsec_tls_builder = (
         x509.CertificateBuilder()
         .subject_name(x509.Name([
             x509.NameAttribute(NameOID.COMMON_NAME, hostname),
@@ -2472,11 +2486,18 @@ def _provision_ipsec_tls_cert(ca: "CertificateAuthority", hostname: str):
             x509.AuthorityKeyIdentifier.from_issuer_public_key(ca.ca_key.public_key()),
             critical=False,
         )
-        .sign(ca.ca_key, SHA256())
     )
+    try:
+        from pki_server import _sign_builder as _pki_sign_builder
+        cert = _pki_sign_builder(
+            ipsec_tls_builder, ca.ca_key,
+            rsa_pss=getattr(ca, "_rsa_pss", False),
+        )
+    except ImportError:
+        cert = ipsec_tls_builder.sign(ca.ca_key, SHA256())
 
     key_path.write_bytes(
-        priv.private_bytes(Encoding.PEM, PrivateFormat.TraditionalOpenSSL, NoEncryption())
+        priv.private_bytes(Encoding.PEM, PrivateFormat.PKCS8, NoEncryption())
     )
     cert_path.write_bytes(cert.public_bytes(Encoding.PEM))
     _exp2 = getattr(cert, "not_valid_after_utc", cert.not_valid_after)
