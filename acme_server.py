@@ -322,7 +322,15 @@ class ACMEDatabase:
                 thumbprint  TEXT NOT NULL,
                 status      TEXT NOT NULL DEFAULT 'valid',
                 contact     TEXT,
+                eab_kid     TEXT,
                 created_at  REAL NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS eab_keys (
+                kid          TEXT PRIMARY KEY,
+                mac_key_b64  TEXT NOT NULL,
+                created_at   REAL NOT NULL,
+                revoked_at   REAL
             );
 
             CREATE TABLE IF NOT EXISTS orders (
@@ -399,7 +407,7 @@ class ACMEDatabase:
 
     # -- Accounts --
 
-    def create_or_find_account(self, jwk: dict, contact: Optional[list]) -> tuple:
+    def create_or_find_account(self, jwk: dict, contact: Optional[list], eab_kid: Optional[str] = None) -> tuple:
         """Returns (is_new: bool, account: dict)."""
         thumb = jwk_thumbprint(jwk)
         kid = f"acct-{thumb[:16]}"
@@ -409,9 +417,9 @@ class ACMEDatabase:
             conn.close()
             return False, dict(row)
         conn.execute(
-            "INSERT INTO accounts VALUES (?,?,?,?,?,?)",
+            "INSERT INTO accounts VALUES (?,?,?,?,?,?,?)",
             (kid, json.dumps(jwk), thumb, "valid",
-             json.dumps(contact) if contact else None, time.time())
+             json.dumps(contact) if contact else None, eab_kid, time.time())
         )
         conn.commit()
         account = dict(conn.execute("SELECT * FROM accounts WHERE kid=?", (kid,)).fetchone())
@@ -439,6 +447,23 @@ class ACMEDatabase:
         )
         conn.commit()
         conn.close()
+
+    # -- EAB Keys --
+
+    def add_eab_key(self, kid: str, mac_key_b64: str):
+        conn = self._conn()
+        conn.execute(
+            "INSERT OR REPLACE INTO eab_keys (kid, mac_key_b64, created_at) VALUES (?, ?, ?)",
+            (kid, mac_key_b64, time.time())
+        )
+        conn.commit()
+        conn.close()
+
+    def get_eab_key(self, kid: str) -> Optional[str]:
+        conn = self._conn()
+        row = conn.execute("SELECT mac_key_b64 FROM eab_keys WHERE kid=? AND revoked_at IS NULL", (kid,)).fetchone()
+        conn.close()
+        return row[0] if row else None
 
     # -- Orders --
 
@@ -810,9 +835,62 @@ class ACMEHandler(http.server.BaseHTTPRequestHandler):
     cert_validity_days: int = 90        # validity for ACME-issued certs
     short_lived_threshold_days: int = 7 # certs valid <= this get noRevAvail (RFC 9608)
     allow_private_ip: bool = False      # RFC 8738: permit private/reserved IPs in ip identifiers
+    require_eab: bool = False           # RFC 8555 §7.3.4: gate account creation behind EAB
 
     def log_message(self, format, *args):
         logger.info(f"ACME {self.address_string()} - {format % args}")
+
+    def _verify_external_account_binding(self, eab: dict, account_jwk: dict) -> Tuple[bool, Optional[str], Optional[str]]:
+        """
+        Verify the RFC 8555 §7.3.4 External Account Binding JWS.
+        Returns (ok, error_detail, kid).
+        """
+        try:
+            # 1. Parse outer JWS (already done by verify_jws, but eab is the inner JWS)
+            # The 'eab' field in new-account is itself a JWS in Flattened JSON Serialization.
+            # It MUST use HS256 and be signed with the EAB MAC key.
+            # Its payload MUST be the account's public key (JWK).
+            protected_b64 = eab.get("protected", "")
+            payload_b64   = eab.get("payload", "")
+            signature_b64 = eab.get("signature", "")
+            
+            if not all([protected_b64, payload_b64, signature_b64]):
+                return False, "Missing EAB JWS fields", None
+            
+            header = json.loads(b64url_decode(protected_b64))
+            kid = header.get("kid")
+            if not kid:
+                return False, "EAB JWS missing 'kid' in protected header", None
+            
+            # 2. Lookup MAC key
+            mac_key_b64 = self.db.get_eab_key(kid)
+            if not mac_key_b64:
+                return False, f"EAB kid '{kid}' not found or revoked", None
+            
+            mac_key = b64url_decode(mac_key_b64)
+            
+            # 3. Verify HS256 signature
+            import hmac
+            alg = header.get("alg")
+            if alg != "HS256":
+                return False, f"EAB JWS must use HS256 algorithm (got {alg})", None
+                
+            signing_input = f"{protected_b64}.{payload_b64}".encode()
+            actual_sig = b64url_decode(signature_b64)
+            
+            expected_sig = hmac.new(mac_key, signing_input, hashlib.sha256).digest()
+            if not hmac.compare_digest(actual_sig, expected_sig):
+                return False, "EAB JWS signature verification failed", None
+                
+            # 4. Verify payload matches account JWK
+            payload = json.loads(b64url_decode(payload_b64))
+            # RFC 8555 §7.3.4: "The payload of the JWS is the account's public key... in JWK format"
+            if payload != account_jwk:
+                return False, "EAB payload does not match account public key", None
+                
+            return True, None, kid
+        except Exception as e:
+            return False, f"EAB verification error: {e}", None
 
     # ------------------------------------------------------------------
     # Routing
@@ -962,8 +1040,9 @@ class ACMEHandler(http.server.BaseHTTPRequestHandler):
                 "termsOfService": f"{self.base_url}/terms",
                 "website":        f"{self.base_url}",
                 "caaIdentities":  [],
-                "externalAccountRequired": False,
+                "externalAccountRequired": self.require_eab,
             },
+
         }
         # RFC 8555 §7.1.1 — directory response SHOULD include Replay-Nonce
         self._send_json(directory, 200, add_nonce=True)
@@ -996,8 +1075,29 @@ class ACMEHandler(http.server.BaseHTTPRequestHandler):
 
         contact = payload.get("contact")
         tos_agreed = payload.get("termsOfServiceAgreed", False)
+        eab_payload = payload.get("externalAccountBinding")
+        eab_kid = None
 
-        is_new, account = self.db.create_or_find_account(jwk, contact)
+        if self.require_eab:
+            if not eab_payload:
+                self._send_error(400, "urn:ietf:params:acme:error:externalAccountRequired",
+                                 "External Account Binding is required")
+                return
+            
+            ok, err, eab_kid = self._verify_external_account_binding(eab_payload, jwk)
+            if not ok:
+                self._send_error(400, "urn:ietf:params:acme:error:unauthorized",
+                                 f"External Account Binding failed: {err}")
+                return
+        elif eab_payload:
+            # Optional EAB verification if provided even if not strictly required
+            ok, err, eab_kid = self._verify_external_account_binding(eab_payload, jwk)
+            if not ok:
+                self._send_error(400, "urn:ietf:params:acme:error:unauthorized",
+                                 f"External Account Binding failed: {err}")
+                return
+
+        is_new, account = self.db.create_or_find_account(jwk, contact, eab_kid=eab_kid)
         kid_url = f"{self.base_url}/account/{account['kid']}"
 
         # RFC 8555 §7.3: onlyReturnExisting — return 400 if account doesn't exist
@@ -1678,6 +1778,7 @@ def make_acme_handler(
     cert_validity_days: int = 90,
     short_lived_threshold_days: int = 7,
     allow_private_ip: bool = False,
+    require_eab: bool = False,
 ):
     class BoundACMEHandler(ACMEHandler):
         pass
@@ -1688,6 +1789,7 @@ def make_acme_handler(
     BoundACMEHandler.cert_validity_days       = cert_validity_days
     BoundACMEHandler.short_lived_threshold_days = short_lived_threshold_days
     BoundACMEHandler.allow_private_ip         = allow_private_ip
+    BoundACMEHandler.require_eab             = require_eab
     return BoundACMEHandler
 
 
@@ -1703,6 +1805,8 @@ def start_acme_server(
     short_lived_threshold_days: int = 7,
     dns01_hook=None,
     allow_private_ip: bool = False,
+    require_eab: bool = False,
+    eab_file: Optional[str] = None,
 ):
     """
     Register the ACME handler with *route_table* under *prefix*.
@@ -1726,11 +1830,26 @@ def start_acme_server(
                     When provided, this hook is called instead of the built-in DNS
                     TXT lookup. Use make_dns01_webhook_hook() or
                     make_dns01_rfc2136_hook() from pki_server.py to build one.
+        allow_private_ip: If True, permit private/reserved IPs in orders.
+        require_eab: If True, enforce External Account Binding.
+        eab_file: Path to JSON file with EAB credentials.
     """
     from dispatcher_server import _RouteProxy
 
     db_path = str(ca_dir / "acme.db")
     db = ACMEDatabase(db_path)
+
+    # Load EAB keys if provided
+    if eab_file:
+        try:
+            with open(eab_file, "r") as f:
+                eab_keys = json.load(f)
+            for kid, key_b64 in eab_keys.items():
+                db.add_eab_key(kid, key_b64)
+            logger.info(f"Loaded {len(eab_keys)} EAB key(s) from {eab_file}")
+        except Exception as e:
+            logger.error(f"Failed to load EAB keys from {eab_file}: {e}")
+
     validator = ChallengeValidator(
         auto_approve_dns=auto_approve_dns,
         tls_alpn01_enabled=enable_tls_alpn01,
@@ -1741,6 +1860,7 @@ def start_acme_server(
         cert_validity_days=cert_validity_days,
         short_lived_threshold_days=short_lived_threshold_days,
         allow_private_ip=allow_private_ip,
+        require_eab=require_eab,
     )
 
     route_table.register(prefix, handler_cls)

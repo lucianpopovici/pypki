@@ -1486,13 +1486,10 @@ class WebUIHandler(http.server.BaseHTTPRequestHandler):
             self.wfile.write(pem)
         elif fmt == "p12":
             try:
-                from cryptography.hazmat.primitives.serialization import pkcs12
-                from cryptography.hazmat.primitives.serialization import NoEncryption
-                p12 = pkcs12.serialize_key_and_certificates(
-                    name=b"pypki-cert", key=None, cert=cert,
-                    cas=[self.ca.ca_cert],
-                    encryption_algorithm=NoEncryption(),
-                )
+                p12 = self.ca.export_pkcs12(serial)
+                if not p12:
+                    self._send_json({"error": "certificate not found"}, 404)
+                    return
                 self.send_response(200)
                 self.send_header("Content-Type", "application/x-pkcs12")
                 self.send_header("Content-Disposition",

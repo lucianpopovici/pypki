@@ -4112,6 +4112,77 @@ class TestCertificateTransparency(unittest.TestCase):
         self.assertIsInstance(cert, x509.Certificate)
 
 
+class TestCertificateTransparencyPreCert(unittest.TestCase):
+    """Verify RFC 6962 Pre-certificate flow with Poison extension."""
+
+    def setUp(self):
+        self._tmp = tempfile.mkdtemp()
+        self.ca = _make_ca(self._tmp)
+        self.key = _gen_key()
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self._tmp, ignore_errors=True)
+
+    def test_pre_cert_contains_poison(self):
+        """issue_certificate(ct_poison=True) MUST include the critical Poison extension."""
+        cert = self.ca.issue_certificate("CN=pre-cert", self.key.public_key(), ct_poison=True)
+        # Poison OID 1.3.6.1.4.1.11129.2.4.3
+        found = False
+        for ext in cert.extensions:
+            if ext.oid.dotted_string == "1.3.6.1.4.1.11129.2.4.3":
+                found = True
+                self.assertTrue(ext.critical, "Poison extension MUST be critical")
+                break
+        self.assertTrue(found, "Pre-certificate must contain Poison extension")
+
+    def test_issue_with_ct_uses_pre_cert_flow(self):
+        """issue_certificate_with_ct must obtain SCTs via Pre-cert and produce a final cert without Poison."""
+        import struct
+        # Mock submit_pre_cert_to_ct_log to return a fake SCT
+        # Format: 1(ver) + 32(log_id) + 8(ts) + 2(ext_len=0) + sig_alg(2: SHA256=4, RSA=1) + sig_len(2) + sig(64)
+        fake_sct = (bytes([0]) + bytes(32) + struct.pack(">Q", 0)
+                    + struct.pack(">H", 0) + bytes([4, 1]) + struct.pack(">H", 64) + bytes(64))
+        
+        orig_submit = self.ca.submit_pre_cert_to_ct_log
+        self.ca.submit_pre_cert_to_ct_log = lambda cert, url: fake_sct
+        
+        try:
+            cert = self.ca.issue_certificate_with_ct(
+                "CN=ct-flow", self.key.public_key(),
+                ct_log_urls=["http://mock-log.test"]
+            )
+            
+            # Verify final cert has SCT extension
+            sct_ext = cert.extensions.get_extension_for_oid(x509.ObjectIdentifier("1.3.6.1.4.1.11129.2.4.2"))
+            self.assertIsNotNone(sct_ext)
+            
+            # Verify final cert has NO poison extension
+            for ext in cert.extensions:
+                self.assertNotEqual(ext.oid.dotted_string, "1.3.6.1.4.1.11129.2.4.3",
+                                    "Final certificate MUST NOT contain Poison extension")
+                
+            # Verify final cert is in DB
+            stored = self.ca.get_cert_by_serial(cert.serial_number)
+            self.assertIsNotNone(stored)
+            
+        finally:
+            self.ca.submit_pre_cert_to_ct_log = orig_submit
+
+    def test_forced_serial_and_time(self):
+        """issue_certificate must respect forced_serial and forced_time."""
+        serial = 1234567
+        now = datetime.datetime(2026, 5, 12, 12, 0, 0, tzinfo=datetime.timezone.utc)
+        cert = self.ca.issue_certificate(
+            "CN=forced", self.key.public_key(),
+            forced_serial=serial,
+            forced_time=now
+        )
+        self.assertEqual(cert.serial_number, serial)
+        # Compare as UTC timestamps
+        self.assertEqual(cert.not_valid_before_utc, now)
+
+
 # ===========================================================================
 # 32. Feature 5 — ACME DNS-01 hook factories
 # ===========================================================================
@@ -5991,6 +6062,300 @@ class TestRFC3161TSA(unittest.TestCase):
         parsed = self._parse_resp(resp)
         self.assertEqual(parsed["status"], self.tsa.TSA_STATUS_REJECTION)
         self.assertIsNone(parsed.get("tst_info"))
+
+
+# ===========================================================================
+# EST Label Routing and Profile-Aware csrattrs
+# ===========================================================================
+
+class TestESTRouting(unittest.TestCase):
+    """Verify EST labels map to profiles and csrattrs are profile-aware."""
+
+    def setUp(self):
+        try:
+            import est_server
+            self.est = est_server
+        except ImportError:
+            self.skipTest("est_server.py not importable")
+
+    def test_csrattrs_hints_per_profile(self):
+        """build_csrattrs returns different EKU hints based on profile."""
+        est = self.est
+
+        # Default -> clientAuth
+        der_def = est.build_csrattrs("default")
+        self.assertIn(est._oid(est.OID_CLIENT_AUTH), der_def)
+
+        # tls_server -> serverAuth
+        der_tls = est.build_csrattrs("tls_server")
+        self.assertIn(est._oid(est.OID_SERVER_AUTH), der_tls)
+        self.assertNotIn(est._oid(est.OID_CLIENT_AUTH), der_tls)
+
+        # code_signing -> codeSigning
+        der_cs = est.build_csrattrs("code_signing")
+        self.assertIn(est._oid(est.OID_CODE_SIGNING), der_cs)
+
+        # email -> emailProtection
+        der_email = est.build_csrattrs("email")
+        self.assertIn(est._oid(est.OID_EMAIL_PROTECTION), der_email)
+
+    def test_est_handler_label_to_profile_dispatch(self):
+        """ESTHandler._dispatch correctly maps labels to profiles."""
+        est = self.est
+
+        class MockCA:
+            def __init__(self):
+                self.ca_chain_ders = []
+                self.issued_profile = None
+            def issue_certificate(self, **kwargs):
+                self.issued_profile = kwargs.get("profile")
+                from cryptography import x509
+                from cryptography.hazmat.primitives.asymmetric import rsa
+                from cryptography.hazmat.primitives import hashes
+                import datetime
+                key = rsa.generate_private_key(65537, 2048)
+                builder = x509.CertificateBuilder().subject_name(
+                    x509.Name([])).issuer_name(x509.Name([])).public_key(
+                    key.public_key()).serial_number(1).not_valid_before(
+                    datetime.datetime.now()).not_valid_after(
+                    datetime.datetime.now()).add_extension(
+                    x509.BasicConstraints(False, None), True)
+                return builder.sign(key, hashes.SHA256())
+
+        class DummyHandler(est.ESTHandler):
+            def __init__(self, path):
+                self.path = path
+                self.headers = {"Content-Length": "0"}
+                self.client_address = ("127.0.0.1", 12345)
+                self.connection = None
+                self.rfile = None
+                self.wfile = type("dummy", (), {"write": lambda self, x: None})()
+            def send_response(self, *args, **kwargs): pass
+            def send_header(self, *args, **kwargs): pass
+            def end_headers(self, *args, **kwargs): pass
+            def _get_client_cert(self): return None
+            def _check_basic_auth(self): return "testuser"
+            def _read_body(self): return b""
+            def _decode_csr(self, body):
+                from cryptography import x509
+                from cryptography.hazmat.primitives.asymmetric import rsa
+                from cryptography.hazmat.primitives import hashes
+                key = rsa.generate_private_key(65537, 2048)
+                csr = x509.CertificateSigningRequestBuilder().subject_name(
+                    x509.Name([])).sign(key, hashes.SHA256())
+                return csr
+
+        ca = MockCA()
+        DummyHandler.ca = ca
+        DummyHandler.require_auth = False # simplify
+
+        # 1. No label -> default profile
+        h1 = DummyHandler("/.well-known/est/simpleenroll")
+        h1._dispatch("POST")
+        self.assertEqual(ca.issued_profile, "default")
+
+        # 2. tls-server label -> tls_server profile
+        h2 = DummyHandler("/.well-known/est/tls-server/simpleenroll")
+        h2._dispatch("POST")
+        self.assertEqual(ca.issued_profile, "tls_server")
+
+        # 3. code-signing label -> code_signing profile
+        h3 = DummyHandler("/.well-known/est/code-signing/simpleenroll")
+        h3._dispatch("POST")
+        self.assertEqual(ca.issued_profile, "code_signing")
+
+        # 4. Unknown label -> default profile
+        h4 = DummyHandler("/.well-known/est/unknown-label/simpleenroll")
+        h4._dispatch("POST")
+        self.assertEqual(ca.issued_profile, "default")
+
+
+class TestRFC7030ProfileCSRAttrs(unittest.TestCase):
+    """Verify SPIFFE validation and profile-specific SAN enforcement."""
+
+    def setUp(self):
+        try:
+            import est_server
+            from cryptography import x509
+            from cryptography.hazmat.primitives import hashes
+            from cryptography.hazmat.primitives.asymmetric import rsa
+            self.est = est_server
+            self.x509 = x509
+            self.hashes = hashes
+            self.rsa = rsa
+        except ImportError:
+            self.skipTest("est_server.py not importable")
+
+    def _make_csr(self, cn="test", dns=None, uris=None):
+        key = self.rsa.generate_private_key(65537, 2048)
+        builder = self.x509.CertificateSigningRequestBuilder().subject_name(
+            self.x509.Name([self.x509.NameAttribute(self.x509.oid.NameOID.COMMON_NAME, cn)])
+        )
+        san_list = []
+        if dns:
+            san_list.extend([self.x509.DNSName(d) for d in dns])
+        if uris:
+            san_list.extend([self.x509.UniformResourceIdentifier(u) for u in uris])
+        
+        if san_list:
+            builder = builder.add_extension(self.x509.SubjectAlternativeName(san_list), critical=False)
+        
+        return builder.sign(key, self.hashes.SHA256())
+
+    def test_spiffe_validation_logic(self):
+        """SPIFFE profile enforces URI prefix and non-empty path."""
+        est = self.est
+        
+        # 1. Valid SPIFFE
+        csr1 = self._make_csr(uris=["spiffe://cluster.local/ns/default/sa/foo"])
+        ok, err = est.ESTHandler._validate_csr_for_profile(None, csr1, "spiffe")
+        self.assertTrue(ok, err)
+
+        # 2. Wrong trust domain
+        csr2 = self._make_csr(uris=["spiffe://wrong.domain/foo"])
+        ok, err = est.ESTHandler._validate_csr_for_profile(None, csr2, "spiffe")
+        self.assertFalse(ok)
+        self.assertIn("must start with spiffe://cluster.local/", err)
+
+        # 3. Empty path
+        csr3 = self._make_csr(uris=["spiffe://cluster.local/"])
+        ok, err = est.ESTHandler._validate_csr_for_profile(None, csr3, "spiffe")
+        self.assertFalse(ok)
+        self.assertIn("path must be non-empty", err)
+
+        # 4. DNS SAN in SPIFFE (forbidden by our spec)
+        csr4 = self._make_csr(uris=["spiffe://cluster.local/foo"], dns=["foo.bar"])
+        ok, err = est.ESTHandler._validate_csr_for_profile(None, csr4, "spiffe")
+        self.assertFalse(ok)
+        self.assertIn("forbidden SAN type DNS", err)
+
+    def test_tls_server_san_enforcement(self):
+        """tls_server profile requires SAN and forbids URIs."""
+        est = self.est
+
+        # 1. Missing SAN
+        csr1 = self._make_csr(cn="host.example.com")
+        ok, err = est.ESTHandler._validate_csr_for_profile(None, csr1, "tls_server")
+        self.assertFalse(ok)
+        self.assertIn("requires SubjectAlternativeName", err)
+
+        # 2. Valid DNS SAN
+        csr2 = self._make_csr(dns=["host.example.com"])
+        ok, err = est.ESTHandler._validate_csr_for_profile(None, csr2, "tls_server")
+        self.assertTrue(ok, err)
+
+        # 3. Forbidden URI SAN
+        csr3 = self._make_csr(dns=["host.example.com"], uris=["https://admin.portal"])
+        ok, err = est.ESTHandler._validate_csr_for_profile(None, csr3, "tls_server")
+        self.assertFalse(ok)
+        self.assertIn("forbidden SAN type UniformResourceIdentifier", err)
+
+    def test_san_criticality_for_empty_subject(self):
+        """CA core marks SAN critical if subject is empty (RFC 5280)."""
+        import tempfile
+        import shutil
+        from pathlib import Path
+        from pki_server import CertificateAuthority, ServerConfig
+        from cryptography.hazmat.primitives.asymmetric import rsa
+        from cryptography import x509
+        
+        tmp = Path(tempfile.mkdtemp())
+        try:
+            ca = CertificateAuthority(tmp, config=ServerConfig(ca_dir=tmp))
+            key = rsa.generate_private_key(65537, 2048)
+            
+            # 1. Non-empty subject -> SAN should be non-critical
+            cert1 = ca.issue_certificate("CN=test", key.public_key(), san_dns=["test.com"])
+            san1 = cert1.extensions.get_extension_for_class(x509.SubjectAlternativeName)
+            self.assertFalse(san1.critical)
+            self.assertGreater(len(list(cert1.subject)), 0)
+
+            # 2. Empty subject -> SAN MUST be critical
+            cert2 = ca.issue_certificate("", key.public_key(), san_dns=["test.com"])
+            san2 = cert2.extensions.get_extension_for_class(x509.SubjectAlternativeName)
+            self.assertTrue(san2.critical, "SAN MUST be critical if subject is empty (RFC 5280 §4.2.1.6)")
+            self.assertEqual(len(list(cert2.subject)), 0, "Subject MUST be empty")
+
+        finally:
+            shutil.rmtree(tmp)
+
+
+class TestACMEEAB(unittest.TestCase):
+    """Verify RFC 8555 §7.3.4 External Account Binding."""
+
+    def setUp(self):
+        try:
+            import acme_server
+            import hmac
+            import hashlib
+            import json
+            self.acme = acme_server
+            self.hmac = hmac
+            self.hashlib = hashlib
+            self.json = json
+        except ImportError:
+            self.skipTest("acme_server.py not importable")
+
+    def _b64url(self, data: bytes) -> str:
+        import base64
+        return base64.urlsafe_b64encode(data).rstrip(b"=").decode()
+
+    def test_eab_verification_success(self):
+        """Verify a valid EAB JWS signature matches the account JWK."""
+        kid = "test-kid"
+        mac_key = b"very-secret-mac-key-1234567890123"
+        mac_key_b64 = self._b64url(mac_key)
+        
+        # 1. Mock DB
+        db = type("MockDB", (), {
+            "get_eab_key": lambda k: mac_key_b64 if k == kid else None
+        })()
+        
+        # 2. Prepare Account JWK
+        account_jwk = {"kty": "RSA", "n": "...", "e": "AQAB"}
+        payload_b64 = self._b64url(self.json.dumps(account_jwk).encode())
+        
+        # 3. Prepare Protected Header
+        protected = {"alg": "HS256", "kid": kid, "url": "http://localhost/new-account"}
+        protected_b64 = self._b64url(self.json.dumps(protected).encode())
+        
+        # 4. Sign
+        signing_input = f"{protected_b64}.{payload_b64}".encode()
+        sig = self.hmac.new(mac_key, signing_input, self.hashlib.sha256).digest()
+        sig_b64 = self._b64url(sig)
+        
+        eab = {
+            "protected": protected_b64,
+            "payload": payload_b64,
+            "signature": sig_b64
+        }
+        
+        # 5. Verify
+        handler = self.acme.ACMEHandler
+        handler.db = db
+        ok, err, verified_kid = handler._verify_external_account_binding(None, eab, account_jwk)
+        
+        self.assertTrue(ok, f"Verification failed: {err}")
+        self.assertEqual(verified_kid, kid)
+
+    def test_eab_verification_failure_bad_sig(self):
+        """Verify EAB fails if the signature is incorrect."""
+        kid = "test-kid"
+        mac_key = b"secret"
+        db = type("MockDB", (), {"get_eab_key": lambda k: self._b64url(mac_key)})()
+        
+        account_jwk = {"kty": "RSA"}
+        payload_b64 = self._b64url(self.json.dumps(account_jwk).encode())
+        protected_b64 = self._b64url(self.json.dumps({"alg": "HS256", "kid": kid}).encode())
+        sig_b64 = self._b64url(b"wrong-signature")
+        
+        eab = {"protected": protected_b64, "payload": payload_b64, "signature": sig_b64}
+        
+        handler = self.acme.ACMEHandler
+        handler.db = db
+        ok, err, _ = handler._verify_external_account_binding(None, eab, account_jwk)
+        self.assertFalse(ok)
+        self.assertIn("signature verification failed", err)
 
 
 # ===========================================================================

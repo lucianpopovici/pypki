@@ -142,6 +142,47 @@ OID_KEY_USAGE        = "2.5.29.15"
 OID_SUBJECT_ALT_NAME = "2.5.29.17"
 OID_EKU              = "2.5.29.37"
 OID_CLIENT_AUTH      = "1.3.6.1.5.5.7.3.2"
+OID_SERVER_AUTH      = "1.3.6.1.5.5.7.3.1"
+OID_CODE_SIGNING     = "1.3.6.1.5.5.7.3.3"
+OID_EMAIL_PROTECTION = "1.3.6.1.5.5.7.3.4"
+OID_IKE_INTERMEDIATE = "1.3.6.1.5.5.7.3.14"
+
+# RFC 7030 label routing to certificate profiles
+EST_LABEL_PROFILE = {
+    "tls-server":   "tls_server",
+    "tls-client":   "tls_client",
+    "code-signing": "code_signing",
+    "email":        "email",
+    "ipsec":        "ipsec_end",  # requires ipsec_end profile in pki_server.py
+    "spiffe":       "spiffe",     # placeholder for future SPIFFE work
+}
+
+# Profile-specific CSR attribute constraints and validation rules
+EST_CSR_ATTRS = {
+    "tls_server": {
+        "required_eku":   [OID_SERVER_AUTH],
+        "san_required":   True,
+        "san_types":      {"DNS", "IP"},
+        "forbid_san":     {"RFC822Name", "UniformResourceIdentifier", "OtherName"},
+    },
+    "tls_client": {
+        "required_eku":   [OID_CLIENT_AUTH],
+        "san_required":   True,
+        "san_types":      {"DNS", "RFC822Name"},
+    },
+    "spiffe": {
+        "required_eku":   [OID_CLIENT_AUTH, OID_SERVER_AUTH],
+        "san_required":   True,
+        "san_types":      {"UniformResourceIdentifier"},
+        "uri_scheme":     "spiffe",
+        "uri_authority":  "cluster.local",  # TODO: make configurable per CA
+    },
+    "ipsec_end": {
+        "required_eku":   [OID_IKE_INTERMEDIATE],
+        "san_required":   True,
+        "san_types":      {"DNS", "IP"},
+    },
+}
 
 
 # ---------------------------------------------------------------------------
@@ -225,10 +266,11 @@ class ESTCMSBuilder:
 # CSR attribute builder (csrattrs)
 # ---------------------------------------------------------------------------
 
-def build_csrattrs() -> bytes:
+def build_csrattrs(profile: str = "default") -> bytes:
     """
     Build a DER-encoded CsrAttrs sequence (RFC 7030 §4.5.2).
-    Hints the client to use RSA-2048 or P-256, include SAN, and EKU clientAuth.
+    Hints the client to use RSA-2048 or P-256, include SAN, and
+    provides profile-specific EKU hints.
 
     CsrAttrs ::= SEQUENCE SIZE (0..MAX) OF AttrOrOID
     AttrOrOID ::= CHOICE { oid OID, attribute Attribute }
@@ -237,17 +279,29 @@ def build_csrattrs() -> bytes:
         val_set = _set(b"".join(values))
         return _seq(_oid(oid_str) + val_set)
 
+    # Pick EKU OID based on profile
+    eku_oid_str = OID_CLIENT_AUTH  # default
+    if profile == "tls_server":
+        eku_oid_str = OID_SERVER_AUTH
+    elif profile == "code_signing":
+        eku_oid_str = OID_CODE_SIGNING
+    elif profile == "email":
+        eku_oid_str = OID_EMAIL_PROTECTION
+    elif profile == "ipsec_end":
+        eku_oid_str = OID_IKE_INTERMEDIATE
+
     # Hint: include extensionRequest with SAN + EKU
     san_ext_oid = _oid(OID_SUBJECT_ALT_NAME)
     eku_ext_oid = _oid(OID_EKU)
     ext_request_value = _seq(
         _seq(san_ext_oid)
-        + _seq(eku_ext_oid + _seq(_oid(OID_CLIENT_AUTH)))
+        + _seq(eku_ext_oid + _seq(_oid(eku_oid_str)))
     )
 
     attrs = (
         # Tell client to use RSA or EC (hint only — client can ignore)
         _oid(OID_RSA_ENCRYPTION)
+        + _oid(OID_EC_PUBLIC_KEY)
         + attr(OID_EXTENSION_REQUEST, ext_request_value)
     )
 
@@ -331,6 +385,9 @@ class ESTHandler(http.server.BaseHTTPRequestHandler):
                 self._send_error(404, "Not an EST endpoint")
                 return
 
+            # Map label to certificate profile
+            profile = EST_LABEL_PROFILE.get(label, "default") if label else "default"
+
             # Authenticate
             client_cert = self._get_client_cert()
             basic_user = self._check_basic_auth()
@@ -344,21 +401,21 @@ class ESTHandler(http.server.BaseHTTPRequestHandler):
                 else f"basic:{basic_user}" if basic_user
                 else "anonymous"
             )
-            logger.info(f"EST {method} /{op} auth={auth_id}")
+            logger.info(f"EST {method} /{op} label={label or 'none'} profile={profile} auth={auth_id}")
 
             if method == "GET" and op == "cacerts":
                 self._handle_cacerts()
             elif method == "GET" and op == "csrattrs":
-                self._handle_csrattrs()
+                self._handle_csrattrs(profile)
             elif method == "POST" and op == "simpleenroll":
                 body = self._read_body()
-                self._handle_simpleenroll(body, renew=False, client_cert=client_cert)
+                self._handle_simpleenroll(body, renew=False, client_cert=client_cert, profile=profile)
             elif method == "POST" and op == "simplereenroll":
                 body = self._read_body()
-                self._handle_simpleenroll(body, renew=True, client_cert=client_cert)
+                self._handle_simpleenroll(body, renew=True, client_cert=client_cert, profile=profile)
             elif method == "POST" and op == "serverkeygen":
                 body = self._read_body()
-                self._handle_serverkeygen(body)
+                self._handle_serverkeygen(body, profile=profile)
             else:
                 self._send_error(405, f"Method {method} not allowed for operation {op}")
 
@@ -396,12 +453,12 @@ class ESTHandler(http.server.BaseHTTPRequestHandler):
         self.wfile.write(b64)
         logger.info("EST cacerts: returned CA certificate chain")
 
-    def _handle_csrattrs(self):
+    def _handle_csrattrs(self, profile: str = "default"):
         """
         GET /.well-known/est/csrattrs
         RFC 7030 §4.5 — return CSR attribute hints as base64 DER.
         """
-        attrs_der = build_csrattrs()
+        attrs_der = build_csrattrs(profile)
         b64 = base64.b64encode(attrs_der)
 
         self.send_response(200)
@@ -410,9 +467,9 @@ class ESTHandler(http.server.BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(b64)))
         self.end_headers()
         self.wfile.write(b64)
-        logger.info("EST csrattrs: returned CSR attribute hints")
+        logger.info(f"EST csrattrs: returned CSR attribute hints for profile {profile}")
 
-    def _handle_simpleenroll(self, body: bytes, renew: bool, client_cert: Optional[x509.Certificate]):
+    def _handle_simpleenroll(self, body: bytes, renew: bool, client_cert: Optional[x509.Certificate], profile: str = "default"):
         """
         POST /.well-known/est/simpleenroll  (initial enrolment)
         POST /.well-known/est/simplereenroll (renewal)
@@ -428,6 +485,12 @@ class ESTHandler(http.server.BaseHTTPRequestHandler):
 
         if not csr.is_signature_valid:
             self._send_error(400, "CSR signature is invalid")
+            return
+
+        # Profile-specific validation
+        ok, err = self._validate_csr_for_profile(csr, profile)
+        if not ok:
+            self._send_error(400, err)
             return
 
         if renew:
@@ -448,11 +511,10 @@ class ESTHandler(http.server.BaseHTTPRequestHandler):
         # all (hostname verification would silently fail).
         # RFC 7030 §4.2.1: the server MAY modify the requested attributes;
         # PyPKI's policy is "pass through the canonical four SAN types".
-        # Note: URI SANs (including SPIFFE) are not yet threaded — tracked in
-        # CLAUDE.md "EST CSR SAN pass-through + profile-aware csrattrs".
         san_dns:    list = []
         san_emails: list = []
         san_ips:    list = []
+        san_uris:   list = []
         try:
             csr_san = csr.extensions.get_extension_for_class(
                 x509.SubjectAlternativeName
@@ -464,7 +526,8 @@ class ESTHandler(http.server.BaseHTTPRequestHandler):
                     san_emails.append(n.value)
                 elif isinstance(n, x509.IPAddress):
                     san_ips.append(str(n.value))
-                # URISAN / OtherName intentionally skipped for now
+                elif isinstance(n, x509.UniformResourceIdentifier):
+                    san_uris.append(n.value)
         except x509.ExtensionNotFound:
             pass
 
@@ -475,6 +538,8 @@ class ESTHandler(http.server.BaseHTTPRequestHandler):
                 san_dns=san_dns or None,
                 san_emails=san_emails or None,
                 san_ips=san_ips or None,
+                san_uris=san_uris or None,
+                profile=profile,
             )
         except Exception as e:
             logger.error(f"EST issuance failed: {e}")
@@ -488,7 +553,7 @@ class ESTHandler(http.server.BaseHTTPRequestHandler):
         b64 = base64.b64encode(pkcs7)
 
         op = "simplereenroll" if renew else "simpleenroll"
-        logger.info(f"EST {op}: issued cert for '{subject_str}' serial={cert.serial_number}")
+        logger.info(f"EST {op}: issued cert for '{subject_str}' serial={cert.serial_number} profile={profile}")
 
         self.send_response(200)
         self.send_header("Content-Type", "application/pkcs7-mime; smime-type=certs-only")
@@ -497,7 +562,7 @@ class ESTHandler(http.server.BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(b64)
 
-    def _handle_serverkeygen(self, body: bytes):
+    def _handle_serverkeygen(self, body: bytes, profile: str = "default"):
         """
         POST /.well-known/est/serverkeygen
         RFC 7030 §4.4 — generate a key pair server-side, issue a cert,
@@ -513,14 +578,32 @@ class ESTHandler(http.server.BaseHTTPRequestHandler):
         """
         # Parse optional CSR for subject/extensions hints (body may be empty)
         subject_str = "CN=EST Serverkeygen Client"
-        san_dns = []
+        san_dns, san_emails, san_ips, san_uris = [], [], [], []
         if body:
             csr = self._decode_csr(body)
-            if csr and csr.is_signature_valid:
+            if csr:
+                if not csr.is_signature_valid:
+                    self._send_error(400, "CSR signature is invalid")
+                    return
+
+                # Profile-specific validation
+                ok, err = self._validate_csr_for_profile(csr, profile)
+                if not ok:
+                    self._send_error(400, err)
+                    return
+
                 subject_str = csr.subject.rfc4514_string() or subject_str
                 try:
                     san_ext = csr.extensions.get_extension_for_class(x509.SubjectAlternativeName)
-                    san_dns = [n.value for n in san_ext.value if isinstance(n, x509.DNSName)]
+                    for n in san_ext.value:
+                        if isinstance(n, x509.DNSName):
+                            san_dns.append(n.value)
+                        elif isinstance(n, x509.RFC822Name):
+                            san_emails.append(n.value)
+                        elif isinstance(n, x509.IPAddress):
+                            san_ips.append(str(n.value))
+                        elif isinstance(n, x509.UniformResourceIdentifier):
+                            san_uris.append(n.value)
                 except x509.ExtensionNotFound:
                     pass
 
@@ -532,7 +615,11 @@ class ESTHandler(http.server.BaseHTTPRequestHandler):
             cert = self.ca.issue_certificate(
                 subject_str=subject_str,
                 public_key=public_key,
-                san_dns=san_dns if san_dns else None,
+                san_dns=san_dns or None,
+                san_emails=san_emails or None,
+                san_ips=san_ips or None,
+                san_uris=san_uris or None,
+                profile=profile,
             )
         except Exception as e:
             logger.error(f"EST serverkeygen issuance failed: {e}")
@@ -715,6 +802,58 @@ class ESTHandler(http.server.BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
+
+    def _validate_csr_for_profile(self, csr: x509.CertificateSigningRequest, profile: str) -> Tuple[bool, str]:
+        """
+        Enforce profile-specific constraints on the CSR.
+        Returns (True, "") or (False, "error message").
+        """
+        spec = EST_CSR_ATTRS.get(profile)
+        if not spec:
+            return True, ""
+
+        san_ext = None
+        try:
+            san_ext = csr.extensions.get_extension_for_class(x509.SubjectAlternativeName).value
+        except x509.ExtensionNotFound:
+            pass
+
+        if spec.get("san_required") and not san_ext:
+            return False, f"CSR for profile {profile} requires SubjectAlternativeName extension"
+
+        if san_ext:
+            allowed_types = spec.get("san_types", set())
+            forbidden_types = spec.get("forbid_san", set())
+            for name in san_ext:
+                type_name = name.__class__.__name__
+                if type_name == "RFC822Name": type_name = "RFC822Name"
+                elif type_name == "DNSName": type_name = "DNS"
+                elif type_name == "IPAddress": type_name = "IP"
+                elif type_name == "UniformResourceIdentifier": type_name = "UniformResourceIdentifier"
+
+                if type_name in forbidden_types:
+                    return False, f"CSR for profile {profile} contains forbidden SAN type {type_name}"
+                
+                # Check allowed types if restricted
+                if allowed_types and type_name not in allowed_types:
+                    # Special case: allow DNS for most profiles unless explicitly forbidden
+                    if type_name == "DNS" and "DNS" not in allowed_types:
+                         return False, f"CSR for profile {profile} contains forbidden SAN type DNS"
+                    if type_name != "DNS": # already checked above
+                         return False, f"CSR for profile {profile} contains forbidden SAN type {type_name}"
+
+                # SPIFFE specific validation
+                if profile == "spiffe" and isinstance(name, x509.UniformResourceIdentifier):
+                    uri = name.value
+                    scheme = spec.get("uri_scheme")
+                    auth = spec.get("uri_authority")
+                    prefix = f"{scheme}://{auth}/"
+                    if not uri.startswith(prefix):
+                        return False, f"SPIFFE URI must start with {prefix}"
+                    if len(uri) <= len(prefix):
+                        return False, "SPIFFE URI path must be non-empty"
+
+        return True, ""
 
 
 # ---------------------------------------------------------------------------

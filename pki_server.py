@@ -107,6 +107,9 @@ NO_REV_AVAIL_THRESHOLD_DAYS = 7  # certs valid <=7 days SHOULD carry noRevAvail
 # RFC 8398/9598 — SmtpUTF8Mailbox otherName OID for non-ASCII email in SAN
 OID_SMTP_UTF8_MAILBOX = x509.ObjectIdentifier("1.3.6.1.5.5.7.8.9")
 
+# RFC 6962 — CT Pre-certificate Poison extension OID
+OID_CT_POISON = x509.ObjectIdentifier("1.3.6.1.4.1.11129.2.4.3")
+
 # RFC 5280 §4.2.1.14 — Well-known CA/B Forum policy OIDs (for CertificatePolicies)
 OID_ANY_POLICY          = x509.ObjectIdentifier("2.5.29.32.0")
 OID_POLICY_DV           = x509.ObjectIdentifier("2.23.140.1.2.1")  # CA/B Forum DV
@@ -1411,7 +1414,11 @@ class CertificateAuthority:
         san_dns: Optional[list] = None,
         san_emails: Optional[list] = None,
         san_ips: Optional[list] = None,
+        san_uris: Optional[list] = None,
         profile: str = "default",
+        ct_poison: bool = False,
+        forced_serial: Optional[int] = None,
+        forced_time: Optional[datetime.datetime] = None,
         ocsp_url: Optional[str] = None,
         crl_url: Optional[str] = None,
         no_rev_avail: Optional[bool] = None,
@@ -1498,12 +1505,12 @@ class CertificateAuthority:
                         pass  # non-IDN label (e.g. "com", "org") — store as-is
                 attrs.append(x509.NameAttribute(oid_map[k], v))
 
-        if not attrs:
-            attrs = [x509.NameAttribute(NameOID.COMMON_NAME, subject_str)]
+        if not attrs and not (san_dns or san_emails or san_ips or san_uris):
+            attrs = [x509.NameAttribute(NameOID.COMMON_NAME, subject_str or "PyPKI Entity")]
 
         subject = x509.Name(attrs)
-        serial = self._next_serial()
-        now = datetime.datetime.now(datetime.timezone.utc)
+        serial = forced_serial if forced_serial is not None else self._next_serial()
+        now = forced_time if forced_time is not None else datetime.datetime.now(datetime.timezone.utc)
         path_len = (
             path_length if path_length is not None
             else (prof.get("path_length", 0) if is_ca else None)
@@ -1568,6 +1575,14 @@ class CertificateAuthority:
                 critical=False,
             )
 
+        # RFC 6962 — CT Pre-certificate Poison extension
+        # OID 1.3.6.1.4.1.11129.2.4.3. MUST be critical.
+        if ct_poison:
+            builder = builder.add_extension(
+                x509.UnrecognizedExtension(OID_CT_POISON, b"\x05\x00"), # NULL
+                critical=True,
+            )
+
         # SAN — collect DNS names, emails, IPs
         # RFC 9549 §4.1 / RFC 8399 §2.4: dNSName U-labels MUST be converted to A-labels.
         # RFC 9549 §4.2 / RFC 9598: email routing —
@@ -1608,10 +1623,17 @@ class CertificateAuthority:
                     san_names.append(x509.IPAddress(ipaddress.ip_address(ip)))
                 except ValueError:
                     pass
+        if san_uris:
+            for uri in san_uris:
+                san_names.append(x509.UniformResourceIdentifier(uri))
 
         if san_names:
+            # RFC 5280 §4.2.1.6: "If the subject field is empty... the
+            # subjectAltName extension MUST be present and MUST be marked critical."
+            # Also RFC 4945 §5.1.3 for IPsec.
+            san_critical = len(list(subject)) == 0
             builder = builder.add_extension(
-                x509.SubjectAlternativeName(san_names), critical=False
+                x509.SubjectAlternativeName(san_names), critical=san_critical
             )
 
         # AIA — OCSP URL
@@ -1693,7 +1715,7 @@ class CertificateAuthority:
         conn = sqlite3.connect(str(self.db_path))
         try:
             conn.execute(
-                "INSERT INTO certificates(serial,subject,not_before,not_after,der,revoked,revoked_at,reason,profile) "
+                "INSERT OR REPLACE INTO certificates(serial,subject,not_before,not_after,der,revoked,revoked_at,reason,profile) "
                 "VALUES(?,?,?,?,?,0,NULL,NULL,?)",
                 (
                     serial,
@@ -2237,11 +2259,19 @@ class CertificateAuthority:
             return None
         cert = x509.load_der_x509_certificate(der)
         enc = serialization.BestAvailableEncryption(password) if password else serialization.NoEncryption()
+
+        # RFC 7292: set friendlyName attribute for better UX in OS key stores
+        try:
+            cn_attrs = cert.subject.get_attributes_for_oid(NameOID.COMMON_NAME)
+            friendly_name = cn_attrs[0].value.encode() if cn_attrs else f"cert-{serial}".encode()
+        except Exception:
+            friendly_name = f"cert-{serial}".encode()
+
         # Include the full CA chain in the PKCS#12 CA bag so that importing
         # applications (browsers, OS key stores) can build the complete path.
         ca_bag = [self.ca_cert] + list(self._parent_chain)
         p12 = pkcs12.serialize_key_and_certificates(
-            name=f"cert-{serial}".encode(),
+            name=friendly_name,
             key=None,
             cert=cert,
             cas=ca_bag,
@@ -3028,6 +3058,60 @@ class CertificateAuthority:
         )
         return sct
 
+    def submit_pre_cert_to_ct_log(
+        self,
+        pre_cert: x509.Certificate,
+        log_url: str,
+        timeout: int = 10,
+    ) -> Optional[bytes]:
+        """
+        Submit a Pre-certificate to a CT log and return the raw SCT bytes (DER).
+
+        The call uses the RFC 6962 §4.2 "add-pre-chain" endpoint.
+        Returns the raw TLS-encoded SCT bytes, or None on failure.
+        """
+        import urllib.request as _urllib
+        import urllib.error as _urlerr
+
+        # Build chain: [pre-cert DER, issuer DER]
+        chain_ders = [
+            pre_cert.public_bytes(Encoding.DER),
+            self.ca_cert.public_bytes(Encoding.DER),
+        ]
+        chain_b64 = [base64.b64encode(der).decode() for der in chain_ders]
+        payload = json.dumps({"chain": chain_b64}).encode()
+
+        endpoint = log_url.rstrip("/") + "/ct/v1/add-pre-chain"
+        try:
+            req = _urllib.Request(
+                endpoint,
+                data=payload,
+                headers={"Content-Type": "application/json"},
+            )
+            with _urllib.urlopen(req, timeout=timeout) as resp:
+                body = json.loads(resp.read())
+        except Exception as e:
+            logger.warning(f"CT log pre-cert submission failed ({endpoint}): {e}")
+            return None
+
+        # RFC 6962 §3.2: response structure is the same as add-chain
+        sct_version    = body.get("sct_version", 0)
+        log_id         = base64.b64decode(body["id"])
+        timestamp_ms   = body["timestamp"]
+        extensions     = base64.b64decode(body.get("extensions", ""))
+        sig_bytes      = base64.b64decode(body["signature"])
+
+        import struct as _struct
+        sct = (
+            bytes([sct_version])
+            + log_id
+            + _struct.pack(">Q", timestamp_ms)
+            + _struct.pack(">H", len(extensions))
+            + extensions
+            + sig_bytes
+        )
+        return sct
+
     def embed_scts(
         self,
         cert: x509.Certificate,
@@ -3081,27 +3165,52 @@ class CertificateAuthority:
         **kwargs,
     ) -> x509.Certificate:
         """
-        Convenience wrapper: issue a certificate, submit it to one or more CT
-        logs, embed the resulting SCTs, and return the final certificate.
+        Issue a certificate using the RFC 6962 Pre-certificate flow:
+        1. Issue a Pre-certificate with a critical Poison extension.
+        2. Submit it to CT logs via 'add-pre-chain' to obtain SCTs.
+        3. Issue the final certificate with the SCTs embedded and Poison removed.
 
-        ``ct_log_urls`` defaults to [CT_LOG_ARGON_2025, CT_LOG_XENON_2025].
+        This flow ensures that the SCTs embedded in the final certificate
+        are valid for that specific certificate structure.
+
         SCT submission failures are logged as warnings and do not abort issuance.
         """
-        cert = self.issue_certificate(subject_str=subject_str, public_key=public_key, **kwargs)
+        # 1. Issue Pre-certificate
+        # Capture the serial and time so the final cert matches exactly.
+        forced_time = datetime.datetime.now(datetime.timezone.utc)
+        pre_cert = self.issue_certificate(
+            subject_str=subject_str, 
+            public_key=public_key, 
+            ct_poison=True,
+            forced_time=forced_time,
+            **kwargs
+        )
+        serial = pre_cert.serial_number
 
         urls = ct_log_urls or [self.CT_LOG_ARGON_2025, self.CT_LOG_XENON_2025]
         scts = []
         for url in urls:
-            sct = self.submit_to_ct_log(cert, url)
+            sct = self.submit_pre_cert_to_ct_log(pre_cert, url)
             if sct:
                 scts.append(sct)
 
+        # 2. Issue final certificate with same serial/time but NO poison.
+        final_cert = self.issue_certificate(
+            subject_str=subject_str,
+            public_key=public_key,
+            ct_poison=False,
+            forced_serial=serial,
+            forced_time=forced_time,
+            **kwargs
+        )
+
         if scts:
-            cert = self.embed_scts(cert, scts)
-            logger.info(f"Embedded {len(scts)} SCT(s) into serial={cert.serial_number}")
+            final_cert = self.embed_scts(final_cert, scts)
+            logger.info(f"Embedded {len(scts)} SCT(s) into serial={final_cert.serial_number} (Pre-cert flow)")
         else:
             logger.warning("No SCTs obtained; certificate issued without CT transparency")
-        return cert
+        
+        return final_cert
 
 
     # ------------------------------------------------------------------
@@ -3402,6 +3511,14 @@ def main():
              "reserved, and unspecified IP addresses as `ip` identifiers in "
              "ACME orders. OFF by default to mirror public-CA practice; "
              "enable for homelab and internal-only deployments."
+    )
+    acme_group.add_argument(
+        "--acme-require-eab", action="store_true", default=False,
+        help="RFC 8555 §7.3.4: Require External Account Binding for all new accounts"
+    )
+    acme_group.add_argument(
+        "--acme-eab-file", default=None, metavar="PATH",
+        help="JSON file containing EAB KID to HMAC key mappings (e.g. {\"kid1\": \"key1_b64\"})"
     )
 
     infra_group = parser.add_argument_group(
@@ -3787,6 +3904,8 @@ def main():
                 short_lived_threshold_days=getattr(args, "acme_short_lived_threshold", 7),
                 dns01_hook=_dns01_hook,  # Feature 5: real dns-01 resolver hook
                 allow_private_ip=getattr(args, "acme_allow_private_ip", False),
+                require_eab=getattr(args, "acme_require_eab", False),
+                eab_file=getattr(args, "acme_eab_file", None),
             )
 
     # Start SCEP server if requested
