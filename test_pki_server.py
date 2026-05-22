@@ -6063,6 +6063,44 @@ class TestRFC3161TSA(unittest.TestCase):
         self.assertEqual(parsed["status"], self.tsa.TSA_STATUS_REJECTION)
         self.assertIsNone(parsed.get("tst_info"))
 
+    def test_rfc8933_content_type_present_in_tsa_signed_attrs(self):
+        """RFC 8933 §2 MUST: id-contentType present in TSA SignedData signedAttrs."""
+        import hashlib
+        tsa = self.tsa
+        imprint = hashlib.sha256(b"rfc8933-tsa-check").digest()
+        req = self._make_req(tsa.OID_SHA256, imprint, nonce=0xABCD)
+        parsed_req = tsa.TSARequestParser.parse(req)
+        resp = tsa.TSAResponseBuilder.build(
+            parsed_req, self.tsa_key, self.tsa_cert,
+            tsa.TSA_DEFAULT_POLICY_OID, self.serial_counter.next(),
+        )
+        parsed = self._parse_resp(resp)
+        sa_body = parsed.get("signed_attrs_body")
+        self.assertIsNotNone(sa_body, "signedAttrs must be present in TSA SignerInfo")
+
+        # Walk the signed attrs SET body looking for id-contentType
+        found_oid = None
+        pos = 0
+        while pos < len(sa_body):
+            try:
+                _, attr_seq, pos = tsa._dec_tlv(sa_body, pos)
+                a_pos = 0
+                _, oid_bytes, a_pos = tsa._dec_tlv(attr_seq, a_pos)
+                oid_str = tsa._decode_oid_bytes(oid_bytes)
+                if oid_str == tsa.OID_CONTENT_TYPE:
+                    # Extract the value: SET { OID_TST_INFO }
+                    _, vals_set, _ = tsa._dec_tlv(attr_seq, a_pos)
+                    _, val_bytes, _ = tsa._dec_tlv(vals_set, 0)
+                    found_oid = tsa._decode_oid_bytes(val_bytes)
+                    break
+            except Exception:
+                break
+
+        self.assertIsNotNone(found_oid,
+                             "RFC 8933: id-contentType attribute not found in TSA signedAttrs")
+        self.assertEqual(found_oid, tsa.OID_TST_INFO,
+                         f"contentType value must be OID_TST_INFO, got {found_oid!r}")
+
 
 # ===========================================================================
 # EST Label Routing and Profile-Aware csrattrs

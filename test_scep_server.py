@@ -794,5 +794,152 @@ class TestRFC5083AuthEnvelopedData(unittest.TestCase):
         self.assertEqual(scep._cms_content_type(b"\x00\x01\x02"), "")
 
 
+# ---------------------------------------------------------------------------
+# RFC 8933 — CMS contentType attribute always present in signedAttrs
+# ---------------------------------------------------------------------------
+
+class TestRFC8933CMSContentType(unittest.TestCase):
+    """
+    RFC 8933 §2 MUST: the content-type signed attribute MUST be present
+    whenever signedAttrs are included in a SignerInfo.
+
+    Verifies that CMSBuilder.signed_data always emits OID_CONTENT_TYPE
+    (1.2.840.113549.1.9.3) with value OID_DATA (1.2.840.113549.1.7.1) in
+    signedAttrs, regardless of pki_status or fail_info presence.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls._tmpdir = tempfile.mkdtemp()
+        cls.ca = _make_ca(cls._tmpdir)
+
+    @classmethod
+    def tearDownClass(cls):
+        import shutil
+        shutil.rmtree(cls._tmpdir, ignore_errors=True)
+
+    def _signed_attrs(self, **kwargs):
+        defaults = dict(
+            ca=self.ca,
+            message_type=scep.MSG_CERTRESP,
+            pki_status=scep.STATUS_SUCCESS,
+            transaction_id="txid-8933",
+            sender_nonce=b"\x01" * 16,
+            recipient_nonce=b"\x02" * 16,
+            inner_der=b"",
+        )
+        defaults.update(kwargs)
+        der = scep.CMSBuilder.signed_data(**defaults)
+        result = scep.CMSParser.parse_signed_data(der)
+        self.assertNotIn("parse_error", result, result.get("parse_error"))
+        return result["signer_info"]["signed_attrs"]
+
+    # ---- contentType always present ----
+
+    def test_content_type_present_in_success_response(self):
+        """RFC 8933 §2 MUST: contentType in signedAttrs for SUCCESS."""
+        attrs = self._signed_attrs(pki_status=scep.STATUS_SUCCESS)
+        self.assertIn(scep.OID_CONTENT_TYPE, attrs,
+                      "RFC 8933: contentType must be present in signedAttrs")
+
+    def test_content_type_present_in_failure_response(self):
+        """RFC 8933 §2 MUST: contentType in signedAttrs for FAILURE."""
+        attrs = self._signed_attrs(
+            pki_status=scep.STATUS_FAILURE,
+            fail_info=scep.FAIL_BAD_REQUEST,
+        )
+        self.assertIn(scep.OID_CONTENT_TYPE, attrs,
+                      "RFC 8933: contentType must be present in signedAttrs")
+
+    def test_content_type_present_in_pending_response(self):
+        """RFC 8933 §2 MUST: contentType in signedAttrs for PENDING."""
+        attrs = self._signed_attrs(pki_status=scep.STATUS_PENDING)
+        self.assertIn(scep.OID_CONTENT_TYPE, attrs,
+                      "RFC 8933: contentType must be present in signedAttrs")
+
+    # ---- contentType value is OID_DATA ----
+
+    def test_content_type_value_is_oid_data(self):
+        """contentType attribute value MUST be id-data (1.2.840.113549.1.7.1)."""
+        attrs = self._signed_attrs()
+        raw_value = attrs[scep.OID_CONTENT_TYPE]
+        decoded = scep._decode_oid_bytes(raw_value)
+        self.assertEqual(decoded, scep.OID_DATA,
+                         f"contentType value must be OID_DATA, got {decoded!r}")
+
+    # ---- signedAttrs block always present ----
+
+    def test_signed_attrs_never_absent(self):
+        """SignerInfo MUST include signedAttrs so RFC 8933 contentType can live there."""
+        for status in (scep.STATUS_SUCCESS, scep.STATUS_FAILURE, scep.STATUS_PENDING):
+            der = scep.CMSBuilder.signed_data(
+                ca=self.ca,
+                message_type=scep.MSG_CERTRESP,
+                pki_status=status,
+                transaction_id=f"txid-{status}",
+                sender_nonce=os.urandom(16),
+                recipient_nonce=os.urandom(16),
+                inner_der=b"",
+            )
+            result = scep.CMSParser.parse_signed_data(der)
+            si = result.get("signer_info", {})
+            self.assertIn("signed_attrs", si,
+                          f"signedAttrs absent for status={status!r}")
+
+    # ---- contentType is first (canonical ordering) ----
+
+    def test_content_type_position_is_deterministic(self):
+        """Building two identical responses yields identical signed_attrs bytes (no random ordering)."""
+        kwargs = dict(
+            ca=self.ca,
+            message_type=scep.MSG_CERTRESP,
+            pki_status=scep.STATUS_SUCCESS,
+            transaction_id="txid-stable",
+            sender_nonce=b"\xAA" * 16,
+            recipient_nonce=b"\xBB" * 16,
+            inner_der=b"",
+        )
+        der1 = scep.CMSBuilder.signed_data(**kwargs)
+        der2 = scep.CMSBuilder.signed_data(**kwargs)
+        r1 = scep.CMSParser.parse_signed_data(der1)
+        r2 = scep.CMSParser.parse_signed_data(der2)
+        self.assertEqual(
+            r1["signer_info"].get("signed_attrs_raw"),
+            r2["signer_info"].get("signed_attrs_raw"),
+            "signed_attrs bytes must be deterministic for identical inputs",
+        )
+
+    # ---- signature still verifies after adding contentType ----
+
+    def test_signature_verifies_with_content_type_present(self):
+        """The PKCS#1v15 signature over signedAttrs must verify against CA public key."""
+        from cryptography.hazmat.primitives.asymmetric import padding as ap
+        from cryptography.hazmat.primitives.hashes import SHA256
+        import hashlib
+
+        der = scep.CMSBuilder.signed_data(
+            ca=self.ca,
+            message_type=scep.MSG_CERTRESP,
+            pki_status=scep.STATUS_SUCCESS,
+            transaction_id="txid-verify",
+            sender_nonce=b"\x01" * 16,
+            recipient_nonce=b"\x02" * 16,
+            inner_der=b"",
+        )
+        result = scep.CMSParser.parse_signed_data(der)
+        si = result["signer_info"]
+
+        # Re-encode signed_attrs as SET (0x31) for signature verification
+        raw = si["signed_attrs_raw"]
+        signed_attrs_set = b"\x31" + scep._encode_length(len(raw)) + raw
+
+        sig = si["signature"]
+        pub = self.ca.ca_cert.public_key()
+        try:
+            pub.verify(sig, signed_attrs_set, ap.PKCS1v15(), SHA256())
+        except Exception as e:
+            self.fail(f"Signature verification failed: {e}")
+
+
 if __name__ == "__main__":
     unittest.main()

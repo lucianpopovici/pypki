@@ -496,45 +496,26 @@ the chain gets validated, verification silently degrades.
 
 ---
 
-### EST CSR SAN pass-through + profile-aware csrattrs
+### EST CSR SAN pass-through + profile-aware csrattrs ✅ SHIPPED
 
-**Context.** EST (`est_server.py`) has three related weaknesses around
-Subject Alternative Name handling. Item 1 is a functional bug that silently
-broke TLS hostname verification for any EST-issued cert; fixed now.
-Items 2 and 3 are feature work to make EST useful for profile-scoped
-enrollment (device types, SPIFFE identities, etc.).
+**Context.** EST (`est_server.py`) had three related weaknesses around
+Subject Alternative Name handling. All three are now fixed.
 
 **1. CSR SANs were dropped on issuance — FIXED.**
 
-`_handle_simpleenroll` (`est_server.py:415`) used to call
-`ca.issue_certificate(subject_str=..., public_key=...)` without extracting
-SANs from the CSR's `extensionRequest` attribute. A client asking for
-`DNS:app.example.com` received a cert with **no SAN at all**. Every other
-enrollment path (ACME finalize, CMP p10cr, IPsec `/enroll`, REST
-`/api/certs`) reads CSR SANs and threads them through; EST was the outlier.
+`_handle_simpleenroll` used to call `ca.issue_certificate(subject_str=..., public_key=...)`
+without extracting SANs from the CSR's `extensionRequest` attribute. A client
+asking for `DNS:app.example.com` received a cert with **no SAN at all**.
 
-The fix mirrors the `ipsec_server.py:1963-1975` pattern: extract
-`DNSName`, `RFC822Name`, and `IPAddress` entries from the CSR's SAN
-extension and pass them as `san_dns`, `san_emails`, `san_ips` to
-`issue_certificate`. URI SANs (including SPIFFE) are intentionally skipped
-for now — see item 3.
+The fix mirrors the `ipsec_server.py` pattern: extract `DNSName`,
+`RFC822Name`, `IPAddress`, and `UniformResourceIdentifier` entries from the
+CSR's SAN extension and pass them to `issue_certificate`. URI SANs (including
+SPIFFE) are now plumbed through — see item 3.
 
-**Tests to add** (extend `TestESTModule`)
+**2. EST label routing to certificate profiles — ✅ SHIPPED** (commit `8fefbf5`)
 
-- Build a CSR with two DNS SANs + one IP SAN + one email SAN; submit to
-  `simpleenroll`; parse the response PKCS#7 degenerate SignedData; verify
-  the issued leaf cert's SAN extension contains all four entries.
-- Build a CSR with no SAN extension; assert the issued cert also has no
-  SAN extension (no silent injection).
-- Build a CSR with a URI SAN `spiffe://example.org/ns/default/sa/foo`;
-  assert current behaviour (URI silently dropped) until item 3 lands.
-  Flag with `@unittest.expectedFailure` once item 3 starts.
-
-**2. EST label routing to certificate profiles — TODO.**
-
-`est_server.py:638-640` already parses `/.well-known/est/<label>/<op>` and
-returns `(op, label)`, but every handler currently ignores `label`. Wire it
-through to select a CertProfile:
+`est_server.py` now has `EST_LABEL_PROFILE` mapping and `_handle_simpleenroll`,
+`_handle_csrattrs`, and `_handle_serverkeygen` all accept and use `profile`.
 
 ```
 /.well-known/est/simpleenroll              → profile="default"
@@ -542,206 +523,109 @@ through to select a CertProfile:
 /.well-known/est/tls-client/simpleenroll   → profile="tls_client"
 /.well-known/est/ipsec/simpleenroll        → profile="ipsec_end"
 /.well-known/est/code-signing/simpleenroll → profile="code_signing"
+/.well-known/est/spiffe/simpleenroll       → profile="spiffe"
 ```
 
-**Files to modify**
+Unknown labels default to `"default"` (RFC 7030 doesn't mandate strict
+label handling). `build_csrattrs(profile)` now returns profile-specific EKU
+hints.
 
-- `est_server.py` — plumb `label` from `_parse_path` → `_handle_simpleenroll`
-  → `_handle_csrattrs` → `_handle_serverkeygen`.
-- `est_server.py` — new mapping `EST_LABEL_PROFILE` with the table above;
-  unknown labels default to `"default"` (do not fail — RFC 7030 doesn't
-  mandate strict label handling).
-- `pki_server.py` — pass `profile=...` through to
-  `ca.issue_certificate(...)` at the new call site.
+Tests added: `TestESTRouting` (label → profile routing, profile-aware
+csrattrs EKU hints, unknown label fallback).
 
-**Tests**
+**3. Profile-specific `csrattrs` + server-side SAN format enforcement — ✅ SHIPPED** (commit `8fefbf5`)
 
-- Label `tls-server` routes to the `tls_server` profile: issued cert has
-  `ExtendedKeyUsage` with `serverAuth`.
-- Label `code-signing` routes to `code_signing` profile: issued cert has
-  `id-kp-codeSigning` EKU and `digitalSignature + contentCommitment` KU.
-- Unknown label `widget` silently falls back to default; issuance
-  succeeds.
-
-**3. Profile-specific `csrattrs` + server-side SAN format enforcement — TODO.**
-
-Today `build_csrattrs` (`est_server.py:228-254`) returns a single static
-hint: RSA, SAN (any shape), EKU `clientAuth`. Make it label-aware, and
-**enforce** the hinted constraints on incoming CSRs at `simpleenroll`
-rather than merely hinting.
-
-**Implementation**
-
-Add a per-profile csrattrs spec:
+`EST_CSR_ATTRS` dict in `est_server.py` enforces per-profile SAN constraints
+at `simpleenroll`. New `_validate_csr_for_profile(csr, profile)` helper.
 
 ```python
 EST_CSR_ATTRS = {
     "tls_server": {
-        "key_types":      [OID_RSA_ENCRYPTION, OID_EC_PUBLIC_KEY],
-        "required_eku":   [OID_SERVER_AUTH],
-        "san_required":   True,
-        "san_types":      {"DNS", "IP"},
-        "forbid_san":     {"URI", "otherName"},
+        "san_required": True, "san_types": {"DNS", "IP"},
+        "forbid_san": {"RFC822Name", "UniformResourceIdentifier", "OtherName"},
     },
     "tls_client": {
-        "required_eku":   [OID_CLIENT_AUTH],
-        "san_required":   True,
-        "san_types":      {"DNS", "email"},
+        "san_required": True, "san_types": {"DNS", "RFC822Name"},
     },
     "spiffe": {
-        "required_eku":   [OID_CLIENT_AUTH, OID_SERVER_AUTH],
-        "san_required":   True,
-        "san_types":      {"URI"},
-        "uri_scheme":     "spiffe",
-        "uri_authority":  "cluster.local",  # configurable per-CA
+        "san_required": True, "san_types": {"UniformResourceIdentifier"},
+        "uri_scheme": "spiffe", "uri_authority": "cluster.local",
     },
     "ipsec_end": {
-        "required_eku":   [OID_IKE_INTERMEDIATE],
-        "san_required":   True,
-        "san_types":      {"DNS", "IP"},
+        "san_required": True, "san_types": {"DNS", "IP"},
     },
 }
 ```
 
-Server-side enforcement at `simpleenroll`:
+`pki_server.py` — `issue_certificate` now accepts `san_uris: Optional[list]`
+so SPIFFE URI SANs land in the issued cert.
 
-- CSR signature still checked (existing).
-- If `san_required` and the CSR has no SAN extension → reject 400
-  `"csrattrs for profile <p> requires SAN"`.
-- For every SAN entry: if its type is not in `san_types` (or is in
-  `forbid_san`) → reject 400 with specific detail.
-- For SPIFFE profile: every URI SAN MUST start with
-  `spiffe://<uri_authority>/`; path MUST be non-empty. Reject otherwise.
-- Profile-specific EKU may be injected by the issuer even if absent from
-  the CSR; no client-side requirement beyond the csrattrs hint.
+Tests added: `TestRFC7030ProfileCSRAttrs` — label csrattrs content, SPIFFE
+URI acceptance/rejection, tls-server URI rejection, unknown label fallback.
 
-**Files to modify**
-
-- `est_server.py` — `build_csrattrs(profile)` replaces `build_csrattrs()`;
-  new `_validate_csr_for_profile(csr, profile)` helper.
-- `est_server.py` — `_handle_simpleenroll` calls
-  `_validate_csr_for_profile` before `issue_certificate`.
-- `pki_server.py` — add URI SAN plumbing to `issue_certificate`
-  (`san_uris: Optional[list] = None`) so SPIFFE URIs land in the issued
-  cert. Currently URIs only exist in AIA/CDP extensions
-  (`pki_server.py:1207, 1225`), never as SAN values.
-
-**Tests** (new class `TestRFC7030ProfileCSRAttrs`)
-
-- `GET /.well-known/est/tls-server/csrattrs` returns attrs including
-  `id-kp-serverAuth`.
-- `GET /.well-known/est/spiffe/csrattrs` returns attrs hinting URI SAN with
-  `spiffe://` scheme.
-- `POST /spiffe/simpleenroll` with CSR containing
-  `spiffe://cluster.local/ns/default/sa/foo` → accepted; issued cert has
-  exactly that URI SAN.
-- Same endpoint with `spiffe://wrong-trust-domain/...` → 400.
-- Same endpoint with `DNS:foo.example.com` and no URI SAN → 400.
-- `POST /tls-server/simpleenroll` with URI SAN (no DNS) → 400.
-
-**Why this matters for Kubernetes / SPIFFE.** Current mainstream SPIFFE
-integrations for k8s (Istio via `cert-manager-istio-csr`, SPIRE, csi-driver-
-spiffe) do **not** speak EST — they use cert-manager's internal CSI/gRPC
-paths. So none of this is blocking the k8s deployment plan discussed
-elsewhere. However, EST is still the right answer for non-k8s devices
-(VPN clients, IoT nodes, Windows machines enrolling via NDES) that want
-SPIFFE-style identities, and there's no other open-source server that does
-profile-aware EST today. This lets PyPKI occupy that niche.
+**Why this matters for Kubernetes / SPIFFE.** EST is the right answer for
+non-k8s devices (VPN clients, IoT nodes, Windows machines) that want
+SPIFFE-style identities. PyPKI is now one of very few servers that does
+profile-aware EST with SPIFFE enforcement.
 
 ---
 
 ## Tier 2 — High-value modern additions
 
-### RFC 3161 + RFC 5816 — Time-Stamp Protocol
+### RFC 3161 + RFC 5816 — Time-Stamp Protocol ✅ SHIPPED
 
 **What it requires.** A TSA accepts a `TimeStampReq` (hash + nonce + policy)
 and returns a `TimeStampResp` containing a CMS SignedData wrapping a `TSTInfo`.
 RFC 5816 upgrades the `ESSCertID` to `ESSCertIDv2` with SHA-256. **Always
 implement both together.**
 
-**Files to create**
+**What shipped** (commit `4e95674`)
 
-- `tsa_server.py` — mirror the shape of `ocsp_server.py`: its own
-  `HTTPServer` with a handler class, a builder class, and integration hooks
-  back into `CertificateAuthority`.
+- `tsa_server.py` (new file, ~430 lines): `TSARequestParser`, `TSAResponseBuilder`,
+  `TSAHandler`, `TSASerialCounter`, `provision_tsa_signing_cert`,
+  `start_tsa_server`. Full RFC 3161 DER encode/decode using hand-rolled ASN.1
+  helpers from `scep_server.py`. Signed attributes sorted lexicographically
+  (DER canonical SET OF) and re-tagged `[0] IMPLICIT` for `SignerInfo`.
+- `pki_server.py`: `tsa_signing` CertProfile (EKU `id-kp-timeStamping` critical,
+  KU `digitalSignature` only); TSA wired after OCSP in `main()`; CLI flags
+  `--tsa-prefix`, `--tsa-policy-oid`, `--tsa-accuracy-seconds`, `--tsa-cert`,
+  `--tsa-key`; TSA line in startup banner.
+- RFC 5816 `signingCertificateV2`: SHA-256 of TSA cert DER in `ESSCertIDv2`
+  SEQUENCE; `hashAlgorithm` omitted (DEFAULT sha256 per RFC 5816 §3).
+- Policy: SHA-256/384/512 accepted; MD5/SHA-1 rejected with `badAlg`; wrong
+  `version` rejected with `badRequest`; rate-limited and audit-logged.
+- `TSA_DEFAULT_POLICY_OID = "1.3.6.1.4.1.99999.1"` (placeholder — replace
+  with a real PEN OID in production).
 
-**Files to modify**
+**Tests added** (`TestRFC3161TSA` in `test_pki_server.py`, 25 tests):
 
-- `pki_server.py` — add a dedicated TSA signing cert auto-issued from the CA
-  (EKU `id-kp-timeStamping`, `1.3.6.1.5.5.7.3.8`, critical; KU
-  `digitalSignature` only). Add to `CertProfile` as `tsa_signing`.
-- `dispatcher_server.py` — route `/tsa` POST when `--tsa-port` is active.
-- ASN.1 primitives: reuse `scep_server.py` helpers.
-
-**Implementation**
-
-- Request parser (`TimeStampReq`):
-  ```
-  TimeStampReq ::= SEQUENCE {
-      version             INTEGER  { v1(1) },
-      messageImprint      MessageImprint,
-      reqPolicy           TSAPolicyId              OPTIONAL,
-      nonce               INTEGER                  OPTIONAL,
-      certReq             BOOLEAN                  DEFAULT FALSE,
-      extensions      [0] IMPLICIT Extensions      OPTIONAL }
-  MessageImprint ::= SEQUENCE { hashAlgorithm AlgorithmIdentifier, hashedMessage OCTET STRING }
-  ```
-- Response builder (`TimeStampResp`):
-  ```
-  TimeStampResp ::= SEQUENCE {
-      status                  PKIStatusInfo,
-      timeStampToken          TimeStampToken OPTIONAL }
-  ```
-  `timeStampToken` is a CMS `SignedData` (content type `id-ct-TSTInfo`,
-  `1.2.840.113549.1.9.16.1.4`). Build via existing `CMSBuilder`, extended
-  for this content type.
-- `TSTInfo`: version=1, policy OID (configurable), messageImprint echoed,
-  `serialNumber` (monotonic), `genTime` (UTC, must include microseconds if
-  accuracy requires), `nonce` echoed.
-- **Signed attributes on the TSA signer**:
-  - `contentType` = `id-ct-TSTInfo`
-  - `messageDigest` = SHA-256 of encapContentInfo
-  - `signingTime` (optional; `genTime` is authoritative)
-  - **`signingCertificateV2` (RFC 5816)** with `ESSCertIDv2` containing
-    SHA-256 hash of the TSA cert. OID `1.2.840.113549.1.9.16.2.47`.
-- Policy OID: configurable via `--tsa-policy-oid` (default
-  `1.3.6.1.4.1.<your-pen>.1` — document the need for a real OID).
-- Nonce handling: echo verbatim; refuse if accuracy can't be met.
-- Rate limit + audit log on every request.
+- Parse, grant (status/OID/imprint/nonce/serial), certReq, RFC 5816
+  `signingCertificateV2` present + hash matches, CMS signature verify +
+  corrupt, hash policy (SHA-256/384/512 ✅; MD5 ❌), serial monotonicity.
+- TSA cert RFC compliance: EKU `id-kp-timeStamping` critical, only EKU.
+- `TestModuleStructure::test_cert_profile_has_all_profiles` updated to include
+  `tsa_signing`.
 
 **CLI flags**
 
 ```
---tsa-port 8083              Enable TSA server on given port
---tsa-policy-oid OID         Policy OID (default is a placeholder)
+--tsa-prefix PATH            URL prefix for TSA endpoint (default /tsa)
+--tsa-policy-oid OID         Policy OID (default 1.3.6.1.4.1.99999.1)
 --tsa-accuracy-seconds N     Declared accuracy (default 1)
 --tsa-cert PATH              Pre-provisioned TSA cert (otherwise auto-issued)
 --tsa-key PATH               Pre-provisioned TSA key
 ```
 
-**Tests** (new class `TestRFC3161TSA`)
+**Docs**: README compliance table updated (✅ Full). CHANGELOG `### Added`.
 
-- Build a `TimeStampReq` with SHA-256 imprint + nonce, POST to `/tsa`, verify:
-  - status = granted
-  - `TSTInfo.messageImprint` echoes the request
-  - `TSTInfo.nonce` echoes the request
-  - `signingCertificateV2` present and hash matches TSA cert
-  - CMS signature verifies against TSA cert → CA
-- Reject: MD5 hash algorithm (policy), missing messageImprint, wrong version.
-- OpenSSL round-trip: `openssl ts -verify -in resp.tsr -queryfile req.tsq
-  -CAfile ca.crt`.
-- Integration: use `openssl cms -sign` to create a `.p7s` with our TSA as
-  the countersigner; verify.
+— Original plan retained below for reference —
 
-**Docs**
+**Files created/modified**
 
-- README: new major section "TSA Server (RFC 3161 / RFC 5816)" between EST
-  and OCSP. Include endpoint table, CLI flags, OpenSSL `ts` examples.
-- Compliance table: RFC 3161 `✅ Full`, RFC 5816 `✅ Full`.
-- `pypki-flows.html`: the Software Signing flows already reference an
-  external TSA; add a new section "TSA — Request/Response" showing the
-  now-internal flow.
-- CHANGELOG `### Added`: TSA server with RFC 3161 + RFC 5816 support.
+- `tsa_server.py` — mirror the shape of `ocsp_server.py`: its own
+  `HTTPServer` with a handler class, a builder class, and integration hooks
+  back into `CertificateAuthority`.
+- `pki_server.py` — dedicated TSA signing cert auto-issued from the CA.
 
 ---
 
@@ -958,31 +842,31 @@ correct `sign()` arguments for any key type.
 
 ---
 
-### RFC 7292 — PKCS#12 hardening
+### RFC 7292 — PKCS#12 hardening ✅ SHIPPED (partial)
 
 **What it requires.** PKCS#12 export already works
 (`pki_server.py:1757`). RFC 7292 (v1.1) fixes encoding ambiguities. Modern
 guidance (NIST SP 800-132) demands a strong KDF iteration count.
 
-**Files to modify**
+**What shipped** (commit `8fefbf5`)
 
-- `pki_server.py` → `CertificateAuthority.export_pkcs12()`
+- `pki_server.py` — `export_pkcs12` now sets `friendly_name` to the cert
+  subject CN (falling back to `"cert-<serial>"`), improving UX in Windows
+  and macOS certificate import dialogs. `BestAvailableEncryption(password)`
+  was already in place, giving AES-256 + HMAC-SHA256 with ≥600k PBKDF2
+  iterations via the `cryptography` library.
 
-**Implementation**
+**Outstanding**
 
-- Ensure we use `BestAvailableEncryption(password)` which by default picks
-  AES-256 + HMAC-SHA256 with ≥600k PBKDF2 iterations in current
-  `cryptography` releases.
-- When no password: allow unencrypted only if `--p12-allow-unencrypted`
-  is set; otherwise refuse with a clear error.
-- Friendly-name attribute: set the cert subject CN as friendlyName for
-  better UX in Windows/macOS cert import dialogs.
+- `--p12-allow-unencrypted` flag and rejection of passwordless export —
+  not yet implemented. Currently unencrypted export is accepted silently.
 
-**Tests** (extend `TestPKCS12Export`)
+**Tests**: `TestPKCS12Export` extended to verify `friendlyName` round-trip.
 
-- Export with password, reopen with `cryptography.hazmat.primitives.
-  serialization.pkcs12.load_pkcs12`; verify cert + key + chain + friendlyName.
-- Reject unencrypted export without the flag.
+**Files to modify** (remaining)
+
+- `pki_server.py` → `CertificateAuthority.export_pkcs12()` — reject
+  password-less export unless `--p12-allow-unencrypted` is set.
 
 **Docs**
 
@@ -999,86 +883,84 @@ guidance (NIST SP 800-132) demands a strong KDF iteration count.
 `issue_with_ct()` wraps issuance. Defaults to Google Argon/Xenon 2025 logs
 as sample URLs.
 
-**What's missing for full compliance.**
+**What shipped** (commit `8fefbf5`)
 
-- **Pre-certificate flow** (RFC 6962 §3.1). Today the final cert is
-  submitted directly to the log, then re-issued with the SCT extension —
-  that produces a second cert with the same subject/serial but a different
-  signature, which some verifiers treat as distinct. The correct flow is:
-  1. Build a pre-cert with the `poison` critical extension (OID
-     `1.3.6.1.4.1.11129.2.4.3`).
-  2. Submit pre-cert to logs, receive SCTs.
-  3. Re-issue: remove poison, add SCT list, keep same serial + TBS fields.
-- **CLI wiring.** No `--ct-log-url` flag is plumbed through. Today CT is
-  only reachable programmatically via `ca.issue_with_ct()`.
-- **Log public keys + signature verification** on received SCTs are not
-  checked before embedding.
-- **No minimum-SCT-count enforcement** (Chrome wants ≥2 from qualified
-  logs).
+- **Pre-certificate flow ✅** (RFC 6962 §3.1).
+  - `pki_server.py` — `issue_certificate` accepts `ct_poison: bool = False`;
+    when `True`, adds `OID_CT_POISON` (`1.3.6.1.4.1.11129.2.4.3`) as a
+    critical `UnrecognizedExtension` (NULL encoded as `\x05\x00`).
+  - New `submit_pre_cert_to_ct_log(pre_cert, endpoint)` submits to the log's
+    `add-pre-chain` endpoint.
+  - `issue_with_ct` refactored: (1) issue with `ct_poison=True` using the
+    requested serial, (2) submit pre-cert to each log URL, (3) re-issue with
+    `ct_poison=False` and same serial + SCTs embedded, (4) overwrite DB row
+    via `INSERT OR REPLACE`.
+- Tests added (`TestCertificateTransparencyPreCert`): pre-cert has poison
+  extension + critical; final cert has poison removed + SCT list; serial
+  preserved across both certs; `INSERT OR REPLACE` handles the DB overwrite.
 
-**Files to modify**
+**Outstanding — still TODO**
 
-- `pki_server.py` → introduce `_issue_precert()` returning a poisoned cert,
-  refactor `issue_with_ct` to use pre-cert flow.
+- **CLI wiring**: `--ct-log-url URL` (repeatable), `--ct-log-pubkey PATH`,
+  `--ct-require-n N`. Today CT is only reachable programmatically via
+  `ca.issue_with_ct(ct_log_urls=[...])`.
+- **SCT signature verification** on received SCTs against log public keys
+  before embedding — not yet checked.
+- **Minimum-SCT-count enforcement** (Chrome wants ≥2 from qualified logs).
+
+**Files to modify** (remaining)
+
 - `pki_server.py` CLI parsing → add `--ct-log-url URL` (repeatable),
   `--ct-log-pubkey PATH` (repeatable, aligned by index), `--ct-require-n N`.
 - `pki_server.py` → SCT verification helper that parses the TLS signature
   and verifies with the log's public key.
 
-**Tests** (extend `TestRFC6962CT` — add the class if not present)
+**Tests** (remaining)
 
 - In-process mock CT log that signs SCTs with a known key; verify signature
   check passes on correct key, fails on wrong key.
-- Pre-cert flow: intercept the pre-cert; assert poison extension is
-  present + critical.
-- Final cert: poison removed, SCT list present, serial matches pre-cert.
 - `--ct-require-n 2` with only 1 log reachable → issuance aborts.
 
 **Docs**
 
 - README: document `--ct-log-url` and recommended opt-in for publicly-trusted
   CAs only.
-- Compliance table: keep RFC 6962 at `✅ Opt-in`, annotate "pre-cert flow"
+- Compliance table: keep RFC 6962 at `✅ Opt-in`, annotate "pre-cert flow ✅"
   in notes.
-- CHANGELOG `### Changed`: pre-cert flow + CLI wiring + SCT verification.
+- CHANGELOG `### Changed`: CLI wiring + SCT verification (remaining).
 
 ---
 
-### RFC 5083 + RFC 5084 — AuthEnvelopedData + AES-GCM in CMS
+### RFC 5083 + RFC 5084 — AuthEnvelopedData + AES-GCM in CMS ✅ SHIPPED
 
 **What it requires.** AES-GCM content encryption in CMS, eliminating CBC
 padding-oracle surface in SCEP.
 
-**Files to modify**
+**What shipped** (commit `fe4c22f`)
 
-- `scep_server.py` → `CMSBuilder.enveloped_data()` (line ~614) and
-  `CMSParser.parse_enveloped_data` (line ~375).
+- `scep_server.py` — `CMSParser.parse_enveloped_data` refactored as a
+  dispatcher: `_cms_content_type()` reads the outer `contentType` OID and
+  routes to `_decrypt_enveloped()` (existing CBC path) or
+  `_decrypt_auth_enveloped()` (new GCM path). Both paths remain active.
+- `CMSBuilder.auth_enveloped_data(plaintext, recipient_cert)`: AES-256-GCM
+  with 12-byte random nonce and 16-byte auth tag. CEK is 32 random bytes.
+  `GCMParameters ::= SEQUENCE { nonce OCTET STRING, ICVlen INTEGER }` — ICVlen
+  explicitly encoded as 16 (not DEFAULT 12). Auth tag split from
+  `AESGCM.encrypt()` output into the `mac` field of `AuthEnvelopedData`.
+- New OID constants: `OID_AES_256_GCM`, `OID_AUTH_ENVELOPED_DATA`
+  (`1.2.840.113549.1.9.16.1.23`). SCEP request handler detects incoming
+  `AuthEnvelopedData` and echoes `enc_scheme = "gcm"` in the response.
+- `GetCACaps` updated: advertises `AES-GCM` capability.
 
-**Implementation**
+**Tests added** (`TestRFC5083AuthEnvelopedData` in `test_scep_server.py`, 16 tests):
 
-- Add a new builder method `CMSBuilder.auth_enveloped_data()` producing
-  `ContentInfo { contentType = id-ct-authEnvelopedData
-  (1.2.840.113549.1.9.16.1.23), content = AuthEnvelopedData }`.
-- CEK: 32-byte random; GCM IV: 12-byte random; auth tag: 16-byte.
-- Key-transport RecipientInfo unchanged (RSAES), or add RSA-OAEP (RFC 4055).
-- Parser: detect the OID, decrypt via `AESGCM.decrypt`.
-- Keep CBC paths for compatibility.
+- OID constants correct; round-trips (empty / short / 4096-byte payloads);
+  GCMParameters nonce=12B, ICVlen=16; security failures (wrong key, tampered
+  ciphertext, tampered mac); dispatcher routing; `GetCACaps` includes AES-GCM;
+  `_cms_content_type` helper.
 
-**SCEP negotiation**
-
-- SCEP `GetCACaps` — advertise `AES-GCM` and `SHA-256`.
-- If device sends AuthEnvelopedData, respond in kind. Otherwise keep CBC.
-
-**Tests** (new class `TestRFC5083CMS`)
-
-- Round-trip: build AuthEnvelopedData → parse → decrypt matches plaintext.
-- SCEP PKCSReq with AuthEnvelopedData end-to-end.
-- `GetCACaps` returns `AES-GCM`.
-
-**Docs**
-
-- README SCEP section: add capability row.
-- Compliance table: RFC 5083, RFC 5084 `✅ Full`.
+**Docs**: README SCEP section updated. Compliance table: RFC 5083, RFC 5084 `✅ Full`.
+CHANGELOG `### Added`.
 
 ---
 
@@ -1151,13 +1033,24 @@ Grouped by area. Each is smaller than Tier 2 but still useful.
 - Add a `TestRFC9482LightweightCMP` class with the 9482 Appendix B test
   vectors.
 
-### RFC 8933 — CMS content-type attribute protection
+### RFC 8933 — CMS content-type attribute protection ✅ SHIPPED
 
-- In `CMSBuilder._build_signer_info` (`scep_server.py:485`), ensure that when
-  `signedAttrs` are present, `contentType` attribute is **always** included.
-  Required by 8933 MUST.
-- Audit: the current code includes `contentType` in `_build_signer_info`
-  already (line ~511). Confirm it's never elided and add a test.
+**What it requires.** When `signedAttrs` are present in a `SignerInfo`, the
+`contentType` attribute MUST be included.
+
+**What shipped** (this session)
+
+- Audit confirmed: `CMSBuilder.signed_data` (SCEP, `scep_server.py:605`) and
+  `TSAResponseBuilder.build` (TSA, `tsa_server.py:375`) both unconditionally
+  include `id-contentType` as the first signed attribute.
+- `TestRFC8933CMSContentType` in `test_scep_server.py` (7 tests): contentType
+  present in success/failure/pending responses; value is `OID_DATA`; signedAttrs
+  never absent; signed_attrs bytes are deterministic; PKCS#1v15 signature over
+  signedAttrs verifies against CA public key.
+- `TestRFC3161TSA::test_rfc8933_content_type_present_in_tsa_signed_attrs` in
+  `test_pki_server.py`: TSA signedAttrs contains `id-contentType = OID_TST_INFO`.
+- README compliance table: RFC 8933 `✅ Full`.
+- CHANGELOG `### Added`.
 
 ### RFC 8295 — EST extensions
 
@@ -1528,39 +1421,36 @@ profiles:
 
 ---
 
-### 5.5 ACME EAB + per-account rate limiting
+### 5.5 ACME EAB + per-account rate limiting ✅ SHIPPED (EAB core)
 
 **Why.** RFC 8555 §7.3.4 — External Account Binding gates ACME account
 creation behind a pre-shared MAC key issued by the CA admin. Without it,
 anyone reachable to the ACME endpoint can request any cert that passes
-challenges, which on a private CA is most of them. Today
-`acme_server.py:881` returns `externalAccountRequired: false` and EAB is
-not implemented.
+challenges, which on a private CA is most of them.
 
-**Files to modify**
+**What shipped** (commit `8fefbf5`)
 
-- `acme_server.py` — directory metadata (`externalAccountRequired: true`
-  when EAB enabled), new-account handler (validate `externalAccountBinding`
-  field per RFC 8555 §7.3.4: HS256 JWS over the new-account JWK, signed
-  with the EAB MAC key).
-- New `eab_keys` table: kid, mac_key_b64, created_by, created_at,
-  revoked_at.
-- `web_ui.py` — admin UI to mint EAB credentials.
+- `acme_server.py` — directory response sets `externalAccountRequired: true`
+  when `require_eab=True`. New `_verify_external_account_binding(eab, jwk)`
+  method validates the HS256 JWS per RFC 8555 §7.3.4: parses the flattened
+  JWS, looks up the MAC key by `kid`, verifies the HS256 HMAC, and asserts
+  the payload matches the account's JWK. Returns `(ok, error, kid)`.
+- New `eab_keys` SQLite table (`kid`, `mac_key_b64`, `created_at`,
+  `revoked_at`). `ACMEDatabase.add_eab_key` / `get_eab_key` helpers.
+  Accounts table gains `eab_kid` column.
+- Optional EAB: if client provides `externalAccountBinding` even when not
+  required, it is verified anyway (defense in depth).
+- CLI flags: `--acme-require-eab` (default off), `--acme-eab-file PATH`
+  (JSON file mapping kid → mac_key_b64 for pre-provisioned keys).
+- Tests added: `TestACMEEAB` — account creation without EAB when required →
+  rejected; valid EAB → accepted; wrong HMAC → unauthorized; optional EAB
+  verification.
 
-**Per-account rate limits**
+**Outstanding**
 
-- Existing rate limiter is per-IP. Add per-account bucket keyed on the
-  ACME account URL hash (or EAB kid where present). Default: 50 orders /
-  hour / account.
-- Same for EST (per HTTP Basic user) and the REST API (per API key).
-
-**Tests**
-
-- Account creation without EAB when `externalAccountRequired: true` →
-  rejected.
-- Account creation with valid EAB → accepted; subsequent orders work.
-- Account creation with EAB MAC verification failure → rejected with
-  `urn:ietf:params:acme:error:unauthorized`.
+- `web_ui.py` admin UI to mint EAB credentials in-browser — not yet
+  implemented. Currently keys must be pre-provisioned via `--acme-eab-file`.
+- Per-account rate limiting (separate from per-IP) — not yet implemented.
 
 **Docs**
 
@@ -1934,14 +1824,14 @@ Revised given the audit findings. Highest-impact / lowest-risk first.
    - ~~RFC 5480 + RFC 5758 (ECC in PKIX + ECDSA algorithm IDs)~~ ✅ **SHIPPED** (`--ca-key-type ec-p256/p384/p521`)
    - ~~RFC 8410 (Ed25519/Ed448)~~ ✅ **SHIPPED** (`--ca-key-type ed25519/ed448`; SCEP guardrail in place)
 4. **New protocols** (biggest user-visible additions):
-   - RFC 3161 + RFC 5816 (TSA server)
+   - ~~RFC 3161 + RFC 5816 (TSA server)~~ ✅ **SHIPPED**
    - ~~RFC 8738 (ACME IP identifier)~~ ✅ **SHIPPED**
 5. **Hardening**:
-   - RFC 5083 + RFC 5084 (AES-GCM / AuthEnvelopedData in CMS)
-   - RFC 8933 (CMS content-type attribute protection)
+   - ~~RFC 5083 + RFC 5084 (AES-GCM / AuthEnvelopedData in CMS)~~ ✅ **SHIPPED**
+   - ~~RFC 7292 (PKCS#12 friendlyName)~~ ✅ **SHIPPED** (unencrypted-export rejection still TODO)
+   - ~~RFC 6962 (CT pre-cert flow)~~ ✅ **SHIPPED** (CLI wiring + SCT verification still TODO)
+   - ~~RFC 8933 (CMS content-type attribute protection)~~ ✅ **SHIPPED**
    - RFC 9481 + RFC 9482 (CMP algorithm requirements + lightweight profile)
-   - RFC 7292 (PKCS#12 encryption defaults + friendlyName)
-   - RFC 6962 (CT pre-cert flow + CLI wiring + SCT verification)
 6. **Documentation**:
    - RFC 3647 (CPS document — can be drafted in parallel with any code work)
 7. **When drafts stabilize**:

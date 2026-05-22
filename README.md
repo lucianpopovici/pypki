@@ -1728,6 +1728,7 @@ Every issued certificate includes:
 | RFC 8894 | SCEP — Simple Certificate Enrolment Protocol | ✅ Full |
 | RFC 5083 | CMS AuthEnvelopedData | ✅ Full — `CMSBuilder.auth_enveloped_data` (AES-256-GCM); `CMSParser` dispatches on `id-ct-authEnvelopedData`; SCEP `GetCACaps` advertises `AES-GCM` |
 | RFC 5084 | AES-GCM in CMS | ✅ Full — AES-256-GCM with 12-byte nonce, 16-byte auth tag, `GCMParameters` (nonce + `ICVlen=16`); eliminates CBC padding-oracle surface from SCEP |
+| RFC 8933 | CMS `contentType` attribute protection | ✅ Full — `id-contentType` present in all `signedAttrs` (SCEP + TSA); verified by 8 dedicated tests |
 | RFC 9480 | CMP Updates — CMPv3 features | ✅ Full |
 | RFC 9811 | CMP well-known URI paths | ✅ Full |
 | RFC 7030 | EST — Enrollment over Secure Transport | ✅ Full |

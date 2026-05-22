@@ -60,6 +60,17 @@ This project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **RFC 8933 — CMS `contentType` attribute always present in `signedAttrs`.**
+  Confirmed via audit that `CMSBuilder.signed_data` (SCEP) and
+  `TSAResponseBuilder.build` (TSA) always include the `id-contentType`
+  (`1.2.840.113549.1.9.3`) signed attribute whenever `signedAttrs` are
+  present, satisfying the RFC 8933 MUST. Added `TestRFC8933CMSContentType` in
+  `test_scep_server.py` (7 tests) verifying contentType presence across
+  success/failure/pending SCEP responses, value is `OID_DATA`, signedAttrs
+  is never absent, and the PKCS#1v15 signature over signedAttrs verifies;
+  plus one test in `TestRFC3161TSA` verifying TSA SignedData carries
+  `id-contentType = OID_TST_INFO` in its signedAttrs.
+
 - **RFC 5083 + RFC 5084 — AES-GCM AuthEnvelopedData in SCEP CMS.** Eliminates
   the CBC padding-oracle surface from SCEP-encrypted CSR payloads.
 
