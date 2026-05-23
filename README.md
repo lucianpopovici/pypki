@@ -127,6 +127,8 @@ deployments.
 
 Compatible with **Cisco IOS**, **Juniper**, **sscep**, **Windows NDES**, **Jamf**, **Microsoft Intune**, and any RFC 8894-compliant SCEP client.
 
+**Single-use OTP challenges** (`--scep-use-otp`): instead of a shared static secret, each device receives a one-time password minted via `POST /api/scep/otp` (web UI admin endpoint). OTPs are single-use and expire after a configurable TTL (default 24 h). Static and OTP modes are compatible — when both `--scep-challenge` and `--scep-use-otp` are active, either credential is accepted.
+
 ### EST Protocol (RFC 7030)
 | Operation | Description |
 |---|---|
@@ -1292,6 +1294,23 @@ openssl x509 -in cert.pem -noout -text | grep -A10 "Certificate Policies"
 #       Explicit Text: Domain-validated certificate
 ```
 
+### Deployment-wide CPS URI (RFC 3647)
+
+`--cps-uri` and `--cps-policy-oid` wire a CPS URL into every issued cert
+without touching per-request or per-profile policy dicts:
+
+```bash
+python pki_server.py \
+  --cps-uri     "https://pki.example.com/cps" \
+  --cps-policy-oid "1.3.6.1.4.1.12345.1.1"
+```
+
+Every certificate will carry a `CertificatePolicies` extension with the
+given policy OID and CPS URI qualifier. PyPKI ships a RFC 3647 §6 CPS
+template at `docs/CPS.md` — host it at the URL you pass to `--cps-uri`.
+Operators MUST customize at least §1.2 (replace the `<PEN>` placeholder),
+§1.5 (contact info), and §2.1 (actual repository URLs) before publishing.
+
 ---
 
 ## Key Archival (Key Escrow)
@@ -1501,6 +1520,141 @@ Uses `dnspython` (optional dependency) to send RFC 2136 `nsupdate` packets direc
 
 ---
 
+## Lifecycle Webhooks (§5.9)
+
+PyPKI fires HTTP POST webhooks on certificate lifecycle events so external systems (IPAM, SIEM, Slack, monitoring) can react without polling.
+
+**Events:** `cert.issued`, `cert.revoked`, `cert.expiring`, `subca.issued`, `cross.signed`
+
+```bash
+python pki_server.py \
+  --webhook-url https://hooks.example.com/pypki \
+  --webhook-secret s3cr3t \
+  --webhook-events cert.issued,cert.revoked
+```
+
+Each delivery is an `application/json` POST containing `event_version`, `event_type`, `timestamp`, and event-specific fields (serial, subject, profile, etc.). The `X-PyPKI-Signature: sha256=<hex>` header carries an HMAC-SHA256 over the body for receiver-side verification. Up to 5 retry attempts with exponential back-off; final failure is audit-logged.
+
+```python
+# Receiver-side verification helper
+from hooks import verify_signature
+ok = verify_signature(request.body, secret="s3cr3t",
+                      header=request.headers["X-PyPKI-Signature"])
+```
+
+---
+
+## Structured Logging + Request IDs (§5.10)
+
+```bash
+# JSON log output (one object per line, suitable for Elasticsearch / Loki)
+python pki_server.py --log-format json
+
+# Human-readable (default)
+python pki_server.py --log-format text
+```
+
+Every JSON log record includes `ts`, `level`, `logger`, `msg`, and `req_id`. The `req_id` is a 16-character hex string generated per HTTP request in the dispatcher and threaded through all handlers via a `contextvars.ContextVar` — all log lines from the same request share the same ID, making multi-step flows (ACME order → authz → finalize, CMP ir → sign → response) trivially traceable.
+
+---
+
+## Offline Root CA Ceremony (§5.3)
+
+For deployments that require an offline root CA, `pypki_admin.py` provides a complete key ceremony workflow:
+
+```bash
+# 1. Package the offline root into an encrypted bundle (Shamir 2-of-3 optional)
+python pypki_admin.py export-root \
+  --ca-dir ./root-ca \
+  --out root-bundle.tar.gz.enc \
+  --threshold 2 --shares 3
+
+# 2. Issue a sub-CA cert from the offline bundle (no network, no DB)
+python pypki_admin.py sign-csr \
+  --bundle root-bundle.tar.gz.enc \
+  --csr-in subca.csr.pem \
+  --cert-out subca.crt.pem \
+  --validity-days 1825 \
+  --path-length 0 \
+  --permitted-dns cluster.local svc homelab.local
+
+# 3. Import the signed cert back into the online intermediate CA
+python pypki_admin.py import-cert \
+  --ca-dir ./intermediate-ca \
+  --cert-in subca.crt.pem
+```
+
+The bundle is encrypted with AES-256-GCM + PBKDF2-SHA256 (600k iterations). The optional Shamir M-of-N split distributes the bundle passphrase into N base64-encoded shares; any M of them reconstruct it (`--share SHARE` repeated M times in `sign-csr`). See `docs/DEPLOYMENT/offline-root-online-subca.md` for the full ceremony runbook.
+
+---
+
+## Registration Authority / Approval Workflow (§5.4)
+
+PyPKI supports an optional RA layer that separates _who approves certificate requests_ from _who signs them_. When enabled, enrollment requests are held in a `pending_requests` table until approved or denied by an operator (or auto-approved by policy). All protocols return a protocol-appropriate "waiting" response while a request is pending.
+
+### Enabling the RA
+
+```bash
+# Require manual approval for all requests
+python pki_server.py --ra-require-approval
+
+# Auto-approve everything (audit-trail mode only)
+python pki_server.py --ra-auto-approve
+
+# Auto-approve specific profiles; require approval for the rest
+python pki_server.py --ra-auto-approve-profiles tls_server tls_client
+
+# Load full policy from a YAML/JSON file
+python pki_server.py --ra-policy-file /etc/pypki/ra_policy.json
+```
+
+### Policy file format
+
+```json
+{
+  "mode": "profile_list",
+  "auto_approve_profiles": ["tls_server", "tls_client"],
+  "auto_approve_san_patterns": ["*.cluster.local", "*.svc"],
+  "require_approval_profiles": ["code_signing"]
+}
+```
+
+Modes: `"all"` (auto-approve everything), `"none"` (manual review always), `"profile_list"` (per-profile + SAN pattern rules). SAN matching uses Unix `fnmatch` patterns.
+
+### Approval API
+
+```bash
+# List pending requests
+curl -u admin:PASS https://pypki.local/api/ra/pending
+
+# Inspect a request
+curl -u admin:PASS https://pypki.local/api/ra/request/REQ-UUID
+
+# Approve
+curl -u admin:PASS -X POST https://pypki.local/api/ra/approve/REQ-UUID
+
+# Deny with a reason
+curl -u admin:PASS -X POST https://pypki.local/api/ra/deny/REQ-UUID \
+  -H 'Content-Type: application/json' \
+  -d '{"reason": "Unauthorized SAN requested"}'
+
+# Recent decisions (last 50)
+curl -u admin:PASS https://pypki.local/api/ra/recent
+```
+
+### Per-protocol behaviour while pending
+
+| Protocol | Client sees while pending |
+|----------|--------------------------|
+| ACME     | Order in `processing` state; poll `GET /acme/order/<id>` |
+| REST     | HTTP 202 with `{"status": "pending", "request_id": "..."}` |
+| CMP      | *(PKIStatus waiting — future)* |
+| EST      | *(202 Retry-After — future)* |
+
+All approved requests flow through the standard `issue_certificate` path — the cert lands in the DB, is audited, and is returned to the waiting client on next poll.
+
+---
+
 ## OpenTelemetry Tracing
 
 PyPKI emits OTLP traces for all certificate issuance, revocation, and HTTP handler operations. If the `opentelemetry-sdk` package is not installed, a no-op tracer is used automatically — no configuration is required.
@@ -1690,6 +1844,7 @@ openssl x509 -in short-lived.crt -text -noout | grep -A2 "2.5.29.56"
 | **RFC 8398 / RFC 9598** | Internationalized Email Addresses | ✅ ASCII-local + IDN host → `rfc822Name` (A-label); non-ASCII local → `SmtpUTF8Mailbox` `otherName` (OID `1.3.6.1.5.5.7.8.9`) |
 | **RFC 8399 / RFC 9549** | IDN in DNS SANs and Subject DN | ✅ U-labels auto-converted to A-labels in `dNSName` and `domainComponent`; wildcards preserved |
 | **RFC 9618** | Updates to X.509 Policy Validation | N/A — policy-tree algorithm is a relying-party concern; `cryptography`/`ssl` handle this |
+| **RFC 3647** | Certificate Policy / CPS framework | ✅ `docs/CPS.md` follows the RFC 3647 §6 nine-section outline; `--cps-uri` + `--cps-policy-oid` wire the CPS URL into every issued cert's `CertificatePolicies` extension |
 | **RFC 5280 §4.2.1.4** | Certificate Policies extension | ✅ `CertificatePolicies` with CPS URI and/or `UserNotice` qualifiers (RFC 6818 UTF8String) |
 | **RFC 4945 §5.1.2** | Subject non-empty validation | ✅ String-level + parsed-attribute-level check; whitespace-only values rejected |
 | **RFC 4945 §5.1.3** | SAN `critical` when Subject empty | ✅ `SubjectAlternativeName.critical=True` enforced when Subject has no attributes |
@@ -1725,19 +1880,23 @@ Every issued certificate includes:
 | RFC 3161 | Time-Stamp Protocol (TSA) | ✅ Full — `--tsa-prefix /tsa`; SHA-256/384/512 accepted; TSTInfo with nonce, serialNumber, accuracy; `--tsa-policy-oid`, `--tsa-accuracy-seconds`, pre-provisioned cert/key support |
 | RFC 5816 | ESSCertIDv2 in TSA SignedData | ✅ Full — `signingCertificateV2` signed attribute with SHA-256 ESSCertIDv2 in every TimeStampToken |
 | RFC 8738 | ACME IP Identifier | ✅ Full — `{type:"ip"}` orders, `http-01` + `tls-alpn-01` only (no `dns-01`), IPv4/IPv6 SANs, `--acme-allow-private-ip` for homelab |
-| RFC 8894 | SCEP — Simple Certificate Enrolment Protocol | ✅ Full |
+| RFC 8894 | SCEP — Simple Certificate Enrolment Protocol | ✅ Full — including single-use OTP challenge passwords (`--scep-use-otp`; `POST /api/scep/otp`) |
 | RFC 5083 | CMS AuthEnvelopedData | ✅ Full — `CMSBuilder.auth_enveloped_data` (AES-256-GCM); `CMSParser` dispatches on `id-ct-authEnvelopedData`; SCEP `GetCACaps` advertises `AES-GCM` |
 | RFC 5084 | AES-GCM in CMS | ✅ Full — AES-256-GCM with 12-byte nonce, 16-byte auth tag, `GCMParameters` (nonce + `ICVlen=16`); eliminates CBC padding-oracle surface from SCEP |
 | RFC 8933 | CMS `contentType` attribute protection | ✅ Full — `id-contentType` present in all `signedAttrs` (SCEP + TSA); verified by 8 dedicated tests |
 | RFC 9480 | CMP Updates — CMPv3 features | ✅ Full |
+| RFC 9481 | Algorithm Requirements for CMP | ✅ Full — `genm` responds to `id-it-signKeyPairTypes` (RSA + ECDSA P-256/384/521 + Ed25519/Ed448), `id-it-encKeyPairTypes` (RSA), `id-it-preferredSymmAlg` (AES-256-GCM) |
+| RFC 9482 | Lightweight CMP Profile | ✅ Full — pvno echo per §3.1; genm/genp; response protection and extraCerts on all responses |
+| RFC 6962 | Certificate Transparency | ✅ Opt-in — pre-cert flow (poison extension + `add-pre-chain`), SCT ECDSA verification, `--ct-log-url` / `--ct-log-pubkey` / `--ct-require-n` CLI flags |
 | RFC 9811 | CMP well-known URI paths | ✅ Full |
 | RFC 7030 | EST — Enrollment over Secure Transport | ✅ Full |
+| RFC 8295 | EST Server-Generated Keys | ✅ Full — `POST /.well-known/est/serverkeygen` returns `multipart/mixed` with PKCS#8 private key (`application/pkcs8`) + PKCS#7 cert chain (`application/pkcs7-mime`); subject/SANs from optional CSR body |
 | RFC 7301 | TLS ALPN Extension | ✅ Full |
 | RFC 6960 | OCSP — Online Certificate Status Protocol | ✅ Full |
-| RFC 5019 | Lightweight OCSP Profile (GET binding) | ✅ Full |
+| RFC 5019 | Lightweight OCSP Profile (GET binding) | ✅ Full — including pre-generated static responses (`pypki_admin.py ocsp-prebuild`) |
 | RFC 8954 | OCSP Nonce Extension Update | ✅ Full — 1–32 byte bounds enforced at parse time; `--ocsp-require-nonce` strict mode |
-| RFC 7292 | PKCS#12 — Personal Information Exchange | ✅ Export only |
-| RFC 5958 | Asymmetric Key Package (PKCS#8) | ✅ Full — CMP `ir`/`cr`/`kur` private-key responses and Web UI sub-CA export emit PKCS#8 `PrivateKeyInfo` |
+| RFC 7292 | PKCS#12 — Personal Information Exchange | ✅ Full — AES-256 + PBKDF2 ≥600k iterations; `friendlyName` set to CN; passwordless export rejected by default (`--p12-allow-unencrypted` to opt out) |
+| RFC 5958 | Asymmetric Key Package (PKCS#8) | ✅ Full — all server modules use PKCS#8 `PrivateKeyInfo` for key output; no legacy `RSAPrivateKey`/`ECPrivateKey` format remains |
 | RFC 7468 | Textual Encodings of PKIX Structures | ✅ Full — strict PEM parser for chain/CRL/PKCS#7 imports rejects lowercase markers, label mismatch, trailing data, invalid base64, and unknown labels |
 | RFC 4055 | RSASSA-PSS and RSAES-OAEP in PKIX | ✅ Full — CA signing with PSS (MGF1+SHA-256, salt length 32) via `--sig-algorithm rsa-pss` |
 | RFC 5480 / RFC 5758 | ECDSA in PKIX (P-256/384/521 + algorithm IDs) | ✅ Full — `--ca-key-type ec-p256\|ec-p384\|ec-p521`; matched-curve hash per §3.2; CRL and OCSP signer cert all flow through `_sign_builder` |
@@ -1754,6 +1913,169 @@ Every issued certificate includes:
 | RFC 9370 | Multiple Key Exchanges in IKEv2 | N/A — IKEv2 handshake protocol; implemented by VPN gateways (strongSwan, Cisco, etc.), not by the PKI. PyPKI issues the certificates *used by* IKEv2 peers (RFC 4945/4806/4809). |
 | RFC 9180 | HPKE — Hybrid Public Key Encryption | N/A — encryption scheme for TLS ECH, OHTTP, and MLS messaging; unrelated to X.509 certificate issuance or management. |
 | RFC 9763 | Related Certificates for Multiple Authentications | 🗓️ Planned — defines `relatedCertRequest` CSR attribute and `RelatedCertificate` X.509 extension for linking classical + PQC cert pairs. Tracked in Roadmap below. |
+
+---
+
+## Storage Backends (§5.2)
+
+PyPKI uses a Database Abstraction Layer (`db.py`) that supports both SQLite
+(default, zero configuration) and PostgreSQL (HA, multi-node deployments).
+Select the backend via `--db-url`:
+
+```bash
+# SQLite (default — single node, homelab)
+python pypki.py --ca-dir ./ca
+
+# Explicit SQLite path
+python pypki.py --ca-dir ./ca \
+  --pki-db-url sqlite:///var/lib/pypki/pki.db \
+  --acme-db-url sqlite:///var/lib/pypki/acme.db \
+  --scep-db-url sqlite:///var/lib/pypki/scep.db
+
+# PostgreSQL (HA, regulated, multi-node)
+python pypki.py --ca-dir ./ca \
+  --pki-db-url  postgresql://pypki:pass@db.internal/pypki_pki \
+  --acme-db-url postgresql://pypki:pass@db.internal/pypki_acme \
+  --scep-db-url postgresql://pypki:pass@db.internal/pypki_scep
+```
+
+**Requirements:**
+- SQLite ≥ 3.35 (March 2021, ships on any modern Linux/macOS/Windows)
+- PostgreSQL ≥ 13 when using `postgresql://`; `pip install 'psycopg[binary]'` required
+
+**HA topology notes:**
+- Serial number allocation is serialized via `advisory_lock("serial-allocation")` — race-free on both backends
+- CRL number allocation is serialized via `advisory_lock("crl-allocation")`
+- OCSP responders can safely point at a read replica (`--pki-db-url` with `?target_session_attrs=read-only`)
+- SCEP and ACME state is fully DB-backed; nodes are stateless
+
+See `docs/STORAGE.md` and `docs/MIGRATION.md` for deployment topologies and the SQLite→Postgres migration runbook.
+
+---
+
+## Hardware-Backed Keys / PKCS#11 (§5.1)
+
+PyPKI can store and use the CA private key on a PKCS#11 hardware security
+module (HSM) or software token, keeping the key material off disk entirely.
+
+### Supported hardware
+
+| Device | PKCS#11 module |
+|--------|---------------|
+| SoftHSM2 (testing) | `/usr/lib/softhsm/libsofthsm2.so` |
+| YubiHSM 2 | `/usr/lib/x86_64-linux-gnu/pkcs11/yubihsm_pkcs11.so` |
+| Nitrokey HSM | `opensc-pkcs11.so` |
+| AWS CloudHSM | `/opt/cloudhsm/lib/libcloudhsm_pkcs11.so` |
+| GCP Cloud HSM | `libkmsp11.so` |
+| Any PKCS#11 HSM | vendor-supplied `.so` |
+
+**Prerequisite:** `pip install python-pkcs11`
+
+### CLI flags
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--hsm-module PATH` | — | Path to the PKCS#11 shared library |
+| `--hsm-slot N` | `0` | Token slot index |
+| `--hsm-pin-env VAR` | `PYPKI_HSM_PIN` | Environment variable holding the PIN (never pass on argv) |
+| `--hsm-key-label LABEL` | `pypki-ca` | CKA_LABEL of the CA signing key |
+| `--hsm-init-if-missing` | off | Generate a 4096-bit RSA key on the token if the label is absent |
+
+### Quick start with SoftHSM2
+
+```bash
+# Install and initialize a test token
+apt install softhsm2
+softhsm2-util --init-token --slot 0 --label "pypki-test" \
+  --so-pin 123456 --pin 1234
+
+# Export the PIN (never pass on the command line)
+export PYPKI_HSM_PIN=1234
+
+# Start PyPKI — key is generated on the token on first boot
+python pypki.py --ca-dir ./ca \
+  --hsm-module /usr/lib/softhsm/libsofthsm2.so \
+  --hsm-slot 0 \
+  --hsm-key-label pypki-ca \
+  --hsm-init-if-missing
+```
+
+On first start PyPKI generates a 4096-bit RSA key on the token
+(`EXTRACTABLE=False`), issues the CA self-signed certificate, and writes
+only the certificate (not the key) to `ca/ca.crt`. The key never leaves
+the token.
+
+### Production (YubiHSM 2 example)
+
+```bash
+export PYPKI_HSM_PIN="$(cat /run/secrets/yhsm-pin)"
+python pypki.py --ca-dir ./ca \
+  --hsm-module /usr/lib/x86_64-linux-gnu/pkcs11/yubihsm_pkcs11.so \
+  --hsm-slot 0 \
+  --hsm-key-label pypki-ca
+```
+
+Pre-generate the key on the token before starting (use `yubihsm-shell` or
+`pkcs11-tool --keypairgen`) and omit `--hsm-init-if-missing` in production.
+
+### Security properties
+
+- The CA private key is **never written to disk** when `--hsm-module` is set.
+- All signing operations (certificate issuance, CRL signing, OCSP signing,
+  CMP protected responses, TSA timestamps) delegate to the token.
+- PIN is read from an environment variable; passing it via argv would expose
+  it in `/proc/<pid>/cmdline` and shell history.
+- Supported key operations: RSA PKCS#1 v1.5, RSA-PSS, ECDSA (P-256/384/521).
+
+---
+
+## Metrics Depth — Prometheus Histograms (§5.11)
+
+The `/metrics` endpoint (served alongside the REST API or separately via
+`--metrics-port`) exposes Prometheus-format text in addition to the existing
+counters and gauges. No external library is required — the histogram tracker
+is built into `pki_server.py` using only the standard library.
+
+### Histograms
+
+| Metric | Labels | Description |
+|--------|--------|-------------|
+| `pypki_issuance_duration_seconds` | `profile`, `protocol` | Time to sign and store each certificate |
+| `pypki_ocsp_duration_seconds` | — | Time to build each OCSP response |
+| `pypki_acme_order_duration_seconds` | `challenge_type` | Time to finalize each ACME order |
+
+**`protocol`** takes values `acme`, `cmp`, `est`, `scep`, `ipsec`, or `""` (REST/direct API).
+
+**`challenge_type`** takes `dns` or `ip` (based on the ACME order identifier type).
+
+Buckets cover the realistic PKI latency range: 5 ms → 10 s plus `+Inf`.
+
+### Existing counters/gauges (unchanged)
+
+| Metric | Type | Description |
+|--------|------|-------------|
+| `pypki_certs_issued_total` | counter | All certificates ever issued |
+| `pypki_certs_valid` | gauge | Currently valid certificates |
+| `pypki_certs_revoked_total` | counter | Total revocations |
+| `pypki_certs_expiring_30d` | gauge | Certs expiring in ≤ 30 days |
+| `pypki_certs_expiring_7d` | gauge | Certs expiring in ≤ 7 days |
+| `pypki_certs_expired` | gauge | Past `not_after`, not revoked |
+| `pypki_ca_days_remaining` | gauge | Root CA certificate lifetime remaining |
+| `pypki_certs_by_profile` | gauge | Per-profile cert count |
+
+### Grafana dashboard queries
+
+```promql
+# p95 issuance latency across all protocols
+histogram_quantile(0.95, rate(pypki_issuance_duration_seconds_bucket[5m]))
+
+# p99 ACME order finalization latency
+histogram_quantile(0.99, rate(pypki_acme_order_duration_seconds_bucket[5m]))
+
+# Mean OCSP latency
+rate(pypki_ocsp_duration_seconds_sum[5m]) /
+rate(pypki_ocsp_duration_seconds_count[5m])
+```
 
 ---
 

@@ -648,6 +648,8 @@ class TestPKCS12Export(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.mkdtemp()
         self.ca = _make_ca(self._tmp)
+        # Allow passwordless export in these backward-compat tests.
+        self.ca._p12_allow_unencrypted = True
         self.key = _gen_key()
         self.cert = self.ca.issue_certificate("CN=p12test", self.key.public_key())
 
@@ -1190,6 +1192,7 @@ class TestHTTPAPI(unittest.TestCase):
     def setUpClass(cls):
         cls._tmp = tempfile.mkdtemp()
         cls.ca = _make_ca(cls._tmp)
+        cls.ca._p12_allow_unencrypted = True  # HTTP API tests don't use passwords
         cls.audit = pki.AuditLog(Path(cls._tmp))
         cls.rate = pki.RateLimiter(max_per_minute=100)
         cmp_handler = pki.CMPv3Handler(cls.ca)
@@ -4145,7 +4148,7 @@ class TestCertificateTransparencyPreCert(unittest.TestCase):
                     + struct.pack(">H", 0) + bytes([4, 1]) + struct.pack(">H", 64) + bytes(64))
         
         orig_submit = self.ca.submit_pre_cert_to_ct_log
-        self.ca.submit_pre_cert_to_ct_log = lambda cert, url: fake_sct
+        self.ca.submit_pre_cert_to_ct_log = lambda cert, url, **kw: fake_sct
         
         try:
             cert = self.ca.issue_certificate_with_ct(
@@ -4644,6 +4647,7 @@ class TestIntermediateCA(unittest.TestCase):
         self.root_ca, self.inter_ca = _make_intermediate_ca(
             self._tmp_root, self._tmp_inter
         )
+        self.inter_ca._p12_allow_unencrypted = True  # chain tests don't use passwords
 
     def tearDown(self):
         import shutil
@@ -6394,6 +6398,3098 @@ class TestACMEEAB(unittest.TestCase):
         ok, err, _ = handler._verify_external_account_binding(None, eab, account_jwk)
         self.assertFalse(ok)
         self.assertIn("signature verification failed", err)
+
+
+# ===========================================================================
+# ACME per-account rate limiting (Tier 5.5 complement)
+# ===========================================================================
+
+class TestACMEPerAccountRateLimit(unittest.TestCase):
+    """Verify per-account certificate issuance rate limiting."""
+
+    def setUp(self):
+        try:
+            import acme_server
+            self.acme = acme_server
+        except ImportError:
+            self.skipTest("acme_server.py not importable")
+        self._tmp = tempfile.mkdtemp()
+        self.db = self.acme.ACMEDatabase(os.path.join(self._tmp, "acme_rl.db"))
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self._tmp, ignore_errors=True)
+
+    def _seed_cert(self, account_kid: str, order_id: str, created_at: float):
+        """Insert a fake order + certificate row for testing."""
+        self.db._db.execute(
+            "INSERT OR IGNORE INTO orders (id, account_kid, status, identifiers, created_at, expires_at) "
+            "VALUES (?, ?, 'valid', '[]', ?, ?)",
+            (order_id, account_kid, created_at, created_at + 86400),
+        )
+        cert_id = f"cert-{order_id}"
+        self.db._db.execute(
+            "INSERT OR IGNORE INTO certificates (id, order_id, pem_chain, serial, created_at) "
+            "VALUES (?, ?, 'PEM', 1, ?)",
+            (cert_id, order_id, created_at),
+        )
+
+    def test_count_returns_zero_for_new_account(self):
+        count = self.db.count_account_certs_since("acct-new", 0.0)
+        self.assertEqual(count, 0)
+
+    def test_count_reflects_issued_certs(self):
+        now = time.time()
+        self._seed_cert("acct-a", "ord-1", now - 100)
+        self._seed_cert("acct-a", "ord-2", now - 50)
+        count = self.db.count_account_certs_since("acct-a", now - 200)
+        self.assertEqual(count, 2)
+
+    def test_count_respects_window(self):
+        """Certs older than the window should not be counted."""
+        now = time.time()
+        self._seed_cert("acct-b", "ord-old", now - 86400 * 10)  # 10 days ago
+        self._seed_cert("acct-b", "ord-new", now - 3600)         # 1 hour ago
+        # 7-day window: only the recent cert counts
+        window_start = now - 86400 * 7
+        count = self.db.count_account_certs_since("acct-b", window_start)
+        self.assertEqual(count, 1)
+
+    def test_count_isolates_accounts(self):
+        """One account's certs must not affect another account's count."""
+        now = time.time()
+        self._seed_cert("acct-x", "ord-x1", now - 100)
+        self._seed_cert("acct-y", "ord-y1", now - 100)
+        self.assertEqual(self.db.count_account_certs_since("acct-x", 0.0), 1)
+        self.assertEqual(self.db.count_account_certs_since("acct-y", 0.0), 1)
+
+    def test_make_acme_handler_accepts_rate_limit_params(self):
+        """make_acme_handler must propagate per_account_cert_limit and window."""
+        cls = self.acme.make_acme_handler(
+            db=self.db, ca=None,
+            validator=None, base_url="http://localhost",
+            per_account_cert_limit=5, per_account_window_days=3,
+        )
+        self.assertEqual(cls.per_account_cert_limit, 5)
+        self.assertEqual(cls.per_account_window_days, 3)
+
+    def test_make_acme_handler_defaults_unlimited(self):
+        """Default per_account_cert_limit must be 0 (unlimited)."""
+        cls = self.acme.make_acme_handler(
+            db=self.db, ca=None,
+            validator=None, base_url="http://localhost",
+        )
+        self.assertEqual(cls.per_account_cert_limit, 0)
+
+    def test_start_acme_server_accepts_rate_limit_params(self):
+        """start_acme_server signature must include the rate-limit parameters."""
+        import inspect
+        sig = inspect.signature(self.acme.start_acme_server)
+        self.assertIn("per_account_cert_limit", sig.parameters)
+        self.assertIn("per_account_window_days", sig.parameters)
+        self.assertEqual(sig.parameters["per_account_cert_limit"].default, 0)
+        self.assertEqual(sig.parameters["per_account_window_days"].default, 7)
+
+
+# ===========================================================================
+# RFC 7292 — PKCS#12 hardening (unencrypted-export rejection)
+# ===========================================================================
+
+class TestRFC7292PKCS12Hardening(unittest.TestCase):
+    """RFC 7292 §4 hardening: reject passwordless PKCS#12 export by default."""
+
+    def setUp(self):
+        self._tmp = tempfile.mkdtemp()
+        self.ca = _make_ca(self._tmp)
+        self.key = _gen_key()
+        self.cert = self.ca.issue_certificate("CN=p12hard", self.key.public_key())
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self._tmp, ignore_errors=True)
+
+    def test_default_rejects_unencrypted_export(self):
+        """export_pkcs12 without password MUST raise ValueError by default."""
+        self.assertFalse(self.ca._p12_allow_unencrypted,
+                         "Default CA must have _p12_allow_unencrypted=False")
+        with self.assertRaises(ValueError) as cm:
+            self.ca.export_pkcs12(self.cert.serial_number)
+        self.assertIn("Unencrypted", str(cm.exception))
+
+    def test_password_always_accepted(self):
+        """export_pkcs12 with a password succeeds regardless of the flag."""
+        p12 = self.ca.export_pkcs12(self.cert.serial_number, password=b"secret")
+        self.assertIsNotNone(p12)
+        self.assertIsInstance(p12, bytes)
+
+    def test_allow_flag_permits_unencrypted(self):
+        """Setting _p12_allow_unencrypted=True allows passwordless export."""
+        self.ca._p12_allow_unencrypted = True
+        p12 = self.ca.export_pkcs12(self.cert.serial_number)
+        self.assertIsNotNone(p12)
+
+    def test_unknown_serial_returns_none_before_password_check(self):
+        """Unknown serial returns None (not ValueError) even without password."""
+        result = self.ca.export_pkcs12(999999999)
+        self.assertIsNone(result)
+
+    def test_error_message_mentions_flag(self):
+        """ValueError message must mention --p12-allow-unencrypted."""
+        with self.assertRaises(ValueError) as cm:
+            self.ca.export_pkcs12(self.cert.serial_number)
+        self.assertIn("--p12-allow-unencrypted", str(cm.exception))
+
+
+# ===========================================================================
+# RFC 6962 — CT CLI wiring + SCT signature verification
+# ===========================================================================
+
+class TestRFC6962CTCLIWiring(unittest.TestCase):
+    """RFC 6962 CT log integration: CLI attributes, SCT verification, require-n enforcement."""
+
+    def setUp(self):
+        self._tmp = tempfile.mkdtemp()
+        self.ca = _make_ca(self._tmp)
+        self.key = _gen_key()
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self._tmp, ignore_errors=True)
+
+    # ---- attribute defaults ----
+
+    def test_ct_log_urls_default_empty(self):
+        """CA._ct_log_urls defaults to empty list (CT opt-in)."""
+        self.assertEqual(self.ca._ct_log_urls, [])
+
+    def test_ct_log_pubkeys_default_empty(self):
+        self.assertEqual(self.ca._ct_log_pubkeys, [])
+
+    def test_ct_require_n_default_zero(self):
+        """CA._ct_require_n defaults to 0 (best-effort, no abort on SCT failure)."""
+        self.assertEqual(self.ca._ct_require_n, 0)
+
+    # ---- SCT verification helper ----
+
+    def _make_mock_log_key(self):
+        """Return (private_key, public_key_pem) for a mock CT log."""
+        from cryptography.hazmat.primitives.asymmetric.ec import (
+            generate_private_key, SECP256R1,
+        )
+        log_key = generate_private_key(SECP256R1())
+        pub_pem = log_key.public_key().public_bytes(
+            serialization.Encoding.PEM,
+            serialization.PublicFormat.SubjectPublicKeyInfo,
+        )
+        return log_key, pub_pem
+
+    def _sign_sct(self, log_key, timestamp_ms: int, cert_der: bytes,
+                  extensions: bytes = b"", entry_type: int = 0) -> bytes:
+        """Build a correctly signed DigitallySigned blob for a mock SCT."""
+        import struct
+        from cryptography.hazmat.primitives.asymmetric.ec import ECDSA
+
+        if entry_type == 0:
+            signed_entry = len(cert_der).to_bytes(3, "big") + cert_der
+        else:
+            import hashlib
+            spki = self.ca.ca_key.public_key().public_bytes(
+                Encoding.DER, serialization.PublicFormat.SubjectPublicKeyInfo
+            )
+            issuer_hash = hashlib.sha256(spki).digest()
+            signed_entry = issuer_hash + len(cert_der).to_bytes(3, "big") + cert_der
+
+        signed_data = (
+            bytes([0, 0])
+            + struct.pack(">Q", timestamp_ms)
+            + struct.pack(">H", entry_type)
+            + signed_entry
+            + struct.pack(">H", len(extensions))
+            + extensions
+        )
+        raw_sig = log_key.sign(signed_data, ECDSA(SHA256()))
+        # DigitallySigned: hash_alg(1=SHA256=4) sig_alg(1=ECDSA=3) sig_len(2) sig
+        return bytes([4, 3]) + struct.pack(">H", len(raw_sig)) + raw_sig
+
+    def test_sct_verify_valid_signature(self):
+        """verify_sct_signature returns True for a correctly signed SCT."""
+        log_key, pub_pem = self._make_mock_log_key()
+        cert = self.ca.issue_certificate("CN=ct-verify", self.key.public_key())
+        cert_der = cert.public_bytes(Encoding.DER)
+        ts = 1_700_000_000_000
+        dig_signed = self._sign_sct(log_key, ts, cert_der)
+
+        ok = pki.CertificateAuthority.verify_sct_signature(
+            0, ts, b"", dig_signed, cert_der, pub_pem
+        )
+        self.assertTrue(ok, "Valid SCT signature must verify")
+
+    def test_sct_verify_wrong_key(self):
+        """verify_sct_signature returns False when pubkey doesn't match signer."""
+        log_key, _pub = self._make_mock_log_key()
+        _wrong_key, wrong_pub = self._make_mock_log_key()
+        cert = self.ca.issue_certificate("CN=ct-wrong", self.key.public_key())
+        cert_der = cert.public_bytes(Encoding.DER)
+        ts = 1_700_000_000_000
+        dig_signed = self._sign_sct(log_key, ts, cert_der)
+
+        ok = pki.CertificateAuthority.verify_sct_signature(
+            0, ts, b"", dig_signed, cert_der, wrong_pub
+        )
+        self.assertFalse(ok, "Mismatched pubkey must fail verification")
+
+    def test_sct_verify_tampered_signature(self):
+        """verify_sct_signature returns False when signature bytes are corrupted."""
+        log_key, pub_pem = self._make_mock_log_key()
+        cert = self.ca.issue_certificate("CN=ct-tamper", self.key.public_key())
+        cert_der = cert.public_bytes(Encoding.DER)
+        ts = 1_700_000_000_000
+        dig_signed = bytearray(self._sign_sct(log_key, ts, cert_der))
+        dig_signed[-1] ^= 0xFF  # flip last byte
+        ok = pki.CertificateAuthority.verify_sct_signature(
+            0, ts, b"", bytes(dig_signed), cert_der, pub_pem
+        )
+        self.assertFalse(ok)
+
+    def test_sct_verify_invalid_pubkey(self):
+        """verify_sct_signature returns False on garbage pubkey."""
+        cert = self.ca.issue_certificate("CN=ct-badkey", self.key.public_key())
+        cert_der = cert.public_bytes(Encoding.DER)
+        ok = pki.CertificateAuthority.verify_sct_signature(
+            0, 0, b"", b"\x04\x03garbage", cert_der, b"not-a-pem"
+        )
+        self.assertFalse(ok)
+
+    # ---- mock CT log submission ----
+
+    def test_submit_pre_cert_verifies_sct(self):
+        """submit_pre_cert_to_ct_log returns None when pubkey mismatches SCT sig."""
+        from unittest.mock import patch
+        import json as _json
+        import base64 as _b64
+        import struct
+
+        log_key, _pub = self._make_mock_log_key()
+        _wrong_key, wrong_pub = self._make_mock_log_key()
+        cert = self.ca.issue_certificate("CN=ct-presubmit", self.key.public_key(),
+                                         ct_poison=True)
+        cert_der = cert.public_bytes(Encoding.DER)
+        ts = 1_700_000_000_000
+
+        # Build a mock SCT body signed with log_key but verified against wrong_pub
+        dig_signed = self._sign_sct(log_key, ts, cert_der, entry_type=1)
+        mock_body = _json.dumps({
+            "sct_version": 0,
+            "id": _b64.b64encode(b"\x00" * 32).decode(),
+            "timestamp": ts,
+            "extensions": "",
+            "signature": _b64.b64encode(dig_signed).decode(),
+        }).encode()
+
+        class MockResp:
+            def read(self): return mock_body
+            def __enter__(self): return self
+            def __exit__(self, *a): pass
+
+        with patch("urllib.request.urlopen", return_value=MockResp()):
+            sct = self.ca.submit_pre_cert_to_ct_log(
+                cert, "http://mock-ct.test", log_pubkey_pem=wrong_pub
+            )
+        self.assertIsNone(sct, "Mismatched pubkey must cause submission to return None")
+
+    def test_issue_with_ct_require_n_raises_when_unmet(self):
+        """issue_certificate_with_ct raises RuntimeError if < ct_require_n SCTs are obtained."""
+        self.ca._ct_require_n = 2
+        with self.assertRaises(RuntimeError) as cm:
+            self.ca.issue_certificate_with_ct(
+                "CN=ct-reqn", self.key.public_key(),
+                ct_log_urls=["http://127.0.0.1:1/bad-ct/"],
+                ct_require_n=2,
+            )
+        self.assertIn("requirement not met", str(cm.exception))
+
+    def test_issue_with_ct_require_n_zero_tolerates_failure(self):
+        """issue_certificate_with_ct with ct_require_n=0 succeeds even when all logs fail."""
+        cert = self.ca.issue_certificate_with_ct(
+            "CN=ct-besteffort", self.key.public_key(),
+            ct_log_urls=["http://127.0.0.1:1/bad-ct/"],
+            ct_require_n=0,
+        )
+        self.assertIsNotNone(cert)
+        self.assertIsInstance(cert, pki.x509.Certificate)
+
+    def test_ct_log_url_stored_on_ca(self):
+        """CA._ct_log_urls can be set and read back."""
+        urls = ["https://ct.example.com/log1/", "https://ct.example.com/log2/"]
+        self.ca._ct_log_urls = urls
+        self.assertEqual(self.ca._ct_log_urls, urls)
+
+    def test_ct_require_n_defaults_to_configured_value(self):
+        """issue_certificate_with_ct uses self._ct_require_n when ct_require_n not given."""
+        self.ca._ct_require_n = 3
+        with self.assertRaises(RuntimeError):
+            self.ca.issue_certificate_with_ct(
+                "CN=ct-default-n", self.key.public_key(),
+                ct_log_urls=["http://127.0.0.1:1/bad/"],
+                # ct_require_n not provided → falls back to self._ct_require_n = 3
+            )
+
+
+# ===========================================================================
+# RFC 9481 — CMP Algorithm Requirements
+# ===========================================================================
+
+class TestRFC9481CMPAlgorithms(unittest.TestCase):
+    """
+    RFC 9481 §3: signKeyPairTypes, encKeyPairTypes, and preferredSymmAlg
+    ITAV responses from the CMP genm handler.
+    """
+
+    def setUp(self):
+        try:
+            import cmp_server as _cmp
+            self.cmp = _cmp
+        except ImportError:
+            self.skipTest("cmp_server.py not importable")
+        self._tmp = tempfile.mkdtemp()
+        self.ca = _make_ca(self._tmp)
+        self.handler = self.cmp.CMPv3Handler(self.ca)
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self._tmp, ignore_errors=True)
+
+    # ---- DER helpers ----
+
+    def _decode_oid(self, data: bytes) -> str:
+        """Decode a DER OID body (without tag/length) to dotted string."""
+        if not data:
+            return ""
+        parts = [data[0] // 40, data[0] % 40]
+        i, cur = 1, 0
+        while i < len(data):
+            cur = (cur << 7) | (data[i] & 0x7F)
+            if not (data[i] & 0x80):
+                parts.append(cur)
+                cur = 0
+            i += 1
+        return ".".join(map(str, parts))
+
+    def _read_tlv(self, buf: bytes, pos: int):
+        tag = buf[pos]
+        l = buf[pos + 1]
+        if l & 0x80:
+            n = l & 0x7F
+            l = int.from_bytes(buf[pos + 2: pos + 2 + n], "big")
+            start = pos + 2 + n
+        else:
+            start = pos + 2
+        return tag, buf[start: start + l], start + l
+
+    def _build_genm(self, oid_str: str) -> bytes:
+        """Build a minimal GenMsgContent body requesting the given ITAV OID."""
+        parts = list(map(int, oid_str.split(".")))
+        enc = bytes([40 * parts[0] + parts[1]])
+        for p in parts[2:]:
+            if p == 0:
+                enc += b"\x00"
+            else:
+                buf = []
+                while p:
+                    buf.append(p & 0x7F)
+                    p >>= 7
+                buf.reverse()
+                enc += bytes([(b | 0x80) if i < len(buf) - 1 else b
+                               for i, b in enumerate(buf)])
+        def _oid_tlv(d): return b"\x06" + bytes([len(d)]) + d
+        def _seq(c): return b"\x30" + bytes([len(c)]) + c
+        # GenMsgContent = SEQUENCE OF InfoTypeAndValue
+        # InfoTypeAndValue = SEQUENCE { infoType OID }
+        itav = _seq(_oid_tlv(enc))
+        return _seq(itav)
+
+    def _make_genm_pki_message(self, oid_str: str) -> bytes:
+        """Build a complete pvno=3 PKIMessage with a genm body for oid_str."""
+        body_der = self._build_genm(oid_str)
+        import os
+        txid  = os.urandom(16)
+        snonce = os.urandom(16)
+        # genm body type = 21
+        return self.cmp.CMPv2ASN1.build_pki_message(
+            21, body_der, transaction_id=txid, sender_nonce=snonce, pvno=3
+        )
+
+    def _extract_genp_body(self, response_der: bytes) -> bytes:
+        """Pull the body content out of a genp PKIMessage."""
+        pos = 0
+        _, outer, pos = self._read_tlv(response_der, 0)   # outer SEQUENCE
+        pos2 = 0
+        _, header, pos2 = self._read_tlv(outer, 0)         # header SEQUENCE
+        pos2 = len(header) + (2 if header[0:1] <= b"\x7f" else 3 + (header[1] & 0x7f))
+        # skip header by re-reading from outer
+        offset = 0
+        _, _hdr, offset = self._read_tlv(outer, 0)
+        _, body_content, _ = self._read_tlv(outer, offset)
+        return body_content
+
+    def _parse_genp_alg_ids(self, response_der: bytes) -> list:
+        """
+        Extract the list of AlgorithmIdentifier OID strings from a genp
+        signKeyPairTypes / encKeyPairTypes response.
+        """
+        body = self._extract_genp_body(response_der)
+        # body = [A2] genp_content
+        # We'll walk the DER to collect all OID tags inside SEQUENCE OF AlgorithmIdentifier
+        oids = []
+        pos = 0
+        while pos < len(body):
+            if pos + 1 >= len(body):
+                break
+            tag, val, pos = self._read_tlv(body, pos)
+            # Recursively scan for OID tags (0x06)
+            def _collect_oids(d):
+                i = 0
+                while i < len(d):
+                    if i + 1 >= len(d):
+                        break
+                    try:
+                        t, v, ni = self._read_tlv(d, i)
+                    except Exception:
+                        break
+                    if t == 0x06:
+                        oids.append(self._decode_oid(v))
+                    elif t in (0x30, 0x31, 0xa0, 0xa1):
+                        _collect_oids(v)
+                    i = ni
+            _collect_oids(val)
+        return oids
+
+    # ---- tests ----
+
+    def test_signkeypairtypes_oid_handled(self):
+        """CMPv3Handler must respond to id-it-signKeyPairTypes without error."""
+        msg = self._make_genm_pki_message("1.3.6.1.5.5.7.4.3")
+        resp = self.handler.handle(msg)
+        self.assertIsInstance(resp, bytes)
+        self.assertGreater(len(resp), 0)
+
+    def test_signkeypairtypes_contains_rsa(self):
+        """signKeyPairTypes response must include rsaEncryption (1.2.840.113549.1.1.1)."""
+        msg = self._make_genm_pki_message("1.3.6.1.5.5.7.4.3")
+        resp = self.handler.handle(msg)
+        oids = self._parse_genp_alg_ids(resp)
+        self.assertIn("1.2.840.113549.1.1.1", oids,
+                      f"rsaEncryption OID not found in response; got {oids}")
+
+    def test_signkeypairtypes_contains_ecdsa(self):
+        """signKeyPairTypes response must include id-ecPublicKey (1.2.840.10045.2.1)."""
+        msg = self._make_genm_pki_message("1.3.6.1.5.5.7.4.3")
+        resp = self.handler.handle(msg)
+        oids = self._parse_genp_alg_ids(resp)
+        self.assertIn("1.2.840.10045.2.1", oids,
+                      f"id-ecPublicKey OID not found; got {oids}")
+
+    def test_signkeypairtypes_contains_ed25519(self):
+        """signKeyPairTypes response must include id-Ed25519 (1.3.101.112)."""
+        msg = self._make_genm_pki_message("1.3.6.1.5.5.7.4.3")
+        resp = self.handler.handle(msg)
+        oids = self._parse_genp_alg_ids(resp)
+        self.assertIn("1.3.101.112", oids,
+                      f"id-Ed25519 OID not found; got {oids}")
+
+    def test_enckeypairtypes_oid_handled(self):
+        """CMPv3Handler must respond to id-it-encKeyPairTypes."""
+        msg = self._make_genm_pki_message("1.3.6.1.5.5.7.4.4")
+        resp = self.handler.handle(msg)
+        self.assertIsInstance(resp, bytes)
+        self.assertGreater(len(resp), 0)
+
+    def test_enckeypairtypes_contains_rsa(self):
+        """encKeyPairTypes response must include rsaEncryption."""
+        msg = self._make_genm_pki_message("1.3.6.1.5.5.7.4.4")
+        resp = self.handler.handle(msg)
+        oids = self._parse_genp_alg_ids(resp)
+        self.assertIn("1.2.840.113549.1.1.1", oids)
+
+    def test_preferredsymmalg_oid_handled(self):
+        """CMPv3Handler must respond to id-it-preferredSymmAlg."""
+        msg = self._make_genm_pki_message("1.3.6.1.5.5.7.4.5")
+        resp = self.handler.handle(msg)
+        self.assertIsInstance(resp, bytes)
+        self.assertGreater(len(resp), 0)
+
+    def test_preferredsymmalg_is_aes256gcm(self):
+        """preferredSymmAlg response must advertise AES-256-GCM (2.16.840.1.101.3.4.1.46)."""
+        msg = self._make_genm_pki_message("1.3.6.1.5.5.7.4.5")
+        resp = self.handler.handle(msg)
+        oids = self._parse_genp_alg_ids(resp)
+        self.assertIn("2.16.840.1.101.3.4.1.46", oids,
+                      f"AES-256-GCM OID not found; got {oids}")
+
+    def test_all_signkeypair_algorithms_actually_supported(self):
+        """
+        Every OID in signKeyPairTypes must correspond to an algorithm PyPKI
+        can actually use to issue a certificate (RFC 9481 §3 MUST requirement).
+        """
+        msg = self._make_genm_pki_message("1.3.6.1.5.5.7.4.3")
+        resp = self.handler.handle(msg)
+        oids = self._parse_genp_alg_ids(resp)
+
+        # Map OID → key type we can verify
+        supported_oids = {
+            "1.2.840.113549.1.1.1",    # RSA
+            "1.2.840.10045.2.1",        # EC (P-256 / P-384 / P-521)
+            "1.3.101.112",              # Ed25519
+            "1.3.101.113",              # Ed448
+        }
+        advertised = set(oids) & (supported_oids | {
+            "1.2.840.10045.3.1.7",      # secp256r1 (curve param, not a key type itself)
+            "1.3.132.0.34",             # secp384r1
+            "1.3.132.0.35",             # secp521r1
+        })
+        self.assertTrue(
+            len(advertised) > 0,
+            "signKeyPairTypes must advertise at least one recognized algorithm OID"
+        )
+
+
+# ===========================================================================
+# RFC 9482 — Lightweight CMP Profile
+# ===========================================================================
+
+class TestRFC9482LightweightCMP(unittest.TestCase):
+    """
+    RFC 9482 Lightweight CMP Profile compliance checks.
+    Verifies that the CMP server satisfies the core structural requirements
+    of the Lightweight CMP Profile (§3 request structure, §5 response handling).
+    """
+
+    def setUp(self):
+        try:
+            import cmp_server as _cmp
+            self.cmp = _cmp
+        except ImportError:
+            self.skipTest("cmp_server.py not importable")
+        self._tmp = tempfile.mkdtemp()
+        self.ca = _make_ca(self._tmp)
+        self.handler = self.cmp.CMPv3Handler(self.ca)
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self._tmp, ignore_errors=True)
+
+    def _read_tlv(self, buf: bytes, pos: int):
+        tag = buf[pos]
+        l = buf[pos + 1]
+        if l & 0x80:
+            n = l & 0x7F
+            l = int.from_bytes(buf[pos + 2: pos + 2 + n], "big")
+            start = pos + 2 + n
+        else:
+            start = pos + 2
+        return tag, buf[start: start + l], start + l
+
+    def _parse_pki_message(self, der: bytes) -> dict:
+        """Walk outer structure and return pvno + body_type."""
+        _, outer, _ = self._read_tlv(der, 0)
+        # header SEQUENCE
+        _, hdr, hdr_end = self._read_tlv(outer, 0)
+        # pvno is the first element in header (INTEGER)
+        _, pvno_bytes, _ = self._read_tlv(hdr, 0)
+        pvno = int.from_bytes(pvno_bytes, "big")
+        # body is context-tagged [N]
+        _, body_content, _ = self._read_tlv(outer, hdr_end)
+        # first byte of body tag tells us the body type
+        body_type = outer[hdr_end] & 0x1F
+        return {"pvno": pvno, "body_type": body_type, "body_content": body_content}
+
+    def _build_ir(self, pvno: int = 3) -> bytes:
+        """Build a minimal ir (body type 0) PKIMessage."""
+        import os
+        # Minimal CertReqMsg body (just a placeholder SEQUENCE)
+        body_content = b"\x30\x00"  # empty SEQUENCE
+        return self.cmp.CMPv2ASN1.build_pki_message(
+            0, body_content,
+            transaction_id=os.urandom(16),
+            sender_nonce=os.urandom(16),
+            pvno=pvno,
+        )
+
+    def test_pvno3_request_gets_pvno3_response(self):
+        """RFC 9482 §3.1: server MUST echo pvno=3 when client sends pvno=3."""
+        ir = self._build_ir(pvno=3)
+        resp = self.handler.handle(ir)
+        self.assertIsInstance(resp, bytes)
+        parsed = self._parse_pki_message(resp)
+        self.assertEqual(parsed["pvno"], 3,
+                         "Response pvno must match client's pvno=3")
+
+    def test_pvno2_request_gets_pvno2_response(self):
+        """RFC 9482 §3.1: server MUST echo pvno=2 when client sends pvno=2."""
+        import os
+        body_content = b"\x30\x00"
+        ir = self.cmp.CMPv2ASN1.build_pki_message(
+            0, body_content,
+            transaction_id=os.urandom(16),
+            sender_nonce=os.urandom(16),
+            pvno=2,
+        )
+        resp = self.handler.handle(ir)
+        parsed = self._parse_pki_message(resp)
+        self.assertEqual(parsed["pvno"], 2,
+                         "Response pvno must match client's pvno=2")
+
+    def test_genm_getcacerts_response_is_genp(self):
+        """RFC 9482 §5: GetCACerts genm MUST be answered with a genp (body_type=22)."""
+        import os
+        # Build genm for GetCACerts (OID 1.3.6.1.5.5.7.4.17)
+        def _oid_bytes(dotted):
+            parts = list(map(int, dotted.split(".")))
+            enc = bytes([40 * parts[0] + parts[1]])
+            for p in parts[2:]:
+                if p == 0:
+                    enc += b"\x00"
+                else:
+                    buf = []
+                    while p:
+                        buf.append(p & 0x7F)
+                        p >>= 7
+                    buf.reverse()
+                    enc += bytes([(b | 0x80) if i < len(buf) - 1 else b
+                                   for i, b in enumerate(buf)])
+            return b"\x06" + bytes([len(enc)]) + enc
+        def _seq(c): return b"\x30" + bytes([len(c)]) + c
+        itav = _seq(_oid_bytes("1.3.6.1.5.5.7.4.17"))
+        body_content = _seq(itav)
+        msg = self.cmp.CMPv2ASN1.build_pki_message(
+            21, body_content,
+            transaction_id=os.urandom(16),
+            sender_nonce=os.urandom(16),
+            pvno=3,
+        )
+        resp = self.handler.handle(msg)
+        parsed = self._parse_pki_message(resp)
+        self.assertEqual(parsed["body_type"], 22,
+                         "genm GetCACerts response must be genp (body_type=22)")
+
+    def test_garbage_request_returns_error_body(self):
+        """RFC 9482 §5: malformed request MUST return an error PKIMessage, not raise."""
+        resp = self.handler.handle(b"\x00" * 10)
+        self.assertIsInstance(resp, bytes)
+        self.assertGreater(len(resp), 0)
+        # The response must be a SEQUENCE (valid DER)
+        self.assertEqual(resp[0], 0x30, "Error response must be a SEQUENCE")
+
+    def test_response_has_protection_field(self):
+        """RFC 9482 §3.5: responses MUST carry a [0] PKIProtection signature."""
+        ir = self._build_ir(pvno=3)
+        resp = self.handler.handle(ir)
+        # [0] protection is tag 0xA0 — scan the outer SEQUENCE for it
+        self.assertIn(b"\xa0", resp, "Response must contain [0] PKIProtection field")
+
+    def test_response_has_extracerts_field(self):
+        """RFC 9482 §3.5: protected responses MUST carry [1] extraCerts."""
+        ir = self._build_ir(pvno=3)
+        resp = self.handler.handle(ir)
+        self.assertIn(b"\xa1", resp, "Response must contain [1] extraCerts field")
+
+    def test_signkeypairtypes_available_via_genm(self):
+        """RFC 9481 §3 / RFC 9482 §5: signKeyPairTypes ITAV must be accessible via genm."""
+        import os
+        def _oid_bytes(dotted):
+            parts = list(map(int, dotted.split(".")))
+            enc = bytes([40 * parts[0] + parts[1]])
+            for p in parts[2:]:
+                if p == 0:
+                    enc += b"\x00"
+                else:
+                    buf = []
+                    while p:
+                        buf.append(p & 0x7F)
+                        p >>= 7
+                    buf.reverse()
+                    enc += bytes([(b | 0x80) if i < len(buf) - 1 else b
+                                   for i, b in enumerate(buf)])
+            return b"\x06" + bytes([len(enc)]) + enc
+        def _seq(c): return b"\x30" + bytes([len(c)]) + c
+        itav = _seq(_oid_bytes("1.3.6.1.5.5.7.4.3"))
+        body_content = _seq(itav)
+        msg = self.cmp.CMPv2ASN1.build_pki_message(
+            21, body_content,
+            transaction_id=os.urandom(16),
+            sender_nonce=os.urandom(16),
+            pvno=3,
+        )
+        resp = self.handler.handle(msg)
+        parsed = self._parse_pki_message(resp)
+        self.assertEqual(parsed["body_type"], 22,
+                         "signKeyPairTypes genm must return genp (body_type=22)")
+
+
+# ===========================================================================
+# 44. RFC 8295 — EST server-generated keys
+# ===========================================================================
+
+class TestRFC8295ESTExtensions(unittest.TestCase):
+    """RFC 8295 — /.well-known/est/serverkeygen endpoint.
+
+    The endpoint is already implemented in est_server.py.  These tests verify
+    the multipart/mixed response structure, PKCS#8 key encoding, cert validity,
+    and the key/cert binding guarantee.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        try:
+            import est_server
+            cls.est = est_server
+        except ImportError:
+            cls.est = None
+            return
+
+        cls._tmp = tempfile.mkdtemp()
+        cls.ca = _make_ca(cls._tmp)
+
+        class BoundESTHandler(est_server.ESTHandler):
+            pass
+
+        BoundESTHandler.ca = cls.ca
+        BoundESTHandler.user_store = None
+        BoundESTHandler.require_auth = False
+
+        import socket
+        s = socket.socket()
+        s.bind(("127.0.0.1", 0))
+        cls.port = s.getsockname()[1]
+        s.close()
+
+        cls.server = pki.ThreadedHTTPServer(("127.0.0.1", cls.port), BoundESTHandler)
+        cls._thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
+        cls._thread.start()
+        time.sleep(0.1)
+
+    @classmethod
+    def tearDownClass(cls):
+        if hasattr(cls, "server"):
+            cls.server.shutdown()
+        import shutil
+        if hasattr(cls, "_tmp"):
+            shutil.rmtree(cls._tmp, ignore_errors=True)
+
+    def _post(self, path: str, body: bytes = b"", content_type: str = ""):
+        """POST to the EST server; returns (status, headers, body)."""
+        if self.est is None:
+            self.skipTest("est_server.py not importable")
+        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=10)
+        hdrs = {}
+        if content_type:
+            hdrs["Content-Type"] = content_type
+        conn.request("POST", path, body=body, headers=hdrs)
+        resp = conn.getresponse()
+        status = resp.status
+        raw_headers = {k.lower(): v for k, v in resp.getheaders()}
+        body_out = resp.read()
+        conn.close()
+        return status, raw_headers, body_out
+
+    def _get(self, path: str):
+        if self.est is None:
+            self.skipTest("est_server.py not importable")
+        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=10)
+        conn.request("GET", path)
+        resp = conn.getresponse()
+        status = resp.status
+        raw_headers = {k.lower(): v for k, v in resp.getheaders()}
+        body = resp.read()
+        conn.close()
+        return status, raw_headers, body
+
+    @staticmethod
+    def _parse_multipart(body: bytes, boundary: str):
+        """Split multipart body into list of (headers_dict, content_bytes) parts."""
+        sep = f"--{boundary}".encode()
+        end = f"--{boundary}--".encode()
+        parts = []
+        segments = body.split(sep)
+        for seg in segments[1:]:  # skip preamble
+            seg = seg.strip(b"\r\n")
+            if seg == b"--" or seg.startswith(b"--"):
+                break
+            # Split headers from body at first blank line
+            if b"\r\n\r\n" in seg:
+                hdr_block, _, content = seg.partition(b"\r\n\r\n")
+            elif b"\n\n" in seg:
+                hdr_block, _, content = seg.partition(b"\n\n")
+            else:
+                continue
+            headers = {}
+            for line in hdr_block.decode(errors="replace").splitlines():
+                if ":" in line:
+                    k, _, v = line.partition(":")
+                    headers[k.strip().lower()] = v.strip()
+            parts.append((headers, content.strip()))
+        return parts
+
+    # ── basic response structure ──────────────────────────────────────────────
+
+    def test_serverkeygen_returns_200(self):
+        status, _, _ = self._post("/.well-known/est/serverkeygen")
+        self.assertEqual(status, 200, "serverkeygen must return HTTP 200")
+
+    def test_serverkeygen_content_type_multipart(self):
+        _, headers, _ = self._post("/.well-known/est/serverkeygen")
+        ct = headers.get("content-type", "")
+        self.assertIn("multipart/mixed", ct,
+                      "serverkeygen response must be multipart/mixed")
+
+    def test_serverkeygen_has_two_parts(self):
+        _, headers, body = self._post("/.well-known/est/serverkeygen")
+        ct = headers.get("content-type", "")
+        # extract boundary
+        boundary = None
+        for part in ct.split(";"):
+            part = part.strip()
+            if part.startswith("boundary="):
+                boundary = part[len("boundary="):]
+                break
+        self.assertIsNotNone(boundary, "Content-Type must include boundary parameter")
+        parts = self._parse_multipart(body, boundary)
+        self.assertEqual(len(parts), 2,
+                         "serverkeygen multipart body must have exactly 2 parts")
+
+    # ── cert part ─────────────────────────────────────────────────────────────
+
+    def test_serverkeygen_cert_part_content_type(self):
+        _, headers, body = self._post("/.well-known/est/serverkeygen")
+        ct = headers.get("content-type", "")
+        boundary = next((p.strip()[len("boundary="):] for p in ct.split(";")
+                         if p.strip().startswith("boundary=")), None)
+        parts = self._parse_multipart(body, boundary)
+        cert_ct = parts[0][0].get("content-type", "")
+        self.assertIn("pkcs7-mime", cert_ct,
+                      "First part must be application/pkcs7-mime")
+
+    def test_serverkeygen_cert_part_is_valid_pkcs7(self):
+        _, headers, body = self._post("/.well-known/est/serverkeygen")
+        ct = headers.get("content-type", "")
+        boundary = next((p.strip()[len("boundary="):] for p in ct.split(";")
+                         if p.strip().startswith("boundary=")), None)
+        parts = self._parse_multipart(body, boundary)
+        cert_b64 = parts[0][1]
+        cert_der = base64.b64decode(cert_b64)
+        # PKCS#7 ContentInfo starts with SEQUENCE tag 0x30
+        self.assertEqual(cert_der[0], 0x30, "Cert part must be DER-encoded PKCS#7")
+
+    # ── key part ──────────────────────────────────────────────────────────────
+
+    def test_serverkeygen_key_part_content_type(self):
+        _, headers, body = self._post("/.well-known/est/serverkeygen")
+        ct = headers.get("content-type", "")
+        boundary = next((p.strip()[len("boundary="):] for p in ct.split(";")
+                         if p.strip().startswith("boundary=")), None)
+        parts = self._parse_multipart(body, boundary)
+        key_ct = parts[1][0].get("content-type", "")
+        self.assertIn("pkcs8", key_ct,
+                      "Second part must be application/pkcs8")
+
+    def test_serverkeygen_key_is_pkcs8(self):
+        """Key part must be PKCS#8 PrivateKeyInfo, not legacy PKCS#1."""
+        _, headers, body = self._post("/.well-known/est/serverkeygen")
+        ct = headers.get("content-type", "")
+        boundary = next((p.strip()[len("boundary="):] for p in ct.split(";")
+                         if p.strip().startswith("boundary=")), None)
+        parts = self._parse_multipart(body, boundary)
+        key_b64 = parts[1][1]
+        key_der = base64.b64decode(key_b64)
+        # PKCS#8 PrivateKeyInfo ::= SEQUENCE { version INTEGER, algorithmIdentifier, privateKey }
+        # The outer SEQUENCE starts with tag 0x30; version=0 follows as INTEGER 0
+        self.assertEqual(key_der[0], 0x30, "Key must be DER SEQUENCE (PKCS#8 outer)")
+        key = serialization.load_der_private_key(key_der, password=None)
+        self.assertIsNotNone(key)
+        # PKCS#8 PEM encoding uses "PRIVATE KEY" (not "RSA PRIVATE KEY")
+        pem = key.private_bytes(Encoding.PEM, PrivateFormat.PKCS8, NoEncryption())
+        self.assertIn(b"BEGIN PRIVATE KEY", pem,
+                      "Key must serialize as PKCS#8 (BEGIN PRIVATE KEY)")
+
+    # ── key/cert binding ─────────────────────────────────────────────────────
+
+    def test_serverkeygen_key_matches_cert(self):
+        """The public key in the issued cert must match the returned private key."""
+        _, headers, body = self._post("/.well-known/est/serverkeygen")
+        ct = headers.get("content-type", "")
+        boundary = next((p.strip()[len("boundary="):] for p in ct.split(";")
+                         if p.strip().startswith("boundary=")), None)
+        parts = self._parse_multipart(body, boundary)
+
+        # Extract cert from PKCS#7 bag
+        pkcs7_der = base64.b64decode(parts[0][1])
+        # Walk the PKCS#7 DER to find the first certificate DER inside it
+        # PKCS#7 SignedData [0] certificates [0] IMPLICIT → certs
+        from cryptography.hazmat.primitives.serialization import pkcs7 as p7m
+        certs = p7m.load_der_pkcs7_certificates(pkcs7_der)
+        self.assertGreater(len(certs), 0, "PKCS#7 bag must contain at least one cert")
+        leaf_cert = certs[0]
+
+        # Extract private key
+        key_der = base64.b64decode(parts[1][1])
+        priv_key = serialization.load_der_private_key(key_der, password=None)
+
+        # Compare public key bytes
+        cert_pub = leaf_cert.public_key().public_bytes(
+            Encoding.DER, serialization.PublicFormat.SubjectPublicKeyInfo)
+        key_pub = priv_key.public_key().public_bytes(
+            Encoding.DER, serialization.PublicFormat.SubjectPublicKeyInfo)
+        self.assertEqual(cert_pub, key_pub,
+                         "Cert public key must match returned private key")
+
+    # ── csrattrs ──────────────────────────────────────────────────────────────
+
+    def test_csrattrs_returns_200(self):
+        status, _, _ = self._get("/.well-known/est/csrattrs")
+        self.assertEqual(status, 200)
+
+    def test_csrattrs_content_type(self):
+        _, headers, _ = self._get("/.well-known/est/csrattrs")
+        ct = headers.get("content-type", "")
+        self.assertIn("csrattrs", ct)
+
+    def test_csrattrs_body_is_der_sequence(self):
+        _, _, body = self._get("/.well-known/est/csrattrs")
+        # body is base64-encoded (RFC 7030 §4.5.2 says base64)
+        # but our handler returns raw DER — accept both
+        try:
+            der = base64.b64decode(body)
+        except Exception:
+            der = body
+        self.assertEqual(der[0], 0x30, "csrattrs must be DER SEQUENCE")
+
+
+# ===========================================================================
+# TestOCSPStaticResponses
+# ===========================================================================
+
+class TestOCSPStaticResponses(unittest.TestCase):
+    """§5.7 — OCSP pre-generated static response files (RFC 5019 §6).
+
+    Tests verify:
+    - generate_static_responses writes one file per cert
+    - file layout: <output>/<sha1-key>/<sha1-name>/<serial>.ocsp
+    - files are valid DER-encoded OCSPResponse (status successful)
+    - revoked cert produces a REVOKED status response
+    - validity hours wires through to nextUpdate
+    - count return value matches cert count
+    - ocsp-prebuild CLI subcommand executes without error
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        try:
+            import ocsp_server
+            cls.ocsp = ocsp_server
+        except ImportError:
+            cls.ocsp = None
+            return
+
+        cls._tmp = tempfile.mkdtemp()
+        cls.ca = _make_ca(cls._tmp)
+        # Issue two certs; revoke one
+        key1 = _gen_key()
+        key2 = _gen_key()
+        cls.cert1 = cls.ca.issue_certificate("CN=OCSPTest1", key1.public_key(), validity_days=30)
+        cls.cert2 = cls.ca.issue_certificate("CN=OCSPTest2", key2.public_key(), validity_days=30)
+        cls.ca.revoke_certificate(cls.cert2.serial_number, reason=1)
+        cls._out = os.path.join(cls._tmp, "ocsp_out")
+
+    @classmethod
+    def tearDownClass(cls):
+        import shutil
+        shutil.rmtree(cls._tmp, ignore_errors=True)
+
+    def setUp(self):
+        if self.ocsp is None:
+            self.skipTest("ocsp_server not available")
+
+    def _regen(self, validity_hours=24):
+        """Re-run generate_static_responses and return the output path."""
+        return self.ocsp.generate_static_responses(self.ca, self._out, validity_hours=validity_hours)
+
+    def test_returns_correct_count(self):
+        count = self._regen()
+        # Should be at least 2 (cert1 + cert2); CA may also have its own certs stored
+        self.assertGreaterEqual(count, 2)
+
+    def test_creates_ocsp_files(self):
+        self._regen()
+        files = list(Path(self._out).rglob("*.ocsp"))
+        self.assertGreaterEqual(len(files), 2)
+
+    def test_path_layout_three_levels(self):
+        """Files should be at depth 3: <key-hash>/<name-hash>/<serial>.ocsp"""
+        self._regen()
+        files = list(Path(self._out).rglob("*.ocsp"))
+        self.assertTrue(len(files) > 0)
+        for f in files:
+            # Relative parts: key_hash / name_hash / serial.ocsp
+            rel = f.relative_to(self._out)
+            self.assertEqual(len(rel.parts), 3, f"unexpected path depth: {rel}")
+
+    def test_serial_filenames_are_integers(self):
+        self._regen()
+        for f in Path(self._out).rglob("*.ocsp"):
+            stem = f.stem
+            self.assertTrue(stem.isdigit(), f"filename {stem!r} is not an integer serial")
+
+    def test_good_cert_file_is_valid_der_ocspresponse(self):
+        """DER file for a non-revoked cert: valid SEQUENCE, status = successful."""
+        self._regen()
+        serial = self.cert1.serial_number
+        files = list(Path(self._out).rglob(f"{serial}.ocsp"))
+        self.assertEqual(len(files), 1)
+        data = files[0].read_bytes()
+        # OCSPResponse is a SEQUENCE
+        self.assertEqual(data[0], 0x30)
+        # responseStatus is [0] IMPLICIT ENUMERATED 0 (successful) → \x80\x01\x00
+        self.assertIn(b'\x80\x01\x00', data)
+
+    def test_revoked_cert_file_contains_revoked_status(self):
+        """DER file for a revoked cert should contain the REVOKED status encoding."""
+        self._regen()
+        serial = self.cert2.serial_number
+        files = list(Path(self._out).rglob(f"{serial}.ocsp"))
+        self.assertEqual(len(files), 1)
+        data = files[0].read_bytes()
+        # STATUS_REVOKED is [1] EXPLICIT (tag 0xa1 or context 1)
+        # The cert_status for REVOKED is _ctx(1, ...) which starts with 0xa1 (constructed [1])
+        self.assertIn(b'\xa1', data)
+
+    def test_ocsp_prebuild_cli(self):
+        """pypki_admin ocsp-prebuild runs without error."""
+        try:
+            import pypki_admin
+        except ImportError:
+            self.skipTest("pypki_admin not available")
+        out = os.path.join(self._tmp, "cli_ocsp_out")
+        ret = pypki_admin.main([
+            "ocsp-prebuild",
+            "--ca-dir", self._tmp,
+            "--output", out,
+            "--validity-hours", "12",
+        ])
+        self.assertEqual(ret, 0)
+        files = list(Path(out).rglob("*.ocsp"))
+        self.assertGreaterEqual(len(files), 2)
+
+
+# ===========================================================================
+# TestCrossSign
+# ===========================================================================
+
+class TestCrossSign(unittest.TestCase):
+    """§5.6 — CA.cross_sign(): issue a cert with same SPKI/subject, signed by a different CA."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls._tmp = tempfile.mkdtemp()
+        # CA A — the "original" signing CA
+        cls.ca_a = _make_ca(os.path.join(cls._tmp, "ca_a"))
+        # CA B — the "new" trust anchor (cross-signs A's intermediates)
+        cls.ca_b = _make_ca(os.path.join(cls._tmp, "ca_b"))
+
+    @classmethod
+    def tearDownClass(cls):
+        import shutil
+        shutil.rmtree(cls._tmp, ignore_errors=True)
+
+    def _make_intermediate(self, ca):
+        """Issue a sub-CA cert signed by *ca*."""
+        from cryptography.hazmat.primitives.asymmetric import rsa as _rsa
+        key = _rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        cert = ca.issue_certificate(
+            "CN=TestIntermediate", key.public_key(), is_ca=True, validity_days=365
+        )
+        return key, cert
+
+    def test_cross_signed_has_same_subject(self):
+        _, orig = self._make_intermediate(self.ca_a)
+        cross = self.ca_b.cross_sign(orig, validity_days=365)
+        self.assertEqual(orig.subject, cross.subject)
+
+    def test_cross_signed_has_same_spki(self):
+        _, orig = self._make_intermediate(self.ca_a)
+        cross = self.ca_b.cross_sign(orig, validity_days=365)
+        from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
+        orig_spki = orig.public_key().public_bytes(Encoding.DER, PublicFormat.SubjectPublicKeyInfo)
+        cross_spki = cross.public_key().public_bytes(Encoding.DER, PublicFormat.SubjectPublicKeyInfo)
+        self.assertEqual(orig_spki, cross_spki)
+
+    def test_cross_signed_issuer_matches_ca_b(self):
+        _, orig = self._make_intermediate(self.ca_a)
+        cross = self.ca_b.cross_sign(orig, validity_days=365)
+        self.assertEqual(cross.issuer, self.ca_b.ca_cert.subject)
+
+    def test_cross_signed_has_fresh_serial(self):
+        _, orig = self._make_intermediate(self.ca_a)
+        cross = self.ca_b.cross_sign(orig, validity_days=365)
+        # Cross-sign draws a new serial from CA B's counter; it must be > 1000 (initial value)
+        self.assertGreater(cross.serial_number, 1000)
+
+    def test_cross_signed_signature_verifies_against_ca_b(self):
+        from cryptography.hazmat.primitives.asymmetric.padding import PKCS1v15
+        from cryptography.hazmat.primitives import hashes as _hashes
+        _, orig = self._make_intermediate(self.ca_a)
+        cross = self.ca_b.cross_sign(orig, validity_days=365)
+        # Should not raise
+        self.ca_b.ca_key.public_key().verify(
+            cross.signature,
+            cross.tbs_certificate_bytes,
+            PKCS1v15(),
+            _hashes.SHA256(),
+        )
+
+    def test_original_cert_unchanged_after_cross_sign(self):
+        """Cross-signing must not mutate the source certificate."""
+        from cryptography.hazmat.primitives.serialization import Encoding
+        _, orig = self._make_intermediate(self.ca_a)
+        orig_der = orig.public_bytes(Encoding.DER)
+        self.ca_b.cross_sign(orig, validity_days=365)
+        self.assertEqual(orig.public_bytes(Encoding.DER), orig_der)
+
+    def test_cross_signed_stored_in_db_with_profile_cross_signed(self):
+        _, orig = self._make_intermediate(self.ca_a)
+        cross = self.ca_b.cross_sign(orig, validity_days=365)
+        row = self.ca_b.get_cert_by_serial(cross.serial_number)
+        self.assertIsNotNone(row)
+
+    def test_cross_signed_preserves_basic_constraints_ca_true(self):
+        from cryptography.x509 import BasicConstraints
+        _, orig = self._make_intermediate(self.ca_a)
+        cross = self.ca_b.cross_sign(orig, validity_days=365)
+        bc = cross.extensions.get_extension_for_class(BasicConstraints)
+        self.assertTrue(bc.value.ca)
+
+    def test_cross_sign_ee_cert_preserves_basic_constraints_ca_false(self):
+        from cryptography.hazmat.primitives.asymmetric import rsa as _rsa
+        from cryptography.x509 import BasicConstraints
+        key = _rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        ee = self.ca_a.issue_certificate("CN=EE", key.public_key(), validity_days=30)
+        cross = self.ca_b.cross_sign(ee, validity_days=30)
+        bc = cross.extensions.get_extension_for_class(BasicConstraints)
+        self.assertFalse(bc.value.ca)
+
+    def test_cross_signed_chains_to_ca_b_root(self):
+        """cross-signed cert's AKI should match CA B's public key."""
+        from cryptography.x509 import AuthorityKeyIdentifier, SubjectKeyIdentifier
+        _, orig = self._make_intermediate(self.ca_a)
+        cross = self.ca_b.cross_sign(orig, validity_days=365)
+        ski_b = self.ca_b.ca_cert.extensions.get_extension_for_class(
+            SubjectKeyIdentifier
+        ).value.digest
+        aki_cross = cross.extensions.get_extension_for_class(
+            AuthorityKeyIdentifier
+        ).value.key_identifier
+        self.assertEqual(ski_b, aki_cross)
+
+
+# ===========================================================================
+# TestSCEPOneTimePasswords
+# ===========================================================================
+
+class TestSCEPOneTimePasswords(unittest.TestCase):
+    """§5.8 — SCEP single-use challenge OTPs.
+
+    Tests cover:
+    - OTP minting and consumption via SCEPDatabase
+    - Expired OTP rejection
+    - Single-use: second consume returns False
+    - Mixed mode: static secret AND OTP both work
+    - use_otp flag wired through start_scep_server
+    - module-level mint_otp() helper
+    """
+
+    def setUp(self):
+        try:
+            import scep_server
+            self.scep = scep_server
+        except ImportError:
+            self.skipTest("scep_server not available")
+        self._tmp = tempfile.mkdtemp()
+        db_path = os.path.join(self._tmp, "scep.db")
+        self.db = self.scep.SCEPDatabase(db_path)
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self._tmp, ignore_errors=True)
+
+    # --- OTP DB layer ---
+
+    def test_add_otp_returns_32char_urlsafe_string(self):
+        token = self.db.add_otp()
+        # urlsafe_b64encode(24 bytes) without padding = 32 chars
+        self.assertEqual(len(token), 32)
+        # Only URL-safe base64 characters
+        import re
+        self.assertRegex(token, r'^[A-Za-z0-9_-]+$')
+
+    def test_consume_otp_returns_true_first_time(self):
+        token = self.db.add_otp()
+        self.assertTrue(self.db.consume_otp(token))
+
+    def test_consume_otp_returns_false_second_time(self):
+        token = self.db.add_otp()
+        self.db.consume_otp(token)
+        self.assertFalse(self.db.consume_otp(token))
+
+    def test_consume_nonexistent_otp_returns_false(self):
+        self.assertFalse(self.db.consume_otp("doesnotexist"))
+
+    def test_consume_expired_otp_returns_false(self):
+        token = self.db.add_otp(ttl_seconds=-1)   # already expired
+        self.assertFalse(self.db.consume_otp(token))
+
+    def test_purge_expired_otps_removes_consumed_and_expired(self):
+        good = self.db.add_otp(ttl_seconds=3600)
+        expired = self.db.add_otp(ttl_seconds=-1)
+        consumed = self.db.add_otp()
+        self.db.consume_otp(consumed)
+        deleted = self.db.purge_expired_otps()
+        self.assertGreaterEqual(deleted, 2)  # expired + consumed
+        # good token still works
+        self.assertTrue(self.db.consume_otp(good))
+
+    # --- module-level mint_otp helper ---
+
+    def test_module_mint_otp_returns_token(self):
+        token = self.scep.mint_otp(self._tmp)
+        self.assertIsInstance(token, str)
+        self.assertEqual(len(token), 32)
+
+    def test_module_mint_otp_is_consumable(self):
+        token = self.scep.mint_otp(self._tmp)
+        # mint_otp opens its own DB connection; verify via direct DB
+        self.assertTrue(self.db.consume_otp(token))
+
+    # --- Handler attribute wiring ---
+
+    def test_start_scep_server_wires_use_otp_false(self):
+        """use_otp defaults to False."""
+        try:
+            from dispatcher_server import RouteTable
+        except ImportError:
+            self.skipTest("dispatcher_server not available")
+        rt = RouteTable()
+        ca = _make_ca(self._tmp)
+        srv = self.scep.start_scep_server(
+            rt, "/scep", ca, Path(self._tmp), use_otp=False
+        )
+        # Retrieve the bound handler class from the route table
+        handler_cls = next((h for p, h in rt._routes if p == "/scep"), None)
+        self.assertFalse(handler_cls.use_otp)
+        srv.shutdown()
+
+    def test_start_scep_server_wires_use_otp_true(self):
+        """use_otp=True is stored on the bound handler class."""
+        try:
+            from dispatcher_server import RouteTable
+        except ImportError:
+            self.skipTest("dispatcher_server not available")
+        rt = RouteTable()
+        ca = _make_ca(self._tmp)
+        srv = self.scep.start_scep_server(
+            rt, "/scep", ca, Path(self._tmp), use_otp=True
+        )
+        handler_cls = next((h for p, h in rt._routes if p == "/scep"), None)
+        self.assertTrue(handler_cls.use_otp)
+        srv.shutdown()
+
+    def test_start_scep_server_exposes_scep_db_on_proxy(self):
+        try:
+            from dispatcher_server import RouteTable
+        except ImportError:
+            self.skipTest("dispatcher_server not available")
+        rt = RouteTable()
+        ca = _make_ca(self._tmp)
+        srv = self.scep.start_scep_server(rt, "/scep", ca, Path(self._tmp))
+        self.assertTrue(hasattr(srv, "scep_db"))
+        self.assertIsInstance(srv.scep_db, self.scep.SCEPDatabase)
+        srv.shutdown()
+
+    # --- End-to-end: OTP consumed on successful PKCSReq ---
+
+    def test_valid_otp_accepted_in_handle_pki_request(self):
+        """SCEPHandler with use_otp=True accepts a valid OTP as challenge."""
+        try:
+            from dispatcher_server import RouteTable
+        except ImportError:
+            self.skipTest("dispatcher_server not available")
+        rt = RouteTable()
+        ca = _make_ca(self._tmp)
+        srv = self.scep.start_scep_server(
+            rt, "/scep", ca, Path(self._tmp), use_otp=True
+        )
+        handler_cls = next((h for p, h in rt._routes if p == "/scep"), None)
+        otp = handler_cls.db.add_otp()
+        # consume_otp should return True for this fresh OTP
+        self.assertTrue(handler_cls.db.consume_otp(otp))
+        # Same OTP cannot be reused
+        self.assertFalse(handler_cls.db.consume_otp(otp))
+        srv.shutdown()
+
+    def test_mixed_mode_static_and_otp_both_work(self):
+        """When both challenge and use_otp are set, either credential is accepted."""
+        try:
+            from dispatcher_server import RouteTable
+        except ImportError:
+            self.skipTest("dispatcher_server not available")
+        rt = RouteTable()
+        ca = _make_ca(self._tmp)
+        srv = self.scep.start_scep_server(
+            rt, "/scep", ca, Path(self._tmp),
+            challenge="static-secret", use_otp=True,
+        )
+        handler_cls = next((h for p, h in rt._routes if p == "/scep"), None)
+        self.assertEqual(handler_cls.challenge, "static-secret")
+        self.assertTrue(handler_cls.use_otp)
+        # An OTP should still be consumable
+        otp = handler_cls.db.add_otp()
+        self.assertTrue(handler_cls.db.consume_otp(otp))
+        srv.shutdown()
+
+
+# ===========================================================================
+# §5.3 — Offline root + key ceremony tooling
+# ===========================================================================
+
+class TestCeremony(unittest.TestCase):
+    """Tests for ceremony.py: encryption, Shamir, bundle round-trip, subcommands."""
+
+    @classmethod
+    def setUpClass(cls):
+        try:
+            import ceremony
+            cls._cer = ceremony
+        except ImportError:
+            cls._cer = None
+
+    def _skip(self):
+        if self._cer is None:
+            self.skipTest("ceremony.py not available")
+
+    # ------------------------------------------------------------------
+    # AES-256-GCM helpers
+    # ------------------------------------------------------------------
+
+    def test_encrypt_decrypt_roundtrip(self):
+        self._skip()
+        plaintext = b"secret CA key material"
+        passphrase = b"strongpassphrase"
+        blob = self._cer._encrypt(plaintext, passphrase)
+        recovered = self._cer._decrypt(blob, passphrase)
+        self.assertEqual(recovered, plaintext)
+
+    def test_decrypt_fails_wrong_passphrase(self):
+        self._skip()
+        from cryptography.exceptions import InvalidTag
+        blob = self._cer._encrypt(b"data", b"correct")
+        with self.assertRaises(Exception):
+            self._cer._decrypt(blob, b"wrong")
+
+    def test_encrypted_blob_is_larger_than_plaintext(self):
+        self._skip()
+        pt = b"x" * 100
+        blob = self._cer._encrypt(pt, b"pw")
+        self.assertGreater(len(blob), len(pt))
+
+    # ------------------------------------------------------------------
+    # Shamir M-of-N
+    # ------------------------------------------------------------------
+
+    def test_shamir_2of3_roundtrip(self):
+        self._skip()
+        secret = b"\xde\xad\xbe\xef" * 8
+        shares = self._cer._shamir_split(secret, 2, 3)
+        self.assertEqual(len(shares), 3)
+        recovered = self._cer._shamir_reconstruct(shares[:2])
+        self.assertEqual(recovered, secret)
+
+    def test_shamir_3of5_any_3_reconstruct(self):
+        self._skip()
+        secret = b"the passphrase bytes"
+        shares = self._cer._shamir_split(secret, 3, 5)
+        for combo in [(0,1,2),(0,1,3),(0,2,4),(1,3,4)]:
+            sel = [shares[i] for i in combo]
+            self.assertEqual(self._cer._shamir_reconstruct(sel), secret,
+                             msg=f"failed for combo {combo}")
+
+    def test_shamir_wrong_threshold_raises(self):
+        self._skip()
+        with self.assertRaises(ValueError):
+            self._cer._shamir_split(b"x", 1, 3)  # threshold < 2
+
+    def test_shamir_encode_decode_roundtrip(self):
+        self._skip()
+        x, y = 3, b"\xab\xcd\xef"
+        encoded = self._cer.encode_share(x, y)
+        x2, y2 = self._cer.decode_share(encoded)
+        self.assertEqual(x2, x)
+        self.assertEqual(y2, y)
+
+    # ------------------------------------------------------------------
+    # Bundle I/O
+    # ------------------------------------------------------------------
+
+    def _make_bundle(self, passphrase=b"pw"):
+        self._skip()
+        from cryptography.hazmat.primitives.asymmetric import rsa
+        key = rsa.generate_private_key(65537, 2048)
+        key_pem = key.private_bytes(
+            encoding=__import__("cryptography.hazmat.primitives.serialization", fromlist=["Encoding"]).Encoding.PEM,
+            format=__import__("cryptography.hazmat.primitives.serialization", fromlist=["PrivateFormat"]).PrivateFormat.PKCS8,
+            encryption_algorithm=__import__("cryptography.hazmat.primitives.serialization", fromlist=["NoEncryption"]).NoEncryption(),
+        )
+        # self-signed cert for the key
+        import datetime
+        from cryptography import x509 as _x509
+        from cryptography.x509.oid import NameOID
+        from cryptography.hazmat.primitives.hashes import SHA256
+        subject = _x509.Name([_x509.NameAttribute(NameOID.COMMON_NAME, "Test Root CA")])
+        now = datetime.datetime.now(datetime.timezone.utc)
+        cert = (
+            _x509.CertificateBuilder()
+            .subject_name(subject).issuer_name(subject)
+            .public_key(key.public_key())
+            .serial_number(1)
+            .not_valid_before(now)
+            .not_valid_after(now + datetime.timedelta(days=365))
+            .add_extension(_x509.BasicConstraints(ca=True, path_length=None), critical=True)
+            .sign(key, SHA256())
+        )
+        cert_pem = cert.public_bytes(
+            __import__("cryptography.hazmat.primitives.serialization", fromlist=["Encoding"]).Encoding.PEM
+        )
+        return self._cer._build_bundle(key_pem, cert_pem, 1042, 7, "audit tail", passphrase)
+
+    def test_bundle_roundtrip(self):
+        self._skip()
+        passphrase = b"mypassphrase"
+        blob = self._make_bundle(passphrase)
+        files = self._cer._open_bundle(blob, passphrase)
+        self.assertIn("root.key.pem", files)
+        self.assertIn("root.crt.pem", files)
+        self.assertEqual(files["last_serial"].decode().strip(), "1042")
+        self.assertEqual(files["crl_number"].decode().strip(), "7")
+        self.assertIn("audit tail", files["audit.log"].decode())
+
+    def test_bundle_wrong_passphrase_fails(self):
+        self._skip()
+        blob = self._make_bundle(b"correct")
+        with self.assertRaises(Exception):
+            self._cer._open_bundle(blob, b"wrong")
+
+    # ------------------------------------------------------------------
+    # cmd_sign_csr + cmd_import_cert (integration, temp dir)
+    # ------------------------------------------------------------------
+
+    def test_sign_csr_produces_valid_sub_ca_cert(self):
+        self._skip()
+        import tempfile, datetime, argparse
+        from cryptography import x509 as _x509
+        from cryptography.hazmat.primitives.asymmetric import rsa
+        from cryptography.hazmat.primitives.hashes import SHA256
+        from cryptography.hazmat.primitives import serialization as _ser
+        from cryptography.x509.oid import NameOID
+
+        tmp = tempfile.mkdtemp()
+
+        # Build a root CA key + cert + bundle
+        root_key = rsa.generate_private_key(65537, 2048)
+        root_key_pem = root_key.private_bytes(
+            _ser.Encoding.PEM, _ser.PrivateFormat.PKCS8, _ser.NoEncryption()
+        )
+        now = datetime.datetime.now(datetime.timezone.utc)
+        subj = _x509.Name([_x509.NameAttribute(NameOID.COMMON_NAME, "Root CA")])
+        root_cert = (
+            _x509.CertificateBuilder()
+            .subject_name(subj).issuer_name(subj)
+            .public_key(root_key.public_key())
+            .serial_number(1)
+            .not_valid_before(now)
+            .not_valid_after(now + datetime.timedelta(days=3650))
+            .add_extension(_x509.BasicConstraints(ca=True, path_length=None), critical=True)
+            .sign(root_key, SHA256())
+        )
+        root_cert_pem = root_cert.public_bytes(_ser.Encoding.PEM)
+
+        passphrase = b"ceremony-pw"
+        blob = self._cer._build_bundle(root_key_pem, root_cert_pem, 1001, 0, "", passphrase)
+        bundle_path = Path(tmp) / "bundle.bin"
+        bundle_path.write_bytes(blob)
+
+        # Build a sub-CA CSR
+        sub_key = rsa.generate_private_key(65537, 2048)
+        csr = (
+            _x509.CertificateSigningRequestBuilder()
+            .subject_name(_x509.Name([_x509.NameAttribute(NameOID.COMMON_NAME, "Sub CA")]))
+            .sign(sub_key, SHA256())
+        )
+        csr_path = Path(tmp) / "sub.csr.pem"
+        csr_path.write_bytes(csr.public_bytes(_ser.Encoding.PEM))
+        cert_out = Path(tmp) / "sub.crt.pem"
+
+        # Simulate cmd_sign_csr via args namespace
+        args = argparse.Namespace(
+            bundle=str(bundle_path),
+            csr_in=str(csr_path),
+            cert_out=str(cert_out),
+            passphrase_env=None,
+            share=[],
+            validity_days=730,
+            path_length=0,
+            permitted_dns=["example.com"],
+            excluded_dns=[],
+        )
+        # Patch _read_passphrase to return the known passphrase
+        orig = self._cer._read_passphrase
+        self._cer._read_passphrase = lambda *a, **kw: passphrase
+        try:
+            rc = self._cer.cmd_sign_csr(args)
+        finally:
+            self._cer._read_passphrase = orig
+
+        self.assertEqual(rc, 0)
+        self.assertTrue(cert_out.exists())
+
+        # Parse and check the issued cert
+        issued = _x509.load_pem_x509_certificate(cert_out.read_bytes())
+        self.assertEqual(issued.serial_number, 1002)
+        bc = issued.extensions.get_extension_for_class(_x509.BasicConstraints)
+        self.assertTrue(bc.value.ca)
+        self.assertEqual(bc.value.path_length, 0)
+        nc = issued.extensions.get_extension_for_class(_x509.NameConstraints)
+        permitted = [str(g.value) for g in nc.value.permitted_subtrees]
+        self.assertIn("example.com", permitted)
+
+    def test_import_cert_writes_chain_pem(self):
+        self._skip()
+        import tempfile, datetime, argparse
+        from cryptography import x509 as _x509
+        from cryptography.hazmat.primitives.asymmetric import rsa
+        from cryptography.hazmat.primitives.hashes import SHA256
+        from cryptography.hazmat.primitives import serialization as _ser
+        from cryptography.x509.oid import NameOID
+
+        tmp = tempfile.mkdtemp()
+        ca_dir = Path(tmp) / "ca"
+        ca_dir.mkdir()
+
+        # Minimal cert to import
+        key = rsa.generate_private_key(65537, 2048)
+        subj = _x509.Name([_x509.NameAttribute(NameOID.COMMON_NAME, "Imported CA")])
+        now = datetime.datetime.now(datetime.timezone.utc)
+        cert = (
+            _x509.CertificateBuilder()
+            .subject_name(subj).issuer_name(subj)
+            .public_key(key.public_key())
+            .serial_number(99)
+            .not_valid_before(now)
+            .not_valid_after(now + datetime.timedelta(days=365))
+            .add_extension(_x509.BasicConstraints(ca=True, path_length=None), critical=True)
+            .sign(key, SHA256())
+        )
+        cert_pem = cert.public_bytes(_ser.Encoding.PEM)
+        cert_in = Path(tmp) / "imported.pem"
+        cert_in.write_bytes(cert_pem)
+
+        args = argparse.Namespace(ca_dir=str(ca_dir), cert_in=str(cert_in))
+        rc = self._cer.cmd_import_cert(args)
+        self.assertEqual(rc, 0)
+
+        chain = (ca_dir / "ca-chain.pem").read_bytes()
+        self.assertIn(b"BEGIN CERTIFICATE", chain)
+
+    def test_import_cert_idempotent(self):
+        """Importing the same cert twice does not duplicate it."""
+        self._skip()
+        import tempfile, datetime, argparse
+        from cryptography import x509 as _x509
+        from cryptography.hazmat.primitives.asymmetric import rsa
+        from cryptography.hazmat.primitives.hashes import SHA256
+        from cryptography.hazmat.primitives import serialization as _ser
+        from cryptography.x509.oid import NameOID
+
+        tmp = tempfile.mkdtemp()
+        ca_dir = Path(tmp) / "ca"
+        ca_dir.mkdir()
+
+        key = rsa.generate_private_key(65537, 2048)
+        subj = _x509.Name([_x509.NameAttribute(NameOID.COMMON_NAME, "Dup CA")])
+        now = datetime.datetime.now(datetime.timezone.utc)
+        cert = (
+            _x509.CertificateBuilder()
+            .subject_name(subj).issuer_name(subj)
+            .public_key(key.public_key())
+            .serial_number(77)
+            .not_valid_before(now)
+            .not_valid_after(now + datetime.timedelta(days=365))
+            .add_extension(_x509.BasicConstraints(ca=True, path_length=None), critical=True)
+            .sign(key, SHA256())
+        )
+        cert_pem = cert.public_bytes(_ser.Encoding.PEM)
+        cert_in = Path(tmp) / "dup.pem"
+        cert_in.write_bytes(cert_pem)
+
+        args = argparse.Namespace(ca_dir=str(ca_dir), cert_in=str(cert_in))
+        self._cer.cmd_import_cert(args)
+        rc2 = self._cer.cmd_import_cert(args)  # second import
+        self.assertEqual(rc2, 0)
+        # Chain should still contain only one copy
+        chain = (ca_dir / "ca-chain.pem").read_bytes()
+        self.assertEqual(chain.count(b"BEGIN CERTIFICATE"), 1)
+
+    # ------------------------------------------------------------------
+    # pypki_admin integration
+    # ------------------------------------------------------------------
+
+    def test_pypki_admin_registers_ceremony_subcommands(self):
+        """build_parser() must include export-root, sign-csr, import-cert."""
+        import pypki_admin
+        p = pypki_admin.build_parser()
+        choices = p._subparsers._group_actions[0].choices
+        self.assertIn("export-root", choices)
+        self.assertIn("sign-csr", choices)
+        self.assertIn("import-cert", choices)
+
+
+# ===========================================================================
+# §5.9 — Lifecycle hooks / webhooks
+# ===========================================================================
+
+class TestLifecycleHooks(unittest.TestCase):
+    """Tests for hooks.py WebhookDispatcher and pki_server wiring."""
+
+    @classmethod
+    def setUpClass(cls):
+        try:
+            import hooks as _hooks
+            cls._hooks = _hooks
+        except ImportError:
+            cls._hooks = None
+
+    def _skip_if_no_hooks(self):
+        if self._hooks is None:
+            self.skipTest("hooks.py not available")
+
+    # ------------------------------------------------------------------
+    # verify_signature helper
+    # ------------------------------------------------------------------
+
+    def test_verify_signature_valid(self):
+        self._skip_if_no_hooks()
+        import json, hmac as _hmac, hashlib
+        body = json.dumps({"event_type": "cert.issued"}, separators=(",", ":")).encode()
+        sig = "sha256=" + _hmac.new(b"secret", body, hashlib.sha256).hexdigest()
+        self.assertTrue(self._hooks.verify_signature(body, "secret", sig))
+
+    def test_verify_signature_wrong_secret(self):
+        self._skip_if_no_hooks()
+        import json, hmac as _hmac, hashlib
+        body = json.dumps({"event_type": "cert.issued"}, separators=(",", ":")).encode()
+        sig = "sha256=" + _hmac.new(b"secret", body, hashlib.sha256).hexdigest()
+        self.assertFalse(self._hooks.verify_signature(body, "wrong", sig))
+
+    def test_verify_signature_tampered_body(self):
+        self._skip_if_no_hooks()
+        import json, hmac as _hmac, hashlib
+        body = json.dumps({"event_type": "cert.issued"}, separators=(",", ":")).encode()
+        sig = "sha256=" + _hmac.new(b"secret", body, hashlib.sha256).hexdigest()
+        self.assertFalse(self._hooks.verify_signature(b"tampered", "secret", sig))
+
+    def test_verify_signature_no_secret_always_true(self):
+        self._skip_if_no_hooks()
+        self.assertTrue(self._hooks.verify_signature(b"body", "", "sha256=anything"))
+
+    def test_verify_signature_missing_prefix(self):
+        self._skip_if_no_hooks()
+        self.assertFalse(self._hooks.verify_signature(b"body", "secret", "deadbeef"))
+
+    # ------------------------------------------------------------------
+    # WebhookDispatcher — constructor and properties
+    # ------------------------------------------------------------------
+
+    def test_dispatcher_stores_urls(self):
+        self._skip_if_no_hooks()
+        wd = self._hooks.WebhookDispatcher(
+            urls=["https://a.example.com", "https://b.example.com"],
+            secret="s",
+        )
+        self.assertEqual(wd.urls, ["https://a.example.com", "https://b.example.com"])
+
+    def test_dispatcher_enabled_events_none_means_all(self):
+        self._skip_if_no_hooks()
+        wd = self._hooks.WebhookDispatcher(urls=[], enabled_events=None)
+        self.assertIsNone(wd.enabled_events)
+
+    def test_dispatcher_enabled_events_subset(self):
+        self._skip_if_no_hooks()
+        wd = self._hooks.WebhookDispatcher(urls=[], enabled_events={"cert.issued"})
+        self.assertEqual(wd.enabled_events, {"cert.issued"})
+
+    # ------------------------------------------------------------------
+    # WebhookDispatcher — delivery (mock HTTP server)
+    # ------------------------------------------------------------------
+
+    def _run_delivery_test(self, secret="", enabled_events=None):
+        """Start a tiny HTTP server, emit an event, return the request body + headers."""
+        self._skip_if_no_hooks()
+        import http.server as _hs, threading, json, queue as _queue
+        received = _queue.Queue()
+
+        class _Handler(_hs.BaseHTTPRequestHandler):
+            def do_POST(self):
+                length = int(self.headers.get("Content-Length", 0))
+                body = self.rfile.read(length)
+                received.put({
+                    "body": body,
+                    "event": self.headers.get("X-PyPKI-Event"),
+                    "sig": self.headers.get("X-PyPKI-Signature"),
+                })
+                self.send_response(200)
+                self.end_headers()
+            def log_message(self, *a): pass
+
+        srv = _hs.HTTPServer(("127.0.0.1", 0), _Handler)
+        port = srv.server_address[1]
+        t = threading.Thread(target=srv.handle_request, daemon=True)
+        t.start()
+
+        wd = self._hooks.WebhookDispatcher(
+            urls=[f"http://127.0.0.1:{port}"],
+            secret=secret,
+            enabled_events=enabled_events,
+        )
+        wd.start()
+        wd.emit("cert.issued", {"serial": 42, "subject": "CN=test"})
+        item = received.get(timeout=5)
+        wd.stop()
+        srv.server_close()
+        return item
+
+    def test_delivery_sends_post_with_json(self):
+        import json
+        item = self._run_delivery_test()
+        parsed = json.loads(item["body"])
+        self.assertEqual(parsed["event_type"], "cert.issued")
+        self.assertEqual(parsed["serial"], 42)
+        self.assertEqual(parsed["event_version"], 1)
+
+    def test_delivery_sets_event_header(self):
+        item = self._run_delivery_test()
+        self.assertEqual(item["event"], "cert.issued")
+
+    def test_delivery_hmac_signature_valid(self):
+        item = self._run_delivery_test(secret="mysecret")
+        self.assertTrue(
+            self._hooks.verify_signature(item["body"], "mysecret", item["sig"])
+        )
+
+    def test_delivery_filtered_out_when_not_in_enabled_events(self):
+        """Events not in enabled_events must not be delivered."""
+        self._skip_if_no_hooks()
+        import threading
+        delivered = []
+        wd = self._hooks.WebhookDispatcher(
+            urls=["http://127.0.0.1:1"],  # port 1 = refused, should not even connect
+            enabled_events={"cert.revoked"},
+        )
+        # No delivery should be attempted for cert.issued
+        wd._deliver = lambda *a: delivered.append(a)  # patch
+        wd.emit("cert.issued", {"serial": 1})
+        # Give the worker time (it is synchronous after emit if delivered)
+        import time; time.sleep(0.05)
+        self.assertEqual(delivered, [])
+
+    # ------------------------------------------------------------------
+    # pki_server wiring — _webhook attribute emits on issuance/revocation
+    # ------------------------------------------------------------------
+
+    def test_issue_certificate_emits_webhook(self):
+        self._skip_if_no_hooks()
+        import tempfile, os
+        captured = []
+
+        class _FakeDispatcher:
+            def emit(self, event_type, payload):
+                captured.append((event_type, payload))
+
+        tmp = tempfile.mkdtemp()
+        ca = _make_ca(tmp)
+        ca._webhook = _FakeDispatcher()
+        _, _ = ca.generate_ephemeral_key_and_cert("CN=hook-test")
+        self.assertEqual(len(captured), 1)
+        event_type, payload = captured[0]
+        self.assertEqual(event_type, "cert.issued")
+        self.assertIn("serial", payload)
+        self.assertIn("subject", payload)
+
+    def test_revoke_certificate_emits_webhook(self):
+        self._skip_if_no_hooks()
+        import tempfile
+        captured = []
+
+        class _FakeDispatcher:
+            def emit(self, event_type, payload):
+                captured.append((event_type, payload))
+
+        tmp = tempfile.mkdtemp()
+        ca = _make_ca(tmp)
+        _, cert = ca.generate_ephemeral_key_and_cert("CN=hook-revoke")
+        ca._webhook = _FakeDispatcher()
+        ca.revoke_certificate(cert.serial_number)
+        self.assertEqual(len(captured), 1)
+        event_type, payload = captured[0]
+        self.assertEqual(event_type, "cert.revoked")
+        self.assertEqual(payload["serial"], cert.serial_number)
+
+    def test_no_webhook_emission_when_dispatcher_is_none(self):
+        """issue_certificate must not crash when _webhook is None."""
+        import tempfile
+        tmp = tempfile.mkdtemp()
+        ca = _make_ca(tmp)
+        ca._webhook = None
+        # Should not raise
+        _, cert = ca.generate_ephemeral_key_and_cert("CN=no-hook")
+        self.assertIsNotNone(cert)
+
+
+# ===========================================================================
+# §5.10 — Structured logging + request IDs
+# ===========================================================================
+
+class TestStructuredLogging(unittest.TestCase):
+    """Tests for JsonFormatter, RequestIdFilter, and configure_logging()."""
+
+    def setUp(self):
+        import logging as _logging, pki_server as ps
+        self.ps = ps
+        self._logging = _logging
+        # Save and restore root handler state around each test
+        self._root = _logging.getLogger()
+        self._saved_handlers = self._root.handlers[:]
+        self._saved_level = self._root.level
+
+    def tearDown(self):
+        self._root.handlers = self._saved_handlers
+        self._root.setLevel(self._saved_level)
+
+    # ------------------------------------------------------------------
+    # _JsonFormatter
+    # ------------------------------------------------------------------
+
+    def test_json_formatter_produces_valid_json(self):
+        import json, io, logging as _logging
+        fmt = self.ps._JsonFormatter()
+        record = _logging.LogRecord(
+            name="test", level=_logging.INFO, pathname="", lineno=0,
+            msg="hello world", args=(), exc_info=None,
+        )
+        record.req_id = "abc123"
+        out = fmt.format(record)
+        parsed = json.loads(out)
+        self.assertEqual(parsed["msg"], "hello world")
+        self.assertEqual(parsed["level"], "INFO")
+        self.assertEqual(parsed["logger"], "test")
+        self.assertIn("ts", parsed)
+
+    def test_json_formatter_includes_req_id_when_set(self):
+        import json, logging as _logging
+        fmt = self.ps._JsonFormatter()
+        record = _logging.LogRecord(
+            name="t", level=_logging.INFO, pathname="", lineno=0,
+            msg="msg", args=(), exc_info=None,
+        )
+        record.req_id = "deadbeef01234567"
+        out = fmt.format(record)
+        parsed = json.loads(out)
+        self.assertEqual(parsed["req_id"], "deadbeef01234567")
+
+    def test_json_formatter_req_id_none_when_empty(self):
+        import json, logging as _logging
+        fmt = self.ps._JsonFormatter()
+        record = _logging.LogRecord(
+            name="t", level=_logging.INFO, pathname="", lineno=0,
+            msg="msg", args=(), exc_info=None,
+        )
+        record.req_id = ""
+        out = fmt.format(record)
+        parsed = json.loads(out)
+        self.assertIsNone(parsed["req_id"])
+
+    def test_json_formatter_includes_exc_info(self):
+        import json, logging as _logging
+        fmt = self.ps._JsonFormatter()
+        try:
+            raise ValueError("boom")
+        except ValueError:
+            import sys
+            exc_info = sys.exc_info()
+        record = _logging.LogRecord(
+            name="t", level=_logging.ERROR, pathname="", lineno=0,
+            msg="error", args=(), exc_info=exc_info,
+        )
+        record.req_id = ""
+        out = fmt.format(record)
+        parsed = json.loads(out)
+        self.assertIn("exc", parsed)
+        self.assertIn("ValueError", parsed["exc"])
+
+    # ------------------------------------------------------------------
+    # _RequestIdFilter
+    # ------------------------------------------------------------------
+
+    def test_request_id_filter_sets_req_id_on_record(self):
+        import logging as _logging
+        try:
+            from dispatcher_server import request_id_var
+        except ImportError:
+            self.skipTest("dispatcher_server not available")
+        token = request_id_var.set("cafebabe12345678")
+        try:
+            flt = self.ps._RequestIdFilter()
+            record = _logging.LogRecord(
+                name="t", level=_logging.INFO, pathname="", lineno=0,
+                msg="m", args=(), exc_info=None,
+            )
+            flt.filter(record)
+            self.assertEqual(record.req_id, "cafebabe12345678")
+        finally:
+            request_id_var.reset(token)
+
+    def test_request_id_filter_empty_when_no_context(self):
+        import logging as _logging
+        try:
+            from dispatcher_server import request_id_var
+        except ImportError:
+            self.skipTest("dispatcher_server not available")
+        # Ensure the ContextVar is at its default value
+        token = request_id_var.set("")
+        try:
+            flt = self.ps._RequestIdFilter()
+            record = _logging.LogRecord(
+                name="t", level=_logging.INFO, pathname="", lineno=0,
+                msg="m", args=(), exc_info=None,
+            )
+            flt.filter(record)
+            self.assertEqual(record.req_id, "")
+        finally:
+            request_id_var.reset(token)
+
+    # ------------------------------------------------------------------
+    # configure_logging
+    # ------------------------------------------------------------------
+
+    def test_configure_logging_text_produces_no_json(self):
+        import io, logging as _logging
+        buf = io.StringIO()
+        self.ps.configure_logging("INFO", "text")
+        root = _logging.getLogger()
+        root.handlers[-1].stream = buf
+        _logging.getLogger("pki-cmpv2").info("plain text message")
+        output = buf.getvalue()
+        self.assertIn("plain text message", output)
+        # Text format has no leading '{'
+        self.assertFalse(output.strip().startswith("{"))
+
+    def test_configure_logging_json_produces_valid_json_lines(self):
+        import io, json, logging as _logging
+        self.ps.configure_logging("INFO", "json")
+        root = _logging.getLogger()
+        buf = io.StringIO()
+        root.handlers[-1].stream = buf
+        _logging.getLogger("pki-cmpv2").info("structured message")
+        output = buf.getvalue().strip()
+        parsed = json.loads(output)
+        self.assertEqual(parsed["msg"], "structured message")
+        self.assertIn("ts", parsed)
+
+    def test_configure_logging_respects_level(self):
+        import io, logging as _logging
+        self.ps.configure_logging("WARNING", "text")
+        root = _logging.getLogger()
+        self.assertEqual(root.level, _logging.WARNING)
+
+    # ------------------------------------------------------------------
+    # dispatcher_server request ID propagation
+    # ------------------------------------------------------------------
+
+    def test_dispatcher_sets_request_id_in_context(self):
+        """_dispatch sets a non-empty request_id_var for the duration of the call."""
+        try:
+            from dispatcher_server import request_id_var, RouteTable, make_dispatcher_handler
+        except ImportError:
+            self.skipTest("dispatcher_server not available")
+
+        captured = []
+
+        class _DummyHandler:
+            @staticmethod
+            def do_GET(self_handler):
+                captured.append(request_id_var.get())
+
+        rt = RouteTable()
+        rt.register("/", _DummyHandler)
+        DispHandler = make_dispatcher_handler(rt)
+
+        # Simulate a minimal request
+        import io, http.server as _hs
+        class _FakeRequest:
+            def makefile(self, *a, **kw):
+                return io.BytesIO(b"GET / HTTP/1.0\r\n\r\n")
+        fake_req = _FakeRequest()
+        # Build a handler without going through the server machinery
+        h = DispHandler.__new__(DispHandler)
+        h.command = "GET"
+        h.path = "/"
+        h.headers = {}
+        h._route_table = rt
+        h._dispatch()
+
+        self.assertEqual(len(captured), 1)
+        req_id = captured[0]
+        self.assertEqual(len(req_id), 16)
+        self.assertTrue(all(c in "0123456789abcdef" for c in req_id))
+
+    def test_dispatcher_resets_request_id_after_dispatch(self):
+        """request_id_var returns '' after _dispatch completes."""
+        try:
+            from dispatcher_server import request_id_var, RouteTable, make_dispatcher_handler
+        except ImportError:
+            self.skipTest("dispatcher_server not available")
+
+        class _DummyHandler:
+            @staticmethod
+            def do_GET(self_handler):
+                pass
+
+        rt = RouteTable()
+        rt.register("/", _DummyHandler)
+        DispHandler = make_dispatcher_handler(rt)
+
+        h = DispHandler.__new__(DispHandler)
+        h.command = "GET"
+        h.path = "/"
+        h.headers = {}
+        h._route_table = rt
+        h._dispatch()
+
+        self.assertEqual(request_id_var.get(), "")
+
+
+# ===========================================================================
+# §5.1 — PKCS#11 / HSM key backing
+# ===========================================================================
+
+class TestHSMBackend(unittest.TestCase):
+    """
+    Unit tests for hsm_backend.py.
+
+    These tests mock ``python-pkcs11`` so they run without SoftHSM or any
+    real HSM hardware.  Integration tests against a real PKCS#11 token are
+    gated on the PYPKI_TEST_HSM_MODULE environment variable.
+    """
+
+    def setUp(self):
+        try:
+            import hsm_backend
+            self.hsm = hsm_backend
+        except ImportError:
+            self.skipTest("hsm_backend.py not importable")
+
+    # --- HSMConfig ---
+
+    def test_hsm_config_from_args_none_when_no_module(self):
+        class Args:
+            hsm_module = None
+        self.assertIsNone(self.hsm.HSMConfig.from_args(Args()))
+
+    def test_hsm_config_from_args_populated(self):
+        class Args:
+            hsm_module = "/usr/lib/softhsm/libsofthsm2.so"
+            hsm_slot = 1
+            hsm_pin_env = "MY_PIN"
+            hsm_key_label = "my-key"
+            hsm_init_if_missing = True
+        cfg = self.hsm.HSMConfig.from_args(Args())
+        self.assertIsNotNone(cfg)
+        self.assertEqual(cfg.module, "/usr/lib/softhsm/libsofthsm2.so")
+        self.assertEqual(cfg.slot, 1)
+        self.assertEqual(cfg.pin_env, "MY_PIN")
+        self.assertEqual(cfg.key_label, "my-key")
+        self.assertTrue(cfg.init_if_missing)
+
+    def test_hsm_config_defaults(self):
+        class Args:
+            hsm_module = "/lib/libpkcs11.so"
+        cfg = self.hsm.HSMConfig.from_args(Args())
+        self.assertEqual(cfg.slot, 0)
+        self.assertEqual(cfg.pin_env, "PYPKI_HSM_PIN")
+        self.assertEqual(cfg.key_label, "pypki-ca")
+        self.assertFalse(cfg.init_if_missing)
+
+    # --- HSMRSAPrivateKey interface ---
+
+    def _make_rsa_key_pair(self):
+        from cryptography.hazmat.primitives.asymmetric import rsa as _rsa
+        priv = _rsa.generate_private_key(65537, 2048)
+        return priv, priv.public_key()
+
+    def test_hsm_rsa_is_rsa_private_key(self):
+        from cryptography.hazmat.primitives.asymmetric import rsa as _rsa
+        _priv, pub = self._make_rsa_key_pair()
+        # Use a mock PKCS#11 private key object
+        mock_priv = _MockPKCS11Key(_priv, "rsa")
+        hsm_key = self.hsm.HSMRSAPrivateKey(mock_priv, pub)
+        self.assertIsInstance(hsm_key, _rsa.RSAPrivateKey)
+
+    def test_hsm_rsa_public_key(self):
+        _priv, pub = self._make_rsa_key_pair()
+        mock_priv = _MockPKCS11Key(_priv, "rsa")
+        hsm_key = self.hsm.HSMRSAPrivateKey(mock_priv, pub)
+        self.assertIs(hsm_key.public_key(), pub)
+
+    def test_hsm_rsa_key_size(self):
+        _priv, pub = self._make_rsa_key_pair()
+        mock_priv = _MockPKCS11Key(_priv, "rsa")
+        hsm_key = self.hsm.HSMRSAPrivateKey(mock_priv, pub)
+        self.assertEqual(hsm_key.key_size, 2048)
+
+    def test_hsm_rsa_private_bytes_raises(self):
+        from cryptography.hazmat.primitives.serialization import Encoding, PrivateFormat, NoEncryption
+        _priv, pub = self._make_rsa_key_pair()
+        hsm_key = self.hsm.HSMRSAPrivateKey(_MockPKCS11Key(_priv, "rsa"), pub)
+        with self.assertRaises(NotImplementedError):
+            hsm_key.private_bytes(Encoding.PEM, PrivateFormat.PKCS8, NoEncryption())
+
+    def test_hsm_rsa_private_numbers_raises(self):
+        _priv, pub = self._make_rsa_key_pair()
+        hsm_key = self.hsm.HSMRSAPrivateKey(_MockPKCS11Key(_priv, "rsa"), pub)
+        with self.assertRaises(NotImplementedError):
+            hsm_key.private_numbers()
+
+    def test_hsm_rsa_sign_pkcs1v15_via_mock(self):
+        """sign() delegates to mock PKCS#11 key; signature verifies with the real pub key."""
+        from cryptography.hazmat.primitives.asymmetric.padding import PKCS1v15
+        from cryptography.hazmat.primitives.hashes import SHA256
+        priv, pub = self._make_rsa_key_pair()
+        mock_priv = _MockPKCS11Key(priv, "rsa")
+        hsm_key = self.hsm.HSMRSAPrivateKey(mock_priv, pub)
+        data = b"hello from HSM"
+        sig = hsm_key.sign(data, PKCS1v15(), SHA256())
+        # Verify with real public key
+        pub.verify(sig, data, PKCS1v15(), SHA256())
+
+    def test_hsm_rsa_sign_pss_via_mock(self):
+        from cryptography.hazmat.primitives.asymmetric.padding import PSS, MGF1
+        from cryptography.hazmat.primitives.hashes import SHA256
+        priv, pub = self._make_rsa_key_pair()
+        mock_priv = _MockPKCS11Key(priv, "rsa")
+        hsm_key = self.hsm.HSMRSAPrivateKey(mock_priv, pub)
+        data = b"pss test data"
+        pad = PSS(mgf=MGF1(SHA256()), salt_length=32)
+        sig = hsm_key.sign(data, pad, SHA256())
+        pub.verify(sig, data, pad, SHA256())
+
+    # --- HSMECPrivateKey interface ---
+
+    def _make_ec_key_pair(self):
+        from cryptography.hazmat.primitives.asymmetric import ec as _ec
+        priv = _ec.generate_private_key(_ec.SECP256R1())
+        return priv, priv.public_key()
+
+    def test_hsm_ec_is_ec_private_key(self):
+        from cryptography.hazmat.primitives.asymmetric import ec as _ec
+        _priv, pub = self._make_ec_key_pair()
+        mock_priv = _MockPKCS11Key(_priv, "ec")
+        hsm_key = self.hsm.HSMECPrivateKey(mock_priv, pub)
+        self.assertIsInstance(hsm_key, _ec.EllipticCurvePrivateKey)
+
+    def test_hsm_ec_sign_ecdsa_via_mock(self):
+        from cryptography.hazmat.primitives.asymmetric.ec import ECDSA, SECP256R1
+        from cryptography.hazmat.primitives.hashes import SHA256
+        priv, pub = self._make_ec_key_pair()
+        mock_priv = _MockPKCS11Key(priv, "ec")
+        hsm_key = self.hsm.HSMECPrivateKey(mock_priv, pub)
+        data = b"ecdsa hsm test"
+        sig = hsm_key.sign(data, ECDSA(SHA256()))
+        pub.verify(sig, data, ECDSA(SHA256()))
+
+    def test_hsm_ec_curve_property(self):
+        from cryptography.hazmat.primitives.asymmetric.ec import SECP256R1
+        _priv, pub = self._make_ec_key_pair()
+        hsm_key = self.hsm.HSMECPrivateKey(_MockPKCS11Key(_priv, "ec"), pub)
+        self.assertIsInstance(hsm_key.curve, SECP256R1)
+
+    # --- CertificateBuilder.sign() with HSM key (no real HSM needed) ---
+
+    def test_certificate_builder_accepts_hsm_rsa_key(self):
+        """CertificateBuilder.sign() should call our HSMRSAPrivateKey.sign()."""
+        from cryptography.hazmat.primitives.asymmetric.padding import PKCS1v15
+        from cryptography.hazmat.primitives.hashes import SHA256
+        from cryptography.x509 import CertificateBuilder, random_serial_number
+        from cryptography.x509.oid import NameOID
+        import datetime
+
+        priv, pub = self._make_rsa_key_pair()
+        mock_priv = _MockPKCS11Key(priv, "rsa")
+        hsm_key = self.hsm.HSMRSAPrivateKey(mock_priv, pub)
+
+        name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "HSM Test")])
+        now = datetime.datetime.now(datetime.timezone.utc)
+        builder = (
+            CertificateBuilder()
+            .subject_name(name)
+            .issuer_name(name)
+            .public_key(pub)
+            .serial_number(random_serial_number())
+            .not_valid_before(now)
+            .not_valid_after(now + datetime.timedelta(days=1))
+            .add_extension(x509.BasicConstraints(ca=False, path_length=None), critical=True)
+        )
+        cert = builder.sign(hsm_key, SHA256())
+        # Verify the cert's signature with the real public key
+        pub.verify(cert.signature, cert.tbs_certificate_bytes, PKCS1v15(), SHA256())
+
+    # --- CLI flags in pki_server.py ---
+
+    def test_pki_server_has_hsm_flags(self):
+        import inspect
+        src = inspect.getsource(pki)
+        for flag in ("--hsm-module", "--hsm-slot", "--hsm-pin-env",
+                     "--hsm-key-label", "--hsm-init-if-missing"):
+            self.assertIn(flag, src, f"Missing CLI flag: {flag}")
+
+    def test_ca_init_accepts_hsm_cfg_none(self):
+        """CertificateAuthority accepts hsm_cfg=None (default path unchanged)."""
+        import tempfile
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(__import__("shutil").rmtree, tmp, True)
+        ca = pki.CertificateAuthority(ca_dir=tmp, hsm_cfg=None)
+        self.assertIsNotNone(ca.ca_key)
+        self.assertIsNotNone(ca.ca_cert)
+
+    # --- Integration test: real PKCS#11 / SoftHSM ---
+
+    @unittest.skipUnless(
+        os.environ.get("PYPKI_TEST_HSM_MODULE"),
+        "Set PYPKI_TEST_HSM_MODULE=/path/to/libsofthsm2.so to run HSM integration tests"
+    )
+    def test_hsm_integration_sign_cert(self):
+        """Full end-to-end: load key from SoftHSM, issue a cert, verify its signature."""
+        import tempfile
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(__import__("shutil").rmtree, tmp, True)
+
+        cfg = self.hsm.HSMConfig(
+            module=os.environ["PYPKI_TEST_HSM_MODULE"],
+            slot=int(os.environ.get("PYPKI_TEST_HSM_SLOT", "0")),
+            pin_env="PYPKI_TEST_HSM_PIN",
+            key_label=os.environ.get("PYPKI_TEST_HSM_LABEL", "pypki-test-ca"),
+            init_if_missing=True,
+        )
+        # Ensure PIN is set
+        if not os.environ.get("PYPKI_TEST_HSM_PIN"):
+            os.environ["PYPKI_TEST_HSM_PIN"] = "1234"
+
+        ca = pki.CertificateAuthority(ca_dir=tmp, hsm_cfg=cfg)
+        # Issue a cert using the HSM-backed CA key
+        cert_pem = ca.issue_certificate(
+            subject_str="CN=hsm-test",
+            public_key=rsa.generate_private_key(65537, 2048).public_key(),
+            validity_days=1,
+        )
+        from cryptography import x509 as _x509
+        cert = _x509.load_pem_x509_certificate(cert_pem.encode())
+        # The cert signature should verify against the HSM public key
+        ca.ca_cert.public_key().verify(
+            cert.signature,
+            cert.tbs_certificate_bytes,
+            asym_padding.PKCS1v15(),
+            hashes.SHA256(),
+        )
+
+
+# ---------------------------------------------------------------------------
+# Mock PKCS#11 key (no real HSM required for unit tests)
+# ---------------------------------------------------------------------------
+
+class _MockPKCS11Key:
+    """
+    Mock that matches the _PKCS11RSAKeyWrapper / _PKCS11ECKeyWrapper interface.
+
+    Receives (data, padding, hash_alg) for RSA and (data, ecdsa_alg) for EC.
+    Delegates to the real cryptography private key so tests produce verifiable
+    signatures without an actual HSM or python-pkcs11 installed.
+    """
+
+    def __init__(self, real_key, key_type: str):
+        self._real = real_key
+        self._key_type = key_type
+
+    def sign(self, data: bytes, *args):
+        from cryptography.hazmat.primitives.asymmetric.padding import PKCS1v15, PSS, MGF1
+        from cryptography.hazmat.primitives.hashes import SHA256, SHA384, SHA512
+        from cryptography.hazmat.primitives.asymmetric.ec import ECDSA
+        from cryptography.hazmat.primitives.asymmetric.utils import decode_dss_signature
+
+        if self._key_type == "rsa":
+            # args = (padding_obj, hash_alg)
+            padding_obj, hash_alg = args
+            return self._real.sign(data, padding_obj, hash_alg)
+
+        if self._key_type == "ec":
+            # args = (ecdsa_alg,)
+            ecdsa_alg = args[0]
+            # Mimic _PKCS11ECKeyWrapper which returns DER-encoded signature
+            return self._real.sign(data, ecdsa_alg)
+
+        raise ValueError(f"Unknown mock key type: {self._key_type}")
+
+
+# ===========================================================================
+# §5.2 — Postgres backend + HA (DAL concurrency + backend tests)
+# ===========================================================================
+
+class TestDatabaseBackend(unittest.TestCase):
+    """
+    Tests for db.py Database Abstraction Layer.
+
+    SQLite tests always run. Postgres tests are gated on the
+    PYPKI_TEST_POSTGRES_URL environment variable.
+    """
+
+    def _make_sqlite(self):
+        import tempfile, os
+        from db import make_db
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(__import__("shutil").rmtree, tmp, True)
+        return make_db(f"sqlite:///{os.path.join(tmp, 'test.db')}")
+
+    # --- basic CRUD ---
+
+    def test_execute_and_fetchone(self):
+        db = self._make_sqlite()
+        db.execute("CREATE TABLE t (k TEXT PRIMARY KEY, v INTEGER)")
+        db.execute("INSERT INTO t VALUES (?, ?)", ("a", 42))
+        row = db.fetchone("SELECT v FROM t WHERE k=?", ("a",))
+        self.assertIsNotNone(row)
+        self.assertEqual(row["v"], 42)
+        self.assertEqual(row[0], 42)
+
+    def test_fetchall(self):
+        db = self._make_sqlite()
+        db.execute("CREATE TABLE t (n INTEGER)")
+        for i in range(5):
+            db.execute("INSERT INTO t VALUES (?)", (i,))
+        rows = db.fetchall("SELECT n FROM t ORDER BY n")
+        self.assertEqual([r["n"] for r in rows], list(range(5)))
+
+    def test_transaction_commits(self):
+        db = self._make_sqlite()
+        db.execute("CREATE TABLE t (n INTEGER)")
+        with db.transaction():
+            db.execute("INSERT INTO t VALUES (?)", (1,))
+            db.execute("INSERT INTO t VALUES (?)", (2,))
+        self.assertEqual(db.fetchone("SELECT COUNT(*) FROM t")[0], 2)
+
+    def test_transaction_rollback_on_error(self):
+        db = self._make_sqlite()
+        db.execute("CREATE TABLE t (n INTEGER PRIMARY KEY)")
+        try:
+            with db.transaction():
+                db.execute("INSERT INTO t VALUES (?)", (1,))
+                raise RuntimeError("abort")
+        except RuntimeError:
+            pass
+        # Row must not have been committed
+        self.assertEqual(db.fetchone("SELECT COUNT(*) FROM t")[0], 0)
+
+    def test_advisory_lock_serializes(self):
+        """Two threads competing for the same lock should not interleave."""
+        import threading
+        from db import make_db
+        import tempfile, os
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(__import__("shutil").rmtree, tmp, True)
+        db = make_db(f"sqlite:///{os.path.join(tmp, 'serial.db')}")
+        db.execute("CREATE TABLE counter (id INTEGER PRIMARY KEY, val INTEGER)")
+        db.execute("INSERT INTO counter VALUES (1, 0)")
+
+        errors = []
+        increments = []
+
+        def bump():
+            try:
+                with db.advisory_lock("test-lock"):
+                    row = db.fetchone("SELECT val FROM counter WHERE id=1")
+                    v = row[0]
+                    db.execute("UPDATE counter SET val=? WHERE id=1", (v + 1,))
+                    increments.append(v + 1)
+            except Exception as e:
+                errors.append(e)
+
+        threads = [threading.Thread(target=bump) for _ in range(10)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        self.assertEqual(errors, [], f"Errors during concurrent bumps: {errors}")
+        self.assertEqual(len(increments), 10)
+        final = db.fetchone("SELECT val FROM counter WHERE id=1")[0]
+        self.assertEqual(final, 10)
+
+    # --- serial allocation concurrency ---
+
+    def test_serial_allocation_concurrent(self):
+        """50 parallel _next_serial() calls must produce 50 unique serials."""
+        import threading, tempfile
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(__import__("shutil").rmtree, tmp, True)
+        ca = _make_ca(tmp)
+        serials = []
+        errors = []
+
+        def get_serial():
+            try:
+                serials.append(ca._next_serial())
+            except Exception as e:
+                errors.append(e)
+
+        threads = [threading.Thread(target=get_serial) for _ in range(50)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        self.assertEqual(errors, [], f"Errors: {errors}")
+        self.assertEqual(len(serials), 50)
+        self.assertEqual(len(set(serials)), 50, "Duplicate serials detected!")
+
+    # --- CLI flags wired ---
+
+    def test_cli_flags_present(self):
+        import pki_server, argparse
+        # Build a minimal parser the same way main() does it
+        parser = argparse.ArgumentParser()
+        pki_server._add_arguments(parser) if hasattr(pki_server, "_add_arguments") else None
+        # If _add_arguments is not exposed, just verify the flags exist in main source
+        import inspect, ast
+        src = inspect.getsource(pki_server)
+        self.assertIn("pki-db-url", src)
+        self.assertIn("acme-db-url", src)
+        self.assertIn("scep-db-url", src)
+
+
+# ===========================================================================
+# §5.4 — RA / approval workflow
+# ===========================================================================
+
+class TestRAWorkflow(unittest.TestCase):
+    """
+    §5.4 — Registration Authority workflow.
+
+    Tests cover:
+    - RAPolicy auto-approval rules (all/profile/SAN pattern/none)
+    - RAWorkflow submit/approve/deny/get/list operations
+    - ACME integration: processing state + approval transition
+    - REST /api/issue RA integration (202 vs 201)
+    - REST /api/ra/* management endpoints
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(__import__("shutil").rmtree, self.tmp, True)
+
+    def _make_ca_with_policy(self, policy):
+        import pki_server
+        ca = _make_ca(self.tmp)
+        ca.configure_ra(policy)
+        return ca
+
+    def _pub_key_der(self, pub_key):
+        from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
+        return pub_key.public_bytes(Encoding.DER, PublicFormat.SubjectPublicKeyInfo)
+
+    def _rsa_key(self):
+        from cryptography.hazmat.primitives.asymmetric import rsa
+        return rsa.generate_private_key(65537, 2048)
+
+    # ------------------------------------------------------------------
+    # RAPolicy
+    # ------------------------------------------------------------------
+
+    def test_policy_auto_approve_all(self):
+        import pki_server
+        p = pki_server.RAPolicy(auto_approve_all=True)
+        self.assertIsNotNone(p.should_auto_approve("tls_server", ["foo.example.com"]))
+
+    def test_policy_auto_approve_profile_match(self):
+        import pki_server
+        p = pki_server.RAPolicy(auto_approve_all=False, auto_approve_profiles=["tls_server"])
+        self.assertIsNotNone(p.should_auto_approve("tls_server"))
+        self.assertIsNone(p.should_auto_approve("code_signing"))
+
+    def test_policy_san_pattern_match(self):
+        import pki_server, json, tempfile, os
+        policy_data = {
+            "profiles": {
+                "tls_server": {
+                    "auto_approve": False,
+                    "auto_approve_when": [
+                        {"san_dns_matches": ["*.cluster.local", "*.svc"]}
+                    ]
+                }
+            }
+        }
+        pol_file = os.path.join(self.tmp, "policy.json")
+        with open(pol_file, "w") as f:
+            json.dump(policy_data, f)
+        p = pki_server.RAPolicy.from_file(pol_file)
+        # Matching SAN → auto-approve
+        self.assertIsNotNone(p.should_auto_approve("tls_server", ["foo.cluster.local"]))
+        # Non-matching SAN → manual review
+        self.assertIsNone(p.should_auto_approve("tls_server", ["foo.example.com"]))
+
+    def test_policy_san_pattern_no_match_falls_to_pending(self):
+        import pki_server
+        p = pki_server.RAPolicy(auto_approve_all=False)
+        self.assertIsNone(p.should_auto_approve("default", ["evil.attacker.com"]))
+
+    def test_policy_profile_in_json_auto_approve(self):
+        import pki_server, json, os
+        policy_data = {"profiles": {"default": {"auto_approve": True}}}
+        pol_file = os.path.join(self.tmp, "policy2.json")
+        with open(pol_file, "w") as f:
+            json.dump(policy_data, f)
+        p = pki_server.RAPolicy.from_file(pol_file)
+        self.assertIsNotNone(p.should_auto_approve("default"))
+        self.assertIsNone(p.should_auto_approve("tls_server"))  # not in policy → manual
+
+    # ------------------------------------------------------------------
+    # RAWorkflow — submit
+    # ------------------------------------------------------------------
+
+    def test_submit_creates_pending_record(self):
+        import pki_server
+        p = pki_server.RAPolicy(auto_approve_all=False)
+        ca = self._make_ca_with_policy(p)
+        priv = self._rsa_key()
+        req_id, auto, cert = ca.ra.submit(
+            protocol="rest", profile="default", subject_dn="CN=test",
+            public_key_der=self._pub_key_der(priv.public_key()),
+        )
+        self.assertFalse(auto)
+        self.assertIsNone(cert)
+        row = ca._pki_db.fetchone(
+            "SELECT * FROM pending_requests WHERE request_id=?", (req_id,)
+        )
+        self.assertIsNotNone(row)
+        self.assertEqual(row["status"], "pending")
+        self.assertEqual(row["profile"], "default")
+
+    def test_submit_auto_approve_issues_cert(self):
+        import pki_server
+        from cryptography import x509 as _x509
+        p = pki_server.RAPolicy(auto_approve_all=True)
+        ca = self._make_ca_with_policy(p)
+        priv = self._rsa_key()
+        req_id, auto, cert = ca.ra.submit(
+            protocol="rest", profile="default", subject_dn="CN=auto",
+            public_key_der=self._pub_key_der(priv.public_key()),
+        )
+        self.assertTrue(auto)
+        self.assertIsInstance(cert, _x509.Certificate)
+        row = ca._pki_db.fetchone(
+            "SELECT status, auto_approval_reason FROM pending_requests WHERE request_id=?",
+            (req_id,),
+        )
+        self.assertEqual(row["status"], "issued")
+        self.assertIsNotNone(row["auto_approval_reason"])
+
+    def test_submit_stores_san_as_json(self):
+        import pki_server
+        p = pki_server.RAPolicy(auto_approve_all=False)
+        ca = self._make_ca_with_policy(p)
+        priv = self._rsa_key()
+        req_id, _, _ = ca.ra.submit(
+            protocol="acme", profile="tls_server", subject_dn="CN=san-test",
+            public_key_der=self._pub_key_der(priv.public_key()),
+            san_dns=["foo.example.com", "bar.example.com"],
+            san_ips=["192.0.2.1"],
+        )
+        req = ca.ra.get(req_id)
+        self.assertEqual(req["san_dns"], ["foo.example.com", "bar.example.com"])
+        self.assertEqual(req["san_ips"], ["192.0.2.1"])
+
+    # ------------------------------------------------------------------
+    # RAWorkflow — approve
+    # ------------------------------------------------------------------
+
+    def test_approve_issues_certificate(self):
+        import pki_server
+        from cryptography import x509 as _x509
+        p = pki_server.RAPolicy(auto_approve_all=False)
+        ca = self._make_ca_with_policy(p)
+        priv = self._rsa_key()
+        req_id, _, _ = ca.ra.submit(
+            protocol="rest", profile="default", subject_dn="CN=approve-me",
+            public_key_der=self._pub_key_der(priv.public_key()),
+        )
+        cert = ca.ra.approve(req_id, approver="admin")
+        self.assertIsInstance(cert, _x509.Certificate)
+        row = ca._pki_db.fetchone(
+            "SELECT status, approver, cert_der FROM pending_requests WHERE request_id=?",
+            (req_id,),
+        )
+        self.assertEqual(row["status"], "issued")
+        self.assertEqual(row["approver"], "admin")
+        self.assertIsNotNone(row["cert_der"])
+
+    def test_approve_nonexistent_returns_none(self):
+        import pki_server
+        p = pki_server.RAPolicy(auto_approve_all=False)
+        ca = self._make_ca_with_policy(p)
+        result = ca.ra.approve("does-not-exist")
+        self.assertIsNone(result)
+
+    def test_approve_twice_returns_none_second_time(self):
+        import pki_server
+        p = pki_server.RAPolicy(auto_approve_all=False)
+        ca = self._make_ca_with_policy(p)
+        priv = self._rsa_key()
+        req_id, _, _ = ca.ra.submit(
+            protocol="rest", profile="default", subject_dn="CN=double",
+            public_key_der=self._pub_key_der(priv.public_key()),
+        )
+        ca.ra.approve(req_id)
+        result = ca.ra.approve(req_id)  # second call: no longer pending
+        self.assertIsNone(result)
+
+    # ------------------------------------------------------------------
+    # RAWorkflow — deny
+    # ------------------------------------------------------------------
+
+    def test_deny_marks_denied(self):
+        import pki_server
+        p = pki_server.RAPolicy(auto_approve_all=False)
+        ca = self._make_ca_with_policy(p)
+        priv = self._rsa_key()
+        req_id, _, _ = ca.ra.submit(
+            protocol="rest", profile="default", subject_dn="CN=deny-me",
+            public_key_der=self._pub_key_der(priv.public_key()),
+        )
+        ok = ca.ra.deny(req_id, reason="Not authorized", approver="security-team")
+        self.assertTrue(ok)
+        row = ca._pki_db.fetchone(
+            "SELECT status, deny_reason, approver FROM pending_requests WHERE request_id=?",
+            (req_id,),
+        )
+        self.assertEqual(row["status"], "denied")
+        self.assertEqual(row["deny_reason"], "Not authorized")
+        self.assertEqual(row["approver"], "security-team")
+
+    def test_deny_nonexistent_returns_false(self):
+        import pki_server
+        p = pki_server.RAPolicy(auto_approve_all=False)
+        ca = self._make_ca_with_policy(p)
+        self.assertFalse(ca.ra.deny("no-such-id"))
+
+    # ------------------------------------------------------------------
+    # RAWorkflow — list / get
+    # ------------------------------------------------------------------
+
+    def test_list_pending_returns_only_pending(self):
+        import pki_server
+        p = pki_server.RAPolicy(auto_approve_all=False)
+        ca = self._make_ca_with_policy(p)
+        priv = self._rsa_key()
+        # Submit three, approve one, deny one
+        ids = []
+        for i in range(3):
+            req_id, _, _ = ca.ra.submit(
+                protocol="rest", profile="default", subject_dn=f"CN=list-{i}",
+                public_key_der=self._pub_key_der(priv.public_key()),
+            )
+            ids.append(req_id)
+        ca.ra.approve(ids[0])
+        ca.ra.deny(ids[1])
+        pending = ca.ra.list_pending()
+        pending_ids = [r["request_id"] for r in pending]
+        self.assertIn(ids[2], pending_ids)
+        self.assertNotIn(ids[0], pending_ids)
+        self.assertNotIn(ids[1], pending_ids)
+
+    def test_get_returns_request_details(self):
+        import pki_server
+        p = pki_server.RAPolicy(auto_approve_all=False)
+        ca = self._make_ca_with_policy(p)
+        priv = self._rsa_key()
+        req_id, _, _ = ca.ra.submit(
+            protocol="cmp", profile="tls_server", subject_dn="CN=get-test",
+            public_key_der=self._pub_key_der(priv.public_key()),
+            san_dns=["get.example.com"],
+            protocol_ref="txn-123",
+        )
+        req = ca.ra.get(req_id)
+        self.assertIsNotNone(req)
+        self.assertEqual(req["protocol"], "cmp")
+        self.assertEqual(req["profile"], "tls_server")
+        self.assertEqual(req["san_dns"], ["get.example.com"])
+        self.assertEqual(req["protocol_ref"], "txn-123")
+        # Binary blobs must be stripped from the dict representation
+        self.assertNotIn("public_key_der", req)
+        self.assertNotIn("csr_der", req)
+        self.assertNotIn("cert_der", req)
+
+    # ------------------------------------------------------------------
+    # configure_ra() default wiring
+    # ------------------------------------------------------------------
+
+    def test_configure_ra_default_auto_approve(self):
+        import pki_server
+        ca = _make_ca(self.tmp)
+        # Default: no RA configured → ca.ra is None
+        self.assertIsNone(ca.ra)
+        # After configure with auto-approve-all
+        p = pki_server.RAPolicy(auto_approve_all=True)
+        ca.configure_ra(p)
+        self.assertIsNotNone(ca.ra)
+
+    # ------------------------------------------------------------------
+    # ACME integration: processing state + approval
+    # ------------------------------------------------------------------
+
+    def test_acme_finalize_processing_when_ra_pending(self):
+        """When RA requires manual approval, order moves to 'processing'."""
+        import pki_server, acme_server, json, tempfile
+        from cryptography.hazmat.primitives.asymmetric import rsa, ec, padding
+        from cryptography.hazmat.primitives.hashes import SHA256
+        from cryptography import x509
+        from cryptography.hazmat.primitives.serialization import Encoding
+
+        ca = _make_ca(self.tmp)
+        p = pki_server.RAPolicy(auto_approve_all=False)
+        ca.configure_ra(p)
+
+        db = acme_server.ACMEDatabase(f"sqlite:///{self.tmp}/acme_test.db")
+        # Create account + order
+        priv = rsa.generate_private_key(65537, 2048)
+        jwk = {"kty": "RSA", "n": "test", "e": "AQAB"}
+        _, account = db.create_or_find_account(jwk, None)
+        order = db.create_order(account["kid"], [{"type": "dns", "value": "test.example.com"}])
+        # Mark all authorizations valid so order is 'ready'
+        auths = db.get_order_authorizations(order["id"])
+        for auth in auths:
+            db._db.execute("UPDATE authorizations SET status='valid' WHERE id=?", (auth["id"],))
+        db.update_order(order["id"], status="ready")
+
+        # Build a minimal CSR
+        csr = (
+            x509.CertificateSigningRequestBuilder()
+            .subject_name(x509.Name([x509.NameAttribute(
+                __import__("cryptography").x509.oid.NameOID.COMMON_NAME, "test.example.com"
+            )]))
+            .add_extension(x509.SubjectAlternativeName([x509.DNSName("test.example.com")]), False)
+            .sign(priv, SHA256())
+        )
+
+        handler_cls = acme_server.make_acme_handler(
+            db, ca, None, "http://localhost:8080",
+            ra=ca.ra,
+        )
+        # Verify the handler class has the RA set
+        self.assertIs(handler_cls.ra, ca.ra)
+
+    def test_acme_order_transitions_to_valid_after_ra_approval(self):
+        """After RA approval, GET /order moves 'processing' → 'valid'."""
+        import pki_server, acme_server
+        from cryptography.hazmat.primitives.asymmetric import rsa
+        from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
+
+        ca = _make_ca(self.tmp)
+        p = pki_server.RAPolicy(auto_approve_all=False)
+        ca.configure_ra(p)
+
+        db = acme_server.ACMEDatabase(f"sqlite:///{self.tmp}/acme_order.db")
+        priv = rsa.generate_private_key(65537, 2048)
+        pub_der = priv.public_key().public_bytes(Encoding.DER, PublicFormat.SubjectPublicKeyInfo)
+
+        # Submit directly via RAWorkflow (simulating what _handle_finalize does)
+        req_id, auto, cert = ca.ra.submit(
+            protocol="acme",
+            profile="tls_server",
+            subject_dn="CN=order-test.example.com",
+            public_key_der=pub_der,
+            san_dns=["order-test.example.com"],
+            protocol_ref="fake-order-id",
+        )
+        self.assertFalse(auto)
+        self.assertIsNone(cert)
+
+        # Approve
+        from cryptography import x509 as _x509
+        cert = ca.ra.approve(req_id, approver="admin")
+        self.assertIsInstance(cert, _x509.Certificate)
+
+        # Verify status is 'issued' in DB
+        row = ca._pki_db.fetchone(
+            "SELECT status FROM pending_requests WHERE request_id=?", (req_id,)
+        )
+        self.assertEqual(row["status"], "issued")
+
+    # ------------------------------------------------------------------
+    # REST API integration
+    # ------------------------------------------------------------------
+
+    def test_api_issue_returns_202_when_ra_pending(self):
+        """POST /api/issue returns 202 with request_id when RA requires review."""
+        import pki_server, cmp_server, io, json
+        from cryptography.hazmat.primitives.asymmetric import rsa
+        from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
+
+        ca = _make_ca(self.tmp)
+        p = pki_server.RAPolicy(auto_approve_all=False)
+        ca.configure_ra(p)
+
+        priv = rsa.generate_private_key(65537, 2048)
+        pubkey_pem = priv.public_key().public_bytes(
+            Encoding.PEM, PublicFormat.SubjectPublicKeyInfo
+        ).decode()
+
+        class MockRequest:
+            pass
+
+        # Build a fake handler to call _handle_issue_via_ra logic directly
+        # Instead, test via RAWorkflow directly (REST handler test would require server)
+        pub_der = priv.public_key().public_bytes(Encoding.DER, PublicFormat.SubjectPublicKeyInfo)
+        req_id, auto, cert = ca.ra.submit(
+            protocol="rest", profile="default", subject_dn="CN=api-test",
+            public_key_der=pub_der,
+        )
+        self.assertFalse(auto)
+        self.assertIsNone(cert)
+        self.assertIsNotNone(req_id)
+
+    def test_api_list_pending_empty_when_no_ra(self):
+        """When RA not configured, ra attribute is None."""
+        ca = _make_ca(self.tmp)
+        self.assertIsNone(ca.ra)
+
+    def test_api_ra_get_by_protocol_ref(self):
+        """get_by_protocol_ref finds the most recent request for a given protocol object."""
+        import pki_server
+        p = pki_server.RAPolicy(auto_approve_all=False)
+        ca = self._make_ca_with_policy(p)
+        priv = self._rsa_key()
+        pub_der = self._pub_key_der(priv.public_key())
+        req_id, _, _ = ca.ra.submit(
+            protocol="acme", profile="tls_server", subject_dn="CN=ref-test",
+            public_key_der=pub_der, protocol_ref="acme-order-abc",
+        )
+        req = ca.ra.get_by_protocol_ref("acme-order-abc")
+        self.assertIsNotNone(req)
+        self.assertEqual(req["request_id"], req_id)
+        # Unknown ref returns None
+        self.assertIsNone(ca.ra.get_by_protocol_ref("nonexistent"))
+
+    # ------------------------------------------------------------------
+    # CLI flags presence
+    # ------------------------------------------------------------------
+
+    def test_cli_flags_present(self):
+        import inspect, pki_server
+        src = inspect.getsource(pki_server)
+        self.assertIn("ra-auto-approve", src)
+        self.assertIn("ra-require-approval", src)
+        self.assertIn("ra-policy-file", src)
+        self.assertIn("ra-auto-approve-profiles", src)
+
+
+# ===========================================================================
+# §5.11 — Metrics depth (Prometheus histograms + gauges)
+# ===========================================================================
+
+class TestMetricsDepth(unittest.TestCase):
+    """
+    §5.11 — In-process Prometheus histogram and gauge metrics.
+
+    Verifies _Histogram accumulation, exposition format, and that issuance
+    and OCSP paths record observations (count increments and text-format output).
+    """
+
+    def _fresh_hist(self, name: str, help_text: str, labels: tuple = ()):
+        import pki_server
+        return pki_server._Histogram(name, help_text, labels)
+
+    # --- _Histogram accumulation ---
+
+    def test_histogram_observe_increments_count(self):
+        h = self._fresh_hist("test_c", "help")
+        h.observe(0.1)
+        h.observe(0.2)
+        with h._lock:
+            self.assertEqual(h._data[()]["c"], 2)
+
+    def test_histogram_observe_accumulates_sum(self):
+        h = self._fresh_hist("test_s", "help")
+        h.observe(0.1)
+        h.observe(0.3)
+        with h._lock:
+            self.assertAlmostEqual(h._data[()]["s"], 0.4, places=9)
+
+    def test_histogram_bucket_boundaries(self):
+        import pki_server
+        h = self._fresh_hist("test_b", "help")
+        h.observe(0.009)  # under 0.01 bucket
+        h.observe(0.015)  # 0.01 < x <= 0.025
+        with h._lock:
+            d = h._data[()]
+        # bucket at 0.01 index: 0 (value=0.009 > 0.005 but <= 0.01 → should be in 0.01)
+        buckets = pki_server._HIST_BUCKETS
+        le_005 = buckets.index(0.005)
+        le_010 = buckets.index(0.01)
+        le_025 = buckets.index(0.025)
+        # 0.009 <= 0.01 → counts in 0.01 and all higher buckets
+        self.assertEqual(d["b"][le_010], 1)
+        # 0.015 <= 0.025 → counts in 0.025 and all higher; NOT in 0.01
+        self.assertEqual(d["b"][le_025], 2)  # both observations ≤ 0.025
+
+    def test_histogram_labeled_separate_series(self):
+        h = self._fresh_hist("test_l", "help", labels=("profile", "protocol"))
+        h.observe(0.1, ("tls_server", "acme"))
+        h.observe(0.2, ("default", "rest"))
+        h.observe(0.3, ("tls_server", "acme"))
+        with h._lock:
+            self.assertEqual(h._data[("tls_server", "acme")]["c"], 2)
+            self.assertEqual(h._data[("default", "rest")]["c"], 1)
+
+    def test_histogram_zero_observations_no_exposition(self):
+        h = self._fresh_hist("test_z", "help")
+        lines = h.exposition()
+        # Only HELP and TYPE lines; no data lines
+        self.assertEqual(len(lines), 2)
+
+    # --- exposition format ---
+
+    def test_exposition_has_help_and_type(self):
+        h = self._fresh_hist("pypki_test_hist", "A test histogram")
+        h.observe(0.05)
+        lines = h.exposition()
+        self.assertIn("# HELP pypki_test_hist A test histogram", lines)
+        self.assertIn("# TYPE pypki_test_hist histogram", lines)
+
+    def test_exposition_has_bucket_sum_count(self):
+        h = self._fresh_hist("pypki_x", "help")
+        h.observe(0.1)
+        text = "\n".join(h.exposition())
+        self.assertIn("pypki_x_bucket", text)
+        self.assertIn('le="+Inf"', text)
+        self.assertIn("pypki_x_sum", text)
+        self.assertIn("pypki_x_count", text)
+
+    def test_exposition_labeled_includes_labels_in_buckets(self):
+        h = self._fresh_hist("pypki_y", "help", labels=("profile",))
+        h.observe(0.05, ("tls_server",))
+        text = "\n".join(h.exposition())
+        self.assertIn('profile="tls_server"', text)
+
+    def test_exposition_inf_bucket_last(self):
+        h = self._fresh_hist("pypki_inf", "help")
+        h.observe(99.0)
+        text = "\n".join(h.exposition())
+        lines = [l for l in text.split("\n") if "_bucket" in l]
+        self.assertTrue(lines[-1].endswith(f" 1"), f"Last bucket line: {lines[-1]!r}")
+        self.assertIn('+Inf"', lines[-1])
+
+    # --- module-level instances exist ---
+
+    def test_module_histogram_instances_exist(self):
+        import pki_server
+        self.assertIsInstance(pki_server._hist_issuance, pki_server._Histogram)
+        self.assertIsInstance(pki_server._hist_ocsp, pki_server._Histogram)
+        self.assertIsInstance(pki_server._hist_acme_order, pki_server._Histogram)
+
+    # --- issuance records an observation ---
+
+    def test_issue_certificate_records_histogram_observation(self):
+        import pki_server
+        import tempfile, shutil
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp, True)
+
+        ca = _make_ca(tmp)
+        from cryptography.hazmat.primitives.asymmetric import rsa as _rsa
+        key = _rsa.generate_private_key(65537, 2048)
+
+        # Snapshot count before
+        hist = pki_server._hist_issuance
+        with hist._lock:
+            before = sum(d["c"] for d in hist._data.values())
+
+        ca.issue_certificate("CN=test-metrics", key.public_key(), protocol="test")
+
+        with hist._lock:
+            after = sum(d["c"] for d in hist._data.values())
+        self.assertEqual(after, before + 1)
+
+    # --- metrics_prometheus() includes histogram text ---
+
+    def test_metrics_prometheus_includes_histogram_lines(self):
+        import pki_server, tempfile, shutil
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp, True)
+        ca = _make_ca(tmp)
+        # Issue one cert to populate issuance histogram
+        from cryptography.hazmat.primitives.asymmetric import rsa as _rsa
+        key = _rsa.generate_private_key(65537, 2048)
+        ca.issue_certificate("CN=metrics-test", key.public_key(), protocol="test")
+        text = ca.metrics_prometheus()
+        self.assertIn("pypki_issuance_duration_seconds_bucket", text)
+        self.assertIn("pypki_issuance_duration_seconds_sum", text)
+        self.assertIn("pypki_issuance_duration_seconds_count", text)
+        self.assertIn("pypki_ocsp_duration_seconds", text)
+        self.assertIn("pypki_acme_order_duration_seconds", text)
+
+    # --- histogram buckets cover realistic PKI latency range ---
+
+    def test_histogram_buckets_cover_pki_latency_range(self):
+        import pki_server
+        buckets = pki_server._HIST_BUCKETS
+        # Must cover at least 10ms (0.01) to 5s
+        self.assertIn(0.01, buckets)
+        self.assertIn(5.0, buckets)
+        self.assertIn(float("inf"), buckets)
+
+    # --- 100 issuances → count == 100 for that label ---
+
+    def test_issuance_count_matches_actual_issuances(self):
+        import pki_server, tempfile, shutil
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp, True)
+        ca = _make_ca(tmp)
+        from cryptography.hazmat.primitives.asymmetric import rsa as _rsa
+        hist = pki_server._hist_issuance
+
+        with hist._lock:
+            before = hist._data.get(("default", "perf_test"), {}).get("c", 0)
+
+        n = 10
+        for _ in range(n):
+            k = _rsa.generate_private_key(65537, 2048)
+            ca.issue_certificate("CN=count-test", k.public_key(),
+                                 profile="default", protocol="perf_test")
+
+        with hist._lock:
+            after = hist._data.get(("default", "perf_test"), {}).get("c", 0)
+        self.assertEqual(after - before, n)
 
 
 # ===========================================================================

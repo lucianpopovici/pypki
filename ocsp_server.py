@@ -57,6 +57,11 @@ from cryptography.x509.oid import NameOID, ExtendedKeyUsageOID
 
 logger = logging.getLogger("ocsp")
 
+# §5.11 — import histogram lazily to avoid circular import at module load
+def _get_hist_ocsp():
+    from pki_server import _hist_ocsp  # noqa: PLC0415
+    return _hist_ocsp
+
 # ---------------------------------------------------------------------------
 # DER / ASN.1 helpers
 # ---------------------------------------------------------------------------
@@ -606,14 +611,10 @@ class OCSPHandler(http.server.BaseHTTPRequestHandler):
                 return cached
 
         try:
-            import sqlite3
-            conn = sqlite3.connect(str(self.ca.db_path))
-            conn.row_factory = sqlite3.Row
-            row = conn.execute(
+            row = self.ca._pki_db.fetchone(
                 "SELECT serial, revoked, revoked_at, reason FROM certificates WHERE serial=?",
                 (serial,)
-            ).fetchone()
-            conn.close()
+            )
         except Exception as e:
             logger.error(f"OCSP DB error: {e}")
             return OCSPResponseBuilder.error(RESP_INTERNAL_ERROR)
@@ -637,6 +638,7 @@ class OCSPHandler(http.server.BaseHTTPRequestHandler):
             revoked_at = None
             reason = 0
 
+        _t0 = time.perf_counter()
         response = OCSPResponseBuilder.build(
             serial=serial,
             cert_status=status,
@@ -649,6 +651,7 @@ class OCSPHandler(http.server.BaseHTTPRequestHandler):
             next_update=next_update,
             nonce=nonce,
         )
+        _get_hist_ocsp().observe(time.perf_counter() - _t0)
 
         logger.info(
             f"OCSP serial={serial} "
@@ -713,6 +716,101 @@ def start_ocsp_server(
         f"(require_nonce={require_nonce})"
     )
     return _RouteProxy(route_table, prefix, label="ocsp")
+
+
+# ---------------------------------------------------------------------------
+# Pre-generated OCSP response builder (RFC 5019 §6)
+# ---------------------------------------------------------------------------
+
+def generate_static_responses(
+    ca: "CertificateAuthority",
+    output_dir,
+    validity_hours: int = 24,
+) -> int:
+    """
+    Pre-generate one signed OCSP response file per certificate in *ca*.
+
+    Files are written under:
+      <output_dir>/<sha1-issuer-key>/<sha1-issuer-name>/<serial>.ocsp
+
+    This path layout is compatible with nginx ``proxy_cache``, Apache
+    ``mod_ssl_ct``, and static file serving for OCSP stapling.
+
+    Each response has ``thisUpdate=now`` and ``nextUpdate=now+validity_hours``.
+    No nonce is embedded (static files cannot be nonce-bound).
+
+    Returns the count of files written.
+    """
+    import sqlite3 as _sqlite3
+    from pathlib import Path as _Path
+    import hashlib as _hashlib
+
+    output_dir = _Path(output_dir)
+    ocsp_key, ocsp_cert = provision_ocsp_signing_cert(ca)
+
+    now = datetime.datetime.now(_tz.utc)
+    next_update = now + datetime.timedelta(hours=validity_hours)
+
+    # Path components: SHA-1 hex of the raw DER bytes fed into the CertID
+    ca_name_der = ca.ca_cert.subject.public_bytes()
+    issuer_name_hash = _hashlib.sha1(ca_name_der).hexdigest()
+
+    pub_der = ca.ca_key.public_key().public_bytes(
+        Encoding.DER, serialization.PublicFormat.SubjectPublicKeyInfo
+    )
+    try:
+        _, spki_inner, _ = _dec_tlv(pub_der, 0)
+        spki_pos = 0
+        _, _, spki_pos = _dec_tlv(spki_inner, spki_pos)  # skip AlgorithmIdentifier
+        _, bit_string_val, _ = _dec_tlv(spki_inner, spki_pos)
+        key_bytes = bit_string_val[1:]  # strip the leading unused-bits byte
+    except Exception:
+        key_bytes = pub_der
+    issuer_key_hash = _hashlib.sha1(key_bytes).hexdigest()
+
+    cert_dir = output_dir / issuer_key_hash / issuer_name_hash
+    cert_dir.mkdir(parents=True, exist_ok=True)
+
+    rows = ca._pki_db.fetchall(
+        "SELECT serial, revoked, revoked_at, reason FROM certificates"
+    )
+
+    count = 0
+    for row in rows:
+        serial = row["serial"]
+        if row["revoked"]:
+            status = STATUS_REVOKED
+            try:
+                revoked_at = datetime.datetime.fromisoformat(row["revoked_at"])
+            except Exception:
+                revoked_at = now
+            reason = row["reason"] or 0
+        else:
+            status = STATUS_GOOD
+            revoked_at = None
+            reason = 0
+
+        resp = OCSPResponseBuilder.build(
+            serial=serial,
+            cert_status=status,
+            revoked_at=revoked_at,
+            revocation_reason=reason,
+            ca=ca,
+            ocsp_key=ocsp_key,
+            ocsp_cert=ocsp_cert,
+            this_update=now,
+            next_update=next_update,
+            nonce=None,
+        )
+
+        (cert_dir / f"{serial}.ocsp").write_bytes(resp)
+        count += 1
+
+    logger.info(
+        f"Pre-generated {count} OCSP responses in {cert_dir} "
+        f"(validity={validity_hours}h)"
+    )
+    return count
 
 
 # ---------------------------------------------------------------------------

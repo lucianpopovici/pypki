@@ -9,6 +9,122 @@ This project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **RFC 3647 — Certificate Policy / CPS framework** (`docs/CPS.md`).
+  CPS document follows the full RFC 3647 §6 nine-section outline,
+  calibrated for self-hosted PyPKI deployments (homelab + small enterprise).
+  `--cps-uri URL` and `--cps-policy-oid OID` CLI flags (already wired in
+  `pki_server.py`) embed a CPS URI qualifier and policy OID in the
+  `CertificatePolicies` extension of every issued certificate. Section 1.3
+  updated to reflect the shipped RA approval workflow. Compliance table row
+  and README "Deployment-wide CPS URI" subsection added.
+
+- **§5.4 — Registration Authority / approval workflow** (`pki_server.py`,
+  `acme_server.py`, `cmp_server.py`, `db_migrations/pki/003_pending_requests.sql`).
+  New `RAPolicy` class evaluates auto-approval rules: `mode="all"` (approve
+  everything), `mode="none"` (always require manual review), `mode="profile_list"`
+  (per-profile list + `fnmatch` SAN patterns). New `RAWorkflow` class manages
+  the `pending_requests` table — `submit()` either auto-issues or stores a pending
+  row, `approve()` calls `issue_certificate()` and finalises the request,
+  `deny()` records a reason. ACME finalization routes through RA when enabled:
+  orders that require approval move to `processing` state (RFC 8555 §7.4) and
+  carry an `ra_request_id` linking them to the pending row; `GET /acme/order/<id>`
+  transitions the order to `valid`/`invalid` when the RA decision arrives. REST
+  API returns HTTP 202 with `{"status": "pending", "request_id": "..."}` for
+  pending requests. Approve/deny/list REST endpoints at `/api/ra/approve/<id>`,
+  `/api/ra/deny/<id>`, `/api/ra/pending`, `/api/ra/recent`, `/api/ra/request/<id>`.
+  CLI flags: `--ra-auto-approve`, `--ra-require-approval`,
+  `--ra-auto-approve-profiles PROFILE [...]`, `--ra-policy-file PATH`.
+  22 tests in `TestRAWorkflow`.
+
+- **§5.11 — Prometheus histogram metrics** (`pki_server.py`,
+  `ocsp_server.py`, `acme_server.py`). New `_Histogram` class and three
+  module-level instances: `pypki_issuance_duration_seconds` (labels:
+  `profile`, `protocol`), `pypki_ocsp_duration_seconds`, and
+  `pypki_acme_order_duration_seconds` (label: `challenge_type`). Timing
+  is recorded via `time.perf_counter()` at the signing call in
+  `issue_certificate()`, at `OCSPResponseBuilder.build()`, and at ACME
+  finalization. `CertificateAuthority.metrics_prometheus()` now appends
+  histogram exposition lines (Prometheus text format: `_bucket`, `_sum`,
+  `_count` per label set). New `protocol` parameter on `issue_certificate()`
+  (default `""`) lets callers label observations by enrollment protocol
+  (`"acme"`, `"cmp"`, `"est"`, `"scep"`, `"ipsec"`, `""`). No new
+  pip dependencies. 14 tests in `TestMetricsDepth`.
+
+- **§5.1 — PKCS#11 / HSM backend** (`hsm_backend.py`, `pki_server.py`).
+  New `HSMConfig` dataclass and `load_hsm_signing_key(cfg)` function open a
+  PKCS#11 session, locate a key by label, and return an `HSMRSAPrivateKey`
+  or `HSMECPrivateKey` that subclasses the `cryptography` library ABCs so
+  `CertificateBuilder.sign()` and all existing signing paths work unchanged.
+  Raw PKCS#11 ECDSA output (r||s) is converted to DER inside the wrapper;
+  RSA PKCS#1 v1.5 and PSS are supported via mechanism mapping. The CA key
+  is never written to disk when `--hsm-module` is set. Key generation on the
+  token (`EXTRACTABLE=False`) via `--hsm-init-if-missing`. CLI flags:
+  `--hsm-module PATH`, `--hsm-slot N`, `--hsm-pin-env VAR` (default
+  `PYPKI_HSM_PIN`), `--hsm-key-label LABEL` (default `pypki-ca`),
+  `--hsm-init-if-missing`. Optional dependency: `pip install python-pkcs11`;
+  import is deferred and only triggered when `--hsm-module` is supplied.
+  16 unit tests in `TestHSMBackend` (mock HSM, RSA/EC signing, ABC
+  isinstance checks, CertificateBuilder integration); 1 integration test
+  gated on `PYPKI_TEST_HSM_MODULE` env var.
+
+- **§5.2 — Dual-backend storage: SQLite (default) + PostgreSQL** (`db.py`,
+  `migrations.py`, `pki_server.py`, `acme_server.py`, `scep_server.py`,
+  `ocsp_server.py`, `ipsec_server.py`). New `Database` ABC with `SQLiteDB`
+  and `PostgresDB` implementations; `make_db(url)` factory selects the
+  backend from a URL (`sqlite:///…` or `postgresql://…`). All
+  `sqlite3.connect()` call sites across all server modules replaced with
+  the DAL. Serial and CRL number allocation race-free via
+  `advisory_lock("serial-allocation")` / `advisory_lock("crl-allocation")`
+  on both backends (SQLite `BEGIN IMMEDIATE`, Postgres `pg_advisory_xact_lock`).
+  New CLI flags `--pki-db-url`, `--acme-db-url`, `--scep-db-url` (default:
+  `sqlite:///…` matching the current `ca_dir` layout). `SCEPDatabase` and
+  `ACMEDatabase` accept either a path string (backwards-compat) or a
+  `Database` object. `ApprovalQueue` (IPsec) migrated to DAL.
+  PostgreSQL requires `pip install 'psycopg[binary]'`; SQLite ≥ 3.35 required.
+  7 tests in `TestDatabaseBackend` (basic CRUD, transaction rollback, advisory
+  lock serialization, 50-thread serial concurrency test, CLI flag audit).
+
+- **§5.10 — Structured logging + request IDs** (`pki_server.py`,
+  `dispatcher_server.py`). `JsonFormatter` emits one JSON object per log
+  line; `RequestIdFilter` injects a 16-char hex `req_id` (set per HTTP
+  request in `dispatcher_server._dispatch` via `contextvars.ContextVar`) so
+  all log records from a single request share the same ID. New
+  `configure_logging(level, format)` helper replaces the old `basicConfig`
+  call. New `--log-format json|text` CLI flag (default `text` for
+  back-compat). 11 tests in `TestStructuredLogging`.
+
+- **§5.9 — Lifecycle hooks / webhooks** (`hooks.py`, `pki_server.py`). New
+  `WebhookDispatcher` class delivers JSON POST notifications to one or more
+  URLs on `cert.issued`, `cert.revoked`, `cert.expiring`, `subca.issued`,
+  and `cross.signed` events. Delivery is asynchronous (background thread +
+  queue); up to 5 retry attempts with exponential back-off (capped at 300 s);
+  final failure is audit-logged. `X-PyPKI-Signature: sha256=<hex>` header
+  signs every delivery via HMAC-SHA256 so receivers can verify authenticity.
+  `verify_signature(body, secret, header)` helper for receiver-side
+  verification. Dispatcher enabled by new CLI flags `--webhook-url URL`
+  (repeatable), `--webhook-secret SECRET`, `--webhook-events EVENT,...`
+  (default: all). `CertificateAuthority._webhook` attribute wired into
+  `issue_certificate`, `revoke_certificate`, `cross_sign`, and the expiry
+  monitor. 15 tests in `TestLifecycleHooks`.
+
+- **§5.3 — Offline root + key ceremony tooling** (`ceremony.py`,
+  `pypki_admin.py`). Three new `pypki_admin` subcommands:
+  - `export-root` — packages the CA key, cert, and counters into an
+    AES-256-GCM encrypted tar.gz bundle (PBKDF2-SHA256, 600k iterations).
+    Optional Shamir M-of-N passphrase splitting in GF(256) (`--threshold M
+    --shares N`); shares are base64-encoded for distribution.
+  - `sign-csr` — decrypts the bundle (or reconstructs the passphrase from
+    M shares via `--share`) and issues a sub-CA certificate from the offline
+    root. Supports `--validity-days`, `--path-length`, `--permitted-dns`,
+    `--excluded-dns`. No DB writes, no network access required.
+  - `import-cert` — appends a ceremony-signed cert into the online CA's
+    `ca-chain.pem`; idempotent (second import of the same cert is a no-op).
+  13 tests in `TestCeremony` covering encryption round-trips, 2-of-3 and
+  3-of-5 Shamir reconstruction, bundle I/O, `sign-csr` issuing a valid
+  NameConstraints sub-CA cert, and import idempotency.
+
 ### Security
 
 - **RFC 4210 §5.1.3 — CMPv2/v3 response signature protection.** Every
@@ -36,6 +152,16 @@ This project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   client-supplied SPKI, the response is a `PKIStatusInfo` rejection with
   `failInfo` bit 9 (`badPOP`) per RFC 4210 §3.1.4 and the event is
   audit-logged as `popo_failed` / `popo_missing`.
+
+### Changed
+
+- **RFC 5958 — Remaining PKCS#8 cleanup** (`pki_server.py`). Three
+  remaining `PrivateFormat.TraditionalOpenSSL` sites converted to
+  `PrivateFormat.PKCS8`: TLS server key written to disk at startup
+  (line ~2396), mTLS client key returned from the internal
+  `issue_client_cert()` helper (line ~2483), and the throwaway CT
+  pre-cert signing key written to a temp file (line ~2633). No server
+  module now uses PKCS#1 or SEC1 legacy key format.
 
 ### Fixed
 
@@ -70,6 +196,100 @@ This project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   is never absent, and the PKCS#1v15 signature over signedAttrs verifies;
   plus one test in `TestRFC3161TSA` verifying TSA SignedData carries
   `id-contentType = OID_TST_INFO` in its signedAttrs.
+
+- **RFC 7292 — PKCS#12 unencrypted-export rejection.** `export_pkcs12` now
+  rejects passwordless export by default, raising `ValueError` with a message
+  that points operators to `--p12-allow-unencrypted`. The opt-out flag wires
+  through `main()` → `ca._p12_allow_unencrypted`. Tests in
+  `TestRFC7292PKCS12Hardening` (5 tests) verify the guard, the opt-out, and
+  the error message.
+
+- **RFC 6962 — CT CLI wiring and SCT ECDSA verification.** Three new CLI flags:
+  `--ct-log-url URL` (repeatable), `--ct-log-pubkey PATH` (repeatable, aligned
+  by index with log URLs), `--ct-require-n N` (minimum SCTs; 0 = best-effort).
+  All three wire into `ca._ct_log_urls`, `ca._ct_log_pubkeys`, `ca._ct_require_n`
+  in `main()`. New `CertificateAuthority.verify_sct_signature` static method
+  verifies the `DigitallySigned` TLS structure from a CT log response: parses hash
+  algorithm, signature algorithm, and signature bytes; reconstructs the
+  `TreeLeafMessage` signed bytes (version, sig_type, timestamp, entry_type,
+  signed_entry, extensions); verifies the ECDSA P-256 signature against the log's
+  PEM public key. Wrong key, tampered bytes, or invalid pubkey return `False`
+  without raising. `issue_certificate_with_ct` raises `RuntimeError` when fewer
+  than `ct_require_n` SCTs are obtained. Tests in `TestRFC6962CTCLIWiring`
+  (11 tests).
+
+- **RFC 9481 + RFC 9482 — CMP algorithm advertisement and pvno echo.** The CMP
+  `genm`/`genp` exchange now handles three RFC 9481 info-type OIDs:
+  `id-it-signKeyPairTypes` returns RSA + ECDSA P-256/P-384/P-521 + Ed25519/Ed448
+  as `SEQUENCE OF AlgorithmIdentifier`; `id-it-encKeyPairTypes` returns RSA;
+  `id-it-preferredSymmAlg` returns AES-256-GCM. Also fixed a critical pre-existing
+  bug in `parse_pki_message` (`data[0]` referenced before assignment, causing
+  `UnboundLocalError` silently caught → `body_type=None` for all CMP messages).
+  RFC 9482 §3.1 pvno echo: `_handle_cert_request` now propagates the client's
+  `pvno` so `ir`/`cr` responses from a pvno=3 client carry pvno=3. Tests in
+  `TestRFC9481CMPAlgorithms` (9 tests) and `TestRFC9482LightweightCMP` (7 tests).
+
+- **ACME per-account certificate rate limiting.** New `--acme-per-account-cert-limit N`
+  and `--acme-per-account-window-days N` CLI flags (default: 0 = unlimited, 7 days).
+  When a limit is set, `_handle_finalize` counts certificates issued for the account
+  in the rolling window via `ACMEDatabase.count_account_certs_since` (joins `certificates`
+  + `orders` tables) and returns 429 `rateLimited` if the limit is reached. The limit
+  is 0 (off) by default, preserving existing behavior. Tests in
+  `TestACMEPerAccountRateLimit` (7 tests) verify DB counting, window isolation,
+  multi-account isolation, handler propagation, and CLI defaults.
+
+- **§5.7 — OCSP pre-generated static responses (RFC 5019 §6).** New
+  `ocsp_server.generate_static_responses(ca, output_dir, validity_hours=24)`
+  pre-builds one signed `.ocsp` file per certificate in the CA database. Files
+  are written under `<output_dir>/<sha1-issuer-key>/<sha1-issuer-name>/<serial>.ocsp`
+  (compatible with nginx `proxy_cache`, Apache `mod_ssl_ct`, and any static
+  file serving infrastructure). Each file is a DER-encoded `OCSPResponse` with
+  `thisUpdate=now` and `nextUpdate=now+validity_hours`; good/revoked/unknown status
+  from the DB. Returns the count of files written. New `pypki_admin.py` subcommand
+  `ocsp-prebuild --ca-dir DIR --output DIR --validity-hours N` calls the function
+  from the command line. Tests in `TestOCSPStaticResponses` (7 tests) verify count,
+  file creation, three-level path layout, integer serial filenames, valid DER
+  OCSPResponse structure, revoked status encoding, and CLI subcommand execution.
+
+- **§5.6 — Cross-signing.** New `CertificateAuthority.cross_sign(other_cert, validity_days)`
+  issues a certificate with the same subject DN and public key as an existing certificate,
+  signed by this CA. Enables CA algorithm migrations (RSA → ECC → ML-DSA) and dual-trust
+  path deployments: clients trusting the old root continue using the old-signed copy;
+  clients trusting the new root use the cross-signed copy. Extensions copied from source:
+  BasicConstraints (critical, ca flag + path_length preserved), KeyUsage, SubjectAlternativeName.
+  Generated fresh: SubjectKeyIdentifier, AuthorityKeyIdentifier (from this CA's key),
+  AIA/CDP from this CA's configured URLs. Serial from `_next_serial()`, validity from
+  `not_valid_before=now`. Cross-signed certs stored in DB with `profile='cross_signed'`
+  and audit-logged with both source and destination SHA-256 fingerprints (first 16 hex
+  chars). New `POST /api/cross-sign` web UI endpoint (admin auth required) accepts
+  `{"certificate_pem": "...", "validity_days": N}` and returns `{"certificate_pem":
+  "...", "serial": N}`. Tests in `TestCrossSign` (10 tests) verify subject/SPKI
+  preservation, fresh serial, correct issuer and AKI, signature verification, DB storage,
+  BasicConstraints for both CA and EE certs, and source immutability.
+
+- **§5.8 — SCEP single-use OTP challenge passwords.** Replaces the static shared
+  secret with per-enrollment one-time passwords. New `SCEPDatabase.add_otp(ttl_seconds)`
+  mints a 32-character URL-safe base64 token (24 random bytes, stored in new
+  `otp_tokens` table); `consume_otp(token)` atomically marks it used via
+  `BEGIN IMMEDIATE` transaction; `purge_expired_otps()` cleans up stale rows.
+  New `SCEPHandler.use_otp = True` class attribute activates the OTP path
+  (checked first; falls back to static challenge if also set — mixed mode).
+  New module-level `mint_otp(ca_dir, ttl_seconds)` helper allows the web UI
+  and admin scripts to mint OTPs without a handler reference. New
+  `POST /api/scep/otp` web UI endpoint (requires admin auth) calls `mint_otp`
+  and returns `{"otp": token, "ttl_seconds": n}`. CLI: new `--scep-use-otp`
+  flag enables OTP mode at startup. Tests in `TestSCEPOneTimePasswords` (13
+  tests) cover minting, single-use enforcement, expiry, purge, module helper,
+  handler wiring, proxy `scep_db` exposure, and mixed-mode compatibility.
+
+- **RFC 8295 — EST server-generated keys endpoint.** `POST /.well-known/est/serverkeygen`
+  returns a `multipart/mixed` response with two base64-encoded parts: an
+  `application/pkcs7-mime; smime-type=certs-only` cert chain and an
+  `application/pkcs8` PKCS#8 PrivateKeyInfo (RFC 5958 compliant — not legacy
+  PKCS#1). An optional PKCS#10 CSR body is accepted for subject/SAN hints and
+  profile-specific SAN validation. Tests in `TestRFC8295ESTExtensions` (11 tests)
+  verify the multipart structure, PKCS#7 cert validity, PKCS#8 key format, and
+  the binding guarantee that the cert's public key matches the returned private key.
 
 - **RFC 5083 + RFC 5084 — AES-GCM AuthEnvelopedData in SCEP CMS.** Eliminates
   the CBC padding-oracle surface from SCEP-encrypted CSR payloads.

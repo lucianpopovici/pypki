@@ -540,6 +540,7 @@ class ESTHandler(http.server.BaseHTTPRequestHandler):
                 san_ips=san_ips or None,
                 san_uris=san_uris or None,
                 profile=profile,
+                protocol="est",
             )
         except Exception as e:
             logger.error(f"EST issuance failed: {e}")
@@ -620,6 +621,7 @@ class ESTHandler(http.server.BaseHTTPRequestHandler):
                 san_ips=san_ips or None,
                 san_uris=san_uris or None,
                 profile=profile,
+                protocol="est",
             )
         except Exception as e:
             logger.error(f"EST serverkeygen issuance failed: {e}")

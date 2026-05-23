@@ -937,6 +937,10 @@ class WebUIHandler(http.server.BaseHTTPRequestHandler):
                 self._api_issue_sub_ca(data)
             elif path.startswith("/api/services/"):
                 self._api_service_action(path, data)
+            elif path == "/api/scep/otp":
+                self._api_scep_mint_otp(data)
+            elif path == "/api/cross-sign":
+                self._api_cross_sign(data)
             else:
                 self._send_json({"error": "not found"}, 404)
         except Exception as e:
@@ -1660,6 +1664,48 @@ class WebUIHandler(http.server.BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(data)))
         self.end_headers()
         self.wfile.write(data)
+
+    def _api_cross_sign(self, data: dict):
+        """POST /api/cross-sign — cross-sign a PEM certificate with this CA's key."""
+        from cryptography.x509 import load_pem_x509_certificate
+        pem = data.get("certificate_pem", "")
+        if not pem:
+            self._send_json({"error": "certificate_pem required"}, 400)
+            return
+        validity_days = int(data.get("validity_days", 365))
+        if validity_days < 1 or validity_days > 7300:
+            self._send_json({"error": "validity_days must be 1–7300"}, 400)
+            return
+        try:
+            cert_in = load_pem_x509_certificate(pem.encode())
+        except Exception as e:
+            self._send_json({"error": f"invalid certificate_pem: {e}"}, 400)
+            return
+        cert_out = self.ca.cross_sign(
+            cert_in,
+            validity_days=validity_days,
+            audit=self.audit_log,
+            requester_ip=self.client_address[0] if self.client_address else "",
+        )
+        from cryptography.hazmat.primitives.serialization import Encoding as _Enc
+        pem_out = cert_out.public_bytes(_Enc.PEM).decode()
+        self._send_json({
+            "certificate_pem": pem_out,
+            "serial": cert_out.serial_number,
+        })
+
+    def _api_scep_mint_otp(self, data: dict):
+        """POST /api/scep/otp — mint a single-use SCEP enrolment OTP."""
+        scep_mod = (self.service_registry or {}).get("_modules", {}).get("scep")
+        if scep_mod is None:
+            self._send_json({"error": "SCEP module not loaded"}, 404)
+            return
+        ttl = int(data.get("ttl_seconds", 86400))
+        if ttl < 60 or ttl > 7 * 86400:
+            self._send_json({"error": "ttl_seconds must be 60–604800"}, 400)
+            return
+        token = scep_mod.mint_otp(self.ca.ca_dir, ttl)
+        self._send_json({"otp": token, "ttl_seconds": ttl})
 
     # ------------------------------------------------------------------
     # JSON API — service management

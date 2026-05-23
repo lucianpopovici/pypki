@@ -69,6 +69,7 @@ Usage:
 import argparse
 import base64
 import datetime
+import fnmatch
 import hashlib
 import hmac
 import http.server
@@ -78,12 +79,14 @@ import os
 import re
 import socket
 import sqlite3
+from db import make_db, Database
 import ssl
 import struct
 import tempfile
 import threading
 import time
 import traceback
+import uuid
 from pathlib import Path
 from typing import Optional, Tuple, Dict, Any, List
 
@@ -180,6 +183,14 @@ except ImportError:
 HAS_CMP = False
 _cmp_module = None
 
+# §5.9 — Lifecycle hooks / webhooks (optional)
+try:
+    import hooks as _hooks_module
+    HAS_HOOKS = True
+except ImportError:
+    HAS_HOOKS = False
+    _hooks_module = None  # type: ignore[assignment]
+
 # ASN.1 imports for CMPv2 message parsing
 try:
     from pyasn1.type import univ, namedtype, tag, constraint, namedval, useful
@@ -191,10 +202,56 @@ except ImportError:
     HAS_PYASN1 = False
     print("WARNING: pyasn1 not found. Install with: pip install pyasn1 pyasn1-modules")
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s"
-)
+# ---------------------------------------------------------------------------
+# §5.10 — Structured logging + request IDs
+# ---------------------------------------------------------------------------
+
+class _RequestIdFilter(logging.Filter):
+    """Inject the current request ID (from dispatcher ContextVar) into every record."""
+    def filter(self, record: logging.LogRecord) -> bool:
+        try:
+            from dispatcher_server import request_id_var
+            record.req_id = request_id_var.get()
+        except Exception:
+            record.req_id = ""
+        return True
+
+
+class _JsonFormatter(logging.Formatter):
+    """One JSON object per line, suitable for log aggregators."""
+    def format(self, record: logging.LogRecord) -> str:
+        import json as _json
+        d: dict = {
+            "ts":      self.formatTime(record, "%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z",
+            "level":   record.levelname,
+            "logger":  record.name,
+            "msg":     record.getMessage(),
+            "req_id":  getattr(record, "req_id", "") or None,
+        }
+        if record.exc_info:
+            d["exc"] = self.formatException(record.exc_info)
+        return _json.dumps(d, separators=(",", ":"))
+
+
+def configure_logging(level: str = "INFO", log_format: str = "text") -> None:
+    """Configure the root logger; called once from main() after arg parsing."""
+    root = logging.getLogger()
+    root.setLevel(getattr(logging, level.upper(), logging.INFO))
+    root.handlers.clear()
+    handler = logging.StreamHandler()
+    if log_format == "json":
+        fmt: logging.Formatter = _JsonFormatter()
+    else:
+        fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+    handler.setFormatter(fmt)
+    handler.addFilter(_RequestIdFilter())
+    root.addHandler(handler)
+
+
+# Bootstrap with text format so import-time messages are readable; main()
+# calls configure_logging() again once CLI args are parsed.
+configure_logging("INFO", "text")
+
 logger = logging.getLogger("pki-cmpv2")
 
 # ---------------------------------------------------------------------------
@@ -269,6 +326,396 @@ def _get_tracer():
 _tracer = None  # Set to _get_tracer() after _setup_otel() is called in main()
 
 
+# ---------------------------------------------------------------------------
+# §5.11 — In-process Prometheus histogram (no prometheus_client dependency)
+# ---------------------------------------------------------------------------
+
+_HIST_BUCKETS = (0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, float("inf"))
+
+
+class _Histogram:
+    """Thread-safe Prometheus-format histogram stored in process memory."""
+
+    def __init__(self, name: str, help_text: str, labels: tuple = (),
+                 buckets: tuple = _HIST_BUCKETS) -> None:
+        self._name = name
+        self._help = help_text
+        self._label_names = labels
+        self._buckets = buckets
+        self._lock = threading.Lock()
+        self._data: dict = {}  # label_values_tuple → {"b": [...], "s": float, "c": int}
+
+    def observe(self, value: float, label_values: tuple = ()) -> None:
+        with self._lock:
+            if label_values not in self._data:
+                self._data[label_values] = {
+                    "b": [0] * len(self._buckets),
+                    "s": 0.0,
+                    "c": 0,
+                }
+            d = self._data[label_values]
+            for i, bound in enumerate(self._buckets):
+                if value <= bound:
+                    d["b"][i] += 1
+            d["s"] += value
+            d["c"] += 1
+
+    def exposition(self) -> list:
+        lines = [
+            f"# HELP {self._name} {self._help}",
+            f"# TYPE {self._name} histogram",
+        ]
+        with self._lock:
+            snapshot = list(self._data.items())
+        for label_vals, d in sorted(snapshot, key=lambda x: str(x[0])):
+            if self._label_names:
+                label_body = ",".join(
+                    f'{k}="{v}"' for k, v in zip(self._label_names, label_vals)
+                )
+                pfx = f"{{{label_body},"
+                sfx = "}"
+            else:
+                pfx = "{"
+                sfx = "}"
+            for i, bound in enumerate(self._buckets):
+                le = "+Inf" if bound == float("inf") else str(bound)
+                lines.append(f'{self._name}_bucket{pfx}le="{le}"{sfx} {d["b"][i]}')
+            lines.append(f'{self._name}_sum{{{label_body}}} {d["s"]}' if self._label_names
+                         else f'{self._name}_sum {d["s"]}')
+            lines.append(f'{self._name}_count{{{label_body}}} {d["c"]}' if self._label_names
+                         else f'{self._name}_count {d["c"]}')
+        return lines
+
+
+# Module-level histogram instances — imported by acme_server.py and ocsp_server.py
+_hist_issuance = _Histogram(
+    "pypki_issuance_duration_seconds",
+    "Histogram of certificate issuance duration in seconds",
+    labels=("profile", "protocol"),
+)
+_hist_ocsp = _Histogram(
+    "pypki_ocsp_duration_seconds",
+    "Histogram of OCSP response generation duration in seconds",
+)
+_hist_acme_order = _Histogram(
+    "pypki_acme_order_duration_seconds",
+    "Histogram of ACME order finalization duration in seconds",
+    labels=("challenge_type",),
+)
+
+
+# ---------------------------------------------------------------------------
+# §5.4 — RA / approval workflow
+# ---------------------------------------------------------------------------
+
+def _dns_matches_pattern(name: str, pattern: str) -> bool:
+    """Match a DNS name against a glob-style pattern (fnmatch semantics)."""
+    return fnmatch.fnmatch(name.lower(), pattern.lower())
+
+
+class RAPolicy:
+    """
+    Auto-approval policy engine for the RA workflow.
+
+    Evaluation order (first match wins):
+    1. ``auto_approve_all=True`` → always auto-approve.
+    2. Profile in ``auto_approve_profiles`` → auto-approve that profile.
+    3. JSON policy rules loaded from ``--ra-policy-file``:
+       each profile can declare ``auto_approve: true`` or a list of
+       ``auto_approve_when`` rules that match on SAN DNS patterns.
+    4. Default → require manual review (return None).
+
+    JSON policy file schema::
+
+        {
+          "profiles": {
+            "tls_server": {
+              "auto_approve": false,
+              "auto_approve_when": [
+                {"san_dns_matches": ["*.cluster.local", "*.svc"]}
+              ]
+            },
+            "default": {"auto_approve": true}
+          }
+        }
+    """
+
+    def __init__(
+        self,
+        auto_approve_all: bool = True,
+        auto_approve_profiles: Optional[List[str]] = None,
+        policy_rules: Optional[dict] = None,
+    ) -> None:
+        self._all = auto_approve_all
+        self._profiles: set = set(auto_approve_profiles or [])
+        self._rules: dict = policy_rules or {}
+
+    @classmethod
+    def from_file(cls, path: str, auto_approve_profiles: Optional[List[str]] = None):
+        with open(path) as fh:
+            cfg = json.load(fh)
+        rules = {}
+        for profile, pcfg in cfg.get("profiles", {}).items():
+            rules[profile] = {
+                "auto_approve": bool(pcfg.get("auto_approve", False)),
+                "auto_approve_when": pcfg.get("auto_approve_when", []),
+            }
+        return cls(
+            auto_approve_all=False,
+            auto_approve_profiles=auto_approve_profiles,
+            policy_rules=rules,
+        )
+
+    def should_auto_approve(
+        self,
+        profile: str,
+        san_dns: Optional[List[str]] = None,
+        san_ips: Optional[List[str]] = None,
+    ) -> Optional[str]:
+        """Return a reason string if the request should be auto-approved, else None."""
+        if self._all:
+            return "auto_approve_all"
+        if profile in self._profiles:
+            return f"profile '{profile}' in auto-approve list"
+        pcfg = self._rules.get(profile, {})
+        if pcfg.get("auto_approve"):
+            return f"policy: profile '{profile}' auto_approve=true"
+        for rule in pcfg.get("auto_approve_when", []):
+            patterns = rule.get("san_dns_matches", [])
+            for dns in (san_dns or []):
+                for pat in patterns:
+                    if _dns_matches_pattern(dns, pat):
+                        return f"SAN '{dns}' matches pattern '{pat}'"
+        return None
+
+
+class RAWorkflow:
+    """
+    Registration Authority workflow — submit, approve, and deny certificate requests.
+
+    Backed by the ``pending_requests`` table in the PKI DB.
+    Created by ``CertificateAuthority`` when RA is configured; exposed as
+    ``ca.ra`` so REST and protocol handlers can call ``ca.ra.submit()``.
+    """
+
+    def __init__(self, db: "Database", ca: "CertificateAuthority", policy: RAPolicy) -> None:
+        self._db = db
+        self._ca = ca
+        self._policy = policy
+
+    # ------------------------------------------------------------------
+    # Submit a new request
+    # ------------------------------------------------------------------
+
+    def submit(
+        self,
+        protocol: str,
+        profile: str,
+        subject_dn: str,
+        public_key_der: bytes,
+        san_dns: Optional[List[str]] = None,
+        san_ips: Optional[List[str]] = None,
+        san_emails: Optional[List[str]] = None,
+        san_uris: Optional[List[str]] = None,
+        csr_der: Optional[bytes] = None,
+        validity_days: Optional[int] = None,
+        requester_ip: str = "",
+        protocol_ref: str = "",
+        audit: Optional["AuditLog"] = None,
+    ) -> tuple:
+        """
+        Record a certificate request and evaluate auto-approval policy.
+
+        Returns ``(request_id, auto_approved, cert_or_None)``.
+        When ``auto_approved`` is True the cert has already been issued and
+        ``cert_or_None`` is the ``x509.Certificate``.  When False the request
+        is pending and the caller should return an appropriate waiting response.
+        """
+        request_id = str(uuid.uuid4())
+        now = int(time.time())
+        self._db.execute(
+            "INSERT INTO pending_requests "
+            "(request_id, protocol, profile, subject_dn, "
+            " san_dns, san_ips, san_emails, san_uris, "
+            " public_key_der, csr_der, validity_days, "
+            " requester_ip, status, created_at, protocol_ref) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                request_id, protocol, profile, subject_dn,
+                json.dumps(san_dns) if san_dns else None,
+                json.dumps(san_ips) if san_ips else None,
+                json.dumps(san_emails) if san_emails else None,
+                json.dumps(san_uris) if san_uris else None,
+                public_key_der, csr_der, validity_days,
+                requester_ip, "pending", now, protocol_ref,
+            ),
+        )
+
+        auto_reason = self._policy.should_auto_approve(profile, san_dns, san_ips)
+        if auto_reason:
+            cert = self._issue_and_finalize(
+                request_id, auto_reason, approver=None, audit=audit,
+                requester_ip=requester_ip,
+            )
+            return request_id, True, cert
+
+        if audit:
+            audit.record("ra_pending",
+                         f"request_id={request_id} protocol={protocol} "
+                         f"profile={profile} subject='{subject_dn}'",
+                         requester_ip)
+        return request_id, False, None
+
+    # ------------------------------------------------------------------
+    # Approve / deny
+    # ------------------------------------------------------------------
+
+    def approve(
+        self,
+        request_id: str,
+        approver: str = "admin",
+        audit: Optional["AuditLog"] = None,
+        requester_ip: str = "",
+    ) -> Optional["x509.Certificate"]:
+        """
+        Approve a pending request.  Issues the certificate immediately and
+        marks the request as 'issued'.  Returns the issued cert or None if
+        the request_id was not found / not pending.
+        """
+        row = self._db.fetchone(
+            "SELECT * FROM pending_requests WHERE request_id=? AND status='pending'",
+            (request_id,),
+        )
+        if not row:
+            return None
+        return self._issue_and_finalize(
+            request_id, None, approver=approver, audit=audit, requester_ip=requester_ip,
+        )
+
+    def deny(
+        self,
+        request_id: str,
+        reason: str = "",
+        approver: str = "admin",
+        audit: Optional["AuditLog"] = None,
+        requester_ip: str = "",
+    ) -> bool:
+        """
+        Deny a pending request.  Returns True if the request was found and
+        updated, False if it didn't exist or was already decided.
+        """
+        row = self._db.fetchone(
+            "SELECT request_id FROM pending_requests WHERE request_id=? AND status='pending'",
+            (request_id,),
+        )
+        if not row:
+            return False
+        self._db.execute(
+            "UPDATE pending_requests "
+            "SET status='denied', approver=?, deny_reason=?, decided_at=? "
+            "WHERE request_id=?",
+            (approver, reason, int(time.time()), request_id),
+        )
+        if audit:
+            audit.record("ra_denied",
+                         f"request_id={request_id} approver={approver} reason='{reason}'",
+                         requester_ip)
+        return True
+
+    # ------------------------------------------------------------------
+    # Query
+    # ------------------------------------------------------------------
+
+    def get(self, request_id: str) -> Optional[dict]:
+        row = self._db.fetchone(
+            "SELECT * FROM pending_requests WHERE request_id=?", (request_id,)
+        )
+        return self._row_to_dict(row) if row else None
+
+    def list_pending(self) -> List[dict]:
+        rows = self._db.fetchall(
+            "SELECT * FROM pending_requests WHERE status='pending' ORDER BY created_at"
+        )
+        return [self._row_to_dict(r) for r in rows]
+
+    def list_recent(self, limit: int = 100) -> List[dict]:
+        rows = self._db.fetchall(
+            "SELECT * FROM pending_requests ORDER BY created_at DESC LIMIT ?", (limit,)
+        )
+        return [self._row_to_dict(r) for r in rows]
+
+    def get_by_protocol_ref(self, protocol_ref: str) -> Optional[dict]:
+        row = self._db.fetchone(
+            "SELECT * FROM pending_requests WHERE protocol_ref=? ORDER BY created_at DESC LIMIT 1",
+            (protocol_ref,),
+        )
+        return self._row_to_dict(row) if row else None
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    def _issue_and_finalize(
+        self,
+        request_id: str,
+        auto_reason: Optional[str],
+        approver: Optional[str],
+        audit: Optional["AuditLog"],
+        requester_ip: str = "",
+    ) -> "x509.Certificate":
+        from cryptography.hazmat.primitives.serialization import load_der_public_key
+        row = self._db.fetchone(
+            "SELECT * FROM pending_requests WHERE request_id=?", (request_id,)
+        )
+        pub_key = load_der_public_key(bytes(row["public_key_der"]))
+        san_dns = json.loads(row["san_dns"]) if row["san_dns"] else None
+        san_ips = json.loads(row["san_ips"]) if row["san_ips"] else None
+        san_emails = json.loads(row["san_emails"]) if row["san_emails"] else None
+        san_uris = json.loads(row["san_uris"]) if row["san_uris"] else None
+
+        cert = self._ca.issue_certificate(
+            subject_str=row["subject_dn"],
+            public_key=pub_key,
+            profile=row["profile"],
+            san_dns=san_dns,
+            san_ips=san_ips,
+            san_emails=san_emails,
+            san_uris=san_uris,
+            validity_days=row["validity_days"],
+            audit=audit,
+            requester_ip=requester_ip,
+            protocol=f"ra-{row['protocol']}",
+        )
+        cert_der = cert.public_bytes(__import__("cryptography").hazmat.primitives.serialization.Encoding.DER)
+
+        self._db.execute(
+            "UPDATE pending_requests "
+            "SET status='issued', cert_der=?, decided_at=?, approver=?, auto_approval_reason=? "
+            "WHERE request_id=?",
+            (cert_der, int(time.time()), approver, auto_reason, request_id),
+        )
+        if audit:
+            event = "ra_auto_approved" if auto_reason else "ra_approved"
+            audit.record(
+                event,
+                f"request_id={request_id} serial={cert.serial_number} "
+                f"subject='{row['subject_dn']}' approver={approver!r} "
+                f"reason={auto_reason or 'manual'}",
+                requester_ip,
+            )
+        return cert
+
+    @staticmethod
+    def _row_to_dict(row) -> dict:
+        d = dict(row)
+        for col in ("san_dns", "san_ips", "san_emails", "san_uris"):
+            if d.get(col):
+                d[col] = json.loads(d[col])
+        # Strip binary blobs from the API representation
+        d.pop("public_key_der", None)
+        d.pop("csr_der", None)
+        d.pop("cert_der", None)
+        return d
 
 
 # ---------------------------------------------------------------------------
@@ -1053,7 +1500,9 @@ class CertificateAuthority:
                  ocsp_url: str = "", crl_url: str = "",
                  parent_chain_path: Optional[str] = None,
                  ca_key_type: str = "rsa-4096",
-                 sig_algorithm: str = "rsa-pkcs1v15"):
+                 sig_algorithm: str = "rsa-pkcs1v15",
+                 pki_db_url: str = "",
+                 hsm_cfg=None):
         """
         Parameters
         ----------
@@ -1073,10 +1522,20 @@ class CertificateAuthority:
         sig_algorithm     : Signature padding for RSA CA keys — one of
                             ``rsa-pkcs1v15`` (default) or ``rsa-pss`` (RFC 4055).
                             No-op for ECDSA / EdDSA keys.
+        pki_db_url        : Database URL for the PKI certificate store.
+                            Defaults to ``sqlite:///<ca_dir>/certificates.db``.
+                            Use ``postgresql://user:pass@host/db`` for HA deployments.
+        hsm_cfg           : Optional HSMConfig for PKCS#11 / HSM key backing (§5.1).
+                            When set, the CA signing key is loaded from the HSM
+                            token instead of ca.key on disk. The public cert is
+                            still stored in ca.crt.
         """
         self.ca_dir = Path(ca_dir)
         self.ca_dir.mkdir(parents=True, exist_ok=True)
         self.db_path = self.ca_dir / "certificates.db"
+        # §5.2 — Database Abstraction Layer (SQLite default; Postgres via --pki-db-url)
+        _pki_url = pki_db_url or f"sqlite:///{self.db_path}"
+        self._pki_db: Database = make_db(_pki_url)
         self.config  = config  # may be None (uses hardcoded defaults as fallback)
         self._ocsp_url = ocsp_url   # embedded in every issued cert AIA extension
         self._crl_url  = crl_url    # embedded in every issued cert CDP extension
@@ -1090,13 +1549,32 @@ class CertificateAuthority:
             )
         self._sig_algorithm = sig_algorithm
         self._rsa_pss = (sig_algorithm == "rsa-pss")
+        # §5.1 — optional PKCS#11 HSM config; None = file-backed key (default)
+        self._hsm_cfg = hsm_cfg
+        # RFC 7292 hardening: reject unencrypted PKCS#12 export unless explicitly allowed.
+        # Set to True via --p12-allow-unencrypted CLI flag.
+        self._p12_allow_unencrypted: bool = False
+        # RFC 6962 CT configuration: populated by CLI flags --ct-log-url /
+        # --ct-log-pubkey / --ct-require-n.  Empty by default (CT opt-in).
+        self._ct_log_urls: List[str] = []
+        self._ct_log_pubkeys: List[bytes] = []   # PEM-encoded ECDSA pubkeys, aligned to _ct_log_urls
+        self._ct_require_n: int = 0              # min SCTs required; 0 = best-effort
+        # §5.9 — Lifecycle webhooks: set by main() after CLI arg parsing.
+        self._webhook: Optional["_hooks_module.WebhookDispatcher"] = None  # type: ignore[name-defined]
+        # §5.4 — RA workflow: set by configure_ra() after CLI arg parsing;
+        # defaults to auto-approve-all (backwards-compatible behaviour).
+        self.ra: Optional[RAWorkflow] = None
         self._init_db()
         self._load_or_create_ca()
         self._load_parent_chain(parent_chain_path)
 
+    def configure_ra(self, policy: RAPolicy) -> None:
+        """Attach an RAWorkflow to this CA with the given approval policy."""
+        self.ra = RAWorkflow(self._pki_db, self, policy)
+
     def _init_db(self):
-        conn = sqlite3.connect(str(self.db_path))
-        conn.execute("""
+        # Bootstrap the core schema directly via the DAL (idempotent).
+        self._pki_db.execute("""
             CREATE TABLE IF NOT EXISTS certificates (
                 serial      INTEGER PRIMARY KEY,
                 subject     TEXT NOT NULL,
@@ -1109,13 +1587,13 @@ class CertificateAuthority:
                 profile     TEXT DEFAULT 'default'
             )
         """)
-        conn.execute("""
+        self._pki_db.execute("""
             CREATE TABLE IF NOT EXISTS serial_counter (
                 id    INTEGER PRIMARY KEY,
                 value INTEGER NOT NULL
             )
         """)
-        conn.execute("""
+        self._pki_db.execute("""
             CREATE TABLE IF NOT EXISTS crl_base (
                 id          INTEGER PRIMARY KEY,
                 issued_at   TEXT NOT NULL,
@@ -1124,14 +1602,14 @@ class CertificateAuthority:
                 der         BLOB NOT NULL
             )
         """)
-        conn.execute("INSERT OR IGNORE INTO serial_counter VALUES (1, 1000)")
+        self._pki_db.execute("INSERT OR IGNORE INTO serial_counter VALUES (1, 1000)")
         # Migrate: add profile column if missing (for existing DBs)
         try:
-            conn.execute("ALTER TABLE certificates ADD COLUMN profile TEXT DEFAULT 'default'")
+            self._pki_db.execute(
+                "ALTER TABLE certificates ADD COLUMN profile TEXT DEFAULT 'default'"
+            )
         except Exception:
             pass
-        conn.commit()
-        conn.close()
 
         # Apply pending pki-namespace migrations (versioned schema files
         # under db_migrations/pki/). The 001 file is a no-op against an
@@ -1139,7 +1617,6 @@ class CertificateAuthority:
         # subsequent migrations (e.g. 002_crl_number.sql for RFC 5280
         # §5.2.3 compliance) are applied here.
         try:
-            from db import make_db
             from migrations import MigrationRunner
             mig_root = os.environ.get(
                 "PYPKI_MIGRATIONS_ROOT",
@@ -1147,68 +1624,48 @@ class CertificateAuthority:
             )
             mig_dir = Path(mig_root) / "pki"
             if mig_dir.is_dir():
-                d = make_db(f"sqlite:///{self.db_path}")
-                try:
-                    MigrationRunner(d, mig_dir, namespace="pki").apply_pending()
-                finally:
-                    d.close()
+                MigrationRunner(self._pki_db, mig_dir, namespace="pki").apply_pending()
         except Exception as e:
             logger.warning(f"pki-namespace migrations skipped: {e}")
 
     def _next_serial(self) -> int:
-        conn = sqlite3.connect(str(self.db_path))
-        try:
-            row = conn.execute("SELECT value FROM serial_counter WHERE id=1").fetchone()
+        with self._pki_db.advisory_lock("serial-allocation"):
+            row = self._pki_db.fetchone("SELECT value FROM serial_counter WHERE id=1")
             serial = row[0]
-            conn.execute("UPDATE serial_counter SET value=? WHERE id=1", (serial + 1,))
-            conn.commit()
-            return serial
-        finally:
-            conn.close()
+            self._pki_db.execute(
+                "UPDATE serial_counter SET value=? WHERE id=1", (serial + 1,)
+            )
+        return serial
 
     def _next_crl_number(self) -> int:
         """
         Atomically allocate the next CRL number (RFC 5280 §5.2.3).
 
-        Both base and delta CRLs share this counter. BEGIN IMMEDIATE
-        acquires the database write lock for the duration of the
-        increment, preventing concurrent CRL generation from assigning
-        the same number twice. Falls back to 1 if the table is missing
-        (e.g., migration not yet applied — defensive behavior).
+        Both base and delta CRLs share this counter. advisory_lock serializes
+        concurrent CRL generation across all processes/nodes so the same number
+        is never assigned twice. Falls back to 1 if the table is missing.
         """
-        conn = sqlite3.connect(str(self.db_path))
         try:
-            try:
-                conn.execute("BEGIN IMMEDIATE")
-                row = conn.execute(
-                    "SELECT value FROM crl_number WHERE id=1"
-                ).fetchone()
+            with self._pki_db.advisory_lock("crl-allocation"):
+                row = self._pki_db.fetchone("SELECT value FROM crl_number WHERE id=1")
                 if row is None:
-                    # Migration not applied; seed defensively.
-                    conn.execute(
+                    self._pki_db.execute(
                         "INSERT OR IGNORE INTO crl_number(id, value) VALUES (1, 0)"
                     )
                     current = 0
                 else:
                     current = row[0]
                 next_num = current + 1
-                conn.execute(
+                self._pki_db.execute(
                     "UPDATE crl_number SET value=? WHERE id=1", (next_num,)
                 )
-                conn.commit()
-                return next_num
-            except sqlite3.OperationalError as e:
-                # Table doesn't exist (very old DB without migration).
-                # Without persistence, the best we can do is return 1
-                # and log loudly so the operator notices.
-                logger.warning(
-                    f"crl_number table missing; CRL will use number 1 "
-                    f"(reapply migrations to fix): {e}"
-                )
-                conn.rollback()
-                return 1
-        finally:
-            conn.close()
+            return next_num
+        except Exception as e:
+            logger.warning(
+                f"crl_number table missing; CRL will use number 1 "
+                f"(reapply migrations to fix): {e}"
+            )
+            return 1
 
     def _cfg(self, attr: str, default: int) -> int:
         """Read a validity value from config, falling back to default."""
@@ -1219,6 +1676,10 @@ class CertificateAuthority:
     def _load_or_create_ca(self):
         ca_key_path = self.ca_dir / "ca.key"
         ca_cert_path = self.ca_dir / "ca.crt"
+
+        if self._hsm_cfg is not None:
+            self._load_or_create_ca_hsm(ca_cert_path)
+            return
 
         if ca_key_path.exists() and ca_cert_path.exists():
             logger.info("Loading existing CA key and certificate.")
@@ -1276,6 +1737,61 @@ class CertificateAuthority:
                 f.write(self.ca_cert.public_bytes(Encoding.PEM))
 
             logger.info(f"CA certificate written to {ca_cert_path}")
+
+    def _load_or_create_ca_hsm(self, ca_cert_path: Path):
+        """
+        §5.1 — HSM-backed CA key initialisation.
+
+        The signing key lives on the PKCS#11 token and never touches disk.
+        Only the self-signed CA certificate is written to ca.crt on first boot.
+        On subsequent boots the cert is read from disk and the key is re-loaded
+        from the token.
+        """
+        from hsm_backend import load_hsm_signing_key
+
+        self.ca_key = load_hsm_signing_key(self._hsm_cfg)
+
+        if ca_cert_path.exists():
+            logger.info("Loading existing CA certificate (HSM key mode).")
+            with open(ca_cert_path, "rb") as f:
+                self.ca_cert = x509.load_pem_x509_certificate(f.read())
+            return
+
+        logger.info("Generating self-signed CA certificate using HSM key...")
+        subject = issuer = x509.Name([
+            x509.NameAttribute(NameOID.COUNTRY_NAME, "US"),
+            x509.NameAttribute(NameOID.ORGANIZATION_NAME, "PyPKI CMPv2"),
+            x509.NameAttribute(NameOID.COMMON_NAME, "PyPKI Root CA"),
+        ])
+        now = datetime.datetime.now(datetime.timezone.utc)
+        ca_days = self._cfg("ca_days", 3650)
+        builder = (
+            x509.CertificateBuilder()
+            .subject_name(subject)
+            .issuer_name(issuer)
+            .public_key(self.ca_key.public_key())
+            .serial_number(x509.random_serial_number())
+            .not_valid_before(now)
+            .not_valid_after(now + datetime.timedelta(days=ca_days))
+            .add_extension(x509.BasicConstraints(ca=True, path_length=None), critical=True)
+            .add_extension(
+                x509.KeyUsage(
+                    digital_signature=True, content_commitment=True,
+                    key_encipherment=False, data_encipherment=False,
+                    key_agreement=False, key_cert_sign=True,
+                    crl_sign=True, encipher_only=False, decipher_only=False,
+                ),
+                critical=True,
+            )
+            .add_extension(
+                x509.SubjectKeyIdentifier.from_public_key(self.ca_key.public_key()),
+                critical=False,
+            )
+        )
+        self.ca_cert = _sign_builder(builder, self.ca_key, rsa_pss=self._rsa_pss)
+        with open(ca_cert_path, "wb") as f:
+            f.write(self.ca_cert.public_bytes(Encoding.PEM))
+        logger.info(f"CA certificate written to {ca_cert_path} (HSM-signed)")
 
     # ------------------------------------------------------------------
     # Intermediate CA — parent chain loading
@@ -1426,6 +1942,7 @@ class CertificateAuthority:
         audit: Optional["AuditLog"] = None,
         requester_ip: str = "",
         path_length: Optional[int] = None,
+        protocol: str = "",
     ) -> x509.Certificate:
         """
         Issue a certificate signed by this CA.
@@ -1704,35 +2221,43 @@ class CertificateAuthority:
 
         # Feature 10: OpenTelemetry span for certificate issuance
         _t = _tracer or _get_tracer()
+        _t0 = time.perf_counter()
         with _t.start_as_current_span("ca.issue_certificate") as _span:
             _span.set_attribute("cert.serial", serial)
             _span.set_attribute("cert.subject", subject_str)
             _span.set_attribute("cert.profile", profile)
             _span.set_attribute("cert.validity_days", validity_days or 0)
             cert = _sign_builder(builder, self.ca_key, rsa_pss=self._rsa_pss)
+        _hist_issuance.observe(time.perf_counter() - _t0, (profile, protocol))
 
         # Store in DB (including profile)
-        conn = sqlite3.connect(str(self.db_path))
-        try:
-            conn.execute(
-                "INSERT OR REPLACE INTO certificates(serial,subject,not_before,not_after,der,revoked,revoked_at,reason,profile) "
-                "VALUES(?,?,?,?,?,0,NULL,NULL,?)",
-                (
-                    serial,
-                    subject_str,
-                    now.isoformat(),
-                    (now + datetime.timedelta(days=validity_days)).isoformat(),
-                    cert.public_bytes(Encoding.DER),
-                    profile,
-                ),
-            )
-            conn.commit()
-        finally:
-            conn.close()
+        self._pki_db.execute(
+            "INSERT OR REPLACE INTO certificates"
+            "(serial,subject,not_before,not_after,der,revoked,revoked_at,reason,profile) "
+            "VALUES(?,?,?,?,?,0,NULL,NULL,?)",
+            (
+                serial,
+                subject_str,
+                now.isoformat(),
+                (now + datetime.timedelta(days=validity_days)).isoformat(),
+                cert.public_bytes(Encoding.DER),
+                profile,
+            ),
+        )
 
         if audit:
             audit.record("issue", f"serial={serial} subject='{subject_str}' profile={profile}",
                          requester_ip)
+
+        if self._webhook:
+            event = "subca.issued" if profile in ("sub_ca", "cross_signed") else "cert.issued"
+            self._webhook.emit(event, {
+                "serial": serial,
+                "subject": subject_str,
+                "profile": profile,
+                "not_after": cert.not_valid_after_utc.isoformat(),
+                "requester_ip": requester_ip,
+            })
 
         logger.info(f"Issued certificate serial={serial} subject='{subject_str}' profile={profile}")
         return cert
@@ -1749,21 +2274,23 @@ class CertificateAuthority:
         with _t.start_as_current_span("ca.revoke_certificate") as _span:
             _span.set_attribute("cert.serial", serial)
             _span.set_attribute("cert.revocation_reason", reason)
-        conn = sqlite3.connect(str(self.db_path))
-        try:
-            row = conn.execute("SELECT serial FROM certificates WHERE serial=? AND revoked=0", (serial,)).fetchone()
-            if not row:
-                return False
-            now = datetime.datetime.now(datetime.timezone.utc).isoformat()
-            conn.execute(
-                "UPDATE certificates SET revoked=1, revoked_at=?, reason=? WHERE serial=?",
-                (now, reason, serial),
-            )
-            conn.commit()
-            logger.info(f"Revoked certificate serial={serial} reason={reason}")
-            return True
-        finally:
-            conn.close()
+        row = self._pki_db.fetchone(
+            "SELECT serial FROM certificates WHERE serial=? AND revoked=0", (serial,)
+        )
+        if not row:
+            return False
+        now = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        self._pki_db.execute(
+            "UPDATE certificates SET revoked=1, revoked_at=?, reason=? WHERE serial=?",
+            (now, reason, serial),
+        )
+        logger.info(f"Revoked certificate serial={serial} reason={reason}")
+        if self._webhook:
+            self._webhook.emit("cert.revoked", {
+                "serial": serial,
+                "reason": reason,
+            })
+        return True
 
     def generate_crl(self) -> bytes:
         """
@@ -1774,12 +2301,9 @@ class CertificateAuthority:
           - authorityKeyIdentifier    (matches the CA cert's SKI)
         Both are non-critical.
         """
-        conn = sqlite3.connect(str(self.db_path))
-        revoked = conn.execute(
+        revoked = self._pki_db.fetchall(
             "SELECT serial, revoked_at, reason FROM certificates WHERE revoked=1"
-        ).fetchall()
-        conn.close()
-
+        )
         crl_number = self._next_crl_number()
 
         builder = (
@@ -1798,13 +2322,13 @@ class CertificateAuthority:
             )
         )
 
-        for serial, revoked_at, reason in revoked:
+        for r in revoked:
             rev_cert = (
                 x509.RevokedCertificateBuilder()
-                .serial_number(serial)
+                .serial_number(int(r["serial"]))
                 .revocation_date(
-                    datetime.datetime.fromisoformat(revoked_at)
-                    if revoked_at
+                    datetime.datetime.fromisoformat(r["revoked_at"])
+                    if r["revoked_at"]
                     else datetime.datetime.now(datetime.timezone.utc)
                 )
                 .build()
@@ -1815,19 +2339,24 @@ class CertificateAuthority:
         return crl.public_bytes(Encoding.DER)
 
     def get_cert_by_serial(self, serial: int) -> Optional[bytes]:
-        conn = sqlite3.connect(str(self.db_path))
-        row = conn.execute("SELECT der FROM certificates WHERE serial=?", (serial,)).fetchone()
-        conn.close()
-        return row[0] if row else None
+        row = self._pki_db.fetchone(
+            "SELECT der FROM certificates WHERE serial=?", (serial,)
+        )
+        return row["der"] if row else None
 
     def list_certificates(self) -> list:
-        conn = sqlite3.connect(str(self.db_path))
-        rows = conn.execute(
+        rows = self._pki_db.fetchall(
             "SELECT serial, subject, not_before, not_after, revoked, profile FROM certificates"
-        ).fetchall()
-        conn.close()
+        )
         return [
-            {"serial": r[0], "subject": r[1], "not_before": r[2], "not_after": r[3], "revoked": bool(r[4]), "profile": r[5] or "default"}
+            {
+                "serial": r["serial"],
+                "subject": r["subject"],
+                "not_before": r["not_before"],
+                "not_after": r["not_after"],
+                "revoked": bool(r["revoked"]),
+                "profile": r["profile"] or "default",
+            }
             for r in rows
         ]
 
@@ -1864,7 +2393,7 @@ class CertificateAuthority:
         )
 
         with open(key_path, "wb") as f:
-            f.write(priv_key.private_bytes(Encoding.PEM, PrivateFormat.TraditionalOpenSSL, NoEncryption()))
+            f.write(priv_key.private_bytes(Encoding.PEM, PrivateFormat.PKCS8, NoEncryption()))
 
         # When running as intermediate CA, server.crt must include the full chain
         # (leaf + intermediates) so TLS clients can build the path to their root.
@@ -1940,8 +2469,7 @@ class CertificateAuthority:
         cert = _sign_builder(client_builder, self.ca_key, rsa_pss=self._rsa_pss)
 
         # Persist in DB
-        conn = sqlite3.connect(str(self.db_path))
-        conn.execute(
+        self._pki_db.execute(
             "INSERT INTO certificates VALUES (?,?,?,?,?,0,NULL,NULL)",
             (
                 serial, subject_str, now.isoformat(),
@@ -1949,12 +2477,10 @@ class CertificateAuthority:
                 cert.public_bytes(Encoding.DER),
             ),
         )
-        conn.commit()
-        conn.close()
 
         logger.info(f"Issued client certificate serial={serial} CN={common_name}")
         cert_pem = cert.public_bytes(Encoding.PEM)
-        key_pem = priv_key.private_bytes(Encoding.PEM, PrivateFormat.TraditionalOpenSSL, NoEncryption())
+        key_pem = priv_key.private_bytes(Encoding.PEM, PrivateFormat.PKCS8, NoEncryption())
         return cert_pem, key_pem
 
     # ALPN protocol identifiers
@@ -2104,7 +2630,7 @@ class CertificateAuthority:
             cert_tmp = cf.name
         with tempfile.NamedTemporaryFile(delete=False, suffix=".pem") as kf:
             kf.write(throwaway_key.private_bytes(
-                Encoding.PEM, serialization.PrivateFormat.TraditionalOpenSSL, NoEncryption()
+                Encoding.PEM, serialization.PrivateFormat.PKCS8, NoEncryption()
             ))
             key_tmp = kf.name
 
@@ -2149,15 +2675,13 @@ class CertificateAuthority:
 
     def get_certificate_by_serial(self, serial: int) -> Optional[str]:
         """Return PEM string for the certificate with the given serial number, or None."""
-        conn = sqlite3.connect(str(self.db_path))
-        conn.row_factory = sqlite3.Row
-        try:
-            row = conn.execute(
-                "SELECT cert_pem FROM certificates WHERE serial=?", (serial,)
-            ).fetchone()
-            return row["cert_pem"] if row else None
-        finally:
-            conn.close()
+        row = self._pki_db.fetchone(
+            "SELECT der FROM certificates WHERE serial=?", (serial,)
+        )
+        if not row:
+            return None
+        cert = x509.load_der_x509_certificate(row["der"])
+        return cert.public_bytes(Encoding.PEM).decode("ascii")
 
     def generate_crl_der(self) -> bytes:
         """
@@ -2181,30 +2705,21 @@ class CertificateAuthority:
                 critical=False,
             )
         )
-        conn = sqlite3.connect(str(self.db_path))
-        conn.row_factory = sqlite3.Row
-        try:
-            rows = conn.execute(
-                "SELECT serial, revoked_at FROM certificates WHERE revoked=1"
-            ).fetchall()
-            for row in rows:
-                revoked_cert = (
-                    x509.RevokedCertificateBuilder()
-                    .serial_number(row["serial"])
-                    .revocation_date(
-                        # NB: revoked_at is ISO-8601 TEXT (see revoke_certificate()),
-                        # not a unix timestamp. Pre-existing bug surfaced by RFC
-                        # 6818 test work — fromisoformat matches generate_crl()
-                        # which used the same column correctly.
-                        datetime.datetime.fromisoformat(row["revoked_at"])
-                        if row["revoked_at"]
-                        else datetime.datetime.now(datetime.timezone.utc)
-                    )
-                    .build()
+        rows = self._pki_db.fetchall(
+            "SELECT serial, revoked_at FROM certificates WHERE revoked=1"
+        )
+        for row in rows:
+            revoked_cert = (
+                x509.RevokedCertificateBuilder()
+                .serial_number(row["serial"])
+                .revocation_date(
+                    datetime.datetime.fromisoformat(row["revoked_at"])
+                    if row["revoked_at"]
+                    else datetime.datetime.now(datetime.timezone.utc)
                 )
-                builder = builder.add_revoked_certificate(revoked_cert)
-        finally:
-            conn.close()
+                .build()
+            )
+            builder = builder.add_revoked_certificate(revoked_cert)
         crl = _sign_builder(builder, self.ca_key, rsa_pss=self._rsa_pss)
         return crl.public_bytes(Encoding.DER)
 
@@ -2246,6 +2761,138 @@ class CertificateAuthority:
         return priv_key, cert
 
     # ------------------------------------------------------------------
+    # Cross-signing (§5.6)
+    # ------------------------------------------------------------------
+
+    def cross_sign(
+        self,
+        other_cert: x509.Certificate,
+        validity_days: int,
+        audit: Optional["AuditLog"] = None,
+        requester_ip: str = "",
+    ) -> x509.Certificate:
+        """
+        Cross-sign an existing certificate: same subject + same SPKI, signed by this CA.
+
+        The resulting certificate has a fresh serial number, new validity window,
+        and is signed by this CA's key. The source certificate is unmodified.
+        Trust anchors on both old and new CA can verify each other's intermediates.
+
+        Useful for CA algorithm migrations (RSA → ECC → ML-DSA): clients that
+        only trust the old root can still follow the old-signed copy while clients
+        that have the new root prefer the new-signed copy.
+
+        Extensions copied from source: BasicConstraints, KeyUsage, SubjectAlternativeName.
+        Extensions generated fresh: SKI, AKI (from this CA's key), AIA, CDP.
+        ExtendedKeyUsage is intentionally NOT copied for EE certs — cross-signing
+        an EE cert is unusual; CA profile extensions are carried as-is.
+        """
+        from cryptography.hazmat.primitives import hashes as _hashes
+        public_key = other_cert.public_key()
+        subject = other_cert.subject
+        serial = self._next_serial()
+        now = datetime.datetime.now(datetime.timezone.utc)
+        subject_str = subject.rfc4514_string()
+
+        builder = (
+            x509.CertificateBuilder()
+            .subject_name(subject)
+            .issuer_name(self.ca_cert.subject)
+            .public_key(public_key)
+            .serial_number(serial)
+            .not_valid_before(now)
+            .not_valid_after(now + datetime.timedelta(days=validity_days))
+            .add_extension(
+                x509.SubjectKeyIdentifier.from_public_key(public_key),
+                critical=False,
+            )
+            .add_extension(
+                x509.AuthorityKeyIdentifier.from_issuer_public_key(self.ca_key.public_key()),
+                critical=False,
+            )
+        )
+
+        # Copy structural extensions verbatim from the source cert
+        for ext_cls in (x509.BasicConstraints, x509.KeyUsage, x509.SubjectAlternativeName):
+            try:
+                ext = other_cert.extensions.get_extension_for_class(ext_cls)
+                builder = builder.add_extension(ext.value, critical=ext.critical)
+            except x509.ExtensionNotFound:
+                if ext_cls is x509.BasicConstraints:
+                    # BasicConstraints is required; default to non-CA EE cert
+                    builder = builder.add_extension(
+                        x509.BasicConstraints(ca=False, path_length=None), critical=True
+                    )
+
+        # AIA (OCSP) from this CA's configuration
+        if self._ocsp_url:
+            builder = builder.add_extension(
+                x509.AuthorityInformationAccess([
+                    x509.AccessDescription(
+                        x509.AuthorityInformationAccessOID.OCSP,
+                        x509.UniformResourceIdentifier(self._ocsp_url),
+                    )
+                ]),
+                critical=False,
+            )
+
+        # CDP from this CA's configuration
+        if self._crl_url:
+            builder = builder.add_extension(
+                x509.CRLDistributionPoints([
+                    x509.DistributionPoint(
+                        full_name=[x509.UniformResourceIdentifier(self._crl_url)],
+                        relative_name=None,
+                        reasons=None,
+                        crl_issuer=None,
+                    )
+                ]),
+                critical=False,
+            )
+
+        cert = _sign_builder(builder, self.ca_key, rsa_pss=self._rsa_pss)
+
+        # Store in DB
+        self._pki_db.execute(
+            "INSERT OR REPLACE INTO certificates"
+            "(serial,subject,not_before,not_after,der,revoked,revoked_at,reason,profile) "
+            "VALUES(?,?,?,?,?,0,NULL,NULL,?)",
+            (
+                serial,
+                subject_str,
+                now.isoformat(),
+                (now + datetime.timedelta(days=validity_days)).isoformat(),
+                cert.public_bytes(Encoding.DER),
+                "cross_signed",
+            ),
+        )
+
+        src_fp = other_cert.fingerprint(_hashes.SHA256()).hex()
+        dst_fp = cert.fingerprint(_hashes.SHA256()).hex()
+
+        if audit:
+            audit.record(
+                "cross_sign",
+                f"serial={serial} subject='{subject_str}' "
+                f"src_fp={src_fp[:16]} dst_fp={dst_fp[:16]}",
+                requester_ip,
+            )
+
+        logger.info(
+            f"Cross-signed cert serial={serial} subject='{subject_str}' "
+            f"src_fp={src_fp[:16]} dst_fp={dst_fp[:16]}"
+        )
+        if self._webhook:
+            self._webhook.emit("cross.signed", {
+                "serial": serial,
+                "subject": subject_str,
+                "src_fingerprint": src_fp[:16],
+                "dst_fingerprint": dst_fp[:16],
+                "requester_ip": requester_ip,
+            })
+        return cert
+
+    # ------------------------------------------------------------------
     # PKCS#12 export (cert + CA chain, no private key stored server-side)
     # ------------------------------------------------------------------
 
@@ -2253,10 +2900,18 @@ class CertificateAuthority:
         """
         Return a PKCS#12 bundle containing the certificate + CA chain.
         Private key is NOT included (it is never stored server-side).
+
+        RFC 7292 hardening: unencrypted (passwordless) export is rejected unless
+        ``self._p12_allow_unencrypted`` is True (set via --p12-allow-unencrypted).
         """
         der = self.get_cert_by_serial(serial)
         if not der:
             return None
+        if password is None and not self._p12_allow_unencrypted:
+            raise ValueError(
+                "Unencrypted PKCS#12 export is disabled (RFC 7292 hardening). "
+                "Provide a password or start the server with --p12-allow-unencrypted."
+            )
         cert = x509.load_der_x509_certificate(der)
         enc = serialization.BestAvailableEncryption(password) if password else serialization.NoEncryption()
 
@@ -2288,22 +2943,18 @@ class CertificateAuthority:
         Generate a delta CRL containing only revocations since the last base CRL.
         Stores the current CRL as the new base in crl_base table.
         """
-        conn = sqlite3.connect(str(self.db_path))
-        conn.row_factory = sqlite3.Row
-
         # Fetch the timestamp of the last base CRL
-        base_row = conn.execute(
+        base_row = self._pki_db.fetchone(
             "SELECT issued_at, this_update FROM crl_base ORDER BY id DESC LIMIT 1"
-        ).fetchone()
+        )
         base_issued_at = base_row["issued_at"] if base_row else "1970-01-01T00:00:00"
 
         # Only revocations AFTER the last base
-        rows = conn.execute(
+        rows = self._pki_db.fetchall(
             "SELECT serial, revoked_at, reason FROM certificates "
             "WHERE revoked=1 AND revoked_at > ?",
             (base_issued_at,)
-        ).fetchall()
-        conn.close()
+        )
 
         now = datetime.datetime.now(datetime.timezone.utc)
         next_update = now + datetime.timedelta(hours=6)
@@ -2348,13 +2999,10 @@ class CertificateAuthority:
 
         # Store current full-CRL as new base
         full_crl_der = self.generate_crl()
-        conn2 = sqlite3.connect(str(self.db_path))
-        conn2.execute(
+        self._pki_db.execute(
             "INSERT INTO crl_base(issued_at, this_update, next_update, der) VALUES(?,?,?,?)",
             (now.isoformat(), now.isoformat(), next_update.isoformat(), full_crl_der)
         )
-        conn2.commit()
-        conn2.close()
 
         logger.info(f"Delta CRL generated: {len(rows)} new revocations since {base_issued_at}")
         return delta_der
@@ -2421,9 +3069,8 @@ class CertificateAuthority:
     # ------------------------------------------------------------------
 
     def _init_key_archive_table(self):
-        """Create key_archive table if it does not exist (called from _init_db)."""
-        conn = sqlite3.connect(str(self.db_path))
-        conn.execute("""
+        """Create key_archive table if it does not exist."""
+        self._pki_db.execute("""
             CREATE TABLE IF NOT EXISTS key_archive (
                 serial      INTEGER PRIMARY KEY,
                 archived_at TEXT NOT NULL,
@@ -2431,8 +3078,6 @@ class CertificateAuthority:
                 subject     TEXT NOT NULL
             )
         """)
-        conn.commit()
-        conn.close()
 
     def archive_private_key(self, serial: int, private_key_pem: bytes) -> bool:
         """
@@ -2464,20 +3109,14 @@ class CertificateAuthority:
             + ciphertext
         )
         now = datetime.datetime.now(datetime.timezone.utc).isoformat()
-        conn = sqlite3.connect(str(self.db_path))
-        try:
-            # Fetch subject from certificates table
-            row = conn.execute(
-                "SELECT subject FROM certificates WHERE serial=?", (serial,)
-            ).fetchone()
-            subject = row[0] if row else "unknown"
-            conn.execute(
-                "INSERT OR REPLACE INTO key_archive(serial,archived_at,encrypted,subject) VALUES(?,?,?,?)",
-                (serial, now, payload, subject)
-            )
-            conn.commit()
-        finally:
-            conn.close()
+        row = self._pki_db.fetchone(
+            "SELECT subject FROM certificates WHERE serial=?", (serial,)
+        )
+        subject = row["subject"] if row else "unknown"
+        self._pki_db.execute(
+            "INSERT OR REPLACE INTO key_archive(serial,archived_at,encrypted,subject) VALUES(?,?,?,?)",
+            (serial, now, payload, subject)
+        )
         logger.info(f"Key archived for serial={serial}")
         return True
 
@@ -2489,16 +3128,12 @@ class CertificateAuthority:
         """
         self._init_key_archive_table()
         from cryptography.hazmat.primitives.asymmetric.padding import OAEP, MGF1
-        conn = sqlite3.connect(str(self.db_path))
-        try:
-            row = conn.execute(
-                "SELECT encrypted FROM key_archive WHERE serial=?", (serial,)
-            ).fetchone()
-            if not row:
-                return None
-            payload = row[0]
-        finally:
-            conn.close()
+        row = self._pki_db.fetchone(
+            "SELECT encrypted FROM key_archive WHERE serial=?", (serial,)
+        )
+        if not row:
+            return None
+        payload = row["encrypted"]
         # Unpack
         wk_len = int.from_bytes(payload[:2], "big")
         wrapped_key = payload[2:2 + wk_len]
@@ -2591,20 +3226,15 @@ class CertificateAuthority:
         profile, days_remaining.
         """
         cutoff = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(days=days_ahead)
-        conn = sqlite3.connect(str(self.db_path))
-        try:
-            rows = conn.execute(
-                "SELECT serial, subject, not_after, profile FROM certificates "
-                "WHERE revoked=0 ORDER BY not_after ASC"
-            ).fetchall()
-        finally:
-            conn.close()
+        rows = self._pki_db.fetchall(
+            "SELECT serial, subject, not_after, profile FROM certificates "
+            "WHERE revoked=0 ORDER BY not_after ASC"
+        )
 
         result = []
-        for serial, subject, not_after_str, profile in rows:
+        for r in rows:
             try:
-                not_after = datetime.datetime.fromisoformat(not_after_str)
-                # Make timezone-aware if naive
+                not_after = datetime.datetime.fromisoformat(r["not_after"])
                 if not_after.tzinfo is None:
                     not_after = not_after.replace(tzinfo=datetime.timezone.utc)
             except ValueError:
@@ -2613,10 +3243,10 @@ class CertificateAuthority:
             if now < not_after <= cutoff:
                 days_remaining = (not_after - now).days
                 result.append({
-                    "serial": serial,
-                    "subject": subject,
+                    "serial": r["serial"],
+                    "subject": r["subject"],
                     "not_after": not_after.isoformat(),
-                    "profile": profile or "default",
+                    "profile": r["profile"] or "default",
                     "days_remaining": days_remaining,
                 })
         return result
@@ -2657,6 +3287,8 @@ class CertificateAuthority:
                                     on_expiring(info)
                                 except Exception as cb_err:
                                     logger.error(f"Expiry callback error: {cb_err}")
+                            if self._webhook:
+                                self._webhook.emit("cert.expiring", dict(info))
                         if audit:
                             audit.record(
                                 "expiry_monitor",
@@ -2701,14 +3333,10 @@ class CertificateAuthority:
         subject_str = old_cert.subject.rfc4514_string()
 
         # Extract profile from DB
-        conn = sqlite3.connect(str(self.db_path))
-        try:
-            row = conn.execute(
-                "SELECT profile FROM certificates WHERE serial=?", (serial,)
-            ).fetchone()
-            profile = row[0] if row and row[0] else "default"
-        finally:
-            conn.close()
+        row = self._pki_db.fetchone(
+            "SELECT profile FROM certificates WHERE serial=?", (serial,)
+        )
+        profile = row["profile"] if row and row["profile"] else "default"
 
         # Extract SANs
         san_dns, san_emails, san_ips = [], [], []
@@ -2764,39 +3392,28 @@ class CertificateAuthority:
         Return a dictionary of Prometheus-style gauge/counter metrics collected
         from the in-memory CA state and the SQLite database.
         """
-        conn = sqlite3.connect(str(self.db_path))
-        try:
-            total     = conn.execute("SELECT COUNT(*) FROM certificates").fetchone()[0]
-            revoked   = conn.execute("SELECT COUNT(*) FROM certificates WHERE revoked=1").fetchone()[0]
-            valid     = total - revoked
-            # Expiring within 30 days
-            cutoff = (
-                datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(days=30)
-            ).isoformat()
-            now_str = datetime.datetime.now(datetime.timezone.utc).isoformat()
-            exp30 = conn.execute(
-                "SELECT COUNT(*) FROM certificates WHERE revoked=0 AND not_after <= ? AND not_after > ?",
-                (cutoff, now_str)
-            ).fetchone()[0]
-            # Expiring within 7 days
-            cutoff7 = (
-                datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(days=7)
-            ).isoformat()
-            exp7  = conn.execute(
-                "SELECT COUNT(*) FROM certificates WHERE revoked=0 AND not_after <= ? AND not_after > ?",
-                (cutoff7, now_str)
-            ).fetchone()[0]
-            # Already expired
-            expired = conn.execute(
-                "SELECT COUNT(*) FROM certificates WHERE revoked=0 AND not_after <= ?",
-                (now_str,)
-            ).fetchone()[0]
-            # Per-profile counts
-            profile_rows = conn.execute(
-                "SELECT profile, COUNT(*) FROM certificates WHERE revoked=0 GROUP BY profile"
-            ).fetchall()
-        finally:
-            conn.close()
+        now_str = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        cutoff  = (datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(days=30)).isoformat()
+        cutoff7 = (datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(days=7)).isoformat()
+
+        total    = self._pki_db.fetchone("SELECT COUNT(*) FROM certificates")[0]
+        revoked  = self._pki_db.fetchone("SELECT COUNT(*) FROM certificates WHERE revoked=1")[0]
+        valid    = total - revoked
+        exp30    = self._pki_db.fetchone(
+            "SELECT COUNT(*) FROM certificates WHERE revoked=0 AND not_after <= ? AND not_after > ?",
+            (cutoff, now_str)
+        )[0]
+        exp7     = self._pki_db.fetchone(
+            "SELECT COUNT(*) FROM certificates WHERE revoked=0 AND not_after <= ? AND not_after > ?",
+            (cutoff7, now_str)
+        )[0]
+        expired  = self._pki_db.fetchone(
+            "SELECT COUNT(*) FROM certificates WHERE revoked=0 AND not_after <= ?",
+            (now_str,)
+        )[0]
+        profile_rows = self._pki_db.fetchall(
+            "SELECT profile, COUNT(*) FROM certificates WHERE revoked=0 GROUP BY profile"
+        )
 
         ca_expiry = self.ca_cert.not_valid_after_utc
         ca_days_remaining = (ca_expiry - datetime.datetime.now(datetime.timezone.utc)).days
@@ -2809,7 +3426,7 @@ class CertificateAuthority:
             "pypki_certs_expiring_7d": exp7,
             "pypki_certs_expired": expired,
             "pypki_ca_days_remaining": ca_days_remaining,
-            "pypki_certs_by_profile": dict(profile_rows),
+            "pypki_certs_by_profile": {r[0]: r[1] for r in profile_rows},
         }
 
     def metrics_prometheus(self) -> str:
@@ -2846,6 +3463,9 @@ class CertificateAuthority:
         for profile, count in m["pypki_certs_by_profile"].items():
             safe = profile.replace('"', '\"')
             lines.append(f'pypki_certs_by_profile{{profile="{safe}"}} {count}')
+        # §5.11 — histogram metrics (issuance, OCSP, ACME order)
+        for hist in (_hist_issuance, _hist_ocsp, _hist_acme_order):
+            lines.extend(hist.exposition())
         lines.append("")  # trailing newline
         return "\n".join(lines) + "\n"
 
@@ -3063,15 +3683,19 @@ class CertificateAuthority:
         pre_cert: x509.Certificate,
         log_url: str,
         timeout: int = 10,
+        log_pubkey_pem: Optional[bytes] = None,
     ) -> Optional[bytes]:
         """
-        Submit a Pre-certificate to a CT log and return the raw SCT bytes (DER).
+        Submit a Pre-certificate to a CT log and return the raw SCT bytes.
 
         The call uses the RFC 6962 §4.2 "add-pre-chain" endpoint.
         Returns the raw TLS-encoded SCT bytes, or None on failure.
+
+        If ``log_pubkey_pem`` is given (PEM ECDSA public key), the returned
+        SCT's DigitallySigned is verified against that key before returning.
+        Returns None if verification fails (logs a warning).
         """
         import urllib.request as _urllib
-        import urllib.error as _urlerr
 
         # Build chain: [pre-cert DER, issuer DER]
         chain_ders = [
@@ -3101,6 +3725,18 @@ class CertificateAuthority:
         extensions     = base64.b64decode(body.get("extensions", ""))
         sig_bytes      = base64.b64decode(body["signature"])
 
+        if log_pubkey_pem:
+            pre_cert_der = pre_cert.public_bytes(Encoding.DER)
+            if not self.verify_sct_signature(
+                sct_version, timestamp_ms, extensions, sig_bytes,
+                pre_cert_der, log_pubkey_pem, entry_type=1,
+                issuer_pubkey=self.ca_key.public_key(),
+            ):
+                logger.warning(
+                    f"CT log SCT signature verification FAILED for {log_url}; discarding SCT"
+                )
+                return None
+
         import struct as _struct
         sct = (
             bytes([sct_version])
@@ -3111,6 +3747,89 @@ class CertificateAuthority:
             + sig_bytes
         )
         return sct
+
+    @staticmethod
+    def verify_sct_signature(
+        sct_version: int,
+        timestamp_ms: int,
+        extensions: bytes,
+        dig_signed: bytes,
+        cert_der: bytes,
+        log_pubkey_pem: bytes,
+        *,
+        entry_type: int = 0,
+        issuer_pubkey=None,
+    ) -> bool:
+        """
+        Verify a CT log SCT DigitallySigned structure (RFC 6962 §3.2).
+
+        ``dig_signed`` is the raw bytes of the TLS DigitallySigned struct:
+          [hash_alg(1)] [sig_alg(1)] [sig_len(2)] [signature(sig_len)]
+
+        The signed data (TreeLeafMessage) is reconstructed from the other args:
+          version(1) sig_type(1) timestamp(8) entry_type(2) signed_entry extensions
+
+        ``entry_type``: 0 = x509_entry (leaf cert), 1 = precert_entry.
+        For precert_entry, ``issuer_pubkey`` must be provided (used for
+        issuer_key_hash = SHA-256(SubjectPublicKeyInfo)).
+
+        Returns True if the signature is valid, False otherwise.
+        """
+        import struct as _struct
+        from cryptography.hazmat.primitives.asymmetric.ec import ECDSA
+        from cryptography.hazmat.primitives.serialization import load_pem_public_key
+
+        try:
+            pubkey = load_pem_public_key(log_pubkey_pem)
+        except Exception as e:
+            logger.warning(f"CT pubkey load failed: {e}")
+            return False
+
+        # Parse DigitallySigned: hash_alg(1) sig_alg(1) sig_len(2) signature
+        if len(dig_signed) < 4:
+            return False
+        hash_alg_byte = dig_signed[0]
+        sig_len = _struct.unpack_from(">H", dig_signed, 2)[0]
+        if len(dig_signed) < 4 + sig_len:
+            return False
+        signature = dig_signed[4:4 + sig_len]
+
+        # Choose hash algorithm from TLS hash_alg byte (RFC 5246 §7.4.1.4.1):
+        # 4=SHA256, 5=SHA384, 6=SHA512
+        hash_map = {4: SHA256, 5: SHA384, 6: SHA512}
+        HashClass = hash_map.get(hash_alg_byte, SHA256)
+
+        # Build the TreeLeafMessage signed data:
+        # version(1=v1=0) sig_type(1=cert_ts=0) timestamp(8) entry_type(2) signed_entry extensions
+        if entry_type == 0:
+            # x509_entry: 3-byte length + cert DER
+            signed_entry = len(cert_der).to_bytes(3, "big") + cert_der
+        else:
+            # precert_entry: issuer_key_hash(32) + 3-byte-len + TBSCertificate
+            import hashlib
+            if issuer_pubkey is None:
+                return False
+            spki_der = issuer_pubkey.public_bytes(
+                Encoding.DER, serialization.PublicFormat.SubjectPublicKeyInfo
+            )
+            issuer_key_hash = hashlib.sha256(spki_der).digest()
+            tbs = cert_der  # we pass TBS bytes directly from the pre-cert
+            signed_entry = issuer_key_hash + len(tbs).to_bytes(3, "big") + tbs
+
+        signed_data = (
+            bytes([sct_version, 0])            # version, signature_type=certificate_timestamp
+            + _struct.pack(">Q", timestamp_ms)  # timestamp
+            + _struct.pack(">H", entry_type)    # entry_type (uint16)
+            + signed_entry
+            + _struct.pack(">H", len(extensions))
+            + extensions
+        )
+
+        try:
+            pubkey.verify(signature, signed_data, ECDSA(HashClass()))
+            return True
+        except Exception:
+            return False
 
     def embed_scts(
         self,
@@ -3162,6 +3881,8 @@ class CertificateAuthority:
         subject_str: str,
         public_key,
         ct_log_urls: Optional[List[str]] = None,
+        ct_log_pubkeys: Optional[List[bytes]] = None,
+        ct_require_n: Optional[int] = None,
         **kwargs,
     ) -> x509.Certificate:
         """
@@ -3173,26 +3894,47 @@ class CertificateAuthority:
         This flow ensures that the SCTs embedded in the final certificate
         are valid for that specific certificate structure.
 
-        SCT submission failures are logged as warnings and do not abort issuance.
+        Parameters
+        ----------
+        ct_log_urls     : CT log base URLs; defaults to ``self._ct_log_urls`` (from CLI).
+        ct_log_pubkeys  : PEM ECDSA public keys for each log (for SCT sig verification);
+                          defaults to ``self._ct_log_pubkeys`` (from CLI).
+        ct_require_n    : Minimum number of verified SCTs required before issuance;
+                          defaults to ``self._ct_require_n``.  If fewer SCTs are
+                          obtained, raises ``RuntimeError``.  Set 0 to disable check.
+
+        SCT submission failures are logged as warnings and do not abort issuance
+        (unless ct_require_n is not met).
         """
+        # Resolve defaults from CA-level config (set by CLI flags).
+        urls     = ct_log_urls    or self._ct_log_urls    or [self.CT_LOG_ARGON_2025, self.CT_LOG_XENON_2025]
+        pubkeys  = ct_log_pubkeys or self._ct_log_pubkeys or []
+        req_n    = ct_require_n   if ct_require_n is not None else self._ct_require_n
+
         # 1. Issue Pre-certificate
         # Capture the serial and time so the final cert matches exactly.
         forced_time = datetime.datetime.now(datetime.timezone.utc)
         pre_cert = self.issue_certificate(
-            subject_str=subject_str, 
-            public_key=public_key, 
+            subject_str=subject_str,
+            public_key=public_key,
             ct_poison=True,
             forced_time=forced_time,
             **kwargs
         )
         serial = pre_cert.serial_number
 
-        urls = ct_log_urls or [self.CT_LOG_ARGON_2025, self.CT_LOG_XENON_2025]
         scts = []
-        for url in urls:
-            sct = self.submit_pre_cert_to_ct_log(pre_cert, url)
+        for i, url in enumerate(urls):
+            pubkey_pem = pubkeys[i] if i < len(pubkeys) else None
+            sct = self.submit_pre_cert_to_ct_log(pre_cert, url, log_pubkey_pem=pubkey_pem)
             if sct:
                 scts.append(sct)
+
+        if req_n > 0 and len(scts) < req_n:
+            raise RuntimeError(
+                f"CT transparency requirement not met: got {len(scts)} verified SCT(s), "
+                f"need {req_n} (--ct-require-n). Certificate NOT issued."
+            )
 
         # 2. Issue final certificate with same serial/time but NO poison.
         final_cert = self.issue_certificate(
@@ -3331,6 +4073,15 @@ except ImportError:
     print("         Place cmp_server.py in the same directory as pki_server.py.")
 
 
+def _build_hsm_cfg(args):
+    """Return an HSMConfig from parsed CLI args, or None if --hsm-module was not supplied."""
+    try:
+        from hsm_backend import HSMConfig
+    except ImportError:
+        return None
+    return HSMConfig.from_args(args)
+
+
 def main():
     parser = argparse.ArgumentParser(description="PKI Server with CMPv2 Support + mTLS")
     parser.add_argument("--host", default="0.0.0.0", help="Bind address (default: 0.0.0.0)")
@@ -3338,6 +4089,23 @@ def main():
     parser.add_argument("--cmp-prefix", default="/cmp", metavar="PREFIX",
                         help="Path prefix for CMP handler (default: /cmp)")
     parser.add_argument("--ca-dir", default="./ca", help="CA data directory (default: ./ca)")
+    parser.add_argument(
+        "--pki-db-url", default=None, metavar="URL",
+        help=(
+            "DAL connection URL for the certificate store. Defaults to "
+            "sqlite:///<ca-dir>/certificates.db. Use postgresql://user:pass@host/db "
+            "for HA / multi-node deployments. "
+            "Requires psycopg[binary] installed for postgresql:// URLs."
+        ),
+    )
+    parser.add_argument(
+        "--acme-db-url", default=None, metavar="URL",
+        help="DAL connection URL for ACME state. Defaults to sqlite:///<ca-dir>/acme.db.",
+    )
+    parser.add_argument(
+        "--scep-db-url", default=None, metavar="URL",
+        help="DAL connection URL for SCEP state. Defaults to sqlite:///<ca-dir>/scep.db.",
+    )
     parser.add_argument(
         "--audit-db-url", default=None, metavar="URL",
         help=(
@@ -3348,6 +4116,11 @@ def main():
         ),
     )
     parser.add_argument("--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"])
+    parser.add_argument(
+        "--log-format", default="text", choices=["text", "json"],
+        help="Log output format: 'text' (default) for human-readable, "
+             "'json' for structured one-object-per-line output (§5.10)."
+    )
     parser.add_argument(
         "--cps-uri", default=None, metavar="URL",
         help=(
@@ -3402,6 +4175,61 @@ def main():
             "RSASSA-PSS per RFC 4055 §3.1 (MGF1+SHA-256, salt length 32). "
             "No-op for ECDSA / EdDSA keys, which have a single signature scheme."
         ),
+    )
+    hsm_group = parser.add_argument_group(
+        "HSM / PKCS#11 options (§5.1)",
+        "Delegate CA signing to a hardware security module via PKCS#11. "
+        "Requires python-pkcs11 (pip install python-pkcs11) and a PKCS#11 "
+        "module (.so / .dll) such as SoftHSM2, YubiHSM, or a vendor module. "
+        "The private key never leaves the token."
+    )
+    hsm_group.add_argument(
+        "--hsm-module", metavar="PATH",
+        help="Path to the PKCS#11 shared library (e.g. /usr/lib/softhsm/libsofthsm2.so)"
+    )
+    hsm_group.add_argument(
+        "--hsm-slot", type=int, default=0, metavar="N",
+        help="PKCS#11 slot index (default: 0)"
+    )
+    hsm_group.add_argument(
+        "--hsm-pin-env", default="PYPKI_HSM_PIN", metavar="VAR",
+        help="Environment variable holding the HSM user PIN (default: PYPKI_HSM_PIN). "
+             "Never supply the PIN as a command-line argument."
+    )
+    hsm_group.add_argument(
+        "--hsm-key-label", default="pypki-ca", metavar="LABEL",
+        help="CKA_LABEL of the CA signing key on the token (default: pypki-ca)"
+    )
+    hsm_group.add_argument(
+        "--hsm-init-if-missing", action="store_true", default=False,
+        help="Generate a 4096-bit RSA key on the token if the label is absent. "
+             "The generated key has CKA_EXTRACTABLE=False — it can never be exported."
+    )
+    ra_group = parser.add_argument_group(
+        "RA / approval workflow (§5.4)",
+        "Registration Authority controls. By default all requests are auto-approved "
+        "(backwards-compatible). Use --ra-policy-file or --ra-require-approval to "
+        "gate issuance on human review."
+    )
+    ra_group.add_argument(
+        "--ra-auto-approve", action="store_true", default=False,
+        help="Auto-approve all certificate requests regardless of profile (default when "
+             "no --ra-policy-file or --ra-require-approval is given)"
+    )
+    ra_group.add_argument(
+        "--ra-require-approval", action="store_true", default=False,
+        help="Require manual approval for every certificate request. "
+             "Overrides --ra-auto-approve."
+    )
+    ra_group.add_argument(
+        "--ra-auto-approve-profiles", default="", metavar="PROFILES",
+        help="Comma-separated list of certificate profiles that are auto-approved "
+             "even when --ra-require-approval is set. Example: default,tls_server"
+    )
+    ra_group.add_argument(
+        "--ra-policy-file", default="", metavar="PATH",
+        help="Path to a JSON RA policy file. Overrides --ra-auto-approve-profiles for "
+             "the profiles it mentions."
     )
     tls_group = parser.add_argument_group(
         "TLS options",
@@ -3519,6 +4347,40 @@ def main():
     acme_group.add_argument(
         "--acme-eab-file", default=None, metavar="PATH",
         help="JSON file containing EAB KID to HMAC key mappings (e.g. {\"kid1\": \"key1_b64\"})"
+    )
+    acme_group.add_argument(
+        "--acme-per-account-cert-limit", type=int, default=0, metavar="N",
+        help="Maximum certificates an ACME account may obtain per window (0 = unlimited, default). "
+             "Works with --acme-per-account-window-days."
+    )
+    acme_group.add_argument(
+        "--acme-per-account-window-days", type=int, default=7, metavar="N",
+        help="Rolling window in days for --acme-per-account-cert-limit (default: 7)"
+    )
+
+    ct_group = parser.add_argument_group(
+        "Certificate Transparency (RFC 6962 / RFC 9162)",
+        "Opt-in CT log submission and SCT embedding. All flags are optional; "
+        "CT is disabled by default. Only enable for publicly-trusted CAs — "
+        "private / homelab CAs should leave CT off."
+    )
+    ct_group.add_argument(
+        "--ct-log-url", action="append", metavar="URL", dest="ct_log_urls",
+        help="RFC 6962 CT log base URL (e.g. https://ct.googleapis.com/logs/us1/argon2025h2/). "
+             "Repeat for multiple logs. When set, every issuance uses the Pre-cert flow and "
+             "embeds SCTs from each reachable log."
+    )
+    ct_group.add_argument(
+        "--ct-log-pubkey", action="append", metavar="PATH", dest="ct_log_pubkeys",
+        help="Path to PEM ECDSA public key for the corresponding --ct-log-url (by index). "
+             "When provided, each received SCT's DigitallySigned is verified against this "
+             "key before embedding. Discards the SCT silently on verification failure."
+    )
+    ct_group.add_argument(
+        "--ct-require-n", type=int, default=0, metavar="N",
+        help="Minimum number of verified SCTs required for issuance to succeed "
+             "(default: 0 = best-effort, do not abort on SCT failure). "
+             "Set to 2 to require at least two qualifying SCTs (Chrome policy)."
     )
 
     infra_group = parser.add_argument_group(
@@ -3681,6 +4543,14 @@ def main():
         help="PEM private key for --est-tls-cert"
     )
 
+    pkcs12_group = parser.add_argument_group("PKCS#12 options (RFC 7292)")
+    pkcs12_group.add_argument(
+        "--p12-allow-unencrypted", action="store_true", default=False,
+        help="RFC 7292 hardening: allow passwordless PKCS#12 export via the web UI and "
+             "REST API. OFF by default — unencrypted P12 bundles are rejected to prevent "
+             "accidental key exposure. Enable only on trusted internal networks."
+    )
+
     scep_group = parser.add_argument_group(
         "SCEP options (RFC 8894)",
         "Enable the SCEP protocol for network device certificate enrolment. "
@@ -3693,6 +4563,30 @@ def main():
     scep_group.add_argument(
         "--scep-challenge", default="", metavar="SECRET",
         help="Challenge password for SCEP enrolment (empty = no challenge required)"
+    )
+    scep_group.add_argument(
+        "--scep-use-otp", action="store_true", default=False,
+        help="Enable single-use OTP challenges for SCEP enrolment (minted via /api/scep/otp)"
+    )
+
+    webhook_group = parser.add_argument_group(
+        "lifecycle hooks (§5.9)",
+        "HTTP POST webhooks fired on cert.issued, cert.revoked, cert.expiring, subca.issued, cross.signed."
+    )
+    webhook_group.add_argument(
+        "--webhook-url", action="append", default=[], dest="webhook_urls", metavar="URL",
+        help="Webhook endpoint URL (repeatable; all URLs receive every enabled event)"
+    )
+    webhook_group.add_argument(
+        "--webhook-secret", default="", metavar="SECRET",
+        help="HMAC-SHA256 signing secret; sets X-PyPKI-Signature header on every delivery"
+    )
+    webhook_group.add_argument(
+        "--webhook-events", default="", metavar="EVENT,...",
+        help=(
+            "Comma-separated list of events to deliver "
+            "(default: all). Example: cert.issued,cert.revoked"
+        )
     )
 
     validity_group = parser.add_argument_group(
@@ -3710,7 +4604,7 @@ def main():
 
     args = parser.parse_args()
 
-    logging.getLogger().setLevel(args.log_level)
+    configure_logging(args.log_level, getattr(args, "log_format", "text"))
 
     # Build CLI overrides dict (only keys the user explicitly set)
     cli_validity = {}
@@ -3770,9 +4664,33 @@ def main():
         parent_chain_path=getattr(args, "parent_cert", None),
         ca_key_type=getattr(args, "ca_key_type", "rsa-4096"),
         sig_algorithm=getattr(args, "sig_algorithm", "rsa-pkcs1v15"),
+        pki_db_url=getattr(args, "pki_db_url", None) or "",
+        hsm_cfg=_build_hsm_cfg(args),
     )
     # Store reload interval on ca so sub-modules (ipsec_server) can read it
     ca._tls_reload_interval = getattr(args, "tls_reload_interval", 60)
+
+    # RFC 7292 hardening: allow/reject unencrypted PKCS#12 export
+    ca._p12_allow_unencrypted = getattr(args, "p12_allow_unencrypted", False)
+
+    # RFC 6962 CT configuration: load log URLs and pubkeys from CLI
+    _ct_urls = getattr(args, "ct_log_urls", None) or []
+    ca._ct_log_urls = _ct_urls
+    ca._ct_require_n = getattr(args, "ct_require_n", 0)
+    _ct_pubkey_paths = getattr(args, "ct_log_pubkeys", None) or []
+    _ct_pubkeys = []
+    for path in _ct_pubkey_paths:
+        try:
+            _ct_pubkeys.append(Path(path).read_bytes())
+        except Exception as e:
+            logger.warning(f"--ct-log-pubkey {path}: {e}; SCT verification for that log disabled")
+    ca._ct_log_pubkeys = _ct_pubkeys
+    if _ct_urls:
+        logger.info(
+            f"CT transparency: {len(_ct_urls)} log(s) configured, "
+            f"require_n={ca._ct_require_n}, "
+            f"pubkeys={len(_ct_pubkeys)}"
+        )
 
     # Feature 8: expiry monitor thread
     _expiry_days = getattr(args, "expiry_warn_days", 30)
@@ -3782,6 +4700,53 @@ def main():
             check_interval_seconds=86400,
             audit=audit_log,
         )
+
+    # §5.9 — Lifecycle webhook dispatcher
+    _wh_urls = getattr(args, "webhook_urls", []) or []
+    if _wh_urls and HAS_HOOKS:
+        _wh_events_str = getattr(args, "webhook_events", "") or ""
+        _wh_events = (
+            {e.strip() for e in _wh_events_str.split(",") if e.strip()}
+            if _wh_events_str else None
+        )
+        ca._webhook = _hooks_module.WebhookDispatcher(
+            urls=_wh_urls,
+            secret=getattr(args, "webhook_secret", "") or "",
+            enabled_events=_wh_events,
+            audit_fn=audit_log.record if audit_log else None,
+        )
+        ca._webhook.start()
+        logger.info(
+            "Lifecycle webhooks: %d URL(s), events=%s",
+            len(_wh_urls),
+            ",".join(sorted(_wh_events)) if _wh_events else "all",
+        )
+    elif _wh_urls and not HAS_HOOKS:
+        logger.warning("--webhook-url provided but hooks.py not found; webhooks disabled")
+
+    # §5.4 — RA / approval workflow
+    _ra_policy_file = getattr(args, "ra_policy_file", "") or ""
+    _ra_require = getattr(args, "ra_require_approval", False)
+    _ra_auto = getattr(args, "ra_auto_approve", False)
+    _ra_profiles_raw = getattr(args, "ra_auto_approve_profiles", "") or ""
+    _ra_auto_profiles = [p.strip() for p in _ra_profiles_raw.split(",") if p.strip()]
+    if _ra_policy_file:
+        try:
+            _ra_policy = RAPolicy.from_file(_ra_policy_file, _ra_auto_profiles or None)
+            logger.info(f"RA policy loaded from {_ra_policy_file}")
+        except Exception as _e:
+            logger.warning(f"RA policy file load failed ({_e}); falling back to auto-approve-all")
+            _ra_policy = RAPolicy(auto_approve_all=True)
+    elif _ra_require:
+        _ra_policy = RAPolicy(
+            auto_approve_all=False,
+            auto_approve_profiles=_ra_auto_profiles or None,
+        )
+        logger.info(f"RA manual-approval mode; auto-approve profiles: {_ra_auto_profiles or 'none'}")
+    else:
+        # Default / --ra-auto-approve: backwards-compatible auto-approve-all
+        _ra_policy = RAPolicy(auto_approve_all=True)
+    ca.configure_ra(_ra_policy)
 
     # Feature 5: ACME dns-01 hook configuration
     _dns01_hook = None
@@ -3906,6 +4871,9 @@ def main():
                 allow_private_ip=getattr(args, "acme_allow_private_ip", False),
                 require_eab=getattr(args, "acme_require_eab", False),
                 eab_file=getattr(args, "acme_eab_file", None),
+                per_account_cert_limit=getattr(args, "acme_per_account_cert_limit", 0),
+                per_account_window_days=getattr(args, "acme_per_account_window_days", 7),
+                db_url=getattr(args, "acme_db_url", None) or "",
             )
 
     # Start SCEP server if requested
@@ -3921,6 +4889,8 @@ def main():
                 ca=ca,
                 ca_dir=ca_dir,
                 challenge=args.scep_challenge,
+                use_otp=getattr(args, "scep_use_otp", False),
+                db_url=getattr(args, "scep_db_url", None) or "",
             )
 
     # Start EST server if requested

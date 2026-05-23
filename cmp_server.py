@@ -168,8 +168,8 @@ class CMPv2ASN1:
 
         try:
             # PKIMessage ::= SEQUENCE { header, body, [0] protection, [1] extraCerts }
-            if data[0] != 0x30:
-                raise ValueError(f"Expected SEQUENCE (0x30), got 0x{data[0]:02x}")
+            if der_data[0] != 0x30:
+                raise ValueError(f"Expected SEQUENCE (0x30), got 0x{der_data[0]:02x}")
 
             # Unwrap outer SEQUENCE
             _, outer, _ = cls._decode_tlv(der_data, 0)
@@ -892,7 +892,8 @@ class CMPv2Handler:
                 2, f"Internal server error: {e}"
             )
 
-    def _handle_cert_request(self, msg: dict, txid: bytes, snonce: bytes, req_type: str) -> bytes:
+    def _handle_cert_request(self, msg: dict, txid: bytes, snonce: bytes, req_type: str,
+                             pvno: int = 2) -> bytes:
         """Handle ir (Initialization Request) or cr (Certification Request)."""
         body_raw = msg.get("body_raw", b"")
         resp_body_type = 1 if req_type == "ir" else 3  # ip=1, cp=3
@@ -927,7 +928,7 @@ class CMPv2Handler:
                         b"", status=2, fail_info=(1 << 9), request_id=0
                     )
                     return self._protected_response(
-                        resp_body_type, body, txid, os.urandom(16), snonce
+                        resp_body_type, body, txid, os.urandom(16), snonce, pvno=pvno
                     )
             elif spki_der and not popo_raw:
                 # POPO is OPTIONAL on the wire but RFC 4211 §4 makes it
@@ -950,7 +951,7 @@ class CMPv2Handler:
                     b"", status=2, fail_info=(1 << 9), request_id=0
                 )
                 return self._protected_response(
-                    resp_body_type, body, txid, os.urandom(16), snonce
+                    resp_body_type, body, txid, os.urandom(16), snonce, pvno=pvno
                 )
 
             if spki_der:
@@ -960,7 +961,7 @@ class CMPv2Handler:
                 # cryptography's load_der_public_key wants the full TLV.
                 spki_tlv = b"\x30" + CMPv2ASN1._encode_length(len(spki_der)) + spki_der
                 pub_key = serialization.load_der_public_key(spki_tlv)
-                cert = self.ca.issue_certificate(subject_str, pub_key)
+                cert = self.ca.issue_certificate(subject_str, pub_key, protocol="cmp")
                 cert_der = cert.public_bytes(Encoding.DER)
                 private_key_pem = None
             else:
@@ -980,7 +981,8 @@ class CMPv2Handler:
                 self._pending_confirmations[txid] = cert_der
 
             body = CMPv2ASN1.build_ip_cp_body(cert_der, status=0, request_id=0)
-            resp = self._protected_response(resp_body_type, body, txid, os.urandom(16), snonce)
+            resp = self._protected_response(resp_body_type, body, txid, os.urandom(16), snonce,
+                                            pvno=pvno)
 
             logger.info(f"Certificate issued for '{subject_str}', serial={cert.serial_number}")
             return resp
@@ -988,7 +990,8 @@ class CMPv2Handler:
         except Exception as e:
             logger.error(f"Certificate issuance failed: {e}")
             body = CMPv2ASN1.build_ip_cp_body(b"", status=2)
-            return self._protected_response(resp_body_type, body, txid, os.urandom(16), snonce)
+            return self._protected_response(resp_body_type, body, txid, os.urandom(16), snonce,
+                                            pvno=pvno)
 
     def _handle_p10cr(self, msg: dict, txid: bytes, snonce: bytes) -> bytes:
         """Handle PKCS#10 Certificate Request."""
@@ -998,7 +1001,7 @@ class CMPv2Handler:
             csr = x509.load_der_x509_csr(body_raw)
             subject_str = csr.subject.rfc4514_string()
             pub_key = csr.public_key()
-            cert = self.ca.issue_certificate(subject_str, pub_key)
+            cert = self.ca.issue_certificate(subject_str, pub_key, protocol="cmp")
             cert_der = cert.public_bytes(Encoding.DER)
 
             with self._lock:
@@ -1161,9 +1164,11 @@ class CMPv3Handler(CMPv2Handler):
             if body_type == "pollReq":
                 return self._handle_poll_req(msg, txid, snonce, response_pvno)
 
-            # Route to appropriate handler
+            # Route to appropriate handler — pass response_pvno so replies echo
+            # the client's version per RFC 9482 §3.1.
             if body_type in ("ir", "cr"):
-                resp = self._handle_cert_request(msg, txid, snonce, body_type)
+                resp = self._handle_cert_request(msg, txid, snonce, body_type,
+                                                  pvno=response_pvno)
             elif body_type == "kur":
                 resp = self._handle_key_update(msg, txid, snonce)
             elif body_type == "rr":
@@ -1291,6 +1296,53 @@ class CMPv3Handler(CMPv2Handler):
             crls = _seq(crl_der)
             info_val = _seq(_oid_bytes(OID_IT_CRLUPDATERESP) + crls)
             logger.info("genm CRLStatusList: returning current CRL")
+            return _build_genp(info_val)
+
+        elif req_oid == OID_IT_SIGNKEYPAIRTYPES:
+            # RFC 9481 §3 / RFC 4210 §5.3.19.3 — advertise supported signing key types.
+            # SignKeyPairTypes ::= SEQUENCE OF AlgorithmIdentifier
+            # We advertise: RSA, EC P-256, EC P-384, EC P-521, Ed25519, Ed448.
+            def _alg_id(oid_str: str, params: bytes = b"") -> bytes:
+                oid_enc = _oid_bytes(oid_str)
+                inner = oid_enc + params
+                return _seq(inner)
+
+            rsa_alg      = _alg_id("1.2.840.113549.1.1.1", b"\x05\x00")          # rsaEncryption + NULL
+            ec_p256_alg  = _alg_id("1.2.840.10045.2.1",    _oid_bytes("1.2.840.10045.3.1.7"))  # id-ecPublicKey secp256r1
+            ec_p384_alg  = _alg_id("1.2.840.10045.2.1",    _oid_bytes("1.3.132.0.34"))          # id-ecPublicKey secp384r1
+            ec_p521_alg  = _alg_id("1.2.840.10045.2.1",    _oid_bytes("1.3.132.0.35"))          # id-ecPublicKey secp521r1
+            ed25519_alg  = _alg_id("1.3.101.112")                                  # id-Ed25519
+            ed448_alg    = _alg_id("1.3.101.113")                                  # id-Ed448
+
+            sign_key_types = _seq(rsa_alg + ec_p256_alg + ec_p384_alg + ec_p521_alg
+                                  + ed25519_alg + ed448_alg)
+            info_val = _seq(_oid_bytes(OID_IT_SIGNKEYPAIRTYPES) + sign_key_types)
+            logger.info("genm signKeyPairTypes: returning 6 supported signing algorithms")
+            return _build_genp(info_val)
+
+        elif req_oid == OID_IT_ENCKEYPAIRTYPES:
+            # RFC 9481 §3 / RFC 4210 §5.3.19.4 — advertise supported encryption key types.
+            # EncKeyPairTypes ::= SEQUENCE OF AlgorithmIdentifier
+            # RSA PKCS#1 v1.5 (key transport) is the supported type.
+            def _alg_id(oid_str: str, params: bytes = b"") -> bytes:
+                return _seq(_oid_bytes(oid_str) + params)
+
+            rsa_alg = _alg_id("1.2.840.113549.1.1.1", b"\x05\x00")
+            enc_key_types = _seq(rsa_alg)
+            info_val = _seq(_oid_bytes(OID_IT_ENCKEYPAIRTYPES) + enc_key_types)
+            logger.info("genm encKeyPairTypes: returning RSA encryption key type")
+            return _build_genp(info_val)
+
+        elif req_oid == OID_IT_PREFERREDSYMMALG:
+            # RFC 9481 §3 / RFC 4210 §5.3.19.5 — advertise preferred symmetric algorithm.
+            # PreferredSymmAlg ::= AlgorithmIdentifier
+            # We prefer AES-256-GCM (RFC 5084) over CBC for authenticated encryption.
+            def _alg_id(oid_str: str, params: bytes = b"") -> bytes:
+                return _seq(_oid_bytes(oid_str) + params)
+
+            aes256gcm_alg = _alg_id("2.16.840.1.101.3.4.1.46")   # id-aes256-GCM
+            info_val = _seq(_oid_bytes(OID_IT_PREFERREDSYMMALG) + aes256gcm_alg)
+            logger.info("genm preferredSymmAlg: returning AES-256-GCM")
             return _build_genp(info_val)
 
         else:
@@ -1594,6 +1646,7 @@ class CMPv2HTTPHandler(http.server.BaseHTTPRequestHandler):
                     "profile":       data.get("profile", "default"),
                     "audit":         self.audit_log,
                     "requester_ip":  self.client_address[0],
+                    "protocol":      "rest",
                 }
                 if data.get("validity_days"):
                     kwargs["validity_days"] = int(data["validity_days"])
@@ -1612,7 +1665,34 @@ class CMPv2HTTPHandler(http.server.BaseHTTPRequestHandler):
                 if data.get("certificate_policies"):
                     kwargs["certificate_policies"] = data["certificate_policies"]
 
-                cert = self.ca.issue_certificate(**kwargs)
+                # §5.4 — route through RA if configured
+                if getattr(self.ca, "ra", None) is not None:
+                    pub_key_der = pub_key.public_bytes(
+                        Encoding.DER,
+                        serialization.PublicFormat.SubjectPublicKeyInfo,
+                    )
+                    ra_req_id, auto_approved, cert = self.ca.ra.submit(
+                        protocol="rest",
+                        profile=data.get("profile", "default"),
+                        subject_dn=subject_str,
+                        public_key_der=pub_key_der,
+                        san_dns=data.get("san_dns"),
+                        san_ips=data.get("san_ips"),
+                        san_emails=data.get("san_emails"),
+                        validity_days=int(data["validity_days"]) if data.get("validity_days") else None,
+                        requester_ip=self.client_address[0],
+                        audit=self.audit_log,
+                    )
+                    if not auto_approved:
+                        self._send_json({
+                            "ok": False,
+                            "status": "pending",
+                            "request_id": ra_req_id,
+                            "message": "Request submitted for approval",
+                        }, 202)
+                        return
+                else:
+                    cert = self.ca.issue_certificate(**kwargs)
                 resp = {
                     "ok":       True,
                     "serial":   cert.serial_number,
@@ -1627,6 +1707,42 @@ class CMPv2HTTPHandler(http.server.BaseHTTPRequestHandler):
             except Exception as e:
                 logger.exception("POST /api/issue failed")
                 self._send_json({"error": str(e)}, 500)
+
+        elif path in ("/api/ra/approve", "/api/ra/deny") or re.match(r"^/api/ra/(approve|deny)/(.+)$", path):
+            # POST /api/ra/approve/<request_id>  — approve a pending RA request
+            # POST /api/ra/deny/<request_id>     — deny a pending RA request
+            ra = getattr(self.ca, "ra", None)
+            if ra is None:
+                self._send_json({"error": "RA workflow not configured"}, 404)
+                return
+            m = re.match(r"^/api/ra/(approve|deny)/(.+)$", path)
+            if not m:
+                # path is exactly /api/ra/approve or /api/ra/deny — expect id in body
+                action = path.split("/")[-1]
+                request_id = data.get("request_id", "")
+            else:
+                action, request_id = m.group(1), m.group(2)
+            approver = self.client_address[0]
+            if action == "approve":
+                cert = ra.approve(request_id, approver=approver, audit=self.audit_log,
+                                  requester_ip=approver)
+                if cert is None:
+                    self._send_json({"error": "Request not found or not pending"}, 404)
+                else:
+                    self._send_json({
+                        "ok": True,
+                        "request_id": request_id,
+                        "serial": cert.serial_number,
+                        "cert_pem": cert.public_bytes(Encoding.PEM).decode(),
+                    }, 200)
+            else:  # deny
+                reason = data.get("reason", "")
+                ok = ra.deny(request_id, reason=reason, approver=approver,
+                             audit=self.audit_log, requester_ip=approver)
+                if not ok:
+                    self._send_json({"error": "Request not found or not pending"}, 404)
+                else:
+                    self._send_json({"ok": True, "request_id": request_id}, 200)
 
         elif path == "/api/reload-tls":
             # Trigger an immediate TLS certificate reload from disk.
@@ -1952,6 +2068,43 @@ class CMPv2HTTPHandler(http.server.BaseHTTPRequestHandler):
                 self._send_json(self.rate_limiter.status(ip))
             else:
                 self._send_json({"rate_limiting": "disabled"})
+
+        elif path == "/api/ra/pending":
+            # §5.4 — GET /api/ra/pending: list pending RA requests
+            ra = getattr(self.ca, "ra", None)
+            if ra is None:
+                self._send_json({"error": "RA workflow not configured"}, 404)
+            else:
+                self._send_json({"requests": ra.list_pending()})
+
+        elif path == "/api/ra/recent":
+            # GET /api/ra/recent: list recent RA requests (all statuses)
+            ra = getattr(self.ca, "ra", None)
+            if ra is None:
+                self._send_json({"error": "RA workflow not configured"}, 404)
+            else:
+                limit = 100
+                try:
+                    qs = self.path.split("?", 1)[1] if "?" in self.path else ""
+                    for part in qs.split("&"):
+                        if part.startswith("limit="):
+                            limit = min(int(part[6:]), 500)
+                except Exception:
+                    pass
+                self._send_json({"requests": ra.list_recent(limit)})
+
+        elif re.match(r"^/api/ra/request/(.+)$", path):
+            # GET /api/ra/request/<request_id>
+            ra = getattr(self.ca, "ra", None)
+            if ra is None:
+                self._send_json({"error": "RA workflow not configured"}, 404)
+            else:
+                rid = re.match(r"^/api/ra/request/(.+)$", path).group(1)
+                req = ra.get(rid)
+                if req is None:
+                    self._send_json({"error": "Request not found"}, 404)
+                else:
+                    self._send_json(req)
 
         elif path.startswith(CMP_WELL_KNOWN_PATH):
             # RFC 9811: GET /.well-known/cmp -> return CA certificate (full chain)

@@ -360,7 +360,7 @@ class TestSchemaVersionGate(unittest.TestCase):
 
         # Roll dst back to "version 1 only".
         dst = _open_db(f"sqlite:///{self._dst_path}")
-        dst.execute("DELETE FROM schema_migrations WHERE version = ?", (2,))
+        dst.execute("DELETE FROM schema_migrations WHERE version > ?", (1,))
         dst.close()
 
         src = _open_db(f"sqlite:///{self._src_path}")

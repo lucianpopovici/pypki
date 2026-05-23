@@ -56,6 +56,13 @@ import db
 import migration
 import migrations as migration_runner_mod
 
+try:
+    import ceremony as _ceremony_mod
+    HAS_CEREMONY = True
+except ImportError:
+    HAS_CEREMONY = False
+    _ceremony_mod = None  # type: ignore[assignment]
+
 
 def _setup_logging(level: str) -> None:
     logging.basicConfig(
@@ -262,6 +269,17 @@ def _add_common_args(p: argparse.ArgumentParser) -> None:
     )
 
 
+def _ceremony_cmd(fn_name: str):
+    """Return a wrapper that calls ceremony.<fn_name> or prints an error."""
+    def _run(args: argparse.Namespace) -> int:
+        _setup_logging(getattr(args, "log_level", "INFO"))
+        if not HAS_CEREMONY:
+            print("ERROR: ceremony.py not found — place it in the same directory.")
+            return 1
+        return getattr(_ceremony_mod, f"cmd_{fn_name}")(args)
+    return _run
+
+
 def build_parser() -> argparse.ArgumentParser:
     root = argparse.ArgumentParser(
         prog="pypki-admin",
@@ -313,7 +331,133 @@ def build_parser() -> argparse.ArgumentParser:
     )
     vm.set_defaults(func=cmd_verify_migration)
 
+    # ------------------------------------------------------------------
+    # Ceremony subcommands (§5.3)
+    # ------------------------------------------------------------------
+
+    _cer_help = (
+        "§5.3 offline root CA key ceremony. "
+        "Requires ceremony.py in the same directory."
+    )
+
+    er = sub.add_parser(
+        "export-root",
+        help="Export offline root CA bundle (§5.3).",
+        description=(
+            "Package the root CA private key, certificate, and counters "
+            "into an AES-256-GCM encrypted tar.gz bundle suitable for "
+            "airgapped signing ceremonies."
+        ),
+    )
+    er.add_argument("--ca-dir", default="./ca", metavar="DIR")
+    er.add_argument("--out", required=True, metavar="BUNDLE.tar.gz.enc",
+                    help="Output path for the encrypted bundle.")
+    er.add_argument("--passphrase-env", default=None, metavar="ENV_VAR",
+                    help="Read passphrase from this environment variable instead of prompting.")
+    er.add_argument("--threshold", type=int, default=0, metavar="M",
+                    help="Shamir M-of-N threshold (≥2 to enable splitting).")
+    er.add_argument("--shares", type=int, default=0, metavar="N",
+                    help="Total Shamir shares to generate.")
+    er.add_argument("--log-level", default="INFO",
+                    choices=["DEBUG", "INFO", "WARNING", "ERROR"])
+    er.set_defaults(func=_ceremony_cmd("export_root"))
+
+    sc = sub.add_parser(
+        "sign-csr",
+        help="Sign a sub-CA CSR from the offline bundle (§5.3).",
+        description=(
+            "Decrypt the offline root bundle and issue a sub-CA certificate "
+            "for the supplied CSR.  Runs entirely from the bundle; "
+            "no DB writes, no network access required."
+        ),
+    )
+    sc.add_argument("--bundle", required=True, metavar="BUNDLE.tar.gz.enc")
+    sc.add_argument("--csr-in", required=True, metavar="CSR.pem")
+    sc.add_argument("--cert-out", required=True, metavar="CERT.pem")
+    sc.add_argument("--passphrase-env", default=None, metavar="ENV_VAR")
+    sc.add_argument("--share", action="append", default=[], metavar="SHARE",
+                    help="Shamir share (repeat M times to reconstruct passphrase).")
+    sc.add_argument("--validity-days", type=int, default=1825, metavar="N")
+    sc.add_argument("--path-length", type=int, default=None, metavar="N")
+    sc.add_argument("--permitted-dns", nargs="+", default=[], metavar="DOMAIN")
+    sc.add_argument("--excluded-dns", nargs="+", default=[], metavar="DOMAIN")
+    sc.add_argument("--log-level", default="INFO",
+                    choices=["DEBUG", "INFO", "WARNING", "ERROR"])
+    sc.set_defaults(func=_ceremony_cmd("sign_csr"))
+
+    ic = sub.add_parser(
+        "import-cert",
+        help="Import a ceremony-signed cert into an online CA (§5.3).",
+    )
+    ic.add_argument("--ca-dir", default="./ca", metavar="DIR")
+    ic.add_argument("--cert-in", required=True, metavar="CERT.pem")
+    ic.add_argument("--log-level", default="INFO",
+                    choices=["DEBUG", "INFO", "WARNING", "ERROR"])
+    ic.set_defaults(func=_ceremony_cmd("import_cert"))
+
+    op = sub.add_parser(
+        "ocsp-prebuild",
+        help="Pre-generate OCSP response files for static serving (RFC 5019 §6).",
+        description=(
+            "Generate one signed .ocsp file per certificate in the CA database. "
+            "Files are written under OUTPUT/<sha1-issuer-key>/<sha1-issuer-name>/<serial>.ocsp, "
+            "a layout compatible with nginx proxy_cache and Apache mod_ssl_ct static serving."
+        ),
+    )
+    op.add_argument(
+        "--ca-dir", default="./ca", metavar="DIR",
+        help="CA data directory (default: ./ca).",
+    )
+    op.add_argument(
+        "--output", required=True, metavar="DIR",
+        help="Root directory for generated .ocsp files.",
+    )
+    op.add_argument(
+        "--validity-hours", type=int, default=24, metavar="N",
+        help="nextUpdate = now + N hours (default 24).",
+    )
+    op.add_argument(
+        "--log-level", default="INFO",
+        choices=["DEBUG", "INFO", "WARNING", "ERROR"],
+        help="Default INFO.",
+    )
+    op.set_defaults(func=cmd_ocsp_prebuild)
+
     return root
+
+
+def cmd_ocsp_prebuild(args: argparse.Namespace) -> int:
+    """Pre-generate one OCSP response file per certificate in the CA."""
+    _setup_logging(args.log_level)
+    try:
+        from pki_server import CertificateAuthority, ServerConfig
+    except ImportError:
+        print("ERROR: pki_server.py not found — place it in the same directory.")
+        return 1
+    try:
+        import ocsp_server
+    except ImportError:
+        print("ERROR: ocsp_server.py not found — place it in the same directory.")
+        return 1
+
+    ca_dir = Path(args.ca_dir)
+    if not ca_dir.is_dir():
+        print(f"ERROR: CA directory not found: {ca_dir}")
+        return 1
+
+    config = ServerConfig(ca_dir=ca_dir)
+    ca = CertificateAuthority(ca_dir=str(ca_dir), config=config)
+
+    out = Path(args.output)
+    out.mkdir(parents=True, exist_ok=True)
+
+    count = ocsp_server.generate_static_responses(
+        ca=ca,
+        output_dir=out,
+        validity_hours=args.validity_hours,
+    )
+    print(f"Wrote {count} OCSP response(s) to {out}")
+    return 0
 
 
 def main(argv: Optional[List[str]] = None) -> int:

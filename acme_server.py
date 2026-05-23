@@ -71,6 +71,7 @@ import os
 import re
 import sqlite3
 import threading
+from db import make_db, Database
 import time
 import traceback
 import urllib.request
@@ -86,6 +87,11 @@ from cryptography.hazmat.primitives.asymmetric.ec import EllipticCurvePublicKey
 from cryptography.hazmat.primitives.hashes import SHA256
 from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
 from cryptography.x509.oid import NameOID, ExtendedKeyUsageOID
+
+# §5.11 — histogram import (lazy to avoid circular import at module load)
+def _get_hist_acme():
+    from pki_server import _hist_acme_order  # noqa: PLC0415
+    return _hist_acme_order
 
 logger = logging.getLogger("acme")
 
@@ -296,27 +302,28 @@ def verify_jws(body: bytes, stored_jwk: Optional[dict] = None) -> Tuple[dict, di
 # ---------------------------------------------------------------------------
 
 class ACMEDatabase:
-    """SQLite-backed store for ACME accounts, orders, authorizations, challenges."""
+    """DAL-backed store for ACME accounts, orders, authorizations, challenges.
 
-    def __init__(self, db_path: str):
-        self.db_path = db_path
-        self._lock = threading.Lock()
+    Accepts a ``Database`` object so the backend is configurable — SQLite for
+    single-node deployments, PostgreSQL for HA (§5.2).
+    """
+
+    def __init__(self, db):
+        if isinstance(db, str):
+            from db import make_db
+            if not db.startswith(("sqlite:///", "postgresql://", "postgres://")):
+                db = f"sqlite:///{db}"
+            db = make_db(db)
+        self._db = db
         self._init()
 
-    def _conn(self):
-        conn = sqlite3.connect(self.db_path)
-        conn.row_factory = sqlite3.Row
-        return conn
-
     def _init(self):
-        conn = self._conn()
-        conn.executescript("""
-            CREATE TABLE IF NOT EXISTS nonces (
+        for stmt in [
+            """CREATE TABLE IF NOT EXISTS nonces (
                 value TEXT PRIMARY KEY,
                 created_at REAL NOT NULL
-            );
-
-            CREATE TABLE IF NOT EXISTS accounts (
+            )""",
+            """CREATE TABLE IF NOT EXISTS accounts (
                 kid         TEXT PRIMARY KEY,
                 jwk_json    TEXT NOT NULL,
                 thumbprint  TEXT NOT NULL,
@@ -324,16 +331,14 @@ class ACMEDatabase:
                 contact     TEXT,
                 eab_kid     TEXT,
                 created_at  REAL NOT NULL
-            );
-
-            CREATE TABLE IF NOT EXISTS eab_keys (
+            )""",
+            """CREATE TABLE IF NOT EXISTS eab_keys (
                 kid          TEXT PRIMARY KEY,
                 mac_key_b64  TEXT NOT NULL,
                 created_at   REAL NOT NULL,
                 revoked_at   REAL
-            );
-
-            CREATE TABLE IF NOT EXISTS orders (
+            )""",
+            """CREATE TABLE IF NOT EXISTS orders (
                 id          TEXT PRIMARY KEY,
                 account_kid TEXT NOT NULL,
                 status      TEXT NOT NULL DEFAULT 'pending',
@@ -343,18 +348,16 @@ class ACMEDatabase:
                 cert_id     TEXT,
                 created_at  REAL NOT NULL,
                 expires_at  REAL NOT NULL
-            );
-
-            CREATE TABLE IF NOT EXISTS authorizations (
+            )""",
+            """CREATE TABLE IF NOT EXISTS authorizations (
                 id          TEXT PRIMARY KEY,
                 order_id    TEXT NOT NULL,
                 identifier  TEXT NOT NULL,
                 status      TEXT NOT NULL DEFAULT 'pending',
                 created_at  REAL NOT NULL,
                 expires_at  REAL NOT NULL
-            );
-
-            CREATE TABLE IF NOT EXISTS challenges (
+            )""",
+            """CREATE TABLE IF NOT EXISTS challenges (
                 id          TEXT PRIMARY KEY,
                 auth_id     TEXT NOT NULL,
                 type        TEXT NOT NULL,
@@ -362,48 +365,41 @@ class ACMEDatabase:
                 status      TEXT NOT NULL DEFAULT 'pending',
                 validated_at REAL,
                 error       TEXT
-            );
-
-            CREATE TABLE IF NOT EXISTS certificates (
+            )""",
+            """CREATE TABLE IF NOT EXISTS certificates (
                 id          TEXT PRIMARY KEY,
                 order_id    TEXT NOT NULL,
                 pem_chain   TEXT NOT NULL,
                 serial      INTEGER,
                 created_at  REAL NOT NULL
-            );
-        """)
-        conn.commit()
-        conn.close()
+            )""",
+        ]:
+            self._db.execute(stmt)
+        # §5.4 — add ra_request_id column to orders if absent (idempotent)
+        try:
+            self._db.execute("ALTER TABLE orders ADD COLUMN ra_request_id TEXT")
+        except Exception:
+            pass
 
     # -- Nonces --
 
     def create_nonce(self) -> str:
         nonce = b64url_encode(os.urandom(16))
-        conn = self._conn()
-        conn.execute("INSERT INTO nonces VALUES (?, ?)", (nonce, time.time()))
-        conn.commit()
-        conn.close()
+        self._db.execute("INSERT INTO nonces VALUES (?, ?)", (nonce, time.time()))
         return nonce
 
     def consume_nonce(self, nonce: str) -> bool:
         """Returns True if nonce was valid and is now consumed."""
-        with self._lock:
-            conn = self._conn()
-            row = conn.execute("SELECT value FROM nonces WHERE value=?", (nonce,)).fetchone()
+        with self._db.advisory_lock("acme-nonce"):
+            row = self._db.fetchone("SELECT value FROM nonces WHERE value=?", (nonce,))
             if not row:
-                conn.close()
                 return False
-            conn.execute("DELETE FROM nonces WHERE value=?", (nonce,))
-            conn.commit()
-            conn.close()
-            return True
+            self._db.execute("DELETE FROM nonces WHERE value=?", (nonce,))
+        return True
 
     def purge_old_nonces(self, max_age_secs: int = 3600):
         cutoff = time.time() - max_age_secs
-        conn = self._conn()
-        conn.execute("DELETE FROM nonces WHERE created_at < ?", (cutoff,))
-        conn.commit()
-        conn.close()
+        self._db.execute("DELETE FROM nonces WHERE created_at < ?", (cutoff,))
 
     # -- Accounts --
 
@@ -411,59 +407,46 @@ class ACMEDatabase:
         """Returns (is_new: bool, account: dict)."""
         thumb = jwk_thumbprint(jwk)
         kid = f"acct-{thumb[:16]}"
-        conn = self._conn()
-        row = conn.execute("SELECT * FROM accounts WHERE kid=?", (kid,)).fetchone()
-        if row:
-            conn.close()
-            return False, dict(row)
-        conn.execute(
-            "INSERT INTO accounts VALUES (?,?,?,?,?,?,?)",
-            (kid, json.dumps(jwk), thumb, "valid",
-             json.dumps(contact) if contact else None, eab_kid, time.time())
-        )
-        conn.commit()
-        account = dict(conn.execute("SELECT * FROM accounts WHERE kid=?", (kid,)).fetchone())
-        conn.close()
+        with self._db.transaction():
+            row = self._db.fetchone("SELECT * FROM accounts WHERE kid=?", (kid,))
+            if row:
+                return False, dict(row)
+            self._db.execute(
+                "INSERT INTO accounts VALUES (?,?,?,?,?,?,?)",
+                (kid, json.dumps(jwk), thumb, "valid",
+                 json.dumps(contact) if contact else None, eab_kid, time.time())
+            )
+            account = dict(self._db.fetchone("SELECT * FROM accounts WHERE kid=?", (kid,)))
         return True, account
 
     def get_account(self, kid: str) -> Optional[dict]:
-        conn = self._conn()
-        row = conn.execute("SELECT * FROM accounts WHERE kid=?", (kid,)).fetchone()
-        conn.close()
+        row = self._db.fetchone("SELECT * FROM accounts WHERE kid=?", (kid,))
         return dict(row) if row else None
 
     def get_account_by_thumbprint(self, thumb: str) -> Optional[dict]:
-        conn = self._conn()
-        row = conn.execute("SELECT * FROM accounts WHERE thumbprint=?", (thumb,)).fetchone()
-        conn.close()
+        row = self._db.fetchone("SELECT * FROM accounts WHERE thumbprint=?", (thumb,))
         return dict(row) if row else None
 
     def update_account_key(self, kid: str, new_jwk: dict, new_thumbprint: str):
         """Replace the JWK and thumbprint for an existing account (key rollover)."""
-        conn = self._conn()
-        conn.execute(
+        self._db.execute(
             "UPDATE accounts SET jwk_json=?, thumbprint=? WHERE kid=?",
             (json.dumps(new_jwk), new_thumbprint, kid)
         )
-        conn.commit()
-        conn.close()
 
     # -- EAB Keys --
 
     def add_eab_key(self, kid: str, mac_key_b64: str):
-        conn = self._conn()
-        conn.execute(
+        self._db.execute(
             "INSERT OR REPLACE INTO eab_keys (kid, mac_key_b64, created_at) VALUES (?, ?, ?)",
             (kid, mac_key_b64, time.time())
         )
-        conn.commit()
-        conn.close()
 
     def get_eab_key(self, kid: str) -> Optional[str]:
-        conn = self._conn()
-        row = conn.execute("SELECT mac_key_b64 FROM eab_keys WHERE kid=? AND revoked_at IS NULL", (kid,)).fetchone()
-        conn.close()
-        return row[0] if row else None
+        row = self._db.fetchone(
+            "SELECT mac_key_b64 FROM eab_keys WHERE kid=? AND revoked_at IS NULL", (kid,)
+        )
+        return row["mac_key_b64"] if row else None
 
     # -- Orders --
 
@@ -471,47 +454,43 @@ class ACMEDatabase:
         order_id = b64url_encode(os.urandom(12))
         now = time.time()
         expires = now + 86400  # 24 hours
-        conn = self._conn()
-        conn.execute(
-            "INSERT INTO orders VALUES (?,?,?,?,?,?,?,?,?)",
-            (order_id, account_kid, "pending",
-             json.dumps(identifiers), None, None, None, now, expires)
-        )
-        conn.commit()
 
         # Create authorizations for each identifier. Challenge set varies
         # by identifier type per RFC 8738 §4: ip identifiers MUST NOT offer
         # dns-01 (there is no reverse-DNS variant of that challenge).
-        auth_ids = []
-        for ident in identifiers:
-            auth_id = b64url_encode(os.urandom(12))
-            conn.execute(
-                "INSERT INTO authorizations VALUES (?,?,?,?,?,?)",
-                (auth_id, order_id, json.dumps(ident), "pending", now, expires)
+        with self._db.transaction():
+            self._db.execute(
+                "INSERT INTO orders (id,account_kid,status,identifiers,not_before,"
+                "not_after,cert_id,created_at,expires_at,ra_request_id)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?)",
+                (order_id, account_kid, "pending",
+                 json.dumps(identifiers), None, None, None, now, expires, None)
             )
-            challenge_types = _ACME_CHALLENGE_TYPES_BY_IDENTIFIER.get(
-                ident.get("type"),
-                ("http-01", "dns-01", "tls-alpn-01"),
-            )
-            for ctype in challenge_types:
-                chall_id = b64url_encode(os.urandom(12))
-                token = b64url_encode(os.urandom(32))
-                conn.execute(
-                    "INSERT INTO challenges VALUES (?,?,?,?,?,?,?)",
-                    (chall_id, auth_id, ctype, token, "pending", None, None)
+            auth_ids = []
+            for ident in identifiers:
+                auth_id = b64url_encode(os.urandom(12))
+                self._db.execute(
+                    "INSERT INTO authorizations VALUES (?,?,?,?,?,?)",
+                    (auth_id, order_id, json.dumps(ident), "pending", now, expires)
                 )
-            auth_ids.append(auth_id)
-
-        conn.commit()
-        order = dict(conn.execute("SELECT * FROM orders WHERE id=?", (order_id,)).fetchone())
-        conn.close()
+                challenge_types = _ACME_CHALLENGE_TYPES_BY_IDENTIFIER.get(
+                    ident.get("type"),
+                    ("http-01", "dns-01", "tls-alpn-01"),
+                )
+                for ctype in challenge_types:
+                    chall_id = b64url_encode(os.urandom(12))
+                    token = b64url_encode(os.urandom(32))
+                    self._db.execute(
+                        "INSERT INTO challenges VALUES (?,?,?,?,?,?,?)",
+                        (chall_id, auth_id, ctype, token, "pending", None, None)
+                    )
+                auth_ids.append(auth_id)
+            order = dict(self._db.fetchone("SELECT * FROM orders WHERE id=?", (order_id,)))
         order["auth_ids"] = auth_ids
         return order
 
     def get_order(self, order_id: str) -> Optional[dict]:
-        conn = self._conn()
-        row = conn.execute("SELECT * FROM orders WHERE id=?", (order_id,)).fetchone()
-        conn.close()
+        row = self._db.fetchone("SELECT * FROM orders WHERE id=?", (order_id,))
         return dict(row) if row else None
 
     def update_order(self, order_id: str, **kwargs):
@@ -519,25 +498,18 @@ class ACMEDatabase:
             return
         sets = ", ".join(f"{k}=?" for k in kwargs)
         vals = list(kwargs.values()) + [order_id]
-        conn = self._conn()
-        conn.execute(f"UPDATE orders SET {sets} WHERE id=?", vals)
-        conn.commit()
-        conn.close()
+        self._db.execute(f"UPDATE orders SET {sets} WHERE id=?", vals)
 
     def get_order_authorizations(self, order_id: str) -> list:
-        conn = self._conn()
-        rows = conn.execute(
+        rows = self._db.fetchall(
             "SELECT * FROM authorizations WHERE order_id=?", (order_id,)
-        ).fetchall()
-        conn.close()
+        )
         return [dict(r) for r in rows]
 
     # -- Authorizations --
 
     def get_authorization(self, auth_id: str) -> Optional[dict]:
-        conn = self._conn()
-        row = conn.execute("SELECT * FROM authorizations WHERE id=?", (auth_id,)).fetchone()
-        conn.close()
+        row = self._db.fetchone("SELECT * FROM authorizations WHERE id=?", (auth_id,))
         return dict(row) if row else None
 
     def update_authorization(self, auth_id: str, **kwargs):
@@ -545,25 +517,16 @@ class ACMEDatabase:
             return
         sets = ", ".join(f"{k}=?" for k in kwargs)
         vals = list(kwargs.values()) + [auth_id]
-        conn = self._conn()
-        conn.execute(f"UPDATE authorizations SET {sets} WHERE id=?", vals)
-        conn.commit()
-        conn.close()
+        self._db.execute(f"UPDATE authorizations SET {sets} WHERE id=?", vals)
 
     # -- Challenges --
 
     def get_challenge(self, chall_id: str) -> Optional[dict]:
-        conn = self._conn()
-        row = conn.execute("SELECT * FROM challenges WHERE id=?", (chall_id,)).fetchone()
-        conn.close()
+        row = self._db.fetchone("SELECT * FROM challenges WHERE id=?", (chall_id,))
         return dict(row) if row else None
 
     def get_auth_challenges(self, auth_id: str) -> list:
-        conn = self._conn()
-        rows = conn.execute(
-            "SELECT * FROM challenges WHERE auth_id=?", (auth_id,)
-        ).fetchall()
-        conn.close()
+        rows = self._db.fetchall("SELECT * FROM challenges WHERE auth_id=?", (auth_id,))
         return [dict(r) for r in rows]
 
     def update_challenge(self, chall_id: str, **kwargs):
@@ -571,29 +534,31 @@ class ACMEDatabase:
             return
         sets = ", ".join(f"{k}=?" for k in kwargs)
         vals = list(kwargs.values()) + [chall_id]
-        conn = self._conn()
-        conn.execute(f"UPDATE challenges SET {sets} WHERE id=?", vals)
-        conn.commit()
-        conn.close()
+        self._db.execute(f"UPDATE challenges SET {sets} WHERE id=?", vals)
 
     # -- Certificates --
 
     def store_certificate(self, order_id: str, pem_chain: str, serial: int) -> str:
         cert_id = b64url_encode(os.urandom(12))
-        conn = self._conn()
-        conn.execute(
+        self._db.execute(
             "INSERT INTO certificates VALUES (?,?,?,?,?)",
             (cert_id, order_id, pem_chain, serial, time.time())
         )
-        conn.commit()
-        conn.close()
         return cert_id
 
     def get_certificate(self, cert_id: str) -> Optional[dict]:
-        conn = self._conn()
-        row = conn.execute("SELECT * FROM certificates WHERE id=?", (cert_id,)).fetchone()
-        conn.close()
+        row = self._db.fetchone("SELECT * FROM certificates WHERE id=?", (cert_id,))
         return dict(row) if row else None
+
+    def count_account_certs_since(self, account_kid: str, since_unix: float) -> int:
+        """Return number of certificates issued for *account_kid* after *since_unix*."""
+        row = self._db.fetchone(
+            "SELECT COUNT(*) FROM certificates c "
+            "JOIN orders o ON c.order_id = o.id "
+            "WHERE o.account_kid = ? AND c.created_at > ?",
+            (account_kid, since_unix),
+        )
+        return row[0] if row else 0
 
 
 # ---------------------------------------------------------------------------
@@ -830,12 +795,15 @@ class ACMEHandler(http.server.BaseHTTPRequestHandler):
     # Injected by the server factory
     db: ACMEDatabase = None
     ca = None             # CertificateAuthority instance
+    ra = None             # RAWorkflow instance (§5.4); None = auto-issue without RA
     validator: ChallengeValidator = None
     base_url: str = ""    # e.g. "http://localhost:8888"
     cert_validity_days: int = 90        # validity for ACME-issued certs
     short_lived_threshold_days: int = 7 # certs valid <= this get noRevAvail (RFC 9608)
     allow_private_ip: bool = False      # RFC 8738: permit private/reserved IPs in ip identifiers
     require_eab: bool = False           # RFC 8555 §7.3.4: gate account creation behind EAB
+    per_account_cert_limit: int = 0     # max certs per account per window (0 = unlimited)
+    per_account_window_days: int = 7    # rolling window for per-account limit
 
     def log_message(self, format, *args):
         logger.info(f"ACME {self.address_string()} - {format % args}")
@@ -1168,6 +1136,28 @@ class ACMEHandler(http.server.BaseHTTPRequestHandler):
             self._send_error(404, "urn:ietf:params:acme:error:malformed", "Order not found")
             return
 
+        # §5.4 — if order is in 'processing' state, check RA for approval
+        if order.get("status") == "processing" and order.get("ra_request_id") and self.ra:
+            ra_req = self.ra.get(order["ra_request_id"])
+            if ra_req and ra_req["status"] == "issued":
+                # Approved — issue certificate and move order to 'valid'
+                cert_der = self.ra._db.fetchone(
+                    "SELECT cert_der FROM pending_requests WHERE request_id=?",
+                    (order["ra_request_id"],),
+                )["cert_der"]
+                from cryptography import x509 as _x509
+                from cryptography.hazmat.primitives.serialization import Encoding as _Enc
+                cert = _x509.load_der_x509_certificate(bytes(cert_der))
+                cert_pem = cert.public_bytes(_Enc.PEM).decode()
+                ca_pem = self.ca.ca_cert.public_bytes(_Enc.PEM).decode()
+                pem_chain = cert_pem + ca_pem
+                cert_id = self.db.store_certificate(order_id, pem_chain, cert.serial_number)
+                self.db.update_order(order_id, status="valid", cert_id=cert_id)
+                order = self.db.get_order(order_id)
+            elif ra_req and ra_req["status"] == "denied":
+                self.db.update_order(order_id, status="invalid")
+                order = self.db.get_order(order_id)
+
         self._refresh_order_status(order_id)
         order = self.db.get_order(order_id)
         order_url = f"{self.base_url}/order/{order_id}"
@@ -1424,7 +1414,28 @@ class ACMEHandler(http.server.BaseHTTPRequestHandler):
                              f"IP identifiers {order_ip_strs}")
             return
 
-        # Issue the certificate
+        # Per-account rate limit check
+        if self.per_account_cert_limit > 0:
+            account_kid = order["account_kid"]
+            window_secs = self.per_account_window_days * 86400
+            since = time.time() - window_secs
+            count = self.db.count_account_certs_since(account_kid, since)
+            if count >= self.per_account_cert_limit:
+                logger.warning(
+                    f"ACME per-account rate limit hit: account={account_kid} "
+                    f"count={count}/{self.per_account_cert_limit} "
+                    f"window={self.per_account_window_days}d"
+                )
+                self._send_error(
+                    429,
+                    "urn:ietf:params:acme:error:rateLimited",
+                    f"Account certificate limit reached: {count}/{self.per_account_cert_limit} "
+                    f"in the last {self.per_account_window_days} day(s). "
+                    "Retry after the window expires.",
+                )
+                return
+
+        # Issue the certificate (or submit to RA if manual approval is required)
         # RFC 9608: if validity <= short_lived_threshold_days, use short_lived profile
         # which adds id-ce-noRevAvail and suppresses CDP + AIA-OCSP
         try:
@@ -1445,14 +1456,51 @@ class ACMEHandler(http.server.BaseHTTPRequestHandler):
             else:
                 profile = "tls_server"
 
-            cert = self.ca.issue_certificate(
-                subject_str=subject_str,
-                public_key=csr.public_key(),
-                san_dns=list(csr_domains) if csr_domains else None,
-                san_ips=csr_ip_strs if csr_ip_strs else None,
-                validity_days=validity,
-                profile=profile,
-            )
+            # §5.11: label by dominant identifier type for the histogram
+            _challenge_type = "ip" if order_ips and not order_domains else "dns"
+
+            # §5.4 — route through RA if configured
+            if self.ra is not None:
+                pub_key_der = csr.public_key().public_bytes(
+                    Encoding.DER,
+                    __import__("cryptography").hazmat.primitives.serialization.PublicFormat.SubjectPublicKeyInfo,
+                )
+                _t0 = time.perf_counter()
+                ra_req_id, auto_approved, cert = self.ra.submit(
+                    protocol="acme",
+                    profile=profile,
+                    subject_dn=subject_str,
+                    public_key_der=pub_key_der,
+                    san_dns=list(csr_domains) if csr_domains else None,
+                    san_ips=csr_ip_strs if csr_ip_strs else None,
+                    validity_days=validity,
+                    csr_der=csr.public_bytes(Encoding.DER),
+                    requester_ip=self.client_address[0] if hasattr(self, "client_address") else "",
+                    protocol_ref=order_id,
+                )
+                if not auto_approved:
+                    # Manual review required — set order to 'processing' (RFC 8555 §7.4)
+                    self.db.update_order(order_id, status="processing", ra_request_id=ra_req_id)
+                    order = self.db.get_order(order_id)
+                    logger.info(
+                        f"ACME order {order_id} pending RA approval: request_id={ra_req_id} "
+                        f"profile={profile} domains={domains}"
+                    )
+                    self._send_json(self._order_response(order), 200, add_nonce=True)
+                    return
+                _get_hist_acme().observe(time.perf_counter() - _t0, (_challenge_type,))
+            else:
+                _t0 = time.perf_counter()
+                cert = self.ca.issue_certificate(
+                    subject_str=subject_str,
+                    public_key=csr.public_key(),
+                    san_dns=list(csr_domains) if csr_domains else None,
+                    san_ips=csr_ip_strs if csr_ip_strs else None,
+                    validity_days=validity,
+                    profile=profile,
+                    protocol="acme",
+                )
+                _get_hist_acme().observe(time.perf_counter() - _t0, (_challenge_type,))
 
             cert_pem = cert.public_bytes(Encoding.PEM).decode()
             ca_pem = self.ca.ca_cert.public_bytes(Encoding.PEM).decode()
@@ -1779,17 +1827,23 @@ def make_acme_handler(
     short_lived_threshold_days: int = 7,
     allow_private_ip: bool = False,
     require_eab: bool = False,
+    per_account_cert_limit: int = 0,
+    per_account_window_days: int = 7,
+    ra=None,
 ):
     class BoundACMEHandler(ACMEHandler):
         pass
-    BoundACMEHandler.db                       = db
-    BoundACMEHandler.ca                       = ca
-    BoundACMEHandler.validator                = validator
-    BoundACMEHandler.base_url                 = base_url
-    BoundACMEHandler.cert_validity_days       = cert_validity_days
-    BoundACMEHandler.short_lived_threshold_days = short_lived_threshold_days
-    BoundACMEHandler.allow_private_ip         = allow_private_ip
-    BoundACMEHandler.require_eab             = require_eab
+    BoundACMEHandler.db                          = db
+    BoundACMEHandler.ca                          = ca
+    BoundACMEHandler.ra                          = ra
+    BoundACMEHandler.validator                   = validator
+    BoundACMEHandler.base_url                    = base_url
+    BoundACMEHandler.cert_validity_days          = cert_validity_days
+    BoundACMEHandler.short_lived_threshold_days  = short_lived_threshold_days
+    BoundACMEHandler.allow_private_ip            = allow_private_ip
+    BoundACMEHandler.require_eab                 = require_eab
+    BoundACMEHandler.per_account_cert_limit      = per_account_cert_limit
+    BoundACMEHandler.per_account_window_days     = per_account_window_days
     return BoundACMEHandler
 
 
@@ -1807,6 +1861,9 @@ def start_acme_server(
     allow_private_ip: bool = False,
     require_eab: bool = False,
     eab_file: Optional[str] = None,
+    per_account_cert_limit: int = 0,
+    per_account_window_days: int = 7,
+    db_url: str = "",
 ):
     """
     Register the ACME handler with *route_table* under *prefix*.
@@ -1833,11 +1890,12 @@ def start_acme_server(
         allow_private_ip: If True, permit private/reserved IPs in orders.
         require_eab: If True, enforce External Account Binding.
         eab_file: Path to JSON file with EAB credentials.
+        db_url: DAL connection URL (default: sqlite:///<ca_dir>/acme.db).
     """
     from dispatcher_server import _RouteProxy
 
-    db_path = str(ca_dir / "acme.db")
-    db = ACMEDatabase(db_path)
+    _acme_url = db_url or f"sqlite:///{ca_dir / 'acme.db'}"
+    db = ACMEDatabase(make_db(_acme_url))
 
     # Load EAB keys if provided
     if eab_file:
@@ -1861,6 +1919,9 @@ def start_acme_server(
         short_lived_threshold_days=short_lived_threshold_days,
         allow_private_ip=allow_private_ip,
         require_eab=require_eab,
+        per_account_cert_limit=per_account_cert_limit,
+        per_account_window_days=per_account_window_days,
+        ra=getattr(ca, "ra", None),
     )
 
     route_table.register(prefix, handler_cls)
@@ -1909,8 +1970,7 @@ if __name__ == "__main__":
     base_url = args.base_url or f"http://{args.host}:{args.port}"
     ca_dir = Path(args.ca_dir)
 
-    db_path = str(ca_dir / "acme.db")
-    db = ACMEDatabase(db_path)
+    db = ACMEDatabase(make_db(f"sqlite:///{ca_dir / 'acme.db'}"))
     validator = ChallengeValidator(auto_approve_dns=args.auto_approve_dns)
     handler = make_acme_handler(db, ca, validator, base_url)
 

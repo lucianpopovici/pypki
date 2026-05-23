@@ -53,6 +53,7 @@ import json
 import logging
 import os
 import sqlite3
+from db import make_db, Database
 import struct
 import threading
 import time
@@ -852,20 +853,21 @@ class CMSBuilder:
 # ---------------------------------------------------------------------------
 
 class SCEPDatabase:
-    """SQLite store for pending SCEP enrolments."""
+    """DAL-backed store for SCEP enrolments and OTP tokens.
 
-    def __init__(self, db_path: str):
-        self.db_path = db_path
+    Accepts a ``Database`` object so the backend is configurable — SQLite for
+    single-node deployments, PostgreSQL for HA (§5.2).
+    """
+
+    def __init__(self, db):
+        if isinstance(db, str):
+            from db import make_db
+            db = make_db(f"sqlite:///{db}")
+        self._db = db
         self._init_db()
 
-    def _conn(self):
-        conn = sqlite3.connect(self.db_path, check_same_thread=False)
-        conn.row_factory = sqlite3.Row
-        return conn
-
     def _init_db(self):
-        conn = self._conn()
-        conn.executescript("""
+        self._db.execute("""
             CREATE TABLE IF NOT EXISTS scep_transactions (
                 transaction_id  TEXT PRIMARY KEY,
                 status          TEXT NOT NULL DEFAULT 'pending',
@@ -877,49 +879,90 @@ class SCEPDatabase:
                 requester_ip    TEXT,
                 created_at      REAL,
                 updated_at      REAL
-            );
+            )
         """)
-        conn.commit()
-        conn.close()
+        self._db.execute("""
+            CREATE TABLE IF NOT EXISTS otp_tokens (
+                token       TEXT PRIMARY KEY,
+                created_at  REAL NOT NULL,
+                expires_at  REAL NOT NULL,
+                consumed_at REAL
+            )
+        """)
+
+    # ------------------------------------------------------------------
+    # One-time password (OTP) helpers
+    # ------------------------------------------------------------------
+
+    def add_otp(self, ttl_seconds: int = 86400) -> str:
+        """Mint a single-use SCEP challenge OTP. Returns the token string."""
+        import base64
+        token = base64.urlsafe_b64encode(os.urandom(24)).decode().rstrip("=")
+        now = time.time()
+        self._db.execute(
+            "INSERT INTO otp_tokens (token, created_at, expires_at) VALUES (?, ?, ?)",
+            (token, now, now + ttl_seconds),
+        )
+        return token
+
+    def consume_otp(self, token: str) -> bool:
+        """Atomically consume an OTP. Returns True iff the token was valid and unused."""
+        now = time.time()
+        try:
+            with self._db.advisory_lock("scep-otp"):
+                row = self._db.fetchone(
+                    "SELECT consumed_at, expires_at FROM otp_tokens WHERE token = ?",
+                    (token,),
+                )
+                if row is None or row["consumed_at"] is not None or row["expires_at"] < now:
+                    return False
+                self._db.execute(
+                    "UPDATE otp_tokens SET consumed_at = ? WHERE token = ?",
+                    (now, token),
+                )
+            return True
+        except Exception:
+            return False
+
+    def purge_expired_otps(self) -> int:
+        """Delete consumed or expired OTP rows. Returns count deleted."""
+        rows_before = self._db.fetchone("SELECT COUNT(*) FROM otp_tokens")[0]
+        self._db.execute(
+            "DELETE FROM otp_tokens WHERE consumed_at IS NOT NULL OR expires_at < ?",
+            (time.time(),),
+        )
+        rows_after = self._db.fetchone("SELECT COUNT(*) FROM otp_tokens")[0]
+        return rows_before - rows_after
 
     def create_transaction(self, txid: str, subject: str, csr_pem: str, ip: str):
-        conn = self._conn()
         now = time.time()
-        conn.execute(
+        self._db.execute(
             "INSERT OR REPLACE INTO scep_transactions VALUES (?,?,?,?,?,?,?,?,?,?)",
             (txid, "pending", subject, csr_pem, None, None, None, ip, now, now)
         )
-        conn.commit()
-        conn.close()
 
     def set_success(self, txid: str, cert_pem: str):
-        conn = self._conn()
-        conn.execute(
+        self._db.execute(
             "UPDATE scep_transactions SET status='success', cert_pem=?, updated_at=? WHERE transaction_id=?",
             (cert_pem, time.time(), txid)
         )
-        conn.commit()
-        conn.close()
 
     def set_failure(self, txid: str, fail_info: str, reason: str):
-        conn = self._conn()
-        conn.execute(
+        self._db.execute(
             "UPDATE scep_transactions SET status='failure', fail_info=?, fail_reason=?, updated_at=? WHERE transaction_id=?",
             (fail_info, reason, time.time(), txid)
         )
-        conn.commit()
-        conn.close()
 
     def get(self, txid: str) -> Optional[Dict[str, Any]]:
-        conn = self._conn()
-        row = conn.execute("SELECT * FROM scep_transactions WHERE transaction_id=?", (txid,)).fetchone()
-        conn.close()
+        row = self._db.fetchone(
+            "SELECT * FROM scep_transactions WHERE transaction_id=?", (txid,)
+        )
         return dict(row) if row else None
 
     def all_transactions(self) -> list:
-        conn = self._conn()
-        rows = conn.execute("SELECT * FROM scep_transactions ORDER BY created_at DESC").fetchall()
-        conn.close()
+        rows = self._db.fetchall(
+            "SELECT * FROM scep_transactions ORDER BY created_at DESC"
+        )
         return [dict(r) for r in rows]
 
 
@@ -933,6 +976,7 @@ class SCEPHandler(http.server.BaseHTTPRequestHandler):
     ca: "CertificateAuthority" = None
     db: SCEPDatabase = None
     challenge: str = ""           # shared challenge password (empty = no check)
+    use_otp: bool = False         # also accept single-use OTP challenges
     auto_issue: bool = True       # auto-issue on valid PKCSReq vs manual approval
 
     def log_message(self, fmt, *args):
@@ -1140,17 +1184,26 @@ class SCEPHandler(http.server.BaseHTTPRequestHandler):
 
         subject_str = csr.subject.rfc4514_string()
 
-        # Challenge password verification
-        # Extract challengePassword from the CSR attributes
+        # Challenge password verification (static shared secret and/or single-use OTP)
         challenge_ok = True
-        if self.challenge:
+        if self.challenge or self.use_otp:
             csr_challenge = self._extract_csr_challenge(csr_der)
             if not csr_challenge:
                 logger.warning(f"No challengePassword in CSR from {subject_str}")
                 challenge_ok = False
-            elif not hmac_compare(csr_challenge.encode(), self.challenge.encode()):
-                logger.warning(f"Wrong challengePassword from {subject_str}")
-                challenge_ok = False
+            else:
+                accepted = False
+                # Try OTP path first (single-use, consumed atomically)
+                if self.use_otp and self.db.consume_otp(csr_challenge):
+                    accepted = True
+                    logger.info(f"SCEP OTP consumed for {subject_str}")
+                # Fall back to static shared secret
+                if not accepted and self.challenge:
+                    if hmac_compare(csr_challenge.encode(), self.challenge.encode()):
+                        accepted = True
+                if not accepted:
+                    logger.warning(f"Wrong or expired challengePassword from {subject_str}")
+                    challenge_ok = False
 
         if not challenge_ok:
             # Check if this is a renewal (requester presents an existing cert)
@@ -1167,6 +1220,7 @@ class SCEPHandler(http.server.BaseHTTPRequestHandler):
             cert = self.ca.issue_certificate(
                 subject_str=subject_str,
                 public_key=csr.public_key(),
+                protocol="scep",
             )
             cert_pem = cert.public_bytes(Encoding.PEM).decode()
             self.db.set_success(transaction_id, cert_pem)
@@ -1500,6 +1554,17 @@ def hmac_compare(a: bytes, b: bytes) -> bool:
 # Standalone entry point / integration helper
 # ---------------------------------------------------------------------------
 
+def mint_otp(ca_dir, ttl_seconds: int = 86400) -> str:
+    """
+    Mint a single-use SCEP challenge OTP from outside the handler.
+
+    Useful for web-UI admin endpoints and CLI tooling that need to
+    produce OTPs without a reference to the running handler instance.
+    """
+    db = SCEPDatabase(make_db(f"sqlite:///{Path(ca_dir) / 'scep.db'}"))
+    return db.add_otp(ttl_seconds)
+
+
 def start_scep_server(
     route_table,
     prefix: str,
@@ -1507,6 +1572,8 @@ def start_scep_server(
     ca_dir: Path,
     challenge: str = "",
     auto_issue: bool = True,
+    use_otp: bool = False,
+    db_url: str = "",
 ):
     """
     Register the SCEP handler with *route_table* under *prefix*.
@@ -1536,8 +1603,8 @@ def start_scep_server(
     except ImportError:
         pass
 
-    db_path = str(ca_dir / "scep.db")
-    db = SCEPDatabase(db_path)
+    _scep_url = db_url or f"sqlite:///{ca_dir / 'scep.db'}"
+    db = SCEPDatabase(make_db(_scep_url))
 
     class BoundSCEPHandler(SCEPHandler):
         pass
@@ -1545,11 +1612,14 @@ def start_scep_server(
     BoundSCEPHandler.ca = ca
     BoundSCEPHandler.db = db
     BoundSCEPHandler.challenge = challenge
+    BoundSCEPHandler.use_otp = use_otp
     BoundSCEPHandler.auto_issue = auto_issue
 
     route_table.register(prefix, BoundSCEPHandler)
     logger.info(f"SCEP handler registered at prefix {prefix!r}")
-    return _RouteProxy(route_table, prefix, label="scep")
+    proxy = _RouteProxy(route_table, prefix, label="scep")
+    proxy.scep_db = db   # expose for web UI OTP minting
+    return proxy
 
 
 def main():

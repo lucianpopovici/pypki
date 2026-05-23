@@ -94,6 +94,7 @@ import re
 import secrets
 import sqlite3
 import ssl
+from db import make_db, Database
 import threading
 import time
 import traceback
@@ -602,14 +603,11 @@ class RFC4806OCSPHashResolver:
 
         # Look up serial in DB
         try:
-            conn = sqlite3.connect(str(self.ca.db_path))
-            conn.row_factory = sqlite3.Row
-            row = conn.execute(
+            row = self.ca._pki_db.fetchone(
                 "SELECT serial, revoked, revoked_at, reason "
                 "FROM certificates WHERE serial=?",
                 (serial,)
-            ).fetchone()
-            conn.close()
+            )
         except Exception as e:
             logger.error(f"RFC4806 DB error: {e}")
             return False, b"", f"Database error: {e}"
@@ -889,6 +887,7 @@ class IPsecCertIssuer:
             ocsp_url=ocsp_url,
             crl_url=crl_url,
             requester_ip=audit_ip,
+            protocol="ipsec",
         )
 
         # ── Re-sign with correct RFC 4945 EKU (override default profile) ─
@@ -1026,13 +1025,10 @@ class IPsecCertIssuer:
 
         # Update the DER stored in the CA's DB to reflect the rebuilt cert
         try:
-            conn = sqlite3.connect(str(self.ca.db_path))
-            conn.execute(
+            self.ca._pki_db.execute(
                 "UPDATE certificates SET der=? WHERE serial=?",
                 (cert.public_bytes(Encoding.DER), cert.serial_number),
             )
-            conn.commit()
-            conn.close()
         except Exception as e:
             logger.warning(f"Could not update cert DER in DB after EKU rebuild: {e}")
 
@@ -1106,13 +1102,10 @@ class IPsecCertIssuer:
         """
         # Fetch old cert from DB
         try:
-            conn = sqlite3.connect(str(self.ca.db_path))
-            conn.row_factory = sqlite3.Row
-            row = conn.execute(
+            row = self.ca._pki_db.fetchone(
                 "SELECT der, profile FROM certificates WHERE serial=? AND revoked=0",
                 (old_serial,)
-            ).fetchone()
-            conn.close()
+            )
         except Exception as e:
             raise RuntimeError(f"DB error fetching serial {old_serial}: {e}")
 
@@ -1203,13 +1196,10 @@ class IPsecCertIssuer:
         """
         # Fetch old cert from DB
         try:
-            conn = sqlite3.connect(str(self.ca.db_path))
-            conn.row_factory = sqlite3.Row
-            row = conn.execute(
+            row = self.ca._pki_db.fetchone(
                 "SELECT der, profile FROM certificates WHERE serial=? AND revoked=0",
                 (old_serial,)
-            ).fetchone()
-            conn.close()
+            )
         except Exception as e:
             raise RuntimeError(f"DB error fetching serial {old_serial}: {e}")
 
@@ -1306,52 +1296,39 @@ class ApprovalQueue:
     STATE_APPROVED = "approved"
     STATE_REJECTED = "rejected"
 
-    def __init__(self, db_path: str):
-        self.db_path = db_path
-        self._lock = threading.Lock()
+    def __init__(self, db: "Database"):
+        self._db = db
         self._ensure_table()
 
-    def _conn(self):
-        conn = sqlite3.connect(self.db_path)
-        conn.row_factory = sqlite3.Row
-        return conn
-
     def _ensure_table(self):
-        with self._conn() as conn:
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS ipsec_pending_requests (
-                    request_id    TEXT PRIMARY KEY,
-                    state         TEXT NOT NULL DEFAULT 'pending',
-                    created_at    TEXT NOT NULL,
-                    decided_at    TEXT,
-                    confirmed_at  TEXT,
-                    requester_ip  TEXT,
-                    request_json  TEXT NOT NULL,
-                    result_serial INTEGER,
-                    result_cert_pem TEXT,
-                    reject_reason TEXT
-                )
-            """)
-            # RFC 4809 §3.4.10 — confirmations for directly issued certs
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS ipsec_cert_confirmations (
-                    serial        INTEGER PRIMARY KEY,
-                    confirmed_at  TEXT NOT NULL,
-                    requester_ip  TEXT
-                )
-            """)
-            # Migrate existing DB: add confirmed_at if absent (idempotent)
-            cols = {r[1] for r in conn.execute(
-                "PRAGMA table_info(ipsec_pending_requests)"
-            ).fetchall()}
-            if "confirmed_at" not in cols:
-                try:
-                    conn.execute(
-                        "ALTER TABLE ipsec_pending_requests ADD COLUMN confirmed_at TEXT"
-                    )
-                except Exception:
-                    pass
-            conn.commit()
+        self._db.execute("""
+            CREATE TABLE IF NOT EXISTS ipsec_pending_requests (
+                request_id    TEXT PRIMARY KEY,
+                state         TEXT NOT NULL DEFAULT 'pending',
+                created_at    TEXT NOT NULL,
+                decided_at    TEXT,
+                confirmed_at  TEXT,
+                requester_ip  TEXT,
+                request_json  TEXT NOT NULL,
+                result_serial INTEGER,
+                result_cert_pem TEXT,
+                reject_reason TEXT
+            )
+        """)
+        self._db.execute("""
+            CREATE TABLE IF NOT EXISTS ipsec_cert_confirmations (
+                serial        INTEGER PRIMARY KEY,
+                confirmed_at  TEXT NOT NULL,
+                requester_ip  TEXT
+            )
+        """)
+        # Idempotent migration: add confirmed_at if absent
+        try:
+            self._db.execute(
+                "ALTER TABLE ipsec_pending_requests ADD COLUMN confirmed_at TEXT"
+            )
+        except Exception:
+            pass
 
     def record_direct_confirmation(self, serial: int, requester_ip: str = "") -> bool:
         """
@@ -1360,77 +1337,66 @@ class ApprovalQueue:
         Returns True if this is the first confirmation for this serial.
         """
         now = datetime.datetime.now(_tz.utc).isoformat()
-        with self._lock:
-            with self._conn() as conn:
-                try:
-                    conn.execute(
-                        "INSERT INTO ipsec_cert_confirmations (serial, confirmed_at, requester_ip) VALUES (?,?,?)",
-                        (serial, now, requester_ip)
-                    )
-                    conn.commit()
-                    logger.info(f"RFC4809 §3.4.10: direct cert confirmation serial={serial}")
-                    return True
-                except sqlite3.IntegrityError:
-                    return False  # already confirmed
+        with self._db.advisory_lock("ipsec-direct-confirm"):
+            existing = self._db.fetchone(
+                "SELECT serial FROM ipsec_cert_confirmations WHERE serial=?", (serial,)
+            )
+            if existing:
+                return False
+            self._db.execute(
+                "INSERT INTO ipsec_cert_confirmations (serial, confirmed_at, requester_ip) VALUES (?,?,?)",
+                (serial, now, requester_ip)
+            )
+        logger.info(f"RFC4809 §3.4.10: direct cert confirmation serial={serial}")
+        return True
 
     def enqueue(self, request_data: Dict[str, Any], requester_ip: str = "") -> str:
         """Add a request to the pending queue. Returns request_id."""
         import uuid
         request_id = str(uuid.uuid4())
         now = datetime.datetime.now(_tz.utc).isoformat()
-        with self._lock:
-            with self._conn() as conn:
-                conn.execute(
-                    "INSERT INTO ipsec_pending_requests "                    "(request_id, state, created_at, requester_ip, request_json) "                    "VALUES (?,?,?,?,?)",
-                    (request_id, self.STATE_PENDING, now, requester_ip,
-                     json.dumps(request_data))
-                )
-                conn.commit()
+        self._db.execute(
+            "INSERT INTO ipsec_pending_requests "
+            "(request_id, state, created_at, requester_ip, request_json) "
+            "VALUES (?,?,?,?,?)",
+            (request_id, self.STATE_PENDING, now, requester_ip, json.dumps(request_data))
+        )
         logger.info(f"RFC4809 §3.4.4: queued pending request {request_id}")
         return request_id
 
     def get(self, request_id: str) -> Optional[Dict]:
         """Return the pending request row as a dict, or None."""
-        with self._conn() as conn:
-            row = conn.execute(
-                "SELECT * FROM ipsec_pending_requests WHERE request_id=?",
-                (request_id,)
-            ).fetchone()
-        if row is None:
-            return None
-        return dict(row)
+        row = self._db.fetchone(
+            "SELECT * FROM ipsec_pending_requests WHERE request_id=?", (request_id,)
+        )
+        return dict(row) if row is not None else None
 
     def list_pending(self) -> List[Dict]:
         """Return all pending (unapproved) requests."""
-        with self._conn() as conn:
-            rows = conn.execute(
-                "SELECT * FROM ipsec_pending_requests WHERE state=? ORDER BY created_at",
-                (self.STATE_PENDING,)
-            ).fetchall()
+        rows = self._db.fetchall(
+            "SELECT * FROM ipsec_pending_requests WHERE state=? ORDER BY created_at",
+            (self.STATE_PENDING,)
+        )
         return [dict(r) for r in rows]
 
     def approve(self, request_id: str, serial: int, cert_pem: str):
         """Mark a request as approved and store the issued cert."""
         now = datetime.datetime.now(_tz.utc).isoformat()
-        with self._lock:
-            with self._conn() as conn:
-                conn.execute(
-                    "UPDATE ipsec_pending_requests SET state=?, decided_at=?, "                    "result_serial=?, result_cert_pem=? WHERE request_id=?",
-                    (self.STATE_APPROVED, now, serial, cert_pem, request_id)
-                )
-                conn.commit()
+        self._db.execute(
+            "UPDATE ipsec_pending_requests SET state=?, decided_at=?, "
+            "result_serial=?, result_cert_pem=? WHERE request_id=?",
+            (self.STATE_APPROVED, now, serial, cert_pem, request_id)
+        )
         logger.info(f"RFC4809 §3.4.4: approved request {request_id} → serial={serial}")
 
     def reject(self, request_id: str, reason: str = ""):
         """Mark a request as rejected."""
         now = datetime.datetime.now(_tz.utc).isoformat()
-        with self._lock:
-            with self._conn() as conn:
-                conn.execute(
-                    "UPDATE ipsec_pending_requests SET state=?, decided_at=?, "                    "reject_reason=? WHERE request_id=?",
-                    (self.STATE_REJECTED, now, reason, request_id)
-                )
-                conn.commit()
+        self._db.execute(
+            "UPDATE ipsec_pending_requests SET state=?, decided_at=?, "
+            "reject_reason=? WHERE request_id=?",
+            (self.STATE_REJECTED, now, reason, request_id)
+        )
         logger.info(f"RFC4809 §3.4.4: rejected request {request_id}: {reason}")
 
     def confirm_receipt(self, request_id: str, serial: int) -> bool:
@@ -1440,33 +1406,24 @@ class ApprovalQueue:
         Returns True if the record was found and updated, False otherwise.
         """
         now = datetime.datetime.now(_tz.utc).isoformat()
-        with self._lock:
-            with self._conn() as conn:
-                conn.execute(
-                    "ALTER TABLE ipsec_pending_requests "
-                    "ADD COLUMN confirmed_at TEXT"
-                ) if not self._has_column(conn, "confirmed_at") else None
-                cursor = conn.execute(
-                    "UPDATE ipsec_pending_requests SET confirmed_at=? "
-                    "WHERE request_id=? AND result_serial=?",
-                    (now, request_id, serial)
-                )
-                conn.commit()
-                updated = cursor.rowcount > 0
-        if updated:
-            logger.info(
-                f"RFC4809 §3.4.10: enrollment confirmation received — "
-                f"request_id={request_id} serial={serial}"
+        with self._db.advisory_lock("ipsec-confirm-receipt"):
+            row = self._db.fetchone(
+                "SELECT request_id FROM ipsec_pending_requests "
+                "WHERE request_id=? AND result_serial=?",
+                (request_id, serial)
             )
-        return updated
-
-    @staticmethod
-    def _has_column(conn: sqlite3.Connection, col: str) -> bool:
-        """Check whether ipsec_pending_requests already has a given column."""
-        rows = conn.execute(
-            "PRAGMA table_info(ipsec_pending_requests)"
-        ).fetchall()
-        return any(r[1] == col for r in rows)
+            if not row:
+                return False
+            self._db.execute(
+                "UPDATE ipsec_pending_requests SET confirmed_at=? "
+                "WHERE request_id=? AND result_serial=?",
+                (now, request_id, serial)
+            )
+        logger.info(
+            f"RFC4809 §3.4.10: enrollment confirmation received — "
+            f"request_id={request_id} serial={serial}"
+        )
+        return True
 
 
 # ---------------------------------------------------------------------------
@@ -1622,12 +1579,9 @@ class IPsecHandler(http.server.BaseHTTPRequestHandler):
                 self._send_json({"error": "Invalid serial number"}, 400)
                 return
             try:
-                conn = sqlite3.connect(str(self.ca.db_path))
-                conn.row_factory = sqlite3.Row
-                row = conn.execute(
+                row = self.ca._pki_db.fetchone(
                     "SELECT der, revoked FROM certificates WHERE serial=?", (serial,)
-                ).fetchone()
-                conn.close()
+                )
             except Exception as e:
                 self._send_json({"error": str(e)}, 500)
                 return
@@ -2163,12 +2117,9 @@ class IPsecHandler(http.server.BaseHTTPRequestHandler):
             # Verify the serial actually exists in the CA database (optional audit)
             cert_exists = False
             try:
-                conn = sqlite3.connect(str(self.ca.db_path))
-                conn.row_factory = sqlite3.Row
-                row = conn.execute(
+                row = self.ca._pki_db.fetchone(
                     "SELECT serial FROM certificates WHERE serial=? AND revoked=0", (serial,)
-                ).fetchone()
-                conn.close()
+                )
                 cert_exists = row is not None
             except Exception:
                 pass
@@ -2536,8 +2487,8 @@ def start_ipsec_server(
     class BoundHandler(IPsecHandler):
         pass
 
-    # RFC 4809 §3.4.4 — approval queue shares the CA's SQLite DB
-    aq = ApprovalQueue(str(ca.db_path))
+    # RFC 4809 §3.4.4 — approval queue shares the CA's PKI DB
+    aq = ApprovalQueue(ca._pki_db)
 
     BoundHandler.ca             = ca
     BoundHandler.issuer         = issuer

@@ -86,17 +86,7 @@ Two MUST-violations existed in PyPKI's CRL builders:
 - `test_crl_signature_still_verifies` — sanity check that the new
   extensions don't break signing
 
-**Outstanding**
-
-- README compliance table: change RFC 5280 row note to mention CRL
-  extensions; add RFC 6818 row as `✅ Full`. Pending — markdown only,
-  no code.
-- CHANGELOG under `### Fixed`: "CRL now includes mandatory `cRLNumber`
-  and `authorityKeyIdentifier` extensions (RFC 5280 §5.2.1, §5.2.3 /
-  RFC 6818)." Pending — markdown only.
-- CHANGELOG under `### Fixed`: "Pre-existing crash in `generate_crl_der`
-  when revoked certs were present (used `fromtimestamp()` instead of
-  `fromisoformat()`)." Pending — markdown only.
+**Docs**: README compliance table updated; CHANGELOG fixed entries added.
 
 ---
 
@@ -130,12 +120,7 @@ profiles it strictly.
 - Strict mode rejects nonceless request with unauthorized
 - Strict mode accepts request that DOES carry a valid nonce
 
-**Outstanding**
-
-- README OCSP section bullet — pending markdown only.
-- CHANGELOG `### Added`: "RFC 8954 nonce profile enforcement
-  (1–32 byte bounds at parse time; `--ocsp-require-nonce` strict mode
-  flag)." — pending markdown only.
+**Docs**: README OCSP section and compliance table updated; CHANGELOG added entry.
 
 ---
 
@@ -282,12 +267,7 @@ validators) reject unprotected responses.
 - Protection signature fails against corrupted body bytes
 - ExtraCerts contains the signer cert DER
 
-**Outstanding**
-
-- README CMP section bullet — pending markdown only.
-- CHANGELOG `### Security`: "CMPv2/v3 responses now carry signature
-  protection and CA cert chain in extraCerts, closing RFC 4210 §5.1.3
-  gap." — pending markdown only.
+**Docs**: README CMP feature table and compliance table updated; CHANGELOG security entry added.
 
 ---
 
@@ -336,12 +316,7 @@ someone else's public key.
 - raVerified ([0] NULL) variant → rejected
 - Empty inputs return False without crashing
 
-**Outstanding**
-
-- README CMP section bullet — pending markdown only.
-- CHANGELOG `### Security`: "Enforce CRMF proof-of-possession per
-  RFC 4211 §4; prevent cert issuance for third-party public keys."
-  — pending markdown only.
+**Docs**: README CMP feature table and compliance table updated; CHANGELOG security entry added.
 
 ---
 
@@ -684,11 +659,7 @@ SAN entries on the issued certificate.
 - End-to-end finalize: an ip-only issuance produces a cert with
   exactly one `iPAddress` SAN and zero `dNSName` SANs.
 
-**Outstanding**
-
-- README compliance table — done (✅ Full).
-- README ACME section bullet — done.
-- CHANGELOG `### Added` — done.
+**Docs**: README compliance table updated (✅ Full); ACME section bullet and CHANGELOG added.
 
 ---
 
@@ -842,7 +813,7 @@ correct `sign()` arguments for any key type.
 
 ---
 
-### RFC 7292 — PKCS#12 hardening ✅ SHIPPED (partial)
+### RFC 7292 — PKCS#12 hardening ✅ SHIPPED
 
 **What it requires.** PKCS#12 export already works
 (`pki_server.py:1757`). RFC 7292 (v1.1) fixes encoding ambiguities. Modern
@@ -856,17 +827,16 @@ guidance (NIST SP 800-132) demands a strong KDF iteration count.
   was already in place, giving AES-256 + HMAC-SHA256 with ≥600k PBKDF2
   iterations via the `cryptography` library.
 
-**Outstanding**
+**Also shipped** (this session)
 
-- `--p12-allow-unencrypted` flag and rejection of passwordless export —
-  not yet implemented. Currently unencrypted export is accepted silently.
+- `pki_server.py` — `export_pkcs12` now rejects passwordless export by default,
+  raising `ValueError` with a clear message. Opt-out via `--p12-allow-unencrypted`
+  CLI flag (sets `ca._p12_allow_unencrypted = True`).
+- New `TestRFC7292PKCS12Hardening` (5 tests): default rejects passwordless; password
+  accepted; `_p12_allow_unencrypted=True` allows passwordless; unknown serial returns
+  None; error message references the flag.
 
 **Tests**: `TestPKCS12Export` extended to verify `friendlyName` round-trip.
-
-**Files to modify** (remaining)
-
-- `pki_server.py` → `CertificateAuthority.export_pkcs12()` — reject
-  password-less export unless `--p12-allow-unencrypted` is set.
 
 **Docs**
 
@@ -875,7 +845,7 @@ guidance (NIST SP 800-132) demands a strong KDF iteration count.
 
 ---
 
-### RFC 6962 / RFC 9162 — Certificate Transparency (hardening)
+### RFC 6962 / RFC 9162 — Certificate Transparency (hardening) ✅ SHIPPED
 
 **Current state.** Already implemented as opt-in at `pki_server.py:2459-2620`:
 `OID_SCT_LIST` constant, `submit_to_ct_log()` against RFC 6962 §4.1
@@ -899,35 +869,26 @@ as sample URLs.
   extension + critical; final cert has poison removed + SCT list; serial
   preserved across both certs; `INSERT OR REPLACE` handles the DB overwrite.
 
-**Outstanding — still TODO**
+**Also shipped** (this session)
 
-- **CLI wiring**: `--ct-log-url URL` (repeatable), `--ct-log-pubkey PATH`,
-  `--ct-require-n N`. Today CT is only reachable programmatically via
-  `ca.issue_with_ct(ct_log_urls=[...])`.
-- **SCT signature verification** on received SCTs against log public keys
-  before embedding — not yet checked.
-- **Minimum-SCT-count enforcement** (Chrome wants ≥2 from qualified logs).
-
-**Files to modify** (remaining)
-
-- `pki_server.py` CLI parsing → add `--ct-log-url URL` (repeatable),
-  `--ct-log-pubkey PATH` (repeatable, aligned by index), `--ct-require-n N`.
-- `pki_server.py` → SCT verification helper that parses the TLS signature
-  and verifies with the log's public key.
-
-**Tests** (remaining)
-
-- In-process mock CT log that signs SCTs with a known key; verify signature
-  check passes on correct key, fails on wrong key.
-- `--ct-require-n 2` with only 1 log reachable → issuance aborts.
-
-**Docs**
-
-- README: document `--ct-log-url` and recommended opt-in for publicly-trusted
-  CAs only.
-- Compliance table: keep RFC 6962 at `✅ Opt-in`, annotate "pre-cert flow ✅"
-  in notes.
-- CHANGELOG `### Changed`: CLI wiring + SCT verification (remaining).
+- **CLI wiring ✅**: `--ct-log-url URL` (repeatable, appended to list),
+  `--ct-log-pubkey PATH` (repeatable, aligned by index with log URLs),
+  `--ct-require-n N` (minimum SCTs required; 0 = best-effort). Wired into
+  `main()` → `ca._ct_log_urls`, `ca._ct_log_pubkeys`, `ca._ct_require_n`.
+- **SCT ECDSA signature verification ✅**: `CertificateAuthority.verify_sct_signature`
+  static method. Parses the `DigitallySigned` TLS structure (hash_alg + sig_alg +
+  length-prefixed signature), reconstructs the `TreeLeafMessage` signed data
+  (version 0x00, sig_type 0x00, timestamp 8 bytes, entry_type uint16, signed_entry,
+  extensions length-prefixed), and verifies the ECDSA signature against the log's
+  PEM-encoded public key via `cryptography`. Wrong key, tampered signature, or
+  invalid pubkey → returns `False` without raising.
+- **Minimum-SCT-count enforcement ✅**: `issue_certificate_with_ct` raises
+  `RuntimeError` when `ct_require_n > 0` and fewer than `ct_require_n` SCTs were
+  successfully obtained. Best-effort mode (`ct_require_n=0`) embeds whatever SCTs
+  are available.
+- New `TestRFC6962CTCLIWiring` (11 tests): attribute defaults, SCT verify valid /
+  wrong key / tampered / invalid pubkey; mock submission with wrong pubkey → None;
+  require_n enforcement; best-effort mode; URL storage; default n config.
 
 ---
 
@@ -1015,23 +976,47 @@ pairing. Track the draft; implement once stable.
 
 Grouped by area. Each is smaller than Tier 2 but still useful.
 
-### RFC 9481 — Algorithm Requirements for CMP
+### RFC 9481 — Algorithm Requirements for CMP ✅ SHIPPED
 
-- Audit current CMP algorithm usage vs 9481's MUST/SHOULD list.
-- Explicitly advertise supported algs in CMP `genp` response (OID
-  `1.3.6.1.5.5.7.4.1` — signKeyPairTypes).
-- Add a test class `TestRFC9481CMPAlgorithms` that parses a `genp` response
-  and asserts each listed alg is genuinely supported.
+**What it requires.** CMP servers should advertise supported algorithm identifiers
+via `genm`/`genp` responses for `id-it-signKeyPairTypes`, `id-it-encKeyPairTypes`,
+and `id-it-preferredSymmAlg`.
 
-### RFC 9482 — Lightweight CMP Profile
+**What shipped** (this session)
 
-- Already partial (RFC 9483 badge in README). 9482 is the client profile that
-  embedded stacks target; 9483 is an older informational title for the same
-  ground — double-check which applies.
-- Verify compliance with 9482 §3 (request structure) and §5 (response
-  handling). Most should already pass.
-- Add a `TestRFC9482LightweightCMP` class with the 9482 Appendix B test
-  vectors.
+- `cmp_server.py` — `_handle_genm_v3` now responds to three new genm OIDs:
+  - `OID_IT_SIGNKEYPAIRTYPES` (`1.3.6.1.5.5.7.4.3`) → SEQUENCE OF AlgorithmIdentifier
+    advertising RSA (`1.2.840.113549.1.1.1` + NULL params), ECDSA P-256/P-384/P-521
+    (`1.2.840.10045.2.1` + named-curve OID param), Ed25519 (`1.3.101.112`),
+    Ed448 (`1.3.101.113`).
+  - `OID_IT_ENCKEYPAIRTYPES` (`1.3.6.1.5.5.7.4.4`) → RSA only (the only
+    key-encipherment type currently supported).
+  - `OID_IT_PREFERREDSYMMALG` (`1.3.6.1.5.5.7.4.5`) → AES-256-GCM
+    (`2.16.840.1.101.3.4.1.46`).
+  - All three use hand-rolled DER AlgorithmIdentifier encoding consistent with the
+    existing `_seq`/`_oid` helpers in `scep_server.py`.
+- Critical pre-existing bug fixed: `parse_pki_message` in `cmp_server.py` used
+  `data[0]` at line 171 before `data` was assigned (`data = outer` at line 176),
+  causing `UnboundLocalError` silently caught → `body_type=None` for ALL parsed
+  CMP messages. Fixed to `der_data[0]`.
+- `TestRFC9481CMPAlgorithms` (9 tests): signKeyPairTypes handled; contains RSA /
+  ECDSA / Ed25519 OIDs; encKeyPairTypes contains RSA; preferredSymmAlg is
+  AES-256-GCM OID; all-algorithms-supported check.
+
+### RFC 9482 — Lightweight CMP Profile ✅ SHIPPED
+
+**What shipped** (this session)
+
+- `cmp_server.py` — `_handle_cert_request` now accepts and propagates `pvno: int = 2`.
+  When invoked from `CMPv3Handler` (pvno=3 client), `response_pvno=3` is threaded
+  through `_protected_response` so the response echoes the client's version number
+  per RFC 9482 §3.1.
+- `CMPv3Handler` routing updated to pass `pvno=response_pvno` to
+  `_handle_cert_request` for `ir`/`cr` body types.
+- `TestRFC9482LightweightCMP` (7 tests): pvno=3 request → pvno=3 response; pvno=2
+  request → pvno=2 response; `GetCACerts` via genm → genp body present; garbage
+  input → error response (not crash); protected response has `[0]` field; extraCerts
+  has `[1]` field; `signKeyPairTypes` via genm returns supported algorithms.
 
 ### RFC 8933 — CMS content-type attribute protection ✅ SHIPPED
 
@@ -1052,14 +1037,27 @@ Grouped by area. Each is smaller than Tier 2 but still useful.
 - README compliance table: RFC 8933 `✅ Full`.
 - CHANGELOG `### Added`.
 
-### RFC 8295 — EST extensions
+### RFC 8295 — EST extensions ✅ SHIPPED
 
-- `server-generated-keys` endpoint: `/.well-known/est/serverkeygen`.
-  Returns PKCS#8 private key + issued cert in a multipart response.
-- `csrattrs` v2 with explicit OIDs for required extensions.
-- Files: `est_server.py`. New endpoint handler; extend CMS multipart
-  builder.
-- Test class: `TestRFC8295ESTExtensions`.
+**What it requires.** `serverkeygen` endpoint (`POST /.well-known/est/serverkeygen`)
+where the server generates a key pair, issues a cert, and returns both in a
+`multipart/mixed` response. Key in `application/pkcs8`, cert in
+`application/pkcs7-mime; smime-type=certs-only`.
+
+**What shipped**
+
+- `est_server.py` — `ESTHandler._handle_serverkeygen`: generates RSA-2048 key,
+  issues cert via `ca.issue_certificate`, returns `multipart/mixed` with two
+  base64-encoded parts. PKCS#8 key (PKCS#8 `PrivateKeyInfo`, not PKCS#1).
+  Optional CSR body: if provided, subject and SANs are extracted; profile-specific
+  SAN validation is enforced as in `simpleenroll`.
+- `csrattrs` endpoint already returns profile-aware EKU hints (OIDs for SAN,
+  EKU, and key type hints) per RFC 7030 §4.5.2.
+- `TestRFC8295ESTExtensions` (11 tests): 200 status, `multipart/mixed`
+  Content-Type, two parts, cert part is `pkcs7-mime`, cert part DER is PKCS#7,
+  key part is `pkcs8`, key DER decodes as PKCS#8 PrivateKeyInfo, key matches
+  cert public key, csrattrs returns 200 with `csrattrs` Content-Type and DER
+  SEQUENCE body.
 
 ### RFC 9148 — EST over CoAP (EST-coaps)
 
@@ -1446,11 +1444,20 @@ challenges, which on a private CA is most of them.
   rejected; valid EAB → accepted; wrong HMAC → unauthorized; optional EAB
   verification.
 
+**Also shipped** (this session)
+
+- Per-account rate limiting: `--acme-per-account-cert-limit N` and
+  `--acme-per-account-window-days N` (default 0 = unlimited, 7 days).
+  `ACMEDatabase.count_account_certs_since` joins `certificates` + `orders`.
+  `_handle_finalize` returns 429 `rateLimited` when the limit is reached.
+  `make_acme_handler` and `start_acme_server` accept the new parameters.
+  `TestACMEPerAccountRateLimit` (7 tests): DB counting, window isolation,
+  multi-account isolation, handler propagation, CLI defaults.
+
 **Outstanding**
 
 - `web_ui.py` admin UI to mint EAB credentials in-browser — not yet
   implemented. Currently keys must be pre-provisioned via `--acme-eab-file`.
-- Per-account rate limiting (separate from per-IP) — not yet implemented.
 
 **Docs**
 
@@ -1460,58 +1467,51 @@ challenges, which on a private CA is most of them.
 
 ---
 
-### 5.6 Cross-signing
+### 5.6 Cross-signing ✅ SHIPPED
 
 **Why.** Two CAs sign each other's intermediates so trust paths can shift
-without re-deploying root trust to every endpoint. Important for migrations
-between key types (RSA → ECC → ML-DSA): you can issue an
-ML-DSA-signed intermediate with the same name and key as your existing
-intermediate, sign it with both old and new roots, and have clients
-discover whichever path they trust.
+without re-deploying root trust to every endpoint.
 
-**Files to modify**
+**What shipped**
 
-- `pki_server.py` — new method `cross_sign(other_cert: x509.Certificate,
-  validity_days)` that issues a certificate over the *same subject + same
-  public key* as `other_cert`, signed by self.
-- `web_ui.py` — `POST /api/cross-sign` endpoint accepting a PEM upload.
+- `pki_server.py` — new `CertificateAuthority.cross_sign(other_cert, validity_days,
+  audit, requester_ip)`. Copies subject DN and SPKI verbatim; generates fresh serial
+  from `_next_serial()`; copies BasicConstraints, KeyUsage, SubjectAlternativeName;
+  generates fresh SKI/AKI and adds this CA's AIA/CDP URLs; signs with this CA's key.
+  Stored in DB with `profile='cross_signed'`; audit-logged with both fingerprints.
+- `web_ui.py` — `POST /api/cross-sign` (admin auth required). Accepts
+  `{"certificate_pem": "...", "validity_days": N}`; returns
+  `{"certificate_pem": "...", "serial": N}`.
 
-**Implementation**
+**Tests** (`TestCrossSign`, 10 tests):
 
-- Subject and SPKI copied verbatim from input cert. Validity, AIA, CDP,
-  CRL number from this CA. Serial number freshly generated. Extensions
-  reviewed: keep BasicConstraints (cA=true, path_length); copy
-  KeyUsage; do not copy ExtendedKeyUsage if it's an EE cert (cross-signing
-  EE certs is unusual but supported).
-- Audit-log carefully: cross-signing is a high-trust action, log the
-  source cert's fingerprint and the resulting cert's fingerprint.
-
-**Tests**
-
-- Cross-sign an intermediate from another CA test fixture; verify the
-  resulting cert has the same SPKI as input but a different signature.
-- Verify the cross-signed cert chains to *this* CA's root.
-- Verify the original cert still chains to *its* root (we didn't mutate
-  anything).
+- Same subject and SPKI on cross-signed cert.
+- Fresh serial > 1000 (initial counter value).
+- Issuer matches CA B's subject; AKI matches CA B's SKI.
+- Signature verifies against CA B's public key.
+- BasicConstraints `ca=True` preserved for intermediates; `ca=False` for EE certs.
+- Source cert is immutable (DER unchanged after cross-sign call).
+- Cross-signed cert stored in DB.
 
 ---
 
-### 5.7 OCSP stapling helpers + pre-generated responses
+### 5.7 OCSP stapling helpers + pre-generated responses ✅ SHIPPED
 
-**Why.** Generating OCSP responses on every request requires the OCSP
-signer to be online, reachable, and fast. Pre-generated responses (signed
-periodically, served from a static CDN or reverse proxy) eliminate that
-runtime dependency. RFC 5019 explicitly contemplates this for high-volume
-deployments.
+**What shipped**
 
-**Files to modify**
+- `ocsp_server.py` — new `generate_static_responses(ca, output_dir, validity_hours=24)`:
+  queries all certs from the CA DB, builds one signed `OCSPResponse` per cert
+  (good/revoked status from DB), writes to
+  `<output_dir>/<sha1-issuer-key>/<sha1-issuer-name>/<serial>.ocsp`.
+  Returns file count.
+- `pypki_admin.py` — new `ocsp-prebuild` subcommand:
+  `python pypki_admin.py ocsp-prebuild --ca-dir ./ca --output /var/www/ocsp --validity-hours 24`.
 
-- `ocsp_server.py` — new `generate_static_responses(output_dir)` method
-  that writes one signed `.ocsp` file per active cert serial under
-  `output_dir/<sha1-of-issuer-key>/<sha1-of-issuer-name>/<serial>.ocsp`
-  (the path layout nginx and Apache `mod_ssl_ct`-style serving expects).
-- New CLI subcommand: `pypki ocsp prebuild --output /var/www/ocsp
-  --validity 24h`.
+**Tests** (`TestOCSPStaticResponses`, 7 tests):
+
+- Count return ≥ 2 certs; files created; three-level path layout; integer
+  serial filenames; valid SEQUENCE DER with `\x80\x01\x00` (status=successful);
+  revoked cert has `\xa1` (RevokedInfo context tag); CLI returns exit code 0.
 
 **Implementation**
 
@@ -1529,38 +1529,38 @@ deployments.
 
 ---
 
-### 5.8 SCEP one-time challenge passwords
+### 5.8 SCEP one-time challenge passwords ✅ SHIPPED
 
-**Why.** Static SCEP challenge (one shared secret for all enrollments,
-`scep_server.py:758`) is unsafe in any setting where an enrolling device
-could be compromised before, during, or after enrollment. Microsoft NDES
-solved this 20 years ago with one-time passwords minted by an admin per
-enrollment.
+**Why.** Static SCEP challenge (one shared secret for all enrollments) is
+unsafe in any setting where an enrolling device could be compromised before,
+during, or after enrollment.
 
-**Files to modify**
+**What shipped**
 
-- `scep_server.py` — accept either `--scep-challenge SECRET` (current
-  behaviour) or `--scep-otp-store` (a small SQLite table or in-memory
-  store of `otp → expiry`). On successful PKCSReq, mark the OTP consumed.
-- `web_ui.py` — admin endpoint `POST /api/scep/otp` mints a fresh OTP,
-  returns it once.
+- `scep_server.py` — new `SCEPDatabase.add_otp(ttl_seconds=86400)` mints a
+  32-char URL-safe base64 token (24 random bytes, stored in new `otp_tokens`
+  table); `consume_otp(token)` atomically marks it used via `BEGIN IMMEDIATE`;
+  `purge_expired_otps()` cleans up stale rows.
+- `scep_server.py` — new `SCEPHandler.use_otp = False` class attribute; when
+  `True`, `_handle_pki_request` tries to consume the CSR challengePassword as
+  an OTP first, then falls back to the static `challenge` if set (mixed mode).
+- `scep_server.py` — new module-level `mint_otp(ca_dir, ttl_seconds)` helper
+  for callers without a handler reference.
+- `scep_server.py` — `start_scep_server` accepts `use_otp: bool = False`;
+  exposes `proxy.scep_db` so the web UI can mint OTPs.
+- `web_ui.py` — `POST /api/scep/otp` (admin-auth required) calls
+  `scep_module.mint_otp(ca.ca_dir, ttl_seconds)` and returns
+  `{"otp": token, "ttl_seconds": n}`.
+- `pki_server.py` — `--scep-use-otp` CLI flag wired to `start_scep_server`.
 
-**Implementation**
+**Tests** (`TestSCEPOneTimePasswords`, 13 tests):
 
-- OTP format: 32-char URL-safe base64 (24 random bytes). Single-use, TTL
-  configurable (default 24h).
-- Concurrency: the consume operation is a transaction (`UPDATE ... WHERE
-  consumed=0 RETURNING ...`). On Postgres, use the row-level lock; on
-  SQLite, use the existing flock.
-- Backwards-compat: if `--scep-challenge` is set, accept it OR an OTP.
-  Document the precedence.
-
-**Tests**
-
-- Mint OTP; first enrollment succeeds; second enrollment with same OTP
-  rejected.
-- Expired OTP rejected.
-- Mixed mode: legacy static challenge AND OTPs both work.
+- `add_otp` returns 32-char URL-safe base64; `consume_otp` returns True first
+  time, False second time; nonexistent and expired tokens return False.
+- `purge_expired_otps` removes consumed and expired rows, keeps valid rows.
+- `mint_otp` module helper is consumable via `SCEPDatabase`.
+- `start_scep_server` wires `use_otp=False`/`True` and exposes `proxy.scep_db`.
+- Mixed mode: `challenge + use_otp` both work independently.
 
 ---
 
@@ -1792,7 +1792,9 @@ here's the order I'd take it in:
    for it. Adds significant code volume.
 7. **5.10**, **5.11** structured logs + metrics depth — alongside
    whatever is being built; cross-cutting.
-8. **5.6, 5.7, 5.8, 5.9** — opportunistic, when the use case appears.
+8. **5.9** — opportunistic, when the use case appears.
+   ~~5.6~~ ✅ **SHIPPED** (cross-signing), ~~5.7~~ ✅ **SHIPPED** (OCSP prebuild),
+   ~~5.8~~ ✅ **SHIPPED** (SCEP OTP challenges).
 
 ---
 
@@ -1828,17 +1830,18 @@ Revised given the audit findings. Highest-impact / lowest-risk first.
    - ~~RFC 8738 (ACME IP identifier)~~ ✅ **SHIPPED**
 5. **Hardening**:
    - ~~RFC 5083 + RFC 5084 (AES-GCM / AuthEnvelopedData in CMS)~~ ✅ **SHIPPED**
-   - ~~RFC 7292 (PKCS#12 friendlyName)~~ ✅ **SHIPPED** (unencrypted-export rejection still TODO)
-   - ~~RFC 6962 (CT pre-cert flow)~~ ✅ **SHIPPED** (CLI wiring + SCT verification still TODO)
+   - ~~RFC 7292 (PKCS#12 hardening — friendlyName + unencrypted-export rejection)~~ ✅ **SHIPPED**
+   - ~~RFC 6962 (CT pre-cert flow + CLI wiring + SCT ECDSA verification + require-n enforcement)~~ ✅ **SHIPPED**
    - ~~RFC 8933 (CMS content-type attribute protection)~~ ✅ **SHIPPED**
-   - RFC 9481 + RFC 9482 (CMP algorithm requirements + lightweight profile)
+   - ~~RFC 9481 + RFC 9482 (CMP algorithm advertisement + pvno echo)~~ ✅ **SHIPPED**
 6. **Documentation**:
    - RFC 3647 (CPS document — can be drafted in parallel with any code work)
 7. **When drafts stabilize**:
    - RFC 9763 (paired certs) + ML-DSA in X.509
    - Composite signature drafts
 8. **On demand only**:
-   - RFC 8295, 8739, 8398/8399, 8551, 9148
+   - ~~RFC 8295 (EST serverkeygen + csrattrs)~~ ✅ **SHIPPED**
+   - RFC 8739, 8398/8399, 8551, 9148
 9. **Operational maturity (Tier 5)**: see Tier 5 section for its own
    ordering. Documentation deliverables (5.12) can run in parallel with any
    code work above.

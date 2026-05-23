@@ -66,7 +66,7 @@ and `--cps-policy-oid` flags.
 | Role | Description |
 |---|---|
 | **Certification Authority (CA)** | The PyPKI server holding the private key that signs certificates. May be a single root, or a sub-CA chained from a root CA whose private key is stored offline (see [DEPLOYMENT/offline-root-online-subca.md](DEPLOYMENT/offline-root-online-subca.md)). |
-| **Registration Authority (RA)** | Built into PyPKI. The same operator who controls the CA also controls the enrollment endpoints. Out-of-band approval workflows are not implemented as of this CPS version (planned: Tier 5.4 RA workflow). |
+| **Registration Authority (RA)** | Built into PyPKI. The same operator who controls the CA also controls the enrollment endpoints. An optional RA approval workflow (`--ra-require-approval`, `--ra-policy-file`) allows requests to be held for manual or policy-driven review before issuance. |
 | **Subscribers** | Any entity (server, device, user, container, IoT node) that obtains a certificate from a PyPKI instance. |
 | **Relying parties** | Any entity that validates a PyPKI-issued certificate to authenticate a subscriber. |
 | **Repository operator** | The PyPKI operator. PyPKI publishes its CRL, OCSP responses, and CA chain over HTTP at endpoints documented in §2. |

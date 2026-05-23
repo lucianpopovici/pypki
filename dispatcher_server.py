@@ -29,12 +29,20 @@ Usage (from pki_server.py)::
 
 from __future__ import annotations
 
+import contextvars
 import http.server
 import logging
 import threading
+import uuid
 from typing import Optional, List, Tuple
 
 logger = logging.getLogger("dispatcher")
+
+# §5.10 — per-request ID threaded through all handlers via ContextVar.
+# Set in _dispatch; read by RequestIdFilter in pki_server.py.
+request_id_var: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "request_id", default=""
+)
 
 # HTTP methods that services may implement
 _HTTP_METHODS = ("GET", "POST", "HEAD", "PUT", "PATCH", "DELETE", "OPTIONS")
@@ -149,6 +157,10 @@ def make_dispatcher_handler(route_table: RouteTable) -> type:
                 self.send_error(404, "No service registered for this path")
                 return
             orig_path = self.path
+            # Assign a unique request ID for this HTTP request; all log records
+            # emitted during _dispatch will carry it via RequestIdFilter.
+            req_id = uuid.uuid4().hex[:16]
+            token = request_id_var.set(req_id)
             # Strip prefix so the service handler sees its own root-relative path
             if prefix != "/":
                 rest = self.path[len(prefix):]
@@ -165,6 +177,7 @@ def make_dispatcher_handler(route_table: RouteTable) -> type:
                 handler_method(self)
             finally:
                 self.path = orig_path
+                request_id_var.reset(token)
 
         def log_message(self, fmt, *args):
             logger.debug("%s - - %s", self.client_address[0], fmt % args)
