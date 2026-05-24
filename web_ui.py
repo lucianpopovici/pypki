@@ -532,6 +532,7 @@ def _page(title: str, body: str, active: str = "") -> str:
         ("Revocation",   "/revocation", "revocation"),
         ("Sub-CA",       "/sub-ca",     "sub-ca"),
         ("RA Queue",     "/ra-queue",   "ra-queue"),
+        ("ACME EAB",     "/acme-eab",   "acme-eab"),
         ("Metrics",      "/metrics-ui", "metrics-ui"),
         ("Config",       "/config-ui",  "config-ui"),
         ("Audit Log",    "/audit",      "audit"),
@@ -909,6 +910,10 @@ class WebUIHandler(http.server.BaseHTTPRequestHandler):
                 self._expiring_page()
             elif path == "/ra-queue":
                 self._ra_queue_page()
+            elif path == "/acme-eab":
+                self._acme_eab_page()
+            elif path == "/api/acme/eab/keys":
+                self._api_acme_eab_list()
             elif path == "/metrics-ui":
                 self._metrics_page()
             elif path == "/api/certs":
@@ -972,6 +977,11 @@ class WebUIHandler(http.server.BaseHTTPRequestHandler):
                 self._api_service_action(path, data)
             elif path == "/api/scep/otp":
                 self._api_scep_mint_otp(data)
+            elif path == "/api/acme/eab/mint":
+                self._api_acme_eab_mint()
+            elif path.startswith("/api/acme/eab/revoke/"):
+                kid = path.split("/api/acme/eab/revoke/", 1)[1].strip("/")
+                self._api_acme_eab_revoke(kid)
             elif path == "/api/cross-sign":
                 self._api_cross_sign(data)
             elif path == "/api/paired-issue":
@@ -2015,6 +2025,162 @@ class WebUIHandler(http.server.BaseHTTPRequestHandler):
             "ml_dsa_variant": ml_dsa_variant,
             "classical_key_type": classical_key_type,
         })
+
+    # ------------------------------------------------------------------
+    # ACME EAB management page + API
+    # ------------------------------------------------------------------
+
+    def _acme_eab_db(self):
+        """Return the ACMEDatabase from the running ACME server, or None."""
+        srv = (self.service_registry or {}).get("acme", {}).get("server")
+        return getattr(srv, "acme_db", None)
+
+    def _acme_eab_page(self):
+        acme_db = self._acme_eab_db()
+        if acme_db is None:
+            body = (
+                '<div class="card">'
+                '  <div class="card-head"><h2>ACME External Account Binding</h2></div>'
+                '  <div class="card-body">'
+                '    <p style="color:#6b7280">The ACME service is not running. '
+                '    Start the server with <code>--acme</code> to use EAB management.</p>'
+                "  </div>"
+                "</div>"
+            )
+            self._send_html(200, _page("ACME EAB", body, "acme-eab"))
+            return
+
+        keys = acme_db.list_eab_keys()
+        require_eab = bool(
+            (self.service_registry or {}).get("acme", {}).get("config", {}).get("require_eab")
+        )
+
+        if keys:
+            rows_html = ""
+            for k in keys:
+                kid = k["kid"]
+                created = datetime.datetime.fromtimestamp(
+                    k["created_at"], tz=datetime.timezone.utc
+                ).strftime("%Y-%m-%d %H:%M UTC")
+                if k["revoked_at"]:
+                    revoked = datetime.datetime.fromtimestamp(
+                        k["revoked_at"], tz=datetime.timezone.utc
+                    ).strftime("%Y-%m-%d %H:%M UTC")
+                    status_html = "<span class='badge-rev'>Revoked {}</span>".format(revoked)
+                    action_html = "—"
+                else:
+                    status_html = "<span class='badge-ok'>Active</span>"
+                    action_html = (
+                        "<button class='btn btn-danger' style='font-size:.8rem;padding:3px 10px' "
+                        "onclick='revokeKey(\"{kid}\")'>Revoke</button>"
+                    ).format(kid=kid)
+                rows_html += (
+                    "<tr>"
+                    "<td><code style='font-size:.78rem'>{kid}</code></td>"
+                    "<td>{created}</td><td>{status}</td><td>{action}</td>"
+                    "</tr>"
+                ).format(kid=kid, created=created, status=status_html, action=action_html)
+            table_html = (
+                "<table>"
+                "<thead><tr><th>Key ID (kid)</th><th>Created</th><th>Status</th><th>Action</th></tr></thead>"
+                "<tbody>{}</tbody>"
+                "</table>"
+            ).format(rows_html)
+        else:
+            table_html = '<p style="color:#6b7280;padding:8px 0">No EAB keys yet. Use the button above to mint one.</p>'
+
+        eab_notice = (
+            '<div style="background:#fef3c7;border:1px solid #f59e0b;border-radius:6px;'
+            'padding:10px 14px;margin-bottom:16px;font-size:.9rem">'
+            '  <strong>Note:</strong> EAB enforcement is currently <strong>disabled</strong>. '
+            '  Start the server with <code>--acme-require-eab</code> to gate account creation '
+            '  behind these keys.'
+            "</div>"
+        ) if not require_eab else ""
+
+        body = (
+            '<div class="card">'
+            '  <div class="card-head">'
+            '    <h2>ACME External Account Binding</h2>'
+            '    <button class="btn btn-primary" onclick="mintKey()">Mint New Key</button>'
+            "  </div>"
+            '  <div class="card-body">'
+            "    {notice}"
+            '    <p style="font-size:.9rem;color:#6b7280;margin-bottom:12px">'
+            "      EAB keys are pre-shared secrets issued by the CA admin. ACME clients present "
+            "      an HMAC-HS256 JWS signed with the mac_key when creating accounts. "
+            "      Each mac_key is shown exactly once at mint time — it cannot be retrieved later."
+            "    </p>"
+            '    <div style="overflow-x:auto">{table}</div>'
+            "  </div>"
+            "</div>"
+            "<div id='mint-result' style='display:none' class='card'>"
+            "  <div class='card-head'><h2>New EAB Key — Save This Now</h2></div>"
+            "  <div class='card-body'>"
+            "    <p style='color:#b45309'>The mac_key is shown only once and cannot be recovered. "
+            "    Copy it before navigating away.</p>"
+            "    <table><tbody>"
+            "      <tr><td><strong>kid</strong></td><td><code id='new-kid'></code></td></tr>"
+            "      <tr><td><strong>mac_key</strong></td><td><code id='new-mac'></code></td></tr>"
+            "    </tbody></table>"
+            "    <button class='btn btn-secondary' style='margin-top:12px' "
+            "            onclick=\"document.getElementById('mint-result').style.display='none'\">Dismiss</button>"
+            "  </div>"
+            "</div>"
+            "<script>"
+            "async function mintKey() {{"
+            "  const r = await fetch('/api/acme/eab/mint', {{method:'POST', headers:{{'Content-Type':'application/json'}}, body:'{{}}'}});"
+            "  const d = await r.json();"
+            "  if (!r.ok) {{ alert('Error: ' + (d.error || r.status)); return; }}"
+            "  document.getElementById('new-kid').textContent = d.kid;"
+            "  document.getElementById('new-mac').textContent = d.mac_key;"
+            "  document.getElementById('mint-result').style.display = '';"
+            "  location.reload();"
+            "}}"
+            "async function revokeKey(kid) {{"
+            "  if (!confirm('Revoke key ' + kid + '?')) return;"
+            "  const r = await fetch('/api/acme/eab/revoke/' + kid, {{method:'POST', headers:{{'Content-Type':'application/json'}}, body:'{{}}'}});"
+            "  const d = await r.json();"
+            "  if (!r.ok) {{ alert('Error: ' + (d.error || r.status)); return; }}"
+            "  location.reload();"
+            "}}"
+            "</script>"
+        ).format(notice=eab_notice, table=table_html)
+
+        self._send_html(200, _page("ACME EAB", body, "acme-eab"))
+
+    def _api_acme_eab_list(self):
+        """GET /api/acme/eab/keys — list all EAB keys (no mac_key in response)."""
+        acme_db = self._acme_eab_db()
+        if acme_db is None:
+            self._send_json({"error": "ACME service not running"}, 503)
+            return
+        keys = acme_db.list_eab_keys()
+        self._send_json({"keys": keys})
+
+    def _api_acme_eab_mint(self):
+        """POST /api/acme/eab/mint — generate and return a new EAB kid + mac_key."""
+        acme_db = self._acme_eab_db()
+        if acme_db is None:
+            self._send_json({"error": "ACME service not running"}, 503)
+            return
+        kid, mac_key = acme_db.mint_eab_key()
+        self._send_json({"kid": kid, "mac_key": mac_key})
+
+    def _api_acme_eab_revoke(self, kid: str):
+        """POST /api/acme/eab/revoke/<kid> — revoke an EAB key."""
+        acme_db = self._acme_eab_db()
+        if acme_db is None:
+            self._send_json({"error": "ACME service not running"}, 503)
+            return
+        if not kid:
+            self._send_json({"error": "kid required"}, 400)
+            return
+        ok = acme_db.revoke_eab_key(kid)
+        if not ok:
+            self._send_json({"error": "key not found"}, 404)
+        else:
+            self._send_json({"ok": True, "kid": kid})
 
     def _api_scep_mint_otp(self, data: dict):
         """POST /api/scep/otp — mint a single-use SCEP enrolment OTP."""

@@ -10753,6 +10753,202 @@ class TestRFC9763RelatedCerts(unittest.TestCase):
 
 
 # ===========================================================================
+# ACME EAB Web UI (Tier 5.5 complement)
+# ===========================================================================
+
+class TestACMEEABWebUI(unittest.TestCase):
+    """§5.5 Web UI — /acme-eab page + /api/acme/eab/* REST endpoints."""
+
+    @classmethod
+    def _make_handler(cls, ca, acme_db=None):
+        import web_ui
+        class Bound(web_ui.WebUIHandler):
+            pass
+        Bound.ca = ca
+        Bound.audit_log = None
+        Bound.rate_limiter = None
+        Bound.require_auth = False
+        Bound.route_table = None
+        if acme_db is not None:
+            proxy = type("Proxy", (), {"acme_db": acme_db})()
+            Bound.service_registry = {"acme": {"server": proxy}}
+        else:
+            Bound.service_registry = {}
+        return Bound
+
+    @classmethod
+    def setUpClass(cls):
+        import socket
+        import acme_server
+        cls._tmp = tempfile.mkdtemp()
+        cls.ca = _make_ca(cls._tmp)
+        cls.acme_db = acme_server.ACMEDatabase(os.path.join(cls._tmp, "acme.db"))
+
+        handler = cls._make_handler(cls.ca, cls.acme_db)
+        s = socket.socket()
+        s.bind(("127.0.0.1", 0))
+        cls.port = s.getsockname()[1]
+        s.close()
+        cls.server = pki.ThreadedHTTPServer(("127.0.0.1", cls.port), handler)
+        cls._thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
+        cls._thread.start()
+        time.sleep(0.1)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.server.shutdown()
+        __import__("shutil").rmtree(cls._tmp, True)
+
+    def _get(self, path):
+        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
+        conn.request("GET", path)
+        resp = conn.getresponse()
+        body = resp.read()
+        conn.close()
+        return resp.status, body.decode()
+
+    def _post(self, path, data=None):
+        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
+        raw = json.dumps(data or {}).encode()
+        conn.request("POST", path, body=raw,
+                     headers={"Content-Type": "application/json"})
+        resp = conn.getresponse()
+        body = resp.read()
+        conn.close()
+        return resp.status, json.loads(body)
+
+    # ── ACMEDatabase methods ─────────────────────────────────────────────────
+
+    def test_mint_eab_key_returns_tuple(self):
+        import re
+        kid, mac_key = self.acme_db.mint_eab_key()
+        self.assertIsInstance(kid, str)
+        self.assertIsInstance(mac_key, str)
+        self.assertRegex(kid, r'^[A-Za-z0-9_-]+$')
+        self.assertRegex(mac_key, r'^[A-Za-z0-9_-]+$')
+
+    def test_list_eab_keys_includes_minted_key(self):
+        kid, _ = self.acme_db.mint_eab_key()
+        keys = self.acme_db.list_eab_keys()
+        kids = [k["kid"] for k in keys]
+        self.assertIn(kid, kids)
+
+    def test_revoke_eab_key_returns_true_for_valid_kid(self):
+        kid, _ = self.acme_db.mint_eab_key()
+        ok = self.acme_db.revoke_eab_key(kid)
+        self.assertTrue(ok)
+
+    def test_revoke_eab_key_returns_false_for_unknown_kid(self):
+        ok = self.acme_db.revoke_eab_key("does-not-exist")
+        self.assertFalse(ok)
+
+    def test_revoke_eab_key_sets_revoked_at(self):
+        kid, _ = self.acme_db.mint_eab_key()
+        self.acme_db.revoke_eab_key(kid)
+        keys = self.acme_db.list_eab_keys()
+        entry = next((k for k in keys if k["kid"] == kid), None)
+        self.assertIsNotNone(entry)
+        self.assertIsNotNone(entry["revoked_at"])
+
+    # ── page rendering ───────────────────────────────────────────────────────
+
+    def test_acme_eab_page_returns_200(self):
+        status, body = self._get("/acme-eab")
+        self.assertEqual(status, 200)
+        self.assertIn("EAB", body)
+
+    def test_acme_eab_page_contains_mint_button(self):
+        _, body = self._get("/acme-eab")
+        self.assertIn("Mint", body)
+
+    def test_acme_eab_page_no_service_shows_message(self):
+        """Handler with no ACME service returns 200 with a helpful message."""
+        import socket, web_ui
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(__import__("shutil").rmtree, tmp, True)
+        ca2 = _make_ca(tmp)
+        handler = self._make_handler(ca2, acme_db=None)
+        s = socket.socket(); s.bind(("127.0.0.1", 0)); p = s.getsockname()[1]; s.close()
+        srv = pki.ThreadedHTTPServer(("127.0.0.1", p), handler)
+        t = threading.Thread(target=srv.serve_forever, daemon=True); t.start()
+        time.sleep(0.05)
+        try:
+            conn = http.client.HTTPConnection("127.0.0.1", p, timeout=5)
+            conn.request("GET", "/acme-eab")
+            resp = conn.getresponse()
+            body = resp.read().decode()
+            conn.close()
+            self.assertEqual(resp.status, 200)
+            self.assertIn("not running", body)
+        finally:
+            srv.shutdown()
+
+    # ── list API ─────────────────────────────────────────────────────────────
+
+    def test_api_eab_list_returns_keys_array(self):
+        status, body = self._get("/api/acme/eab/keys")
+        self.assertEqual(status, 200)
+        data = json.loads(body)
+        self.assertIn("keys", data)
+        self.assertIsInstance(data["keys"], list)
+
+    def test_api_eab_list_no_service_returns_503(self):
+        import socket, web_ui
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(__import__("shutil").rmtree, tmp, True)
+        ca2 = _make_ca(tmp)
+        handler = self._make_handler(ca2, acme_db=None)
+        s = socket.socket(); s.bind(("127.0.0.1", 0)); p = s.getsockname()[1]; s.close()
+        srv = pki.ThreadedHTTPServer(("127.0.0.1", p), handler)
+        t = threading.Thread(target=srv.serve_forever, daemon=True); t.start()
+        time.sleep(0.05)
+        try:
+            conn = http.client.HTTPConnection("127.0.0.1", p, timeout=5)
+            conn.request("GET", "/api/acme/eab/keys")
+            resp = conn.getresponse()
+            self.assertEqual(resp.status, 503)
+        finally:
+            srv.shutdown()
+
+    # ── mint API ─────────────────────────────────────────────────────────────
+
+    def test_api_eab_mint_returns_kid_and_mac_key(self):
+        status, body = self._post("/api/acme/eab/mint")
+        self.assertEqual(status, 200)
+        self.assertIn("kid", body)
+        self.assertIn("mac_key", body)
+        self.assertIsInstance(body["kid"], str)
+        self.assertIsInstance(body["mac_key"], str)
+
+    def test_api_eab_mint_key_is_consumable(self):
+        """Minted key should be retrievable from the DB immediately."""
+        _, body = self._post("/api/acme/eab/mint")
+        kid = body["kid"]
+        entry = self.acme_db.get_eab_key(kid)
+        self.assertIsNotNone(entry)
+
+    # ── revoke API ───────────────────────────────────────────────────────────
+
+    def test_api_eab_revoke_returns_ok(self):
+        kid, _ = self.acme_db.mint_eab_key()
+        status, body = self._post(f"/api/acme/eab/revoke/{kid}")
+        self.assertEqual(status, 200)
+        self.assertTrue(body.get("ok"))
+        self.assertEqual(body.get("kid"), kid)
+
+    def test_api_eab_revoke_unknown_kid_returns_404(self):
+        status, body = self._post("/api/acme/eab/revoke/nonexistent-kid-xyz")
+        self.assertEqual(status, 404)
+        self.assertIn("error", body)
+
+    # ── nav link ─────────────────────────────────────────────────────────────
+
+    def test_acme_eab_nav_link_present_on_dashboard(self):
+        _, body = self._get("/")
+        self.assertIn("/acme-eab", body)
+
+
+# ===========================================================================
 # Entry point
 # ===========================================================================
 

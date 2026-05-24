@@ -461,6 +461,31 @@ class ACMEDatabase:
         )
         return row["mac_key_b64"] if row else None
 
+    def mint_eab_key(self) -> tuple:
+        """Generate a new EAB kid + 32-byte mac_key, store in DB, return (kid, mac_key_b64)."""
+        import secrets
+        kid = base64.urlsafe_b64encode(os.urandom(12)).rstrip(b"=").decode()
+        mac_key_b64 = base64.urlsafe_b64encode(secrets.token_bytes(32)).rstrip(b"=").decode()
+        self.add_eab_key(kid, mac_key_b64)
+        return kid, mac_key_b64
+
+    def list_eab_keys(self) -> list:
+        """Return all EAB key records (newest first). mac_key_b64 is included for active keys only."""
+        rows = self._db.fetchall(
+            "SELECT kid, created_at, revoked_at FROM eab_keys ORDER BY created_at DESC"
+        )
+        return [dict(r) for r in rows] if rows else []
+
+    def revoke_eab_key(self, kid: str) -> bool:
+        """Mark an EAB key as revoked. Returns True if the key existed."""
+        row = self._db.fetchone("SELECT kid FROM eab_keys WHERE kid=?", (kid,))
+        if not row:
+            return False
+        self._db.execute(
+            "UPDATE eab_keys SET revoked_at=? WHERE kid=?", (time.time(), kid)
+        )
+        return True
+
     # -- Orders --
 
     def create_order(
@@ -2169,7 +2194,9 @@ def start_acme_server(
     if star_enabled:
         STARRenewalWorker(db, ca).start()
 
-    return _RouteProxy(route_table, prefix, label="acme")
+    proxy = _RouteProxy(route_table, prefix, label="acme")
+    proxy.acme_db = db   # expose for web UI EAB management
+    return proxy
 
 
 # ---------------------------------------------------------------------------
