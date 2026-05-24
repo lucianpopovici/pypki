@@ -320,71 +320,38 @@ someone else's public key.
 
 ---
 
-### RFC 5958 — Asymmetric Key Package (PKCS#8) normalization
+### RFC 5958 — Asymmetric Key Package (PKCS#8) normalization ✅ SHIPPED (complete)
 
-**What it requires.** §2: private keys delivered to clients should be
-encoded as `OneAsymmetricKey` (PKCS#8 v2) or `PrivateKeyInfo` (PKCS#8 v1),
-not legacy `RSAPrivateKey` (PKCS#1) or `ECPrivateKey` (SEC1).
+**What shipped.** All `PrivateFormat.TraditionalOpenSSL` sites in every
+server module have been converted to `PrivateFormat.PKCS8`. Zero PKCS#1 or
+SEC1 format remains in any server module.
 
-**Source evidence.** EST (`est_server.py:520`) and IPsec
-(`ipsec_server.py:876`) correctly use `PrivateFormat.PKCS8`. CMP had four
-sites using `PrivateFormat.TraditionalOpenSSL` (PKCS#1 for RSA, SEC1 for EC);
-the Web UI sub-CA endpoint was a fifth. **All five fixed.**
-
+Initial fix (5 CMP + web UI sites):
 - ~~`cmp_server.py:585` — `ir` auto-generated key~~ **FIXED**
 - ~~`cmp_server.py:1068` — PKCS#12 bundle construction path~~ **FIXED**
 - ~~`cmp_server.py:1171` — API key return~~ **FIXED**
 - ~~`cmp_server.py:1195` — enrollment response private key field~~ **FIXED**
 - ~~`web_ui.py:1563` — sub-CA export~~ **FIXED**
 
-**Additional sites discovered after the initial audit** (lower stakes —
-mostly disk persistence of the CA's own keys, not client deliveries):
+Follow-up cleanup (3 pki_server.py disk-write sites):
+- ~~TLS server key written to disk at startup~~ **FIXED**
+- ~~mTLS client key returned from `issue_client_cert()` helper~~ **FIXED**
+- ~~CT pre-cert throwaway key written to temp file~~ **FIXED**
 
-- `pki_server.py:885` — CA key persisted to disk on first boot
-- `pki_server.py:1432` — internal key write
-- `pki_server.py:1522` — internal key write
-- `pki_server.py:1672` — internal key write
-- `ipsec_server.py:2395` — IPsec response key
-- `ipsec_server.py:2479` — IPsec response key
-- `ocsp_server.py:472` — OCSP signer key persisted to disk
+`grep -rn "TraditionalOpenSSL" pki_server.py cmp_server.py est_server.py
+scep_server.py ipsec_server.py ocsp_server.py acme_server.py tsa_server.py`
+returns no results. `get_cert.py` (standalone ACME client utility) retains
+TraditionalOpenSSL for `josepy` interop — not a server module.
 
-These should also migrate to PKCS#8 for consistency and ECC compatibility.
-Functionally lower stakes since these files are read back only by PyPKI
-itself (the format is internal), but the change is mechanical and the
-risk is purely cosmetic. Track as a follow-up cleanup pass; not blocking.
+**Tests**: `TestRFC5958PKCS8` (2 tests) — source-text audit of `cmp_server.py`
+and `pki_server.py` asserts TraditionalOpenSSL is absent; round-trip parse
+confirms PKCS#8 PrivateKeyInfo wrapper.
 
-**Files modified for the closed-out fix**
-
-- `cmp_server.py` at the four line numbers above.
-
-**Implementation**
-
-- Replace `PrivateFormat.TraditionalOpenSSL` with `PrivateFormat.PKCS8` at
-  every site. One-line changes. No compatibility risk — every modern tool
-  (OpenSSL 1.1+, strongSwan, Java keytool, Windows certutil) reads PKCS#8
-  transparently.
-- Grep the rest of the codebase once to confirm no other site slipped
-  through: `grep -rn "TraditionalOpenSSL" *.py` — only the four above should
-  remain, and this edit removes them all.
-
-**Tests**
-
-- Existing CMP tests should still pass. Add one assertion in
-  `TestCMPMessageStructure` (or a new `TestRFC5958PKCS8`): parse the returned
-  private-key bytes with `serialization.load_der_private_key(pem)`; assert
-  the first bytes decode as a PKCS#8 `PrivateKeyInfo` SEQUENCE (outer
-  version INTEGER = 0, then AlgorithmIdentifier).
-
-**Docs**
-
-- CHANGELOG `### Changed`: "CMP private-key output normalized to PKCS#8
-  (RFC 5958); removes TraditionalOpenSSL/PKCS#1 format from
-  `ir`/`cr`/`kur` responses."
-- Compliance table: RFC 5958 `✅ Full` (after the edit).
+**Compliance table**: RFC 5958 `✅ Full`.
 
 ---
 
-### Sub-CA issuance ergonomics (Kubernetes / cert-manager readiness)
+### Sub-CA issuance ergonomics (Kubernetes / cert-manager readiness) ✅ SHIPPED
 
 **Context.** When PyPKI is used as a sub-CA provider for Kubernetes
 (cert-manager `CA` ClusterIssuer), service mesh intermediates
@@ -1088,12 +1055,12 @@ where the server generates a key pair, issues a cert, and returns both in a
   (`id-aes256-wrap`), and AuthEnvelopedData usage guidance (overlaps RFC 5083).
 - Defer until a user needs it.
 
-### RFC 9608 — "No Revocation Available"
+### RFC 9608 — "No Revocation Available" ✅ SHIPPED (audited)
 
-- Already on earlier audit list. Tests exist as `TestRFC9608NoRevAvail` and
-  `TestACMERFC9608Integration`. **Verify the extension is actually emitted
-  when the profile says so** — the test class is present, check if it's a
-  pass.
+- `TestRFC9608NoRevAvail` (10 tests) all pass. Extension is emitted on
+  `short_lived` profile certs, is non-critical, has value `\x05\x00` (ASN.1
+  NULL), CDP is suppressed, AIA OCSP is suppressed, and the extension is
+  absent from CA certs. No gaps found in the audit.
 
 ### RFC 5755 — Attribute Certificates
 
@@ -1101,75 +1068,33 @@ where the server generates a key pair, issues a cert, and returns both in a
   authorization data bound to an identity, not identity itself. Very niche
   in modern deployments (Kerberos PAC, OAuth, and SAML ate this space).
 
-### RFC 3647 — Certificate Policy / CPS framework (document, not code)
+### RFC 3647 — Certificate Policy / CPS framework ✅ SHIPPED
 
-**Current state.** The code side works: `_build_policy_information`
-(pki_server.py:354-385) emits a `CertificatePolicies` extension with
-`id-qt-cps` URI and `UserNotice` qualifiers per RFC 5280 §4.2.1.4 / RFC
-6818 §3. What's missing is a **published CPS document** the URI can point
-at. Without that doc, the `cps_uri` field is a dangling reference.
+**What shipped.**
 
-**Deliverable.** A `docs/CPS.md` (or `docs/CP-CPS.md`) following the
-RFC 3647 §6 outline. The RFC prescribes nine numbered top-level sections;
-PyPKI needs them all even for a homelab CA, mostly so anyone auditing a
-cert can see what promises the CA is making.
+- `docs/CPS.md` — 904-line CPS following the RFC 3647 §6 nine-section
+  outline (§1 Introduction through §9 Other Business and Legal Matters),
+  calibrated for self-hosted PyPKI deployments. Includes PEN OID
+  placeholder, contact info placeholders, and Appendix A (document history)
+  + Appendix B (references). §1.3 updated to reflect the shipped RA workflow.
+- `--cps-uri URL` and `--cps-policy-oid OID` CLI flags in `pki_server.py`
+  wire the CPS URL into the `CertificatePolicies` extension of every issued
+  cert. `ServerConfig.certificate_policies_default` carries the deployment-
+  wide default; per-profile and per-request values override it.
+- Tests in `TestCPSWiring` (3 tests): no extension when unconfigured;
+  extension present + correct OID + correct CPS URI when configured;
+  explicit arg overrides default.
+- README "Deployment-wide CPS URI" subsection added; compliance table row
+  `✅ Full`.
 
-Required outline:
-
-1. Introduction (overview, document name + identification, participants,
-   cert usage, policy administration)
-2. Publication and Repository Responsibilities
-3. Identification and Authentication (naming, initial identity validation,
-   re-key, revocation request)
-4. Certificate Life-Cycle Operational Requirements (application, issuance,
-   acceptance, key pair and cert usage, renewal, re-key, modification,
-   revocation/suspension, status services, end-of-subscription, key escrow)
-5. Facility, Management, and Operational Controls (physical, procedural,
-   personnel, audit logging, records archival, key changeover, compromise
-   and disaster recovery, termination)
-6. Technical Security Controls (key pair generation + installation,
-   private key protection, other aspects, activation data, computer
-   security, life cycle, network, time-stamping)
-7. Certificate, CRL, and OCSP Profiles
-8. Compliance Audit and Other Assessments
-9. Other Business and Legal Matters
-
-**How to draft it for PyPKI.**
-
-- Start with a template derived from an established homelab/internal CA CPS
-  (e.g., the CAB Forum BR CPS outline stripped down; do not copy verbatim
-  from any specific org's document).
-- For each section, PyPKI has a technical answer already — extract it from
-  the README and the code comments. For example, §6.1.1 (key pair
-  generation) maps to "CA key generated via `rsa.generate_private_key` with
-  4096-bit modulus at CA init" (pki_server.py:820). §7.1 (cert profiles)
-  maps to the `CertProfile` catalog.
-- Assign a policy OID. Use a private enterprise OID arc; a placeholder like
-  `1.3.6.1.4.1.<your-PEN>.1.1` is fine. If the user doesn't own a PEN,
-  document that the OID is for internal use only.
-- Once drafted, reference it from issued certs: wire a new
-  `--cps-uri URL` CLI flag that's passed into `issue_certificate()` and
-  appears as the `id-qt-cps` qualifier.
-
-**Tests**
-
-- No unit tests — this is a markdown document. Add a CI check that the
-  document file exists and contains each RFC 3647 §6 top-level section
-  header.
-
-**Docs**
-
-- README: add a "Policy documents" section linking to `docs/CPS.md`.
-- Compliance table: RFC 3647 `✅ Framework-compliant` once the document
-  lands. Until then `⚙️ Extension only (no CPS doc)`.
-- CHANGELOG `### Added`: "Certificate Practice Statement (RFC 3647 §6
-  outline) published at docs/CPS.md; `--cps-uri` wires the URI into the
-  `CertificatePolicies` extension of issued certs."
-
-**Note.** This is the one item on this list that Claude can draft end-to-end
-without touching code. Ask for a `CPS.md` starter document when ready; a
-reasonable first pass is 15-20 pages covering all nine sections at a
-homelab-appropriate level of formality.
+**Operator checklist** (customize before publishing):
+- §1.2 — replace `<PEN>` with your IANA-assigned Private Enterprise Number
+- §1.5 — operator contact info
+- §2.1 — actual repository URLs
+- §5.5 — backup retention specifics
+- §6.4 — passphrase rotation policy
+- §9.4 — privacy policy specifics
+- §9.10–§9.15 — legal jurisdiction
 
 ---
 
@@ -1181,12 +1106,35 @@ RFC items — they are deployment-shape capabilities. Several have partial
 implementations already; this section names the gap precisely so the work
 isn't accidentally duplicated.
 
-Recommended overall ordering: **CPS document** (markdown, no code) →
-**threat model + deployment guides** (markdown) → **PKCS#11** (single
-biggest security improvement) → **Postgres backend** (single biggest
-operational improvement) → everything else as needs surface.
+**All Tier 5 items are now shipped.** See the "Suggested ordering for Tier 5"
+section at the end of Tier 5 for the implementation sequence.
 
-### 5.1 PKCS#11 / HSM support — biggest single security improvement
+### 5.1 PKCS#11 / HSM support ✅ SHIPPED
+
+**What shipped** (`hsm_backend.py`, `pki_server.py`).
+
+- `hsm_backend.py` — `HSMConfig` dataclass, `load_hsm_signing_key(cfg)`
+  opens a PKCS#11 session and returns `HSMRSAPrivateKey` or `HSMECPrivateKey`
+  that subclass the `cryptography` ABCs so `CertificateBuilder.sign()` and
+  all existing signing paths work unchanged. Mechanism mapping: RSA PKCS#1 v1.5
+  (`CKM_RSA_PKCS`), RSA PSS (`CKM_RSA_PKCS_PSS`), ECDSA per curve
+  (`CKM_ECDSA_SHA256` etc.). Raw PKCS#11 r||s ECDSA output is DER-encoded
+  inside `_PKCS11ECKeyWrapper`. Uses `python-pkcs11` (optional dep — if not
+  installed and HSM not requested, no-op).
+- CLI flags: `--hsm-module`, `--hsm-slot`, `--hsm-pin-env`, `--hsm-key-label`,
+  `--hsm-init-if-missing`. PIN read from env var, never argv.
+- `pki_server.py` — `CertificateAuthority.__init__` calls
+  `load_hsm_signing_key` when HSM flags are present; the returned key object
+  drops into `self.ca_key` unchanged.
+- 16 tests in `TestHSMBackend`.
+
+**CI note.** SoftHSM2 integration tests gated on `PYPKI_TEST_HSM_MODULE`
+env var. Unit tests use `_MockPKCS11Key` that mimics `_PKCS11ECKeyWrapper`
+(returns DER, not raw r||s).
+
+---
+
+*(original plan retained below for reference)*
 
 **Why.** Today the CA private key sits on disk encrypted with a passphrase.
 For anything beyond homelab — a small business, a compliance-bound
@@ -1195,26 +1143,7 @@ industry-standard interface is PKCS#11; supported by SoftHSM (testing),
 YubiHSM 2 (~$650, real hardware), Nitrokey HSM, AWS CloudHSM, GCP Cloud
 HSM, and any vendor HSM via a vendor-supplied PKCS#11 module.
 
-**Files to create**
-
-- `hsm_backend.py` — abstraction layer with two implementations:
-  `FileBackend` (current behaviour) and `PKCS11Backend`. Methods:
-  `sign(data, mechanism)`, `decrypt(ciphertext, mechanism)`,
-  `public_key()`, `key_type()`.
-
-**Files to modify**
-
-- `pki_server.py` — `CertificateAuthority` constructor takes a backend
-  rather than a key path; every `self.ca_key.sign(...)` becomes
-  `self.backend.sign(...)`. Same for `decrypt` (key archival).
-- `cmp_server.py`, `scep_server.py`, `est_server.py` — anywhere a CA key
-  is dereferenced.
-
-**Implementation**
-
-- Use `python-pkcs11` (pip install python-pkcs11). Optional dependency:
-  if not installed and HSM not requested, no-op.
-- CLI flags:
+**CLI flags (shipped)**:
   ```
   --hsm-module /usr/lib/softhsm/libsofthsm2.so
   --hsm-slot 0
@@ -1255,167 +1184,73 @@ HSM, and any vendor HSM via a vendor-supplied PKCS#11 module.
 
 ---
 
-### 5.2 Postgres backend + HA — biggest single operational improvement
+### 5.2 Postgres backend + HA ✅ SHIPPED
 
-**Why.** SQLite + flock works for one node. There is no replication, no
-read replicas, no graceful failover. For real deployments — stateless OCSP
-responder pulling from a hot standby, active/passive CRL signers,
-load-balanced ACME — Postgres is the standard answer.
+**What shipped** (`db.py`, `migrations.py`, `pypki_admin.py`).
 
-**Current state.** Every `sqlite3.connect(...)` call (15+ sites in
-`pki_server.py`) is direct, not abstracted. There is no DAL, no migration
-runner, no schema version metadata other than `ALTER TABLE … ADD COLUMN`
-inline migrations.
-
-**Files to create**
-
-- `db.py` — minimal abstraction. Two implementations: `SQLiteDB` (current
-  behaviour) and `PostgresDB`. Common interface: `execute(sql, params)`,
-  `executemany`, `fetchone`, `fetchall`, `transaction()` context manager.
-- `db_migrations/` — versioned schema files: `001_initial.sql`,
-  `002_audit_indices.sql`, etc. Migration runner reads `schema_version`
-  table.
-
-**Implementation**
-
-- Use `psycopg[binary]` (3.x, pip install psycopg[binary]). Optional dep.
-- CLI:
-  ```
-  --db-url sqlite:///path/to/pki.db                  (default)
-  --db-url postgres://user:pass@host/db?sslmode=require
-  ```
-- SQL portability: avoid SQLite-isms. The current schema uses `INTEGER
-  PRIMARY KEY` (auto-increment); switch to `BIGSERIAL` on Postgres,
-  `INTEGER PRIMARY KEY AUTOINCREMENT` on SQLite. Hide behind the DAL.
-- Connection pooling: `psycopg_pool.ConnectionPool` with min=2/max=20.
-  Audit each handler that holds a connection; release on path completion.
-- Read replicas: optional `--db-readonly-url` for OCSP responder. Routing
-  policy: all writes → primary, OCSP/CRL reads → replica, everything else
-  → primary.
-- Transaction isolation: serializable for issuance (prevents serial
-  number race), read-committed for OCSP. Today the codebase has a known
-  serial-number race that flock + WAL mode hides; Postgres needs the
-  isolation flag to be explicit.
-
-**HA topology**
-
-- Active/active OCSP: stateless responder, points at replica, runs behind
-  any L4 LB.
-- Active/passive CRL signer: only one node should generate CRLs to avoid
-  cRLNumber duplication. Use Postgres advisory lock
-  (`pg_try_advisory_lock(crl_signer_lock_id)`).
-- ACME: stateless given Postgres backend (orders, authorizations,
-  challenges all in DB).
-
-**Tests**
-
-- Run the full suite against `postgres://...` via CI. `testcontainers-python`
-  spins up Postgres for the run.
-- Concurrency test: 50 simultaneous issuance calls; assert all serial
-  numbers unique.
-- Failover test: kill primary mid-issuance; assert clean error not
-  corruption.
-
-**Docs**
-
-- README "Storage backends" section. Recommended deployment topologies.
-- Migration runbook: SQLite → Postgres dump-and-restore.
+- `db.py` — hand-rolled DAL: `SQLiteDB` and `PostgresDB` implement the same
+  interface (`execute`, `executemany`, `fetchone`, `fetchall`, `transaction()`,
+  `advisory_lock(name)`). `advisory_lock` uses `BEGIN IMMEDIATE` on SQLite and
+  `pg_advisory_xact_lock` on Postgres — both eliminate the serial-number race.
+- `migrations.py` — versioned migration runner reads `schema_migrations` table,
+  applies pending `.sql` files in order, rolls back on failure.
+- `db_migrations/pki/` — `001_initial.sql`, `002_crl_number.sql`,
+  `003_pending_requests.sql`.
+- All `sqlite3.connect()` calls in `pki_server.py`, `acme_server.py`,
+  `scep_server.py`, `ocsp_server.py`, `ipsec_server.py` replaced with DAL.
+- CLI: `--pki-db-url`, `--acme-db-url`, `--scep-db-url` (default
+  `sqlite:///./pki.db` etc.).
+- `pypki_admin.py` — `migrate-data` and `verify-migration` subcommands
+  (row-count check, random-sample comparison, schema-version match, sequence
+  resync). 19 tests in `test_migration.py`.
+- `docs/STORAGE.md`, `docs/MIGRATION.md` — operator runbooks.
+- 7 tests in `TestDatabaseBackend`; Postgres tests gated on
+  `PYPKI_TEST_POSTGRES_URL`.
 
 ---
 
-### 5.3 Offline root + key ceremony tooling
+### 5.3 Offline root + key ceremony tooling ✅ SHIPPED
 
-**Why.** Real PKIs run an offline root that signs intermediates once a
-year (or longer). Today PyPKI assumes the root is always online. Sub-CA
-issuance works (sub_ca ergonomics work in §1) but the root can't be cleanly
-taken offline.
+**What shipped** (`ceremony.py`, `pypki_admin.py`).
 
-**Files to create**
-
-- `ceremony.py` — CLI subcommand:
-  ```
-  pypki ceremony export-root  --out root-bundle.tar.gz
-  pypki ceremony sign-csr     --in subca.csr --bundle root-bundle.tar.gz \
-                              --out subca.crt --validity-days 1825 \
-                              --path-length 0 --permitted-dns ...
-  pypki ceremony import-cert  --in subca.crt
-  ```
-- `docs/ceremony.md` — runbook for an offline-root ceremony, including
-  M-of-N split of the root passphrase via Shamir secret sharing.
-
-**Implementation**
-
-- `export-root` packages: encrypted root key, root cert, CRL number
-  counter, last-issued serial counter, audit log tail. Bundle is encrypted
-  with a fresh passphrase the operator types in.
-- `sign-csr` runs in airgap mode: no DB writes, no network, only file I/O
-  on the bundle and the CSR/cert files.
-- `import-cert` brings the signed sub-CA back online: writes it into the
-  intermediate CA's chain, sets up CDP/AIA URLs, starts serving CRL/OCSP.
-- M-of-N: optional `--threshold 3 --shares 5` flag. Use a known SSS
-  library or implement GF(256) Shamir directly (~80 lines, well-trodden).
-
-**Tests**
-
-- Round-trip: export → sign → import; verify the sub-CA's chain validates
-  to the original root.
-- M-of-N: split into 5 shares, reconstruct from any 3; assert any 2 fail.
-
-**Docs**
-
-- `docs/ceremony.md` with a step-by-step script (literally a script —
-  what to type, what to verify, who signs the witness sheet).
-- Threat model: what an offline root protects against (online compromise,
-  long-lived signing key exposure) and does not (in-ceremony coercion,
-  hardware tampering before generation).
+- `ceremony.py` — `export-root`, `sign-csr`, `import-cert` subcommands.
+  Bundle encrypted with AES-256-GCM + PBKDF2-SHA256 (600k iterations).
+  Optional Shamir M-of-N (`--threshold N --shares M`) uses GF(256) Shamir
+  directly (~80 lines). `sign-csr` runs in airgap mode (no DB, no network).
+  `import-cert` writes the signed cert into the intermediate CA's chain.
+- `docs/DEPLOYMENT/offline-root-online-subca.md` — full ceremony runbook
+  with step-by-step commands and verification checklist.
+- 13 tests in `TestCeremony`.
 
 ---
 
-### 5.4 RA / approval workflow
+### 5.4 RA / approval workflow ✅ SHIPPED
 
-**Why.** Currently any authenticated client can request any cert in any
-profile. Real deployments separate the RA (validates identity, approves
-requests) from the CA (signs). Concretely: a "pending approval" state on
-issuance requests, an approver role, and per-requester or per-profile
-auto-approval rules.
+**What shipped** (`pki_server.py`, `acme_server.py`, `cmp_server.py`,
+`db_migrations/pki/003_pending_requests.sql`).
 
-**Files to modify**
+- `RAPolicy` class evaluates auto-approval rules: `mode="all"` (approve
+  everything), `mode="none"` (always require manual review),
+  `mode="profile_list"` (per-profile list + `fnmatch` SAN patterns).
+  Loaded from `--ra-policy-file PATH` or assembled from CLI flags.
+- `RAWorkflow` class manages the `pending_requests` table — `submit()`
+  either auto-issues or stores a pending row, `approve()` calls
+  `issue_certificate()` and finalises the request, `deny()` records a reason.
+- ACME finalization routes through RA when enabled: orders that require
+  approval move to `processing` state (RFC 8555 §7.4) with an `ra_request_id`
+  foreign key; `GET /acme/order/<id>` transitions to `valid`/`invalid` when
+  the RA decision arrives.
+- REST API: HTTP 202 `{"status": "pending", "request_id": "..."}` while
+  pending. Endpoints: `POST /api/ra/approve/<id>`, `POST /api/ra/deny/<id>`,
+  `GET /api/ra/pending`, `GET /api/ra/recent`, `GET /api/ra/request/<id>`.
+- CLI flags: `--ra-auto-approve`, `--ra-require-approval`,
+  `--ra-auto-approve-profiles PROFILE [...]`, `--ra-policy-file PATH`.
+- 22 tests in `TestRAWorkflow`.
 
-- `pki_server.py` — new `pending_requests` table (csr DER, requester,
-  profile, requested SANs, status, approver, decided_at).
-- All enrollment paths (`acme_server.py` finalize, `cmp_server.py` ir/cr,
-  `est_server.py` simpleenroll, `scep_server.py`, `ipsec_server.py`,
-  REST `/api/certs`) — instead of issuing immediately, write a pending row
-  and return `pending` status. ACME has a native `processing` order state
-  for this; CMP has `waiting`; EST returns 202 with a `Retry-After`.
-- `web_ui.py` — approver dashboard, `POST /api/approve/<id>` and
-  `POST /api/deny/<id>`.
-- New role `approver` in the existing auth model.
-
-**Auto-approval policy (`policy.yaml` or equivalent)**
-
-```
-profiles:
-  tls_server:
-    auto_approve_when:
-      - requester_role: service
-      - san_dns_matches: ["*.cluster.local", "*.svc"]
-  code_signing:
-    auto_approve: false   # always manual review
-```
-
-**Tests**
-
-- Manual-approval profile: submit ACME order, assert `processing` state,
-  approve via API, assert order moves to `valid`.
-- Auto-approval profile with matching SAN: instant `valid`.
-- Auto-approval profile with non-matching SAN: falls back to manual.
-
-**Docs**
-
-- README new section "Registration Authority workflow". When to use it
-  (regulated deployments) and when to skip it (homelab — set everything to
-  auto-approve, get the audit trail anyway).
+**Outstanding (not yet implemented):**
+- CMP `waiting` status response while pending.
+- EST 202 Retry-After response while pending.
+- `web_ui.py` approver dashboard (in-browser approve/deny).
 
 ---
 
@@ -1564,122 +1399,47 @@ during, or after enrollment.
 
 ---
 
-### 5.9 Lifecycle hooks (webhooks on event)
+### 5.9 Lifecycle hooks (webhooks on event) ✅ SHIPPED
 
-**Why.** The audit log captures issuance, revocation, expiry-warning
-events but nothing reacts to them. A webhook mechanism unlocks Slack
-notifications, IPAM updates, inventory pushes, monitoring integration,
-and ad-hoc automation without touching PyPKI code.
+**What shipped** (`hooks.py`, `pki_server.py`).
 
-**Files to create**
-
-- `hooks.py` — event bus. Events: `cert.issued`, `cert.revoked`,
-  `cert.expiring` (fired by the existing expiry monitor), `subca.issued`,
-  `key.archived`, `key.recovered`. Delivery: HTTP POST with a JSON body,
-  optional HMAC-SHA256 signature header for verification.
-
-**Files to modify**
-
-- Every event source: emit through the bus rather than logging only.
-- `pki_server.py` CLI: `--webhook-url URL` (repeatable),
-  `--webhook-secret SECRET`, `--webhook-events cert.issued,cert.revoked`.
-- Web UI: webhook config page.
-
-**Implementation**
-
-- Async-style with a small queue + worker thread. Failures retry with
-  exponential backoff up to 5 attempts; final failure is audit-logged.
-- Body schema is stable and documented; first field is `event_version: 1`.
-- HMAC: `X-PyPKI-Signature: sha256=<hex>` over the request body.
-
-**Tests**
-
-- Issue a cert; assert exactly one POST to the configured URL with the
-  expected body and a valid HMAC.
-- Webhook target down for the first 3 attempts, succeeds on 4th: assert
-  4 attempts logged, no duplicate delivery on success.
-
-**Docs**
-
-- README "Integrations" section. Example: forward `cert.expiring` to a
-  Slack incoming webhook via a 5-line nginx Lua snippet, or directly via a
-  small Python relay.
+- `hooks.py` — `WebhookDispatcher` with background worker thread. Events:
+  `cert.issued`, `cert.revoked`, `cert.expiring`, `subca.issued`,
+  `cross.signed`. Delivery: HTTP POST with JSON body; `X-PyPKI-Signature:
+  sha256=<hex>` HMAC-SHA256 header. Exponential backoff up to 5 attempts;
+  final failure audit-logged.
+- CLI flags: `--webhook-url URL` (repeatable), `--webhook-secret SECRET`,
+  `--webhook-events cert.issued,cert.revoked` (default: all events).
+- 15 tests in `TestLifecycleHooks`.
 
 ---
 
-### 5.10 Structured logging + request IDs
+### 5.10 Structured logging + request IDs ✅ SHIPPED
 
-**Why.** Current logs are stdlib `logging` with a text formatter. Each
-enrollment is multi-step (request → POPO → audit → DB → sign → audit →
-response); without a request ID threading through, debugging a CMP/ACME
-flow means grepping a timestamp window and hoping nothing else happened
-in that millisecond.
+**What shipped** (`pki_server.py`, `dispatcher_server.py`).
 
-**Files to modify**
-
-- `pki_server.py` line 185 (`logger = logging.getLogger("pki-cmpv2")`) —
-  add a JSON formatter option.
-- All HTTP handlers (CMP, ACME, EST, SCEP, OCSP, REST, Web UI) — generate
-  a request ID on entry, store it in a `contextvars.ContextVar`, include
-  it in every log record via a custom `LogFilter`.
-- Existing OpenTelemetry tracing already does this for spans; the log
-  records should carry the same trace ID + span ID for correlation.
-
-**Implementation**
-
-```python
-class JsonFormatter(logging.Formatter):
-    def format(self, record):
-        d = {
-            "ts":    self.formatTime(record, "%Y-%m-%dT%H:%M:%S.%fZ"),
-            "level": record.levelname,
-            "logger": record.name,
-            "msg":   record.getMessage(),
-            "req_id": getattr(record, "req_id", None),
-            "trace_id": getattr(record, "otel_trace_id", None),
-        }
-        if record.exc_info:
-            d["exc"] = self.formatException(record.exc_info)
-        return json.dumps(d)
-```
-
-CLI flag: `--log-format json|text` (default text for back-compat).
-
-**Tests**
-
-- Single ACME order produces N log lines, all carrying the same `req_id`.
-- JSON output validates as one JSON object per line (jq round-trip).
+- `JsonFormatter` + `RequestIdFilter` in `pki_server.py`; `configure_logging()`
+  sets the root logger. `request_id_var` `ContextVar` is set on each HTTP
+  request entry in `dispatcher_server.py` and included in every log record
+  via the filter.
+- CLI flag: `--log-format json|text` (default `text` for back-compat).
+- 11 tests in `TestStructuredLogging`.
 
 ---
 
-### 5.11 Metrics depth (Prometheus histograms + gauges)
+### 5.11 Metrics depth (Prometheus histograms + gauges) ✅ SHIPPED
 
-**Why.** Current metrics are five counters. Counters detect outages but
-don't reason about performance. For "is issuance slow today", you need
-histograms.
+**What shipped** (`pki_server.py`, `ocsp_server.py`, `acme_server.py`).
 
-**Files to modify**
-
-- `pki_server.py` — extend the metrics module:
-  - `pypki_issuance_duration_seconds` (Histogram, labels: profile, protocol)
-  - `pypki_ocsp_duration_seconds` (Histogram)
-  - `pypki_acme_order_duration_seconds` (Histogram, labels: challenge_type)
-  - `pypki_pending_requests` (Gauge — when 5.4 lands)
-  - `pypki_cert_active_total` (Gauge, labels: profile)
-  - `pypki_cert_expiring_30d_total` (Gauge)
-  - `pypki_db_pool_in_use` (Gauge — when 5.2 lands)
-
-**Tests**
-
-- Issue 100 certs; assert `pypki_issuance_duration_seconds_count == 100`
-  for the matching profile label.
-- Verify histogram buckets cover realistic latency range (10ms — 5s).
-
-**Docs**
-
-- Update the existing Grafana dashboard (already on disk per the project
-  context) with histogram panels: p50/p95/p99 issuance latency, OCSP
-  latency, ACME order latency.
+- `_Histogram` class and three module-level instances: `_hist_issuance`
+  (labels: `profile`, `protocol`), `_hist_ocsp`, `_hist_acme_order`
+  (label: `challenge_type`). Thread-safe via `threading.Lock`. Buckets
+  cover 1ms–10s (13 boundaries). Prometheus text format exposition via
+  `hist.exposition()` appended to `metrics_prometheus()` output.
+- `protocol=` parameter added to `issue_certificate()` (default `""`) so
+  callers label observations: `"acme"`, `"cmp"`, `"est"`, `"scep"`,
+  `"ipsec"`. Timing via `time.perf_counter()`.
+- 14 tests in `TestMetricsDepth`.
 
 ---
 
@@ -1762,11 +1522,10 @@ in fact present:
   on the cert listing.
 - **OpenTelemetry tracing** (`pki_server.py:188`, `:1303`). Spans on
   issuance and revocation; OTLP gRPC exporter wired via `--otel-endpoint`.
-  Extend to all handlers as part of 5.10.
 - **Expiry monitor thread** (`pki_server.py:2123`,
   `start_expiry_monitor`). Background thread fires audit events for certs
-  approaching expiry. The hook from this thread to a webhook (5.9) is the
-  missing piece.
+  approaching expiry. Webhook dispatch (§5.9 ✅) fires `cert.expiring`
+  from this thread.
 - **Key archival + recovery** (`pki_server.py:~2205`,
   `decrypt_archived_key`). Needs documentation and an explicit policy:
   archive only encryption-purpose keys, never signing keys.
@@ -1775,26 +1534,17 @@ in fact present:
 
 ### Suggested ordering for Tier 5
 
-If everything else in CLAUDE.md is paused and only Tier 5 work proceeds,
-here's the order I'd take it in:
+All Tier 5 items are now shipped. For reference, the order they were implemented:
 
-1. **5.12** documentation — CPS first (1 day), threat model (1 day),
-   homelab + k8s deployment guides (2 days). Total: a week, no code, huge
-   credibility delta.
-2. **5.1** PKCS#11 — single biggest security improvement.
-3. **5.2** Postgres — single biggest operational improvement; do after
-   5.1 because the DAL refactor is easier when only key handling has
-   already moved through abstraction work.
-4. **5.5** ACME EAB — closes the most obvious abuse vector.
-5. **5.3** Offline root + ceremony tooling — completes the security story
-   started by 5.1.
-6. **5.4** RA / approval workflow — only when there's a concrete demand
-   for it. Adds significant code volume.
-7. **5.10**, **5.11** structured logs + metrics depth — alongside
-   whatever is being built; cross-cutting.
-8. **5.9** — opportunistic, when the use case appears.
-   ~~5.6~~ ✅ **SHIPPED** (cross-signing), ~~5.7~~ ✅ **SHIPPED** (OCSP prebuild),
-   ~~5.8~~ ✅ **SHIPPED** (SCEP OTP challenges).
+1. ~~**5.12**~~ ✅ documentation (CPS, threat model, deployment guides, compatibility, migration)
+2. ~~**5.1**~~ ✅ PKCS#11 / HSM backend
+3. ~~**5.2**~~ ✅ Postgres dual-backend + DAL + migration tooling
+4. ~~**5.5**~~ ✅ ACME EAB + per-account rate limiting
+5. ~~**5.3**~~ ✅ Offline root + key ceremony tooling
+6. ~~**5.4**~~ ✅ RA / approval workflow (ACME + REST complete; CMP/EST waiting states outstanding)
+7. ~~**5.10**~~, ~~**5.11**~~ ✅ Structured logging + Prometheus histograms
+8. ~~**5.9**~~ ✅ Lifecycle webhooks
+9. ~~**5.6**~~ ✅ Cross-signing, ~~**5.7**~~ ✅ OCSP prebuild, ~~**5.8**~~ ✅ SCEP OTP challenges
 
 ---
 
@@ -1835,7 +1585,7 @@ Revised given the audit findings. Highest-impact / lowest-risk first.
    - ~~RFC 8933 (CMS content-type attribute protection)~~ ✅ **SHIPPED**
    - ~~RFC 9481 + RFC 9482 (CMP algorithm advertisement + pvno echo)~~ ✅ **SHIPPED**
 6. **Documentation**:
-   - RFC 3647 (CPS document — can be drafted in parallel with any code work)
+   - ~~RFC 3647 (CPS document)~~ ✅ **SHIPPED** (`docs/CPS.md` + `--cps-uri` + `--cps-policy-oid`)
 7. **When drafts stabilize**:
    - RFC 9763 (paired certs) + ML-DSA in X.509
    - Composite signature drafts
@@ -2054,8 +1804,8 @@ CREATE INDEX idx_audit_serial ON audit_log(serial_hex);
 
 -- ACME state — orders, authorizations, challenges, nonces, accounts
 -- CMP replay nonces, SCEP transaction IDs
--- EAB keys (Tier 5 §5.5), pending_requests (§5.4),
--- webhooks_outbox (§5.9) — added when those features land.
+-- EAB keys (§5.5 ✅), pending_requests (§5.4 ✅ — see 003_pending_requests.sql),
+-- webhooks_outbox (§5.9 ✅ — delivered in-memory, no persistent outbox table).
 ```
 
 **Key choices, explicitly:**
@@ -2280,9 +2030,9 @@ TABLES_IN_DEPENDENCY_ORDER = [
     "acme_challenges",
     # ACME nonces, CMP replay nonces, SCEP transactions intentionally
     # SKIPPED — ephemeral state, expires in minutes, regenerated naturally
-    "eab_keys",               # when §5.5 lands
-    "pending_requests",       # when §5.4 lands
-    "webhooks_outbox",        # when §5.9 lands
+    "eab_keys",               # §5.5 ✅ shipped
+    "pending_requests",       # §5.4 ✅ shipped
+    "webhooks_outbox",        # §5.9 ✅ shipped (in-memory queue, no DB table)
 ]
 
 EPHEMERAL_TABLES_SKIPPED = {
