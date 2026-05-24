@@ -1662,6 +1662,16 @@ curl -u admin:PASS https://pypki.local/api/ra/recent
 
 All approved requests flow through the standard `issue_certificate` path — the cert lands in the DB, is audited, and is returned to the waiting client on next poll.
 
+### Web UI approver dashboard
+
+Navigate to `/ra-queue` in the PyPKI web UI to see all pending requests and take action:
+
+- **Pending table** — subject DN, protocol, profile, SANs, requester IP, and timestamp for each request. One-click **Approve** button; **Deny** button prompts for an optional reason.
+- **Recent decisions** — last 20 approved/denied requests with approver name and denial reason.
+- When RA is not configured, the page shows a configuration hint instead of an empty table.
+
+The dashboard calls `POST /api/ra/approve/<id>` and `POST /api/ra/deny/<id>` in the background — the same endpoints the cURL examples above use — so it is fully usable alongside scripted automation.
+
 ---
 
 ## OpenTelemetry Tracing

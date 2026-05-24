@@ -61,6 +61,15 @@ This project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   issuer chain) under the `"p12_b64"` key instead of separate `cert_pem`/
   `key_pem` fields. 2 tests in `TestHTTPAPI`.
 
+- **§5.4 — RA approver dashboard** (`web_ui.py`). New "RA Queue" page at
+  `/ra-queue` lists all pending certificate requests with one-click Approve
+  and Deny buttons (Deny prompts for an optional reason). Recent decisions
+  (last 20) are shown in a separate table. `POST /api/ra/approve/<id>` and
+  `POST /api/ra/deny/<id>` REST endpoints backed by `RAWorkflow.approve()`
+  and `RAWorkflow.deny()`. When RA is not enabled the page shows a helpful
+  configuration hint instead of a broken table. 11 tests in
+  `TestRAWebUIDashboard`.
+
 ### Fixed
 
 - **CMP `_parse_pki_header` `transactionID` extraction** (`cmp_server.py`).

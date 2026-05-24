@@ -9655,6 +9655,189 @@ class TestRAWorkflow(unittest.TestCase):
 
 
 # ===========================================================================
+# §5.4 — RA approver dashboard (web UI)
+# ===========================================================================
+
+class TestRAWebUIDashboard(unittest.TestCase):
+    """§5.4 — Web UI RA approval queue: /ra-queue page + /api/ra/approve|deny routes."""
+
+    @classmethod
+    def _make_handler(cls, ca):
+        import web_ui
+        class Bound(web_ui.WebUIHandler):
+            pass
+        Bound.ca = ca
+        Bound.audit_log = None
+        Bound.rate_limiter = None
+        Bound.require_auth = False
+        Bound.service_registry = {}
+        Bound.route_table = None
+        return Bound
+
+    @classmethod
+    def setUpClass(cls):
+        import socket
+        cls._tmp = tempfile.mkdtemp()
+        cls.ca = _make_ca(cls._tmp)
+        policy = pki.RAPolicy(auto_approve_all=False)
+        cls.ca.configure_ra(policy)
+
+        handler = cls._make_handler(cls.ca)
+        s = socket.socket()
+        s.bind(("127.0.0.1", 0))
+        cls.port = s.getsockname()[1]
+        s.close()
+        cls.server = pki.ThreadedHTTPServer(("127.0.0.1", cls.port), handler)
+        cls._thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
+        cls._thread.start()
+        time.sleep(0.1)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.server.shutdown()
+        __import__("shutil").rmtree(cls._tmp, True)
+
+    # ── helpers ─────────────────────────────────────────────────────────────
+
+    def _get(self, path):
+        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
+        conn.request("GET", path)
+        resp = conn.getresponse()
+        body = resp.read()
+        conn.close()
+        return resp.status, body.decode()
+
+    def _post(self, path, data=None):
+        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
+        raw = json.dumps(data or {}).encode()
+        conn.request("POST", path, body=raw,
+                     headers={"Content-Type": "application/json"})
+        resp = conn.getresponse()
+        body = resp.read()
+        conn.close()
+        return resp.status, json.loads(body)
+
+    def _submit_pending(self, subject="CN=webui-test"):
+        from cryptography.hazmat.primitives.asymmetric import rsa
+        from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
+        key = rsa.generate_private_key(65537, 2048)
+        pub_der = key.public_key().public_bytes(Encoding.DER, PublicFormat.SubjectPublicKeyInfo)
+        req_id, auto, _ = self.ca.ra.submit(
+            protocol="est", profile="tls_server", subject_dn=subject,
+            public_key_der=pub_der,
+        )
+        self.assertFalse(auto, "Policy should require manual approval")
+        return req_id
+
+    # ── page rendering ───────────────────────────────────────────────────────
+
+    def test_ra_queue_page_returns_200(self):
+        status, body = self._get("/ra-queue")
+        self.assertEqual(status, 200)
+        self.assertIn("RA", body)
+
+    def test_ra_queue_nav_link_appears_on_dashboard(self):
+        """RA Queue nav link is present on every page (added to nav_links)."""
+        _, body = self._get("/")
+        self.assertIn("/ra-queue", body)
+
+    def test_ra_queue_shows_pending_request(self):
+        req_id = self._submit_pending("CN=queue-display")
+        try:
+            _, body = self._get("/ra-queue")
+            self.assertIn(req_id[:8], body)
+            self.assertIn("Approve", body)
+            self.assertIn("Deny", body)
+        finally:
+            self.ca.ra.deny(req_id, reason="cleanup")
+
+    def test_ra_queue_recent_decisions_after_approval(self):
+        req_id = self._submit_pending("CN=recent-approved")
+        self.ca.ra.approve(req_id, approver="admin")
+        _, body = self._get("/ra-queue")
+        self.assertIn("issued", body)
+
+    # ── approve API ──────────────────────────────────────────────────────────
+
+    def test_api_approve_returns_ok_and_serial(self):
+        req_id = self._submit_pending("CN=approve-api")
+        status, body = self._post(f"/api/ra/approve/{req_id}")
+        self.assertEqual(status, 200)
+        self.assertTrue(body.get("ok"))
+        self.assertIn("serial", body)
+        self.assertEqual(body["request_id"], req_id)
+
+    def test_api_approve_unknown_id_returns_404(self):
+        status, body = self._post("/api/ra/approve/no-such-uuid")
+        self.assertEqual(status, 404)
+        self.assertIn("error", body)
+
+    def test_api_approve_already_decided_returns_404(self):
+        req_id = self._submit_pending("CN=double-approve")
+        self.ca.ra.deny(req_id, reason="pre-denied")
+        status, body = self._post(f"/api/ra/approve/{req_id}")
+        self.assertEqual(status, 404)
+
+    # ── deny API ─────────────────────────────────────────────────────────────
+
+    def test_api_deny_returns_ok(self):
+        req_id = self._submit_pending("CN=deny-api")
+        status, body = self._post(f"/api/ra/deny/{req_id}",
+                                  {"reason": "test denial"})
+        self.assertEqual(status, 200)
+        self.assertTrue(body.get("ok"))
+        self.assertEqual(body["request_id"], req_id)
+
+    def test_api_deny_unknown_id_returns_404(self):
+        status, body = self._post("/api/ra/deny/no-such-uuid", {})
+        self.assertEqual(status, 404)
+
+    # ── RA not configured ────────────────────────────────────────────────────
+
+    def test_ra_queue_page_when_ra_disabled(self):
+        """When CA has no RA, /ra-queue shows a helpful disabled message."""
+        import socket, web_ui
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(__import__("shutil").rmtree, tmp, True)
+        ca2 = _make_ca(tmp)
+        handler = self._make_handler(ca2)
+        s = socket.socket(); s.bind(("127.0.0.1", 0)); p = s.getsockname()[1]; s.close()
+        srv = pki.ThreadedHTTPServer(("127.0.0.1", p), handler)
+        t = threading.Thread(target=srv.serve_forever, daemon=True); t.start()
+        time.sleep(0.05)
+        try:
+            conn = http.client.HTTPConnection("127.0.0.1", p, timeout=5)
+            conn.request("GET", "/ra-queue")
+            resp = conn.getresponse(); body = resp.read().decode(); conn.close()
+            self.assertEqual(resp.status, 200)
+            self.assertIn("not enabled", body.lower())
+        finally:
+            srv.shutdown()
+
+    def test_api_approve_when_ra_disabled_returns_503(self):
+        """Approve endpoint returns 503 when RA is not configured."""
+        import socket, web_ui
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(__import__("shutil").rmtree, tmp, True)
+        ca2 = _make_ca(tmp)
+        handler = self._make_handler(ca2)
+        s = socket.socket(); s.bind(("127.0.0.1", 0)); p = s.getsockname()[1]; s.close()
+        srv = pki.ThreadedHTTPServer(("127.0.0.1", p), handler)
+        t = threading.Thread(target=srv.serve_forever, daemon=True); t.start()
+        time.sleep(0.05)
+        try:
+            conn = http.client.HTTPConnection("127.0.0.1", p, timeout=5)
+            raw = json.dumps({}).encode()
+            conn.request("POST", "/api/ra/approve/any-id", body=raw,
+                         headers={"Content-Type": "application/json"})
+            resp = conn.getresponse(); body = json.loads(resp.read()); conn.close()
+            self.assertEqual(resp.status, 503)
+            self.assertIn("error", body)
+        finally:
+            srv.shutdown()
+
+
+# ===========================================================================
 # §5.11 — Metrics depth (Prometheus histograms + gauges)
 # ===========================================================================
 

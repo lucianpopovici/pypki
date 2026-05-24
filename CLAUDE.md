@@ -1264,8 +1264,11 @@ HSM, and any vendor HSM via a vendor-supplied PKCS#11 module.
   optional CMP header fields; `transactionID` is correctly extracted
   from all messages (was previously always `os.urandom(16)`).
 
-**Outstanding (not yet implemented):**
-- `web_ui.py` approver dashboard (in-browser approve/deny).
+- Web UI approver dashboard: `/ra-queue` page (pending table + approve/deny
+  buttons + recent decisions table) + `POST /api/ra/approve/<id>` and
+  `POST /api/ra/deny/<id>` REST endpoints. 11 tests in `TestRAWebUIDashboard`.
+
+**§5.4 is fully shipped across all protocols and the web UI.**
 
 ---
 

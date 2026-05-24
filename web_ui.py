@@ -489,6 +489,36 @@ function svcStop(name) {
       else alert('Stop failed: ' + (d.error || 'unknown error'));
     });
 }
+
+/* ── RA Queue page ────────────────────────────────────────────────── */
+function raApprove(id) {
+  if (!confirm('Approve request ' + id + '?')) return;
+  const btn = document.getElementById('btn-approve-' + id);
+  const btnD = document.getElementById('btn-deny-' + id);
+  if (btn)  { btn.disabled  = true; btn.textContent  = 'Approving…'; }
+  if (btnD) { btnD.disabled = true; }
+  fetch('/api/ra/approve/' + id, {method: 'POST'})
+    .then(r => r.json()).then(d => {
+      if (d.error) { alert('Approve failed: ' + d.error); location.reload(); }
+      else { location.reload(); }
+    }).catch(() => location.reload());
+}
+function raDeny(id) {
+  const reason = prompt('Denial reason (optional):');
+  if (reason === null) return;   // cancelled
+  const btn = document.getElementById('btn-deny-' + id);
+  const btnA = document.getElementById('btn-approve-' + id);
+  if (btn)  { btn.disabled  = true; btn.textContent  = 'Denying…'; }
+  if (btnA) { btnA.disabled = true; }
+  fetch('/api/ra/deny/' + id, {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({reason: reason}),
+  }).then(r => r.json()).then(d => {
+    if (d.error) { alert('Deny failed: ' + d.error); location.reload(); }
+    else { location.reload(); }
+  }).catch(() => location.reload());
+}
 </script>
 """
 
@@ -501,6 +531,7 @@ def _page(title: str, body: str, active: str = "") -> str:
         ("Expiring",     "/expiring",   "expiring"),
         ("Revocation",   "/revocation", "revocation"),
         ("Sub-CA",       "/sub-ca",     "sub-ca"),
+        ("RA Queue",     "/ra-queue",   "ra-queue"),
         ("Metrics",      "/metrics-ui", "metrics-ui"),
         ("Config",       "/config-ui",  "config-ui"),
         ("Audit Log",    "/audit",      "audit"),
@@ -876,6 +907,8 @@ class WebUIHandler(http.server.BaseHTTPRequestHandler):
                 self._api_docs_page()
             elif path == "/expiring":
                 self._expiring_page()
+            elif path == "/ra-queue":
+                self._ra_queue_page()
             elif path == "/metrics-ui":
                 self._metrics_page()
             elif path == "/api/certs":
@@ -941,6 +974,12 @@ class WebUIHandler(http.server.BaseHTTPRequestHandler):
                 self._api_scep_mint_otp(data)
             elif path == "/api/cross-sign":
                 self._api_cross_sign(data)
+            elif path.startswith("/api/ra/approve/"):
+                req_id = path.split("/api/ra/approve/", 1)[1].strip("/")
+                self._api_ra_approve(req_id)
+            elif path.startswith("/api/ra/deny/"):
+                req_id = path.split("/api/ra/deny/", 1)[1].strip("/")
+                self._api_ra_deny(req_id, data)
             else:
                 self._send_json({"error": "not found"}, 404)
         except Exception as e:
@@ -1413,6 +1452,188 @@ class WebUIHandler(http.server.BaseHTTPRequestHandler):
         ).format(raw=raw)
         self._send_html(200, _page("Prometheus Metrics", body, "metrics-ui"))
 
+    # ------------------------------------------------------------------
+    # RA Queue page + API handlers
+    # ------------------------------------------------------------------
+
+    def _ra_queue_page(self):
+        ra = getattr(self.ca, "ra", None)
+        if ra is None:
+            body = (
+                '<div class="card">'
+                '  <div class="card-head"><h2>RA Approval Queue</h2></div>'
+                '  <div class="card-body">'
+                '    <p style="color:#6b7280">The Registration Authority is not enabled. '
+                '    Start the server with <code>--ra-require-approval</code> or '
+                '    <code>--ra-auto-approve-profiles</code> to use the RA workflow.</p>'
+                "  </div>"
+                "</div>"
+            )
+            self._send_html(200, _page("RA Queue", body, "ra-queue"))
+            return
+
+        pending = ra.list_pending()
+        recent  = ra.list_recent(50)
+
+        # Pending table
+        if pending:
+            p_rows = ""
+            for r in pending:
+                created = datetime.datetime.fromtimestamp(
+                    r["created_at"], tz=datetime.timezone.utc
+                ).strftime("%Y-%m-%d %H:%M UTC")
+                sans = ", ".join(
+                    (r.get("san_dns") and json.loads(r["san_dns"]) or []) +
+                    (r.get("san_ips") and json.loads(r["san_ips"]) or [])
+                ) or "—"
+                rid = r["request_id"]
+                p_rows += (
+                    "<tr>"
+                    "<td><code style='font-size:.78rem'>{short}</code></td>"
+                    "<td>{proto}</td><td>{profile}</td>"
+                    "<td><code>{subject}</code></td>"
+                    "<td>{sans}</td><td>{ip}</td><td>{created}</td>"
+                    "<td>"
+                    "  <button id='btn-approve-{rid}' class='btn btn-success' "
+                    "          style='margin-right:4px' onclick='raApprove(\"{rid}\")'>"
+                    "    Approve</button>"
+                    "  <button id='btn-deny-{rid}' class='btn btn-danger' "
+                    "          onclick='raDeny(\"{rid}\")'>"
+                    "    Deny</button>"
+                    "</td>"
+                    "</tr>"
+                ).format(
+                    short=rid[:8] + "…",
+                    proto=r.get("protocol", ""),
+                    profile=r.get("profile", ""),
+                    subject=r.get("subject_dn", ""),
+                    sans=sans,
+                    ip=r.get("requester_ip", ""),
+                    created=created,
+                    rid=rid,
+                )
+            pending_html = (
+                '<table>'
+                '<thead><tr>'
+                '<th>Request ID</th><th>Protocol</th><th>Profile</th>'
+                '<th>Subject</th><th>SANs</th><th>Requester IP</th>'
+                '<th>Received</th><th>Actions</th>'
+                '</tr></thead>'
+                '<tbody>{rows}</tbody>'
+                '</table>'
+            ).format(rows=p_rows)
+        else:
+            pending_html = '<p style="color:#6b7280;padding:8px 0">No pending requests.</p>'
+
+        # Recent decisions table
+        decided = [r for r in recent if r.get("status") != "pending"]
+        if decided:
+            d_rows = ""
+            for r in decided[:20]:
+                status = r.get("status", "")
+                badge_cls = {"issued": "badge-ok", "denied": "badge-rev"}.get(status, "")
+                decided_ts = r.get("decided_at")
+                decided_str = (
+                    datetime.datetime.fromtimestamp(
+                        decided_ts, tz=datetime.timezone.utc
+                    ).strftime("%Y-%m-%d %H:%M UTC")
+                    if decided_ts else "—"
+                )
+                d_rows += (
+                    "<tr>"
+                    "<td><code style='font-size:.78rem'>{short}</code></td>"
+                    "<td>{proto}</td><td>{profile}</td>"
+                    "<td><code>{subject}</code></td>"
+                    "<td><span class='{badge}'>{status}</span></td>"
+                    "<td>{approver}</td><td>{reason}</td><td>{ts}</td>"
+                    "</tr>"
+                ).format(
+                    short=r["request_id"][:8] + "…",
+                    proto=r.get("protocol", ""),
+                    profile=r.get("profile", ""),
+                    subject=r.get("subject_dn", ""),
+                    badge=badge_cls,
+                    status=status,
+                    approver=r.get("approver") or "auto",
+                    reason=r.get("deny_reason") or "—",
+                    ts=decided_str,
+                )
+            recent_html = (
+                '<table>'
+                '<thead><tr>'
+                '<th>Request ID</th><th>Protocol</th><th>Profile</th>'
+                '<th>Subject</th><th>Status</th><th>Approver</th>'
+                '<th>Reason</th><th>Decided</th>'
+                '</tr></thead>'
+                '<tbody>{rows}</tbody>'
+                '</table>'
+            ).format(rows=d_rows)
+        else:
+            recent_html = '<p style="color:#6b7280;padding:8px 0">No recent decisions.</p>'
+
+        count_badge = (
+            ' <span class="badge-rev" style="font-size:.75rem;padding:2px 8px;'
+            'border-radius:4px;margin-left:8px">{n} pending</span>'.format(n=len(pending))
+            if pending else ""
+        )
+
+        body = (
+            '<div class="card">'
+            '  <div class="card-head">'
+            '    <h2>Pending Requests{badge}</h2>'
+            '    <button class="btn btn-secondary" onclick="location.reload()">Refresh</button>'
+            "  </div>"
+            '  <div class="card-body" style="overflow-x:auto">{pending}</div>'
+            "</div>"
+            '<div class="card">'
+            '  <div class="card-head"><h2>Recent Decisions (last 20)</h2></div>'
+            '  <div class="card-body" style="overflow-x:auto">{recent}</div>'
+            "</div>"
+        ).format(badge=count_badge, pending=pending_html, recent=recent_html)
+
+        self._send_html(200, _page("RA Queue", body, "ra-queue"))
+
+    def _api_ra_approve(self, request_id: str):
+        ra = getattr(self.ca, "ra", None)
+        if ra is None:
+            self._send_json({"error": "RA not enabled"}, 503)
+            return
+        approver = self._current_user() or "webui"
+        cert = ra.approve(
+            request_id,
+            approver=approver,
+            audit=self.audit_log,
+            requester_ip=self.client_address[0],
+        )
+        if cert is None:
+            self._send_json({"error": "request not found or not pending"}, 404)
+        else:
+            self._send_json({
+                "ok": True,
+                "request_id": request_id,
+                "serial": cert.serial_number,
+                "subject": cert.subject.rfc4514_string(),
+            })
+
+    def _api_ra_deny(self, request_id: str, data: dict):
+        ra = getattr(self.ca, "ra", None)
+        if ra is None:
+            self._send_json({"error": "RA not enabled"}, 503)
+            return
+        approver = self._current_user() or "webui"
+        reason = data.get("reason", "")
+        ok = ra.deny(
+            request_id,
+            reason=reason,
+            approver=approver,
+            audit=self.audit_log,
+            requester_ip=self.client_address[0],
+        )
+        if not ok:
+            self._send_json({"error": "request not found or not pending"}, 404)
+        else:
+            self._send_json({"ok": True, "request_id": request_id})
+
     def _api_docs_page(self):
         rows = "\n".join(
             "        <tr><td>{m}</td><td><code>{p}</code></td><td>{d}</td></tr>".format(
@@ -1432,6 +1653,8 @@ class WebUIHandler(http.server.BaseHTTPRequestHandler):
                 ("GET",  "/api/services",              "Service status — all 6 protocol services (JSON)"),
                 ("POST", "/api/services/&lt;name&gt;/start", "Start a service with config body ({port, …})"),
                 ("POST", "/api/services/&lt;name&gt;/stop",  "Stop a running service"),
+                ("POST", "/api/ra/approve/&lt;id&gt;", "Approve a pending RA request"),
+                ("POST", "/api/ra/deny/&lt;id&gt;",    '{&quot;reason&quot;: &quot;optional text&quot;}'),
                 ("GET",  "/ca/cert.pem",               "CA certificate (PEM)"),
                 ("GET",  "/ca/crl",                    "Certificate Revocation List (DER)"),
             ]
