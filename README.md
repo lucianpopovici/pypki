@@ -2135,9 +2135,9 @@ rate(pypki_ocsp_duration_seconds_count[5m])
 
 ---
 
-## Roadmap
+## Post-Quantum Cryptography (PQC)
 
-### Post-Quantum Cryptography (ML-DSA / FIPS 204) ✅ Shipped
+### ML-DSA / FIPS 204 ✅ Shipped
 
 ML-DSA (Module Lattice Digital Signature Algorithm, FIPS 204) X.509 certificate
 issuance is implemented via `issue_ml_dsa_certificate()`. The CA signs ML-DSA EE
@@ -2205,6 +2205,15 @@ OID: 1.3.6.1.5.5.7.1.36 (id-pe-relatedCert), non-critical
 ```
 
 **`POST /api/paired-issue`** is the primary interface — see ML-DSA section above.
+
+---
+
+### Composite signatures — watching the draft
+
+`draft-ietf-lamps-pq-composite-sigs` defines classical + PQC in a single
+signature structure — a cleaner migration path than RFC 9763 certificate
+pairing for some deployments. PyPKI will implement this once the draft
+reaches RFC status.
 
 ---
 
