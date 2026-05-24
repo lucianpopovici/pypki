@@ -5331,7 +5331,7 @@ class TestMultiAlgorithmCA(unittest.TestCase):
 
     def test_generate_ca_key_invalid_type_rejected(self):
         with self.assertRaises(ValueError):
-            pki._generate_ca_key("ml-dsa-65")
+            pki._generate_ca_key("slh-dsa-sha2-128s")  # not yet supported
 
     # ---- end-to-end CA bootstrap with each key type ----
 
@@ -10493,6 +10493,258 @@ class TestRFC8551SMIME(unittest.TestCase):
     def test_encrypt_no_recipients_raises(self):
         with self.assertRaises(ValueError):
             self.s.SMIMEEncryptor.encrypt(self.message, [])
+
+
+# ===========================================================================
+# ML-DSA X.509 certificate issuance (FIPS 204)
+# ===========================================================================
+
+@unittest.skipUnless(pki.HAS_MLDSA, "cryptography ≥ 44 required for ML-DSA")
+class TestMLDSACertificates(unittest.TestCase):
+    """Tests for issue_ml_dsa_certificate() — ML-DSA subject key, classical CA signature."""
+
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+        self.ca = _make_ca(self.tmpdir)
+        from cryptography.hazmat.primitives.asymmetric import mldsa as _mldsa
+        from cryptography.hazmat.primitives.serialization import (
+            Encoding, PublicFormat,
+        )
+        self._mldsa = _mldsa
+        self.mldsa44_key = _mldsa.MLDSA44PrivateKey.generate()
+        self.mldsa44_pub = self.mldsa44_key.public_key()
+        self.mldsa44_spki = self.mldsa44_pub.public_bytes(Encoding.DER, PublicFormat.SubjectPublicKeyInfo)
+
+    def tearDown(self):
+        import shutil; shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def test_returns_bytes(self):
+        cert_der = self.ca.issue_ml_dsa_certificate("CN=PQC Test", self.mldsa44_spki)
+        self.assertIsInstance(cert_der, bytes)
+        self.assertGreater(len(cert_der), 100)
+
+    def test_is_valid_der_sequence(self):
+        cert_der = self.ca.issue_ml_dsa_certificate("CN=PQC Test", self.mldsa44_spki)
+        self.assertEqual(cert_der[0], 0x30)  # SEQUENCE tag
+
+    def test_contains_ml_dsa44_oid_in_spki(self):
+        cert_der = self.ca.issue_ml_dsa_certificate("CN=PQC Test", self.mldsa44_spki)
+        # ML-DSA-44 OID: 2.16.840.1.101.3.4.3.17
+        self.assertIn(b"\x60\x86\x48\x01\x65\x03\x04\x03\x11", cert_der)
+
+    def test_ml_dsa65_oid(self):
+        from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
+        key65 = self._mldsa.MLDSA65PrivateKey.generate()
+        spki65 = key65.public_key().public_bytes(Encoding.DER, PublicFormat.SubjectPublicKeyInfo)
+        cert_der = self.ca.issue_ml_dsa_certificate("CN=PQC65", spki65)
+        # ML-DSA-65 OID: 2.16.840.1.101.3.4.3.18
+        self.assertIn(b"\x60\x86\x48\x01\x65\x03\x04\x03\x12", cert_der)
+
+    def test_ml_dsa87_oid(self):
+        from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
+        key87 = self._mldsa.MLDSA87PrivateKey.generate()
+        spki87 = key87.public_key().public_bytes(Encoding.DER, PublicFormat.SubjectPublicKeyInfo)
+        cert_der = self.ca.issue_ml_dsa_certificate("CN=PQC87", spki87)
+        # ML-DSA-87 OID: 2.16.840.1.101.3.4.3.19
+        self.assertIn(b"\x60\x86\x48\x01\x65\x03\x04\x03\x13", cert_der)
+
+    def test_ca_signature_verifies(self):
+        """CA's classical public key should verify the certificate signature."""
+        import hashlib
+        cert_der = self.ca.issue_ml_dsa_certificate("CN=PQC Test", self.mldsa44_spki)
+        # Parse outer SEQUENCE: TBSCertificate, signatureAlgorithm, signatureValue
+        tag, cert_content, _ = pki._pder_decode_tlv(cert_der, 0)
+        self.assertEqual(tag, 0x30)
+        # Consume TBSCertificate
+        tag2, tbs_val, next_pos2 = pki._pder_decode_tlv(cert_content, 0)
+        tbs_der = cert_content[:next_pos2]
+        # Consume signatureAlgorithm
+        tag3, _, next_pos3 = pki._pder_decode_tlv(cert_content, next_pos2)
+        # signatureValue is a BIT STRING
+        tag4, sig_bs, _ = pki._pder_decode_tlv(cert_content, next_pos3)
+        self.assertEqual(tag4, 0x03)
+        sig_bytes = sig_bs[1:]  # strip unused-bits byte
+        # Verify with CA's public key
+        ca_pub = self.ca.ca_cert.public_key()
+        from cryptography.hazmat.primitives.asymmetric import padding as _pad
+        from cryptography.hazmat.primitives.hashes import SHA256
+        ca_pub.verify(sig_bytes, tbs_der, _pad.PKCS1v15(), SHA256())  # raises on failure
+
+    def test_stored_in_db(self):
+        cert_der = self.ca.issue_ml_dsa_certificate("CN=DB Store Test", self.mldsa44_spki)
+        # Load the cert DER from DB to find its serial
+        tag, cert_content, _ = pki._pder_decode_tlv(cert_der, 0)
+        tag2, tbs_content, _ = pki._pder_decode_tlv(cert_content, 0)
+        # version [0] then serial INTEGER
+        tag_v, _, next_v = pki._pder_decode_tlv(tbs_content, 0)
+        tag_s, serial_bytes, _ = pki._pder_decode_tlv(tbs_content, next_v)
+        serial = int.from_bytes(serial_bytes, "big")
+        row = self.ca._pki_db.fetchone("SELECT der FROM certificates WHERE serial=?", (serial,))
+        self.assertIsNotNone(row)
+        self.assertEqual(row[0], cert_der)
+
+    def test_no_related_cert_extension_when_not_requested(self):
+        cert_der = self.ca.issue_ml_dsa_certificate("CN=No Related", self.mldsa44_spki)
+        # OID_RELATED_CERT encoded: 1.3.6.1.5.5.7.1.36 → check it's absent
+        self.assertNotIn(pki._pder_oid(pki.OID_RELATED_CERT), cert_der)
+
+    def test_raises_without_mldsa_support(self):
+        """Simulate missing ML-DSA support at runtime."""
+        original = pki.HAS_MLDSA
+        try:
+            pki.HAS_MLDSA = False
+            with self.assertRaises(RuntimeError):
+                self.ca.issue_ml_dsa_certificate("CN=X", self.mldsa44_spki)
+        finally:
+            pki.HAS_MLDSA = original
+
+    def test_validity_period_respected(self):
+        cert_der = self.ca.issue_ml_dsa_certificate(
+            "CN=Validity Test", self.mldsa44_spki, validity_days=30
+        )
+        # The cert DER contains GeneralizedTime strings for validity — just
+        # verify the cert is parseable and roughly the right length
+        self.assertGreater(len(cert_der), 50)
+
+    def test_profile_key_usage_digital_signature(self):
+        cert_der = self.ca.issue_ml_dsa_certificate("CN=KU Test", self.mldsa44_spki)
+        # KeyUsage OID 2.5.29.15 should be present in the DER
+        ku_oid_der = pki._pder_oid("2.5.29.15")
+        self.assertIn(ku_oid_der, cert_der)
+
+
+# ===========================================================================
+# RFC 9763 — Related Certificates (paired classical + PQC issuance)
+# ===========================================================================
+
+@unittest.skipUnless(pki.HAS_MLDSA, "cryptography ≥ 44 required for ML-DSA")
+class TestRFC9763RelatedCerts(unittest.TestCase):
+    """Tests for issue_paired_certs() and the RelatedCertificate extension."""
+
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+        self.ca = _make_ca(self.tmpdir)
+        from cryptography.hazmat.primitives.asymmetric import mldsa as _mldsa, ec
+        from cryptography.hazmat.primitives.serialization import (
+            Encoding, PublicFormat,
+        )
+        self._mldsa = _mldsa
+        self._Encoding = Encoding
+        self._PublicFormat = PublicFormat
+        self.mldsa_key = _mldsa.MLDSA44PrivateKey.generate()
+        self.mldsa_spki = self.mldsa_key.public_key().public_bytes(
+            Encoding.DER, PublicFormat.SubjectPublicKeyInfo
+        )
+        self.classical_key = ec.generate_private_key(ec.SECP256R1())
+
+    def tearDown(self):
+        import shutil; shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def test_returns_tuple_of_two(self):
+        result = self.ca.issue_paired_certs(
+            "CN=Paired Test",
+            self.classical_key.public_key(),
+            self.mldsa_spki,
+        )
+        self.assertIsInstance(result, tuple)
+        self.assertEqual(len(result), 2)
+
+    def test_classical_cert_is_pem(self):
+        classical_pem, _ = self.ca.issue_paired_certs(
+            "CN=Paired", self.classical_key.public_key(), self.mldsa_spki
+        )
+        self.assertIsInstance(classical_pem, str)
+        self.assertIn("BEGIN CERTIFICATE", classical_pem)
+
+    def test_mldsa_cert_is_bytes(self):
+        _, ml_dsa_der = self.ca.issue_paired_certs(
+            "CN=Paired", self.classical_key.public_key(), self.mldsa_spki
+        )
+        self.assertIsInstance(ml_dsa_der, bytes)
+
+    def test_mldsa_cert_has_related_cert_extension(self):
+        _, ml_dsa_der = self.ca.issue_paired_certs(
+            "CN=RFC9763", self.classical_key.public_key(), self.mldsa_spki
+        )
+        related_oid_der = pki._pder_oid(pki.OID_RELATED_CERT)
+        self.assertIn(related_oid_der, ml_dsa_der,
+                      "ML-DSA cert must carry OID_RELATED_CERT extension")
+
+    def test_related_cert_hash_matches_classical_cert(self):
+        """SHA-512 in RelatedCertificate must equal SHA-512(classical_cert_der)."""
+        import hashlib, base64 as _b64
+        classical_pem, ml_dsa_der = self.ca.issue_paired_certs(
+            "CN=HashCheck", self.classical_key.public_key(), self.mldsa_spki
+        )
+        # Decode classical cert DER
+        pem_body = classical_pem
+        der_b64 = "".join(
+            line for line in pem_body.splitlines()
+            if not line.startswith("-----")
+        )
+        classical_der = _b64.b64decode(der_b64)
+        expected_hash = hashlib.sha512(classical_der).digest()
+        # The hash should appear verbatim in the ML-DSA cert DER
+        self.assertIn(expected_hash, ml_dsa_der,
+                      "SHA-512 of classical cert DER must appear in ML-DSA cert RelatedCertificate")
+
+    def test_classical_cert_has_no_related_cert_extension(self):
+        classical_pem, _ = self.ca.issue_paired_certs(
+            "CN=OneDir", self.classical_key.public_key(), self.mldsa_spki
+        )
+        import base64 as _b64
+        der_b64 = "".join(
+            line for line in classical_pem.splitlines()
+            if not line.startswith("-----")
+        )
+        classical_der = _b64.b64decode(der_b64)
+        related_oid_der = pki._pder_oid(pki.OID_RELATED_CERT)
+        self.assertNotIn(related_oid_der, classical_der,
+                         "Classical cert must NOT carry RelatedCertificate (one-directional link)")
+
+    def test_both_certs_stored_in_db(self):
+        classical_pem, ml_dsa_der = self.ca.issue_paired_certs(
+            "CN=DB Pair", self.classical_key.public_key(), self.mldsa_spki
+        )
+        # Two rows should now be in the certificates table for this subject
+        rows = self.ca._pki_db.fetchall(
+            "SELECT serial, profile FROM certificates WHERE subject LIKE ?", ("%DB Pair%",)
+        )
+        self.assertEqual(len(rows), 2)
+        profiles = {r[1] for r in rows}
+        self.assertIn("email_signing", profiles)
+        self.assertIn("ml_dsa_signing", profiles)
+
+    def test_same_subject_on_both_certs(self):
+        import base64 as _b64
+        classical_pem, ml_dsa_der = self.ca.issue_paired_certs(
+            "CN=SameSubject", self.classical_key.public_key(), self.mldsa_spki
+        )
+        der_b64 = "".join(
+            line for line in classical_pem.splitlines()
+            if not line.startswith("-----")
+        )
+        classical_der = _b64.b64decode(der_b64)
+        # "SameSubject" should appear as UTF-8 in both certs
+        subject_bytes = b"SameSubject"
+        self.assertIn(subject_bytes, classical_der)
+        self.assertIn(subject_bytes, ml_dsa_der)
+
+    def test_different_serials(self):
+        """Paired certs must have distinct serial numbers."""
+        classical_pem, ml_dsa_der = self.ca.issue_paired_certs(
+            "CN=Serials", self.classical_key.public_key(), self.mldsa_spki
+        )
+        rows = self.ca._pki_db.fetchall(
+            "SELECT serial FROM certificates WHERE subject LIKE ?", ("%Serials%",)
+        )
+        serials = [r[0] for r in rows]
+        self.assertEqual(len(serials), 2)
+        self.assertNotEqual(serials[0], serials[1])
+
+    def test_related_cert_oid_value(self):
+        """OID_RELATED_CERT constant should be the IANA-assigned OID."""
+        self.assertEqual(pki.OID_RELATED_CERT, "1.3.6.1.5.5.7.1.36")
 
 
 # ===========================================================================

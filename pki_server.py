@@ -113,6 +113,29 @@ OID_SMTP_UTF8_MAILBOX = x509.ObjectIdentifier("1.3.6.1.5.5.7.8.9")
 # RFC 6962 — CT Pre-certificate Poison extension OID
 OID_CT_POISON = x509.ObjectIdentifier("1.3.6.1.4.1.11129.2.4.3")
 
+# ML-DSA (FIPS 204) algorithm OIDs — draft-ietf-lamps-dilithium-certificates
+OID_ML_DSA_44 = "2.16.840.1.101.3.4.3.17"
+OID_ML_DSA_65 = "2.16.840.1.101.3.4.3.18"
+OID_ML_DSA_87 = "2.16.840.1.101.3.4.3.19"
+_MLDSA_CLASS_TO_OID: dict = {}  # populated below after conditional import
+
+# RFC 9763 — Related Certificates extension and CSR attribute OIDs
+OID_RELATED_CERT         = "1.3.6.1.5.5.7.1.36"   # id-pe-relatedCert
+OID_RELATED_CERT_REQUEST = "1.2.840.113549.1.9.16.2.60"  # id-aa 60
+
+# ML-DSA availability flag — requires cryptography ≥ 44.0.0
+try:
+    from cryptography.hazmat.primitives.asymmetric import mldsa as _mldsa_mod
+    HAS_MLDSA = True
+    _MLDSA_CLASS_TO_OID = {
+        _mldsa_mod.MLDSA44PrivateKey: OID_ML_DSA_44,
+        _mldsa_mod.MLDSA65PrivateKey: OID_ML_DSA_65,
+        _mldsa_mod.MLDSA87PrivateKey: OID_ML_DSA_87,
+    }
+except ImportError:
+    _mldsa_mod = None
+    HAS_MLDSA = False
+
 # RFC 5280 §4.2.1.14 — Well-known CA/B Forum policy OIDs (for CertificatePolicies)
 OID_ANY_POLICY          = x509.ObjectIdentifier("2.5.29.32.0")
 OID_POLICY_DV           = x509.ObjectIdentifier("2.23.140.1.2.1")  # CA/B Forum DV
@@ -1018,6 +1041,8 @@ def _hash_for_key(key):
         return SHA256
     if isinstance(key, (ed25519.Ed25519PrivateKey, ed448.Ed448PrivateKey)):
         return None
+    if HAS_MLDSA and isinstance(key, tuple(_MLDSA_CLASS_TO_OID)):
+        return None  # ML-DSA signs internally, no external hash
     raise TypeError(f"Unsupported private-key type for signing: {type(key).__name__}")
 
 
@@ -1076,7 +1101,197 @@ def _sign_data(key, data: bytes, *, rsa_pss: bool = False) -> bytes:
         return key.sign(data, ec.ECDSA(hash_cls()))
     if isinstance(key, (ed25519.Ed25519PrivateKey, ed448.Ed448PrivateKey)):
         return key.sign(data)
+    if HAS_MLDSA and isinstance(key, tuple(_MLDSA_CLASS_TO_OID)):
+        return key.sign(data)
     raise TypeError(f"Unsupported private-key type for signing: {type(key).__name__}")
+
+
+# ---------------------------------------------------------------------------
+# Minimal DER helpers for hand-rolled X.509 TBSCertificate construction.
+# Used only for ML-DSA certs — CertificateBuilder doesn't accept ML-DSA keys
+# yet (cryptography 48.0.0). All classical certs continue to use the builder.
+# ---------------------------------------------------------------------------
+
+def _pder_len(n: int) -> bytes:
+    if n < 0x80:
+        return bytes([n])
+    if n < 0x100:
+        return bytes([0x81, n])
+    return bytes([0x82, n >> 8, n & 0xFF])
+
+
+def _pder_tlv(tag: int, body: bytes) -> bytes:
+    return bytes([tag]) + _pder_len(len(body)) + body
+
+
+def _pder_seq(body: bytes) -> bytes:
+    return _pder_tlv(0x30, body)
+
+
+def _pder_oid(dotted: str) -> bytes:
+    parts = [int(x) for x in dotted.split(".")]
+    enc = bytes([40 * parts[0] + parts[1]])
+    for p in parts[2:]:
+        if p == 0:
+            enc += b"\x00"
+        else:
+            buf: list[int] = []
+            while p:
+                buf.append(p & 0x7F); p >>= 7
+            buf.reverse()
+            for i, x in enumerate(buf):
+                enc += bytes([x | (0x80 if i < len(buf) - 1 else 0)])
+    return _pder_tlv(0x06, enc)
+
+
+def _pder_int(n: int) -> bytes:
+    raw = n.to_bytes((n.bit_length() + 8) // 8, "big")
+    return _pder_tlv(0x02, raw)
+
+
+def _pder_os(b: bytes) -> bytes:
+    return _pder_tlv(0x04, b)
+
+
+def _pder_bitstring(b: bytes) -> bytes:
+    return _pder_tlv(0x03, b"\x00" + b)
+
+
+def _pder_null() -> bytes:
+    return b"\x05\x00"
+
+
+def _pder_ctx(n: int, body: bytes, constructed: bool = True) -> bytes:
+    tag = (0xA0 if constructed else 0x80) | n
+    return bytes([tag]) + _pder_len(len(body)) + body
+
+
+def _pder_decode_tlv(data: bytes, pos: int = 0):
+    """Return (tag, value_bytes, next_pos)."""
+    tag = data[pos]; pos += 1
+    first = data[pos]
+    if first < 0x80:
+        length = first; pos += 1
+    elif first == 0x81:
+        length = data[pos + 1]; pos += 2
+    else:
+        length = (data[pos + 1] << 8) | data[pos + 2]; pos += 3
+    return tag, data[pos: pos + length], pos + length
+
+
+def _pder_ext(oid_dotted: str, value_der: bytes, critical: bool = False) -> bytes:
+    """Build DER for a single X.509 Extension TLV."""
+    body = _pder_oid(oid_dotted)
+    if critical:
+        body += b"\x01\x01\xff"  # BOOLEAN TRUE
+    body += _pder_os(value_der)
+    return _pder_seq(body)
+
+
+def _pder_utctime(dt: "datetime.datetime") -> bytes:
+    return _pder_tlv(0x17, dt.strftime("%y%m%d%H%M%SZ").encode())
+
+
+def _pder_gentime(dt: "datetime.datetime") -> bytes:
+    return _pder_tlv(0x18, dt.strftime("%Y%m%d%H%M%SZ").encode())
+
+
+def _pder_validity(not_before: "datetime.datetime", not_after: "datetime.datetime") -> bytes:
+    enc = _pder_utctime if not_before.year < 2050 else _pder_gentime
+    enc2 = _pder_utctime if not_after.year < 2050 else _pder_gentime
+    return _pder_seq(enc(not_before) + enc2(not_after))
+
+
+def _sig_alg_der_for_key(key) -> bytes:
+    """Return AlgorithmIdentifier DER for a private key's signature scheme."""
+    if isinstance(key, rsa.RSAPrivateKey):
+        return _pder_seq(_pder_oid("1.2.840.113549.1.1.11") + _pder_null())  # sha256WithRSAEncryption
+    if isinstance(key, ec.EllipticCurvePrivateKey):
+        curve_sig_oids = {
+            "secp256r1": "1.2.840.10045.4.3.2",
+            "secp384r1": "1.2.840.10045.4.3.3",
+            "secp521r1": "1.2.840.10045.4.3.4",
+        }
+        oid = curve_sig_oids.get(key.public_key().curve.name, "1.2.840.10045.4.3.2")
+        return _pder_seq(_pder_oid(oid))
+    if isinstance(key, ed25519.Ed25519PrivateKey):
+        return _pder_seq(_pder_oid("1.3.101.112"))
+    if isinstance(key, ed448.Ed448PrivateKey):
+        return _pder_seq(_pder_oid("1.3.101.113"))
+    if HAS_MLDSA:
+        oid = _MLDSA_CLASS_TO_OID.get(type(key))
+        if oid:
+            return _pder_seq(_pder_oid(oid))
+    raise TypeError(f"Cannot determine sig alg for key type: {type(key).__name__}")
+
+
+def _ski_from_spki(spki_der: bytes) -> bytes:
+    """Compute the SubjectKeyIdentifier (SHA-1 of BIT STRING key content) from SPKI DER."""
+    import hashlib
+    _, spki_body, _ = _pder_decode_tlv(spki_der, 0)
+    _, _, alg_end = _pder_decode_tlv(spki_body, 0)  # skip AlgorithmIdentifier
+    _, bs_body, _ = _pder_decode_tlv(spki_body, alg_end)  # BIT STRING
+    return hashlib.sha1(bs_body[1:]).digest()  # strip leading 0x00 unused-bits byte
+
+
+def _related_cert_ext_value_der(paired_cert_der: bytes) -> bytes:
+    """
+    Build RFC 9763 RelatedCertificate extension value DER.
+
+    RelatedCertificate ::= SEQUENCE {
+        hashAlgorithm DigestAlgorithmIdentifier,
+        hashValue     OCTET STRING
+    }
+    Uses SHA-512 as the digest algorithm.
+    """
+    import hashlib
+    hash_value = hashlib.sha512(paired_cert_der).digest()
+    sha512_alg = _pder_seq(_pder_oid("2.16.840.1.101.3.4.2.3"))  # id-sha512
+    return _pder_seq(sha512_alg + _pder_os(hash_value))
+
+
+def _build_cert_der_from_tbs(tbs_der: bytes, ca_key, *, rsa_pss: bool = False) -> bytes:
+    """
+    Sign a TBSCertificate DER and return the full Certificate DER.
+
+    AlgorithmIdentifier in Certificate.signatureAlgorithm mirrors TBSCertificate.signature
+    (they are required to be identical per RFC 5280 §4.1.1.2).
+    """
+    sig_alg = _sig_alg_der_for_key(ca_key)
+    signature = _sign_data(ca_key, tbs_der, rsa_pss=rsa_pss)
+    return _pder_seq(tbs_der + sig_alg + _pder_bitstring(signature))
+
+
+def _build_mldsa_tbs(
+    serial: int,
+    ca_key,
+    issuer_name_der: bytes,
+    not_before: "datetime.datetime",
+    not_after: "datetime.datetime",
+    subject_name_der: bytes,
+    spki_der: bytes,
+    extensions: list,  # list of (oid_dotted, value_der, critical) tuples
+) -> bytes:
+    """Build a TBSCertificate DER for an ML-DSA-keyed certificate.
+
+    This hand-rolled builder is used because CertificateBuilder.public_key()
+    does not yet accept ML-DSA public keys (cryptography 48.0.0).
+    """
+    version = _pder_ctx(0, _pder_int(2))  # [0] EXPLICIT INTEGER v3
+    sig_alg = _sig_alg_der_for_key(ca_key)
+    validity = _pder_validity(not_before, not_after)
+    exts_body = b"".join(_pder_ext(oid, val, crit) for oid, val, crit in extensions)
+    ext_field = _pder_ctx(3, _pder_seq(exts_body))  # [3] EXPLICIT SEQUENCE OF Extension
+    return _pder_seq(
+        version
+        + _pder_int(serial)
+        + sig_alg
+        + issuer_name_der
+        + validity
+        + subject_name_der
+        + spki_der
+        + ext_field
+    )
 
 
 # CA key-type catalog. Maps the operator-facing CLI string to a generator
@@ -1090,6 +1305,9 @@ _CA_KEY_FACTORIES = {
     "ec-p521":   lambda: ec.generate_private_key(ec.SECP521R1()),
     "ed25519":   lambda: ed25519.Ed25519PrivateKey.generate(),
     "ed448":     lambda: ed448.Ed448PrivateKey.generate(),
+    "ml-dsa-44": lambda: _mldsa_mod.MLDSA44PrivateKey.generate() if HAS_MLDSA else (_ for _ in ()).throw(ImportError("cryptography ≥ 44 required for ML-DSA")),
+    "ml-dsa-65": lambda: _mldsa_mod.MLDSA65PrivateKey.generate() if HAS_MLDSA else (_ for _ in ()).throw(ImportError("cryptography ≥ 44 required for ML-DSA")),
+    "ml-dsa-87": lambda: _mldsa_mod.MLDSA87PrivateKey.generate() if HAS_MLDSA else (_ for _ in ()).throw(ImportError("cryptography ≥ 44 required for ML-DSA")),
 }
 
 
@@ -1488,6 +1706,18 @@ class CertProfile:
                               key_agreement=False, key_cert_sign=False,
                               crl_sign=False, encipher_only=False, decipher_only=False),
             "eku": [],
+            "san_required": False,
+            "bc_ca": False,
+        },
+        # ML-DSA signing certificate (RFC 8551 §2.3.1 key-usage pattern).
+        # Subject holds an ML-DSA public key; CA signs with classical key.
+        # Profile mirrors email_signing: digitalSignature + nonRepudiation.
+        "ml_dsa_signing": {
+            "key_usage": dict(digital_signature=True, content_commitment=True,
+                              key_encipherment=False, data_encipherment=False,
+                              key_agreement=False, key_cert_sign=False,
+                              crl_sign=False, encipher_only=False, decipher_only=False),
+            "eku": [ExtendedKeyUsageOID.EMAIL_PROTECTION],
             "san_required": False,
             "bc_ca": False,
         },
@@ -2710,6 +2940,185 @@ class CertificateAuthority:
             ca_pem_path = self.ca_dir / "ca.crt"
             ctx.load_verify_locations(str(ca_pem_path))
         return ctx
+
+    # -----------------------------------------------------------------------
+    # ML-DSA / PQC certificate issuance  (RFC 9763)
+    # -----------------------------------------------------------------------
+
+    def issue_ml_dsa_certificate(
+        self,
+        subject_str: str,
+        mldsa_spki_der: bytes,
+        validity_days: int = 365,
+        profile: str = "ml_dsa_signing",
+        san_emails: Optional[list] = None,
+        related_cert_der: Optional[bytes] = None,
+        audit: Optional["AuditLog"] = None,
+        requester_ip: str = "",
+    ) -> bytes:
+        """
+        Issue an X.509 certificate with an ML-DSA subject public key.
+
+        The CA signs with its own (classical) key.  The subject holds an ML-DSA
+        public key encoded as a SubjectPublicKeyInfo DER blob.
+
+        Args:
+            mldsa_spki_der:  DER-encoded SubjectPublicKeyInfo for the ML-DSA public key.
+            related_cert_der: If provided, adds RFC 9763 RelatedCertificate extension
+                              pointing at this cert's SHA-512 hash.
+        Returns:
+            DER bytes of the issued certificate.
+        """
+        if not HAS_MLDSA:
+            raise RuntimeError("ML-DSA support requires cryptography ≥ 44.0.0")
+
+        import hashlib
+
+        prof = CertProfile.get(profile)
+
+        # Parse subject DN (same logic as issue_certificate)
+        attrs = []
+        for part in subject_str.split(","):
+            part = part.strip()
+            if "=" not in part:
+                continue
+            key_s, _, val_s = part.partition("=")
+            oid_map = {
+                "CN": NameOID.COMMON_NAME, "O": NameOID.ORGANIZATION_NAME,
+                "OU": NameOID.ORGANIZATIONAL_UNIT_NAME, "C": NameOID.COUNTRY_NAME,
+                "L": NameOID.LOCALITY_NAME, "ST": NameOID.STATE_OR_PROVINCE_NAME,
+                "EMAIL": NameOID.EMAIL_ADDRESS,
+            }
+            k = key_s.strip().upper()
+            if k in oid_map:
+                attrs.append(x509.NameAttribute(oid_map[k], val_s.strip()))
+        if not attrs:
+            attrs = [x509.NameAttribute(NameOID.COMMON_NAME, subject_str or "ML-DSA Entity")]
+        subject = x509.Name(attrs)
+
+        serial = self._next_serial()
+        now = datetime.datetime.now(datetime.timezone.utc)
+        not_before = now
+        not_after  = now + datetime.timedelta(days=validity_days)
+
+        # Issuer and AKI
+        issuer_name_der = self.ca_cert.issuer.public_bytes()
+        subject_name_der = subject.public_bytes()
+        ca_ski_ext = self.ca_cert.extensions.get_extension_for_class(x509.SubjectKeyIdentifier)
+        ca_ski_bytes = ca_ski_ext.value.key_identifier
+
+        # SKI for the ML-DSA subject key
+        subject_ski = _ski_from_spki(mldsa_spki_der)
+
+        # Build extensions
+        ku = prof["key_usage"]
+        ku_bits = 0
+        for bit_pos, flag_name in enumerate([
+            "digital_signature", "content_commitment", "key_encipherment",
+            "data_encipherment", "key_agreement", "key_cert_sign",
+            "crl_sign", "encipher_only", "decipher_only",
+        ]):
+            if ku.get(flag_name):
+                ku_bits |= (0x80 >> bit_pos)
+        ku_byte = bytes([ku_bits & 0xFF])
+        unused = 0
+        tmp = ku_bits
+        while tmp and not (tmp & 1):
+            unused += 1; tmp >>= 1
+        ku_der = _pder_tlv(0x03, bytes([unused]) + ku_byte)
+
+        extensions = [
+            ("2.5.29.19", _pder_seq(b""), True),                        # BasicConstraints CA=FALSE
+            ("2.5.29.14", _pder_os(subject_ski), False),                 # SKI
+            ("2.5.29.35", _pder_seq(_pder_ctx(0, ca_ski_bytes, False)), False),  # AKI
+            ("2.5.29.15", ku_der, True),                                 # KeyUsage
+        ]
+        if prof.get("eku"):
+            eku_body = b"".join(_pder_oid(oid.dotted_string) for oid in prof["eku"])
+            extensions.append(("2.5.29.37", _pder_seq(eku_body), False))
+        if san_emails:
+            san_body = b"".join(_pder_tlv(0x81, e.encode("ascii")) for e in san_emails)
+            extensions.append(("2.5.29.17", _pder_seq(san_body), False))
+        if related_cert_der is not None:
+            extensions.append((OID_RELATED_CERT, _related_cert_ext_value_der(related_cert_der), False))
+
+        tbs = _build_mldsa_tbs(
+            serial=serial,
+            ca_key=self.ca_key,
+            issuer_name_der=issuer_name_der,
+            not_before=not_before,
+            not_after=not_after,
+            subject_name_der=subject_name_der,
+            spki_der=mldsa_spki_der,
+            extensions=extensions,
+        )
+        cert_der = _build_cert_der_from_tbs(tbs, self.ca_key, rsa_pss=self._rsa_pss)
+
+        subject_str_out = subject.rfc4514_string()
+        self._pki_db.execute(
+            "INSERT OR REPLACE INTO certificates"
+            "(serial,subject,not_before,not_after,der,revoked,revoked_at,reason,profile) "
+            "VALUES(?,?,?,?,?,0,NULL,NULL,?)",
+            (serial, subject_str_out,
+             not_before.isoformat(),
+             not_after.isoformat(),
+             cert_der, profile),
+        )
+        if audit:
+            audit.record("issue_ml_dsa",
+                         f"serial={serial} subject='{subject_str_out}' profile={profile}",
+                         requester_ip=requester_ip)
+        logger.info("Issued ML-DSA cert serial=%d subject='%s' profile=%s", serial, subject_str_out, profile)
+        return cert_der
+
+    def issue_paired_certs(
+        self,
+        subject_str: str,
+        classical_public_key,
+        mldsa_spki_der: bytes,
+        validity_days: int = 365,
+        san_emails: Optional[list] = None,
+        classical_profile: str = "email_signing",
+        mldsa_profile: str = "ml_dsa_signing",
+        audit: Optional["AuditLog"] = None,
+        requester_ip: str = "",
+    ) -> tuple:
+        """
+        RFC 9763 — atomic paired certificate issuance.
+
+        Issues a classical certificate and a linked ML-DSA certificate for the
+        same entity.  The ML-DSA cert carries a RelatedCertificate extension
+        (OID 1.3.6.1.5.5.7.1.36) whose SHA-512 hash points at the classical cert.
+
+        Args:
+            classical_public_key: RSA / EC / Ed25519 public key for the classical cert.
+            mldsa_spki_der:       DER SubjectPublicKeyInfo for the ML-DSA public key.
+
+        Returns:
+            (classical_cert_pem: str, ml_dsa_cert_der: bytes)
+        """
+        classical_cert = self.issue_certificate(
+            subject_str=subject_str,
+            public_key=classical_public_key,
+            validity_days=validity_days,
+            san_emails=san_emails,
+            profile=classical_profile,
+            audit=audit,
+            requester_ip=requester_ip,
+        )
+        classical_cert_der = classical_cert.public_bytes(Encoding.DER)
+        ml_dsa_cert_der = self.issue_ml_dsa_certificate(
+            subject_str=subject_str,
+            mldsa_spki_der=mldsa_spki_der,
+            validity_days=validity_days,
+            profile=mldsa_profile,
+            san_emails=san_emails,
+            related_cert_der=classical_cert_der,
+            audit=audit,
+            requester_ip=requester_ip,
+        )
+        classical_cert_pem = classical_cert.public_bytes(Encoding.PEM).decode()
+        return classical_cert_pem, ml_dsa_cert_der
 
     def get_certificate_by_serial(self, serial: int) -> Optional[str]:
         """Return PEM string for the certificate with the given serial number, or None."""

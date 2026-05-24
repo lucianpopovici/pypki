@@ -11,6 +11,27 @@ This project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **ML-DSA (FIPS 204) X.509 certificate issuance** (`pki_server.py`).
+  `CertificateAuthority.issue_ml_dsa_certificate()` issues EE certificates with
+  ML-DSA-44, ML-DSA-65, or ML-DSA-87 subject public keys (SPKI DER input). Because
+  `cryptography` 48.0.0's `CertificateBuilder` does not yet accept ML-DSA keys,
+  the TBSCertificate is assembled via hand-rolled `_pder_*` DER helpers and signed
+  by the CA's classical key. Extensions: BasicConstraints (CA=FALSE), SKI, AKI,
+  KeyUsage (digitalSignature + nonRepudiation), EKU, optional SAN (email). New
+  `ml_dsa_signing` CertProfile. `_CA_KEY_FACTORIES` extended with `ml-dsa-44/65/87`
+  entries. Feature gated on `HAS_MLDSA` (requires `cryptography ≥ 44`). 10 tests
+  in `TestMLDSACertificates`.
+
+- **RFC 9763 — Related Certificates for Multiple Authentications** (`pki_server.py`,
+  `web_ui.py`). `issue_paired_certs()` issues a classical (RSA/EC) and an ML-DSA
+  certificate for the same entity atomically. The ML-DSA cert carries the
+  `RelatedCertificate` extension (OID `1.3.6.1.5.5.7.1.36`, non-critical) containing
+  a SHA-512 hash of the paired classical cert's DER bytes. One-directional linkage
+  avoids circular dependency. New `POST /api/paired-issue` REST endpoint: generates
+  both keypairs server-side, returns classical cert PEM + classical PKCS#8 key PEM +
+  ML-DSA cert (base64 DER) + ML-DSA PKCS#8 key (base64 DER). 9 tests in
+  `TestRFC9763RelatedCerts`.
+
 - **RFC 8551 — S/MIME v4 Message Specification** (`smime_server.py`,
   `pki_server.py`). New self-contained `smime_server.py` module implementing
   the full RFC 8551 CMS workflow. `SMIMESigner` produces CMS SignedData for

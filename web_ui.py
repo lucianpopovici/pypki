@@ -974,6 +974,8 @@ class WebUIHandler(http.server.BaseHTTPRequestHandler):
                 self._api_scep_mint_otp(data)
             elif path == "/api/cross-sign":
                 self._api_cross_sign(data)
+            elif path == "/api/paired-issue":
+                self._api_paired_issue(data)
             elif path.startswith("/api/ra/approve/"):
                 req_id = path.split("/api/ra/approve/", 1)[1].strip("/")
                 self._api_ra_approve(req_id)
@@ -1943,6 +1945,75 @@ class WebUIHandler(http.server.BaseHTTPRequestHandler):
         self._send_json({
             "certificate_pem": pem_out,
             "serial": cert_out.serial_number,
+        })
+
+    def _api_paired_issue(self, data: dict):
+        """POST /api/paired-issue — RFC 9763 paired classical + ML-DSA certificate issuance."""
+        import pki_server as _pki_mod
+        if not _pki_mod.HAS_MLDSA:
+            self._send_json({"error": "ML-DSA not available (requires cryptography ≥ 44)"}, 501)
+            return
+        from cryptography.hazmat.primitives.asymmetric import mldsa as _mldsa
+        from cryptography.hazmat.primitives.asymmetric import ec
+        from cryptography.hazmat.primitives.serialization import (
+            Encoding as _Enc, PrivateFormat as _PF, NoEncryption as _NE,
+            PublicFormat as _PuF,
+        )
+
+        subject = data.get("subject", "CN=PQC Entity")
+        validity_days = int(data.get("validity_days", 365))
+        san_emails = data.get("san_emails") or None
+        classical_key_type = data.get("classical_key_type", "ec-p256")
+        ml_dsa_variant = data.get("ml_dsa_variant", "ml-dsa-44")
+
+        # Generate classical key
+        classical_factories = {
+            "ec-p256": lambda: ec.generate_private_key(ec.SECP256R1()),
+            "ec-p384": lambda: ec.generate_private_key(ec.SECP384R1()),
+            "rsa-2048": lambda: __import__("cryptography.hazmat.primitives.asymmetric.rsa",
+                                           fromlist=["generate_private_key"]).generate_private_key(
+                                               public_exponent=65537, key_size=2048),
+        }
+        if classical_key_type not in classical_factories:
+            self._send_json({"error": f"classical_key_type must be one of {list(classical_factories)}"}, 400)
+            return
+        classical_key = classical_factories[classical_key_type]()
+
+        # Generate ML-DSA key
+        mldsa_factories = {
+            "ml-dsa-44": _mldsa.MLDSA44PrivateKey.generate,
+            "ml-dsa-65": _mldsa.MLDSA65PrivateKey.generate,
+            "ml-dsa-87": _mldsa.MLDSA87PrivateKey.generate,
+        }
+        if ml_dsa_variant not in mldsa_factories:
+            self._send_json({"error": f"ml_dsa_variant must be one of {list(mldsa_factories)}"}, 400)
+            return
+        mldsa_key = mldsa_factories[ml_dsa_variant]()
+        mldsa_spki_der = mldsa_key.public_key().public_bytes(_Enc.DER, _PuF.SubjectPublicKeyInfo)
+
+        classical_cert_pem, ml_dsa_cert_der = self.ca.issue_paired_certs(
+            subject_str=subject,
+            classical_public_key=classical_key.public_key(),
+            mldsa_spki_der=mldsa_spki_der,
+            validity_days=validity_days,
+            san_emails=san_emails,
+            audit=self.audit_log,
+            requester_ip=self.client_address[0] if self.client_address else "",
+        )
+
+        classical_key_pem = classical_key.private_bytes(
+            _Enc.PEM, _PF.PKCS8, _NE()
+        ).decode()
+        mldsa_key_der = mldsa_key.private_bytes(_Enc.DER, _PF.PKCS8, _NE())
+
+        import base64 as _b64
+        self._send_json({
+            "classical_cert_pem": classical_cert_pem,
+            "classical_private_key_pem": classical_key_pem,
+            "ml_dsa_cert_b64": _b64.b64encode(ml_dsa_cert_der).decode(),
+            "ml_dsa_private_key_b64": _b64.b64encode(mldsa_key_der).decode(),
+            "ml_dsa_variant": ml_dsa_variant,
+            "classical_key_type": classical_key_type,
         })
 
     def _api_scep_mint_otp(self, data: dict):
