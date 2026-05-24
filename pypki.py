@@ -40,12 +40,14 @@ def _build_argv(cfg: dict) -> list:
 
     # ── core ──────────────────────────────────────────────────────────────────
     argv += ["--host",      cfg.get("host", "0.0.0.0")]
-    argv += ["--port",      str(cfg.get("port", 8080))]
+    # CMP port: prefer cfg["cmp"]["port"], fall back to top-level "port" then 8080
+    cmp = cfg.get("cmp", {})
+    cmp_port = cmp.get("port", cfg.get("port", 8080))
+    argv += ["--port",      str(cmp_port)]
     argv += ["--ca-dir",    cfg.get("ca_dir", "./ca")]
     argv += ["--log-level", cfg.get("log_level", "INFO")]
 
     # ── CMP prefix ────────────────────────────────────────────────────────────
-    cmp = cfg.get("cmp", {})
     argv += ["--cmp-prefix", cmp.get("prefix", "/cmp")]
 
     # ── TLS ───────────────────────────────────────────────────────────────────
@@ -72,6 +74,7 @@ def _build_argv(cfg: dict) -> list:
     # ── Web UI — always on ────────────────────────────────────────────────────
     web = cfg.get("web_ui", {})
     argv += ["--web-prefix", web.get("prefix", "/")]
+    argv += ["--web-port",   str(web.get("port", 8080))]
     if web.get("no_auth", False):
         argv.append("--web-no-auth")
     pam_service = web.get("pam_service", "login")
@@ -82,6 +85,7 @@ def _build_argv(cfg: dict) -> list:
     acme = cfg.get("acme", {})
     if acme.get("enabled", False):
         argv += ["--acme-prefix", acme.get("prefix", "/acme")]
+        argv += ["--acme-port",   str(acme.get("port", 8080))]
         if acme.get("cert_days"):
             argv += ["--acme-cert-days", str(acme["cert_days"])]
         if acme.get("short_lived_threshold_days"):
@@ -95,6 +99,7 @@ def _build_argv(cfg: dict) -> list:
     scep = cfg.get("scep", {})
     if scep.get("enabled", False):
         argv += ["--scep-prefix", scep.get("prefix", "/scep")]
+        argv += ["--scep-port",   str(scep.get("port", 8080))]
         if scep.get("challenge"):
             argv += ["--scep-challenge", scep["challenge"]]
 
@@ -102,6 +107,7 @@ def _build_argv(cfg: dict) -> list:
     est = cfg.get("est", {})
     if est.get("enabled", False):
         argv += ["--est-prefix", est.get("prefix", "/est")]
+        argv += ["--est-port",   str(est.get("port", 8080))]
         if est.get("require_auth", True):
             argv.append("--est-require-auth")
 
@@ -109,6 +115,7 @@ def _build_argv(cfg: dict) -> list:
     ocsp = cfg.get("ocsp", {})
     if ocsp.get("enabled", False):
         argv += ["--ocsp-prefix", ocsp.get("prefix", "/ocsp")]
+        argv += ["--ocsp-port",   str(ocsp.get("port", 8080))]
         argv += ["--ocsp-cache-seconds", str(ocsp.get("cache_seconds", 300))]
         if ocsp.get("url"):
             argv += ["--ocsp-url", ocsp["url"]]
@@ -117,6 +124,7 @@ def _build_argv(cfg: dict) -> list:
     ipsec = cfg.get("ipsec", {})
     if ipsec.get("enabled", False):
         argv += ["--ipsec-prefix", ipsec.get("prefix", "/ipsec")]
+        argv += ["--ipsec-port",   str(ipsec.get("port", 8080))]
 
     # ── Validity periods ──────────────────────────────────────────────────────
     validity = cfg.get("validity", {})

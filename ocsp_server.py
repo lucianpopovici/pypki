@@ -691,10 +691,18 @@ def start_ocsp_server(
 
     Returns a _RouteProxy whose .shutdown() unregisters the OCSP routes.
 
+    Backwards-compatible standalone mode: when *route_table* is a ``str``
+    (host address) and *prefix* is an ``int`` (port), a real
+    ``ThreadingHTTPServer`` is started and returned directly.
+
     ``require_nonce`` enables RFC 8954 strict mode: requests without a
     nonce extension are rejected with status 'unauthorized'. Default is
     off, matching RFC 6960 default behavior.
     """
+    # Backwards-compat: start_ocsp_server(host, port, ca, cache_seconds=N)
+    if isinstance(route_table, str) and isinstance(prefix, int):
+        return _start_ocsp_standalone(route_table, prefix, ca, cache_seconds, require_nonce)
+
     from dispatcher_server import _RouteProxy
 
     ocsp_key, ocsp_cert = provision_ocsp_signing_cert(ca)
@@ -716,6 +724,37 @@ def start_ocsp_server(
         f"(require_nonce={require_nonce})"
     )
     return _RouteProxy(route_table, prefix, label="ocsp")
+
+
+def _start_ocsp_standalone(
+    host: str,
+    port: int,
+    ca: "CertificateAuthority",
+    cache_seconds: int = 300,
+    require_nonce: bool = False,
+):
+    """Start a real standalone HTTP OCSP server on host:port (backwards-compat mode)."""
+    import http.server
+    import threading
+
+    ocsp_key, ocsp_cert = provision_ocsp_signing_cert(ca)
+    cache = OCSPResponseCache(ttl_seconds=cache_seconds)
+
+    class _StandaloneOCSPHandler(OCSPHandler):
+        pass
+
+    _StandaloneOCSPHandler.ca = ca
+    _StandaloneOCSPHandler.ocsp_key = ocsp_key
+    _StandaloneOCSPHandler.ocsp_cert = ocsp_cert
+    _StandaloneOCSPHandler.cache = cache
+    _StandaloneOCSPHandler.cache_max_age = cache_seconds
+    _StandaloneOCSPHandler.require_nonce = require_nonce
+
+    server = http.server.ThreadingHTTPServer((host, port), _StandaloneOCSPHandler)
+    t = threading.Thread(target=server.serve_forever, daemon=True)
+    t.start()
+    logger.info("OCSP standalone server started on %s:%d", host, port)
+    return server
 
 
 # ---------------------------------------------------------------------------

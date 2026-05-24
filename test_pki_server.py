@@ -3039,7 +3039,9 @@ class TestModuleStructure(unittest.TestCase):
 
     def test_cert_profile_has_all_profiles(self):
         expected = {"tls_server", "tls_client", "code_signing", "email",
-                    "ocsp_signing", "tsa_signing", "sub_ca", "short_lived", "default"}
+                    "email_signing", "email_encryption_rsa", "email_encryption_ec",
+                    "ocsp_signing", "tsa_signing", "sub_ca", "short_lived", "default",
+                    "ml_dsa_signing"}
         actual = set(pki.CertProfile.PROFILES.keys())
         self.assertEqual(actual, expected,
                          f"Missing profiles: {expected - actual}")
@@ -6227,6 +6229,9 @@ class TestESTRouting(unittest.TestCase):
                 csr = x509.CertificateSigningRequestBuilder().subject_name(
                     x509.Name([])).sign(key, hashes.SHA256())
                 return csr
+            def _validate_csr_for_profile(self, csr, profile):
+                # Bypass SAN validation so the test focuses on label→profile routing
+                return True, ""
 
         ca = MockCA()
         DummyHandler.ca = ca
@@ -6391,7 +6396,7 @@ class TestACMEEAB(unittest.TestCase):
         
         # 1. Mock DB
         db = type("MockDB", (), {
-            "get_eab_key": lambda k: mac_key_b64 if k == kid else None
+            "get_eab_key": lambda self, k: mac_key_b64 if k == kid else None
         })()
         
         # 2. Prepare Account JWK
@@ -6425,7 +6430,7 @@ class TestACMEEAB(unittest.TestCase):
         """Verify EAB fails if the signature is incorrect."""
         kid = "test-kid"
         mac_key = b"secret"
-        db = type("MockDB", (), {"get_eab_key": lambda k: self._b64url(mac_key)})()
+        db = type("MockDB", (), {"get_eab_key": lambda _self, k: self._b64url(mac_key)})()
         
         account_jwk = {"kty": "RSA"}
         payload_b64 = self._b64url(self.json.dumps(account_jwk).encode())

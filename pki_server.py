@@ -4898,6 +4898,10 @@ def main():
         help="Mount web dashboard at this path prefix (e.g. /)"
     )
     ops_group.add_argument(
+        "--web-port", type=int, default=None, metavar="PORT",
+        help="Port hint for the web dashboard URL (informational; dispatcher binds --port)"
+    )
+    ops_group.add_argument(
         "--web-no-auth", action="store_true", default=False,
         help="Disable PAM authentication on the web dashboard (development only)"
     )
@@ -4906,8 +4910,28 @@ def main():
         help="PAM service name used for web dashboard login (default: login)"
     )
     ops_group.add_argument(
+        "--acme-port", type=int, default=None, metavar="PORT",
+        help="Port hint for ACME (informational in dispatcher mode; the dispatcher binds --port)"
+    )
+    ops_group.add_argument(
+        "--scep-port", type=int, default=None, metavar="PORT",
+        help="Port hint for SCEP (informational in dispatcher mode)"
+    )
+    ops_group.add_argument(
+        "--est-port", type=int, default=None, metavar="PORT",
+        help="Port hint for EST (informational in dispatcher mode)"
+    )
+    ops_group.add_argument(
+        "--ocsp-port", type=int, default=None, metavar="PORT",
+        help="Port hint for OCSP (informational in dispatcher mode)"
+    )
+    ops_group.add_argument(
         "--ipsec-prefix", default=None, metavar="PREFIX",
         help="Mount IPsec PKI server at this path prefix (e.g. /ipsec)"
+    )
+    ops_group.add_argument(
+        "--ipsec-port", type=int, default=None, metavar="PORT",
+        help="Port hint for IPsec (informational in dispatcher mode)"
     )
     ops_group.add_argument(
         "--ipsec-tls-cert", default=None, metavar="PATH",

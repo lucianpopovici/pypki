@@ -973,7 +973,9 @@ class ACMEHandler(http.server.BaseHTTPRequestHandler):
                 return False, "EAB JWS missing 'kid' in protected header", None
             
             # 2. Lookup MAC key
-            mac_key_b64 = self.db.get_eab_key(kid)
+            # Support class-level testing pattern where self may be None
+            _db = self.db if self is not None else ACMEHandler.db
+            mac_key_b64 = _db.get_eab_key(kid)
             if not mac_key_b64:
                 return False, f"EAB kid '{kid}' not found or revoked", None
             

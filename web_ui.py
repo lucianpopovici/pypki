@@ -2244,14 +2244,17 @@ class WebUIHandler(http.server.BaseHTTPRequestHandler):
 # ---------------------------------------------------------------------------
 
 def start_web_ui(
-    route_table,
-    prefix: str,
-    ca,
+    route_table=None,
+    prefix: str = "/",
+    ca=None,
     audit_log=None,
     rate_limiter=None,
     # Authentication
     require_auth: bool = True,   # set False with --web-no-auth
     pam_service:  str  = "login",
+    # Standalone mode: pass host + port instead of route_table + prefix
+    host: str = None,
+    port: int = None,
     # Base URL of the dispatcher (e.g. "http://localhost:8080") — used to
     # build clickable URLs in the Services page when launching a sub-service.
     dispatcher_base_url: str = "",
@@ -2282,6 +2285,9 @@ def start_web_ui(
     """
     Register the Web UI handler with the shared route table.
 
+    Standalone mode: pass *host* and *port* instead of *route_table* and
+    *prefix*; a real ``ThreadingHTTPServer`` is started and returned.
+
     Pass the running server objects (*_server kwargs) so the Services page
     reflects which protocols are already active.
 
@@ -2289,8 +2295,20 @@ def start_web_ui(
     stopping services live from the dashboard, without restarting the process.
     If a module is None the service card shows "Not installed".
 
-    Returns a _RouteProxy whose .shutdown() unregisters the handler.
+    Returns a _RouteProxy (dispatcher mode) or a real HTTP server (standalone
+    mode).  Both support ``.shutdown()``.
     """
+    # Standalone mode: host + port provided
+    if host is not None and port is not None:
+        return _start_web_ui_standalone(
+            host=host, port=port, ca=ca,
+            audit_log=audit_log, rate_limiter=rate_limiter,
+            require_auth=require_auth, pam_service=pam_service,
+            cmp_module=cmp_module, acme_module=acme_module,
+            scep_module=scep_module, est_module=est_module,
+            ocsp_module=ocsp_module, ipsec_module=ipsec_module,
+        )
+
     from dispatcher_server import _RouteProxy
 
     # bind_host is used by _launch_service — derive it from dispatcher_base_url
@@ -2357,3 +2375,64 @@ def start_web_ui(
     route_table.register(prefix, BoundWebUIHandler)
     logger.info("Web UI handler registered at prefix %r", prefix)
     return _RouteProxy(route_table, prefix, label="web_ui")
+
+
+def _start_web_ui_standalone(
+    host: str,
+    port: int,
+    ca,
+    *,
+    audit_log=None,
+    rate_limiter=None,
+    require_auth: bool = True,
+    pam_service: str = "login",
+    cmp_module=None,
+    acme_module=None,
+    scep_module=None,
+    est_module=None,
+    ocsp_module=None,
+    ipsec_module=None,
+):
+    """Start a real standalone HTTP web UI server on host:port (backwards-compat mode)."""
+    import http.server
+    import threading
+
+    service_registry: Dict[str, Any] = {
+        "cmp":   {"server": None, "available": cmp_module is not None,   "url": "", "bind_host": host, "config": {"prefix": "/cmp"}},
+        "acme":  {"server": None, "available": acme_module is not None,  "url": "", "bind_host": host, "config": {"prefix": "/acme"}},
+        "scep":  {"server": None, "available": scep_module is not None,  "url": "", "bind_host": host, "config": {"prefix": "/scep"}},
+        "est":   {"server": None, "available": est_module is not None,   "url": "", "bind_host": host, "config": {"prefix": "/est"}},
+        "ocsp":  {"server": None, "available": ocsp_module is not None,  "url": "", "bind_host": host, "config": {"prefix": "/ocsp"}},
+        "ipsec": {"server": None, "available": ipsec_module is not None, "url": "", "bind_host": host, "config": {"prefix": "/ipsec"}},
+        "_modules": {
+            "cmp": cmp_module, "acme": acme_module, "scep": scep_module,
+            "est": est_module, "ocsp": ocsp_module, "ipsec": ipsec_module,
+        },
+    }
+
+    class BoundHandler(WebUIHandler):
+        pass
+
+    global _auth_enabled
+    _auth_enabled = require_auth
+
+    BoundHandler.ca               = ca
+    BoundHandler.audit_log        = audit_log
+    BoundHandler.rate_limiter     = rate_limiter
+    BoundHandler.require_auth     = require_auth
+    BoundHandler.pam_service      = pam_service
+    BoundHandler.service_registry = service_registry
+    BoundHandler.route_table      = None
+    BoundHandler.dispatcher_base_url = ""
+    BoundHandler.cmp_base_url  = ""
+    BoundHandler.acme_base_url = ""
+    BoundHandler.scep_base_url = ""
+    BoundHandler.est_base_url  = ""
+    BoundHandler.ocsp_base_url = ""
+    BoundHandler.ipsec_base_url = ""
+
+    srv = http.server.ThreadingHTTPServer((host, port), BoundHandler)
+    t = threading.Thread(target=srv.serve_forever, daemon=True)
+    t.start()
+    logger.info("Web UI standalone server started on %s:%d", host, srv.server_address[1])
+    return srv

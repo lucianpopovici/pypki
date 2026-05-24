@@ -2530,21 +2530,22 @@ def start_bootstrap_server(host: str, port: int, ca: CertificateAuthority, cmp_h
 # ---------------------------------------------------------------------------
 
 def start_cmp_server(
-    route_table,
-    prefix: str,
-    ca: "CertificateAuthority",
+    route_table=None,
+    prefix: str = "/cmp",
+    ca: "CertificateAuthority" = None,
     audit_log: Optional["AuditLog"] = None,
     rate_limiter: Optional["RateLimiter"] = None,
     use_cmpv3: bool = True,
     bootstrap_port: Optional[int] = None,
-    # TLS parameters kept for API compatibility but are now handled by the
-    # dispatcher server; passing them here has no effect.
     tls_cert_path: Optional[str] = None,
     tls_key_path: Optional[str] = None,
     require_client_cert: bool = False,
     tls13_only: bool = False,
     alpn_protocols: Optional[List[str]] = None,
     tls_reload_interval: int = 60,
+    # Standalone mode: pass host + port instead of route_table + prefix
+    host: Optional[str] = None,
+    port: Optional[int] = None,
 ):
     """
     Register the CMP handler with *route_table* under *prefix*.
@@ -2562,7 +2563,21 @@ def start_cmp_server(
                    False → CMPv2Handler only
     bootstrap_port : if set, also start a plain-HTTP bootstrap server on
                      this port (separate from the main dispatcher)
+    host, port     : standalone mode — bypass route_table and start a real
+                     HTTPServer on host:port (with optional TLS)
     """
+    # Standalone mode: host + port provided instead of route_table
+    if host is not None and port is not None:
+        return _start_cmp_standalone(
+            host, port, ca,
+            tls_cert_path=tls_cert_path,
+            tls_key_path=tls_key_path,
+            tls_reload_interval=tls_reload_interval,
+            use_cmpv3=use_cmpv3,
+            audit_log=audit_log,
+            rate_limiter=rate_limiter,
+        )
+
     from dispatcher_server import _RouteProxy
 
     if use_cmpv3:
@@ -2583,6 +2598,87 @@ def start_cmp_server(
     # Expose reload_tls() shim for callers that used it on the old server object
     proxy.reload_tls = lambda: False
     return proxy
+
+
+class _StandaloneCMPServer:
+    """Returned by start_cmp_server(host=..., port=...) standalone mode."""
+
+    def __init__(self, http_server, ctx_holder=None, cert_path=None, key_path=None):
+        self._srv = http_server
+        self.ctx_holder = ctx_holder
+        self._cert_path = cert_path
+        self._key_path = key_path
+        self._thread = threading.Thread(target=http_server.serve_forever, daemon=True)
+        self._thread.start()
+
+    def shutdown(self):
+        self._srv.shutdown()
+        self._thread.join(timeout=5)
+
+    def server_close(self):
+        self._srv.server_close()
+
+    @property
+    def server_address(self):
+        return self._srv.server_address
+
+    def reload_tls(self) -> bool:
+        """Reload TLS certificate from disk. Returns True on success, False if no TLS."""
+        if self.ctx_holder is None or not self._cert_path or not self._key_path:
+            return False
+        try:
+            new_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+            new_ctx.load_cert_chain(self._cert_path, self._key_path)
+            self.ctx_holder.swap(new_ctx)
+            return True
+        except Exception:
+            return False
+
+
+def _start_cmp_standalone(
+    host: str,
+    port: int,
+    ca: "CertificateAuthority",
+    *,
+    tls_cert_path: Optional[str] = None,
+    tls_key_path: Optional[str] = None,
+    tls_reload_interval: int = 60,
+    use_cmpv3: bool = True,
+    audit_log=None,
+    rate_limiter=None,
+) -> _StandaloneCMPServer:
+    """Start a real standalone HTTP(S) CMP server on host:port."""
+    import http.server
+
+    if use_cmpv3:
+        cmp_handler_obj = CMPv3Handler(ca)
+        handler_cls = make_cmpv3_handler(ca, cmp_handler_obj, audit_log, rate_limiter)
+    else:
+        cmp_handler_obj = CMPv2Handler(ca)
+        handler_cls = make_handler(ca, cmp_handler_obj, audit_log, rate_limiter)
+
+    ctx_holder = None
+    if tls_cert_path and tls_key_path:
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        ctx.load_cert_chain(tls_cert_path, tls_key_path)
+        ctx_holder = TLSContextHolder(ctx)
+
+        class _TLSServer(http.server.ThreadingHTTPServer):
+            def __init__(self, addr, handler):
+                super().__init__(addr, handler)
+                self.ctx_holder = ctx_holder
+
+            def get_request(self):
+                sock, addr = self.socket.accept()
+                tls_sock = self.ctx_holder.get().wrap_socket(sock, server_side=True)
+                return tls_sock, addr
+
+        srv = _TLSServer((host, port), handler_cls)
+    else:
+        srv = http.server.ThreadingHTTPServer((host, port), handler_cls)
+
+    return _StandaloneCMPServer(srv, ctx_holder=ctx_holder,
+                                cert_path=tls_cert_path, key_path=tls_key_path)
 
 
 # ---------------------------------------------------------------------------
