@@ -11,6 +11,23 @@ This project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **RFC 8551 — S/MIME v4 Message Specification** (`smime_server.py`,
+  `pki_server.py`). New self-contained `smime_server.py` module implementing
+  the full RFC 8551 CMS workflow. `SMIMESigner` produces CMS SignedData for
+  opaque and detached signatures using RSA-PKCS1v15, ECDSA, or Ed25519 via
+  `PKCS7SignatureBuilder`. `SMIMEEncryptor` encrypts content for one or more
+  recipients: RSA recipients use RSA-OAEP with SHA-256 (MUST per RFC 8551
+  §2.7.2.2; PKCS1v15 rejected for new issuance), EC recipients use
+  dhSinglePass-stdDH-sha256kdf-scheme (OID `1.3.132.1.11`) + AES-256-wrap
+  per RFC 5753. Content encryption: AES-256-GCM (default) or AES-256-CBC.
+  Multi-recipient envelopes carry one KTRI per RSA cert and one KARI tagged
+  `[1]` per EC cert. `SMIMEDecryptor` auto-detects RSA-OAEP, legacy
+  PKCS1v15, and ECDH KARI. REST API at `--smime-prefix` with four endpoints:
+  `POST /smime/sign`, `/smime/verify`, `/smime/encrypt`, `/smime/decrypt`.
+  Three new `CertProfile` entries: `email_signing` (digitalSignature +
+  nonRepudiation per §2.3.1), `email_encryption_rsa` (keyEncipherment only),
+  `email_encryption_ec` (keyAgreement only). 25 tests in `TestRFC8551SMIME`.
+
 - **RFC 8739 — ACME STAR (Short-Term Automatic Renewal)** (`acme_server.py`,
   `pki_server.py`). Enables clients to request short-lived certificates that
   are automatically renewed by the server before expiry. New `STARRenewalWorker`

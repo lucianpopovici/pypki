@@ -10296,6 +10296,206 @@ class TestRFC8739ACMESTAR(unittest.TestCase):
 
 
 # ===========================================================================
+# TestRFC8551SMIME — S/MIME v4 Message Specification
+# ===========================================================================
+
+class TestRFC8551SMIME(unittest.TestCase):
+    """RFC 8551 — S/MIME v4 CMS signing, encryption, and decryption."""
+
+    @classmethod
+    def setUpClass(cls):
+        import smime_server as s
+        cls.s = s
+
+        # RSA key + cert
+        from cryptography.hazmat.primitives.asymmetric import rsa, ec
+        from cryptography.hazmat.primitives import hashes
+        from cryptography import x509
+        from cryptography.x509.oid import NameOID
+        import datetime
+
+        cls.rsa_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        subject_rsa = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "Test RSA")])
+        cls.rsa_cert = (
+            x509.CertificateBuilder()
+            .subject_name(subject_rsa).issuer_name(subject_rsa)
+            .public_key(cls.rsa_key.public_key())
+            .serial_number(x509.random_serial_number())
+            .not_valid_before(datetime.datetime.now(datetime.timezone.utc))
+            .not_valid_after(datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(days=1))
+            .sign(cls.rsa_key, hashes.SHA256())
+        )
+
+        # EC P-256 key + cert
+        cls.ec_key = ec.generate_private_key(ec.SECP256R1())
+        subject_ec = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "Test EC")])
+        cls.ec_cert = (
+            x509.CertificateBuilder()
+            .subject_name(subject_ec).issuer_name(subject_ec)
+            .public_key(cls.ec_key.public_key())
+            .serial_number(x509.random_serial_number())
+            .not_valid_before(datetime.datetime.now(datetime.timezone.utc))
+            .not_valid_after(datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(days=1))
+            .sign(cls.ec_key, hashes.SHA256())
+        )
+
+        cls.message = b"Secret S/MIME content per RFC 8551"
+
+    # --- Signing ---
+
+    def test_sign_rsa_produces_der_cms(self):
+        signed = self.s.SMIMESigner.sign(self.message, self.rsa_key, self.rsa_cert)
+        self.assertIsInstance(signed, bytes)
+        # DER ContentInfo starts with SEQUENCE tag 0x30
+        self.assertEqual(signed[0], 0x30)
+
+    def test_sign_ec_produces_der_cms(self):
+        signed = self.s.SMIMESigner.sign(self.message, self.ec_key, self.ec_cert)
+        self.assertIsInstance(signed, bytes)
+        self.assertEqual(signed[0], 0x30)
+
+    def test_sign_detached(self):
+        signed = self.s.SMIMESigner.sign(self.message, self.rsa_key, self.rsa_cert, detached=True)
+        self.assertIsInstance(signed, bytes)
+
+    def test_sign_contains_signer_cert(self):
+        from cryptography.hazmat.primitives.serialization.pkcs7 import load_der_pkcs7_certificates
+        signed = self.s.SMIMESigner.sign(self.message, self.rsa_key, self.rsa_cert)
+        certs = load_der_pkcs7_certificates(signed)
+        self.assertEqual(len(certs), 1)
+        self.assertEqual(certs[0].serial_number, self.rsa_cert.serial_number)
+
+    # --- Verification ---
+
+    def test_verify_rsa_opaque_ok(self):
+        signed = self.s.SMIMESigner.sign(self.message, self.rsa_key, self.rsa_cert)
+        result = self.s.SMIMESigner.verify(signed)
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["errors"], [])
+
+    def test_verify_ec_opaque_ok(self):
+        signed = self.s.SMIMESigner.sign(self.message, self.ec_key, self.ec_cert)
+        result = self.s.SMIMESigner.verify(signed)
+        self.assertTrue(result["ok"])
+
+    def test_verify_detached_ok(self):
+        signed = self.s.SMIMESigner.sign(self.message, self.rsa_key, self.rsa_cert, detached=True)
+        result = self.s.SMIMESigner.verify(signed, detached_content=self.message)
+        self.assertTrue(result["ok"])
+
+    def test_verify_tampered_content_fails(self):
+        signed = self.s.SMIMESigner.sign(self.message, self.rsa_key, self.rsa_cert)
+        # Tamper: flip the last bit of the message inside the CMS
+        tampered = bytearray(signed)
+        tampered[-5] ^= 0xFF
+        result = self.s.SMIMESigner.verify(bytes(tampered))
+        self.assertFalse(result["ok"])
+
+    def test_verify_returns_signer_cert(self):
+        signed = self.s.SMIMESigner.sign(self.message, self.rsa_key, self.rsa_cert)
+        result = self.s.SMIMESigner.verify(signed)
+        self.assertIsNotNone(result["signer_cert"])
+
+    # --- RSA-OAEP Encryption (RFC 8551 §2.7.2.2 MUST) ---
+
+    def test_encrypt_rsa_oaep_roundtrip(self):
+        enc = self.s.SMIMEEncryptor.encrypt(self.message, [self.rsa_cert])
+        plain, ct_oid = self.s.SMIMEDecryptor.decrypt(enc, self.rsa_key, self.rsa_cert)
+        self.assertEqual(plain, self.message)
+        self.assertEqual(ct_oid, self.s.OID_DATA)
+
+    def test_encrypt_rsa_oaep_uses_oaep_oid(self):
+        enc = self.s.SMIMEEncryptor.encrypt(self.message, [self.rsa_cert])
+        # OID_RSAES_OAEP (1.2.840.113549.1.1.7) must appear in the encrypted blob.
+        # The TLV for this OID is: 06 09 2a 86 48 86 f7 0d 01 01 07
+        import binascii
+        hex_blob = binascii.hexlify(enc).decode()
+        self.assertIn("2a864886f70d010107", hex_blob)
+
+    def test_encrypt_rsa_aes256cbc_roundtrip(self):
+        enc = self.s.SMIMEEncryptor.encrypt(self.message, [self.rsa_cert], alg="aes256-cbc")
+        plain, _ = self.s.SMIMEDecryptor.decrypt(enc, self.rsa_key, self.rsa_cert)
+        self.assertEqual(plain, self.message)
+
+    def test_decrypt_wrong_key_fails(self):
+        from cryptography.hazmat.primitives.asymmetric import rsa
+        wrong_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        enc = self.s.SMIMEEncryptor.encrypt(self.message, [self.rsa_cert])
+        with self.assertRaises(ValueError):
+            self.s.SMIMEDecryptor.decrypt(enc, wrong_key, self.rsa_cert)
+
+    # --- ECDH Key Agreement Encryption (RFC 8551 §2.7.2.3) ---
+
+    def test_encrypt_ecdh_gcm_roundtrip(self):
+        enc = self.s.SMIMEEncryptor.encrypt(self.message, [self.ec_cert], alg="aes256-gcm")
+        plain, ct_oid = self.s.SMIMEDecryptor.decrypt(enc, self.ec_key, self.ec_cert)
+        self.assertEqual(plain, self.message)
+        self.assertEqual(ct_oid, self.s.OID_DATA)
+
+    def test_encrypt_ecdh_cbc_roundtrip(self):
+        enc = self.s.SMIMEEncryptor.encrypt(self.message, [self.ec_cert], alg="aes256-cbc")
+        plain, _ = self.s.SMIMEDecryptor.decrypt(enc, self.ec_key, self.ec_cert)
+        self.assertEqual(plain, self.message)
+
+    def test_encrypt_ecdh_uses_kari_tag(self):
+        enc = self.s.SMIMEEncryptor.encrypt(self.message, [self.ec_cert])
+        # The [1] IMPLICIT KARI tag (0xA1) must appear in recipientInfos
+        import binascii
+        hex_blob = binascii.hexlify(enc).decode()
+        self.assertIn("a1", hex_blob)
+
+    def test_encrypt_multi_recipient_rsa_ec(self):
+        enc = self.s.SMIMEEncryptor.encrypt(self.message, [self.rsa_cert, self.ec_cert])
+        plain_rsa, _ = self.s.SMIMEDecryptor.decrypt(enc, self.rsa_key, self.rsa_cert)
+        plain_ec, _ = self.s.SMIMEDecryptor.decrypt(enc, self.ec_key, self.ec_cert)
+        self.assertEqual(plain_rsa, self.message)
+        self.assertEqual(plain_ec, self.message)
+
+    # --- Profile compliance ---
+
+    def test_new_profiles_in_certprofile(self):
+        from pki_server import CertProfile
+        self.assertIn("email_signing", CertProfile.PROFILES)
+        self.assertIn("email_encryption_rsa", CertProfile.PROFILES)
+        self.assertIn("email_encryption_ec", CertProfile.PROFILES)
+
+    def test_email_signing_profile_key_usage(self):
+        from pki_server import CertProfile
+        p = CertProfile.PROFILES["email_signing"]
+        self.assertTrue(p["key_usage"]["digital_signature"])
+        self.assertTrue(p["key_usage"]["content_commitment"])
+        self.assertFalse(p["key_usage"]["key_encipherment"])
+
+    def test_email_encryption_rsa_profile_key_usage(self):
+        from pki_server import CertProfile
+        p = CertProfile.PROFILES["email_encryption_rsa"]
+        self.assertFalse(p["key_usage"]["digital_signature"])
+        self.assertTrue(p["key_usage"]["key_encipherment"])
+
+    def test_email_encryption_ec_profile_key_usage(self):
+        from pki_server import CertProfile
+        p = CertProfile.PROFILES["email_encryption_ec"]
+        self.assertTrue(p["key_usage"]["key_agreement"])
+        self.assertFalse(p["key_usage"]["key_encipherment"])
+
+    def test_make_smime_handler_binds_ca(self):
+        handler_cls = self.s.make_smime_handler(ca="fake_ca")
+        self.assertEqual(handler_cls.ca, "fake_ca")
+
+    def test_make_smime_handler_default_ca_none(self):
+        handler_cls = self.s.make_smime_handler()
+        self.assertIsNone(handler_cls.ca)
+
+    def test_encrypt_unsupported_alg_raises(self):
+        with self.assertRaises(ValueError):
+            self.s.SMIMEEncryptor.encrypt(self.message, [self.rsa_cert], alg="chacha20")
+
+    def test_encrypt_no_recipients_raises(self):
+        with self.assertRaises(ValueError):
+            self.s.SMIMEEncryptor.encrypt(self.message, [])
+
+
+# ===========================================================================
 # Entry point
 # ===========================================================================
 

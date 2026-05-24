@@ -176,6 +176,14 @@ try:
 except ImportError:
     HAS_IPSEC = False
 
+# S/MIME module (optional — loaded if --smime-prefix is specified)
+# RFC 8551 — S/MIME v4 Message Specification
+try:
+    import smime_server as _smime_module
+    HAS_SMIME = True
+except ImportError:
+    HAS_SMIME = False
+
 # CMP server module import is deferred to after all class definitions to avoid
 # circular imports: cmp_server.py does `from pki_server import CertificateAuthority, ...`
 # which requires pki_server to be fully loaded first.
@@ -1407,6 +1415,36 @@ class CertProfile:
             "key_usage": dict(digital_signature=True, content_commitment=True,
                               key_encipherment=True, data_encipherment=False,
                               key_agreement=False, key_cert_sign=False,
+                              crl_sign=False, encipher_only=False, decipher_only=False),
+            "eku": [ExtendedKeyUsageOID.EMAIL_PROTECTION],
+            "san_required": False,
+            "bc_ca": False,
+        },
+        # RFC 8551 §2.3.1 — S/MIME signing certificate: digitalSignature + nonRepudiation.
+        "email_signing": {
+            "key_usage": dict(digital_signature=True, content_commitment=True,
+                              key_encipherment=False, data_encipherment=False,
+                              key_agreement=False, key_cert_sign=False,
+                              crl_sign=False, encipher_only=False, decipher_only=False),
+            "eku": [ExtendedKeyUsageOID.EMAIL_PROTECTION],
+            "san_required": False,
+            "bc_ca": False,
+        },
+        # RFC 8551 §2.3.2 — S/MIME RSA encryption certificate: keyEncipherment only.
+        "email_encryption_rsa": {
+            "key_usage": dict(digital_signature=False, content_commitment=False,
+                              key_encipherment=True, data_encipherment=False,
+                              key_agreement=False, key_cert_sign=False,
+                              crl_sign=False, encipher_only=False, decipher_only=False),
+            "eku": [ExtendedKeyUsageOID.EMAIL_PROTECTION],
+            "san_required": False,
+            "bc_ca": False,
+        },
+        # RFC 8551 §2.3.2 — S/MIME EC encryption certificate: keyAgreement only.
+        "email_encryption_ec": {
+            "key_usage": dict(digital_signature=False, content_commitment=False,
+                              key_encipherment=False, data_encipherment=False,
+                              key_agreement=True, key_cert_sign=False,
                               crl_sign=False, encipher_only=False, decipher_only=False),
             "eku": [ExtendedKeyUsageOID.EMAIL_PROTECTION],
             "san_required": False,
@@ -4471,6 +4509,11 @@ def main():
         help="PEM TLS key for IPsec server (auto-provisioned from CA if omitted)"
     )
     ops_group.add_argument(
+        "--smime-prefix", default=None, metavar="PREFIX",
+        help="Mount RFC 8551 S/MIME v4 REST API at this path prefix (e.g. /smime). "
+             "Endpoints: POST /smime/sign, /smime/verify, /smime/encrypt, /smime/decrypt."
+    )
+    ops_group.add_argument(
         "--rate-limit", type=int, default=0, metavar="N",
         help="Max certificate requests per IP per minute (0 = disabled)"
     )
@@ -4975,6 +5018,18 @@ def main():
                 crl_url=_ipsec_crl_url,
             )
 
+    # Start S/MIME REST API if requested (RFC 8551)
+    smime_srv = None
+    if getattr(args, "smime_prefix", None):
+        if not HAS_SMIME:
+            print("WARNING: smime_server.py not found — S/MIME REST API disabled.")
+        else:
+            smime_srv = _smime_module.start_smime_server(
+                route_table=route_table,
+                prefix=args.smime_prefix,
+                ca=ca,
+            )
+
     # Start Web UI if requested
     web_srv = None
     if getattr(args, "web_prefix", None):
@@ -5028,7 +5083,8 @@ def main():
     ocsp_line = f"{_base}{args.ocsp_prefix}" if (getattr(args,"ocsp_prefix",None) and HAS_OCSP) else "disabled"
     tsa_line  = f"{_base}{args.tsa_prefix}"  if (getattr(args,"tsa_prefix",None)  and HAS_TSA)  else "disabled"
     web_line  = f"{_base}{args.web_prefix}" if getattr(args,"web_prefix",None) else "disabled"
-    ipsec_line = f"{_base}{args.ipsec_prefix}" if (getattr(args,"ipsec_prefix",None) and HAS_IPSEC) else "disabled"
+    ipsec_line  = f"{_base}{args.ipsec_prefix}"  if (getattr(args,"ipsec_prefix",None)  and HAS_IPSEC)  else "disabled"
+    smime_line  = f"{_base}{args.smime_prefix}"  if (getattr(args,"smime_prefix",None)  and HAS_SMIME)  else "disabled"
     cmp_wk    = f"{_base}/.well-known/cmp"
     rl_info   = f"{args.rate_limit}/min per IP" if getattr(args,"rate_limit",0) > 0 else "disabled"
     _tls_reload_interval = getattr(args, "tls_reload_interval", 60)
@@ -5054,6 +5110,7 @@ def main():
 ║  OCSP             : {ocsp_line:<47}║
 ║  TSA              : {tsa_line:<47}║
 ║  IPsec PKI        : {ipsec_line:<47}║
+║  S/MIME v4        : {smime_line:<47}║
 ║  Web Dashboard    : {web_line:<47}║
 ╠══════════════════════════════════════════════════════════════════╣
 ║  CMP Well-Known   : {cmp_wk:<47}║

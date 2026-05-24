@@ -129,6 +129,25 @@ current cert. The order is automatically invalidated when `end-date` passes.
 --acme-star-max-duration SECONDS   Maximum renewal window (default 7776000 = 90 days)
 ```
 
+**S/MIME v4 REST API (RFC 8551).** `smime_server.py` provides CMS signing,
+verification, encryption, and decryption as an optional REST service. Mount it
+with `--smime-prefix /smime`. RFC 8551 §2.7.2.2 compliance: RSA recipients
+always use RSA-OAEP with SHA-256 (PKCS#1 v1.5 is rejected for new encryption);
+EC recipients use ECDH + X9.63-SHA-256-KDF + AES-256-wrap (RFC 5753). Content
+is encrypted with AES-256-GCM by default. Multi-recipient envelopes work across
+RSA and EC key holders in a single call. Three purpose-specific certificate
+profiles — `email_signing`, `email_encryption_rsa`, `email_encryption_ec` —
+enforce the correct RFC 8551 §2.3 KeyUsage bits.
+
+```
+--smime-prefix PREFIX   Mount S/MIME REST API at PREFIX (e.g. /smime)
+
+POST /smime/sign        CMS SignedData (opaque or detached)
+POST /smime/verify      Verify CMS SignedData
+POST /smime/encrypt     CMS EnvelopedData (RSA-OAEP or ECDH, AES-256-GCM/CBC)
+POST /smime/decrypt     Decrypt CMS EnvelopedData
+```
+
 ### SCEP Protocol (RFC 8894)
 | Operation | Description |
 |---|---|
@@ -1915,6 +1934,7 @@ Every issued certificate includes:
 | RFC 5816 | ESSCertIDv2 in TSA SignedData | ✅ Full — `signingCertificateV2` signed attribute with SHA-256 ESSCertIDv2 in every TimeStampToken |
 | RFC 8738 | ACME IP Identifier | ✅ Full — `{type:"ip"}` orders, `http-01` + `tls-alpn-01` only (no `dns-01`), IPv4/IPv6 SANs, `--acme-allow-private-ip` for homelab |
 | RFC 8739 | ACME STAR — Short-Term Automatic Renewal | ✅ Full — `auto-renewal` in new-order, background `STARRenewalWorker` renews at half-lifetime, `meta.autoRenewal` directory advertisement, `short_lived` profile (RFC 9608), CLI flags `--acme-star-enabled` / `--acme-star-min-lifetime` / `--acme-star-max-duration` |
+| RFC 8551 | S/MIME v4 Message Specification | ✅ Full — CMS signing (RSA/ECDSA/Ed25519 via `SMIMESigner`), RSA-OAEP SHA-256 key transport (MUST per §2.7.2.2), ECDH + X9.63-SHA256-KDF + AES-256-wrap key agreement (RFC 5753), AES-256-GCM + AES-256-CBC content encryption, multi-recipient, profiles `email_signing` / `email_encryption_rsa` / `email_encryption_ec`; REST API at `--smime-prefix` |
 | RFC 8894 | SCEP — Simple Certificate Enrolment Protocol | ✅ Full — including single-use OTP challenge passwords (`--scep-use-otp`; `POST /api/scep/otp`) |
 | RFC 5083 | CMS AuthEnvelopedData | ✅ Full — `CMSBuilder.auth_enveloped_data` (AES-256-GCM); `CMSParser` dispatches on `id-ct-authEnvelopedData`; SCEP `GetCACaps` advertises `AES-GCM` |
 | RFC 5084 | AES-GCM in CMS | ✅ Full — AES-256-GCM with 12-byte nonce, 16-byte auth tag, `GCMParameters` (nonce + `ICVlen=16`); eliminates CBC padding-oracle surface from SCEP |
