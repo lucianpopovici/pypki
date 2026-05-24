@@ -1314,6 +1314,47 @@ class TestHTTPAPI(unittest.TestCase):
         bc = cert.extensions.get_extension_for_class(x509.BasicConstraints).value
         self.assertTrue(bc.ca)
 
+    def test_issue_sub_ca_pkcs12_format(self):
+        """POST /api/issue-sub-ca with export_format=pkcs12 returns a valid PKCS#12 bundle."""
+        from cryptography.hazmat.primitives.serialization import pkcs12
+        status, body = self._post("/api/issue-sub-ca", {
+            "cn": "P12 Sub CA", "validity_days": 365,
+            "export_format": "pkcs12", "p12_password": "secret123",
+        })
+        self.assertEqual(status, 200)
+        self.assertTrue(body.get("ok"))
+        self.assertIn("p12_b64", body)
+        self.assertNotIn("cert_pem", body)
+
+        import base64
+        p12_bytes = base64.b64decode(body["p12_b64"])
+        priv_key, cert, chain = pkcs12.load_key_and_certificates(
+            p12_bytes, b"secret123"
+        )
+        self.assertIsNotNone(cert)
+        cn = cert.subject.get_attributes_for_oid(
+            __import__("cryptography").x509.oid.NameOID.COMMON_NAME
+        )[0].value
+        self.assertEqual(cn, "P12 Sub CA")
+        # Sub-CA must have CA=True
+        bc = cert.extensions.get_extension_for_class(
+            __import__("cryptography").x509.BasicConstraints
+        ).value
+        self.assertTrue(bc.ca)
+
+    def test_issue_sub_ca_pkcs12_wrong_password_fails(self):
+        """PKCS#12 bundle returned with a password cannot be opened with wrong password."""
+        from cryptography.hazmat.primitives.serialization import pkcs12
+        import base64
+        status, body = self._post("/api/issue-sub-ca", {
+            "cn": "P12 Pwd Test", "validity_days": 365,
+            "export_format": "pkcs12", "p12_password": "correct-horse",
+        })
+        self.assertEqual(status, 200)
+        p12_bytes = base64.b64decode(body["p12_b64"])
+        with self.assertRaises(Exception):
+            pkcs12.load_key_and_certificates(p12_bytes, b"wrong-password")
+
     def test_cert_pem_download(self):
         key = _gen_key()
         cert = self.ca.issue_certificate("CN=pem-dl", key.public_key())
@@ -9311,6 +9352,306 @@ class TestRAWorkflow(unittest.TestCase):
         self.assertIn("ra-require-approval", src)
         self.assertIn("ra-policy-file", src)
         self.assertIn("ra-auto-approve-profiles", src)
+
+    # ------------------------------------------------------------------
+    # §5.4 CMP waiting / pollReq (RA integration)
+    # ------------------------------------------------------------------
+
+    def _make_ir(self, ca, priv_key, pvno=3):
+        """Build a minimal but valid CRMF-based ir PKIMessage."""
+        import os, cmp_server as cmp
+        from cryptography.hazmat.primitives.serialization import (
+            Encoding, PublicFormat,
+        )
+        from cryptography.hazmat.primitives import hashes
+        from cryptography.hazmat.primitives.asymmetric import padding as _pad
+
+        def _enc_len(n):
+            if n < 0x80: return bytes([n])
+            b = n.to_bytes((n.bit_length() + 7) // 8, "big")
+            return bytes([0x80 | len(b)]) + b
+        def _seq(c): return b"\x30" + _enc_len(len(c)) + c
+        def _ctx(n, c, constructed=True):
+            tag = (0xA0 | n) if constructed else (0x80 | n)
+            return bytes([tag]) + _enc_len(len(c)) + c
+        def _int(v):
+            if v == 0: return b"\x02\x01\x00"
+            b = v.to_bytes((v.bit_length() + 7) // 8 or 1, "big")
+            if b[0] & 0x80: b = b"\x00" + b
+            return b"\x02" + _enc_len(len(b)) + b
+        def _oid(dotted):
+            parts = list(map(int, dotted.split(".")))
+            enc = bytes([40 * parts[0] + parts[1]])
+            for p in parts[2:]:
+                if p == 0: enc += b"\x00"
+                else:
+                    buf = []
+                    while p: buf.append(p & 0x7F); p >>= 7
+                    buf.reverse()
+                    enc += bytes([(b | 0x80) if i < len(buf) - 1 else b for i, b in enumerate(buf)])
+            return b"\x06" + _enc_len(len(enc)) + enc
+
+        spki_tlv = priv_key.public_key().public_bytes(Encoding.DER, PublicFormat.SubjectPublicKeyInfo)
+        content_start = 2 + (spki_tlv[1] & 0x7F if spki_tlv[1] & 0x80 else 0) if spki_tlv[1] & 0x80 else 2
+        spki_content = spki_tlv[content_start:]
+
+        public_key_field = _ctx(6, spki_content, constructed=True)
+        cert_template = _seq(public_key_field)
+        cert_request = _seq(_int(0) + cert_template)
+
+        alg_oid = "1.2.840.113549.1.1.11"
+        sig = priv_key.sign(cert_request, _pad.PKCS1v15(), hashes.SHA256())
+        alg_id = _seq(_oid(alg_oid) + b"\x05\x00")
+        bit_string = b"\x03" + _enc_len(len(sig) + 1) + b"\x00" + sig
+        popo_signing_key = _seq(alg_id + bit_string)
+        popo = _ctx(1, popo_signing_key, constructed=True)
+        cert_req_msg = _seq(cert_request + popo)
+        body_content = _seq(cert_req_msg)
+
+        txid = os.urandom(16)
+        return cmp.CMPv2ASN1.build_pki_message(
+            0, body_content, transaction_id=txid, sender_nonce=os.urandom(16), pvno=pvno
+        ), txid
+
+    def _read_tlv(self, buf: bytes, pos: int):
+        tag = buf[pos]
+        l = buf[pos + 1]
+        if l & 0x80:
+            n = l & 0x7F
+            l = int.from_bytes(buf[pos + 2: pos + 2 + n], "big")
+            start = pos + 2 + n
+        else:
+            start = pos + 2
+        return tag, buf[start: start + l], start + l
+
+    def _parse_response_status(self, der: bytes) -> int:
+        """Extract the PKIStatusInfo status integer from an ip/cp response.
+
+        CertRepMessage has three SEQUENCE wrappers:
+          cert_rep > response SEQUENCE OF > CertResponse > certReqId + PKIStatusInfo
+        """
+        _, outer, _ = self._read_tlv(der, 0)
+        _, _hdr, hdr_end = self._read_tlv(outer, 0)
+        _, body_content, _ = self._read_tlv(outer, hdr_end)
+        # body_content = cert_rep (outer CertRepMessage SEQUENCE)
+        _, resp_seq_of, _ = self._read_tlv(body_content, 0)   # response SEQUENCE OF
+        _, cert_resp_seq, _ = self._read_tlv(resp_seq_of, 0)  # first CertResponse SEQUENCE
+        _, cert_resp_content, _ = self._read_tlv(cert_resp_seq, 0)  # skip inner SEQUENCE
+        # cert_resp_content: certReqId (INTEGER) + PKIStatusInfo (SEQUENCE)
+        _, _, pos2 = self._read_tlv(cert_resp_content, 0)  # skip certReqId
+        _, status_seq, _ = self._read_tlv(cert_resp_content, pos2)
+        _, status_bytes, _ = self._read_tlv(status_seq, 0)
+        return int.from_bytes(status_bytes, "big")
+
+    def _parse_body_type(self, der: bytes) -> int:
+        _, outer, _ = self._read_tlv(der, 0)
+        _, _hdr, hdr_end = self._read_tlv(outer, 0)
+        body_tag = outer[hdr_end]
+        return body_tag & 0x1F
+
+    def test_cmp_ir_returns_waiting_when_ra_pending(self):
+        """CMP ir returns PKIStatus=3 (waiting) when RA requires review."""
+        import pki_server, cmp_server
+        p = pki_server.RAPolicy(auto_approve_all=False)
+        ca = self._make_ca_with_policy(p)
+        handler = cmp_server.CMPv3Handler(ca)
+        priv = self._rsa_key()
+        ir_msg, txid = self._make_ir(ca, priv)
+        resp = handler.handle(ir_msg)
+        self.assertIsInstance(resp, bytes)
+        # PKIStatus=3 means "waiting"
+        status = self._parse_response_status(resp)
+        self.assertEqual(status, 3, f"Expected PKIStatus=3 (waiting), got {status}")
+
+    def test_cmp_poll_req_returns_poll_rep_while_pending(self):
+        """pollReq while RA is still pending returns pollRep (body_type=26)."""
+        import pki_server, cmp_server, os
+        p = pki_server.RAPolicy(auto_approve_all=False)
+        ca = self._make_ca_with_policy(p)
+        handler = cmp_server.CMPv3Handler(ca)
+        priv = self._rsa_key()
+        ir_msg, txid = self._make_ir(ca, priv)
+        handler.handle(ir_msg)  # submit ir → waiting
+
+        # Build a pollReq with the same txid
+        poll_body = b"\x30\x00"  # empty SEQUENCE (minimal pollReqContent)
+        poll_msg = cmp_server.CMPv2ASN1.build_pki_message(
+            25, poll_body,
+            transaction_id=txid,
+            sender_nonce=os.urandom(16),
+            pvno=3,
+        )
+        resp = handler.handle(poll_msg)
+        body_type = self._parse_body_type(resp)
+        self.assertEqual(body_type, 26, f"Expected pollRep (body_type=26), got {body_type}")
+
+    def test_cmp_poll_req_returns_cert_after_ra_approval(self):
+        """pollReq after RA approval returns ip/cp with PKIStatus=0."""
+        import pki_server, cmp_server, os
+        p = pki_server.RAPolicy(auto_approve_all=False)
+        ca = self._make_ca_with_policy(p)
+        handler = cmp_server.CMPv3Handler(ca)
+        priv = self._rsa_key()
+        ir_msg, txid = self._make_ir(ca, priv)
+        handler.handle(ir_msg)  # submit ir → waiting
+
+        # Approve the pending RA request
+        pending = ca.ra.list_pending()
+        self.assertEqual(len(pending), 1)
+        req_id = pending[0]["request_id"]
+        ca.ra.approve(req_id, approver="admin")
+
+        # Poll again — should get ip with status=0
+        poll_body = b"\x30\x00"
+        poll_msg = cmp_server.CMPv2ASN1.build_pki_message(
+            25, poll_body,
+            transaction_id=txid,
+            sender_nonce=os.urandom(16),
+            pvno=3,
+        )
+        resp = handler.handle(poll_msg)
+        body_type = self._parse_body_type(resp)
+        # ip = body_type 1
+        self.assertEqual(body_type, 1, f"Expected ip (body_type=1), got {body_type}")
+        status = self._parse_response_status(resp)
+        self.assertEqual(status, 0, f"Expected PKIStatus=0 (granted), got {status}")
+
+    def test_cmp_poll_req_returns_rejection_after_ra_denial(self):
+        """pollReq after RA denial returns ip/cp with PKIStatus=2 (rejection)."""
+        import pki_server, cmp_server, os
+        p = pki_server.RAPolicy(auto_approve_all=False)
+        ca = self._make_ca_with_policy(p)
+        handler = cmp_server.CMPv3Handler(ca)
+        priv = self._rsa_key()
+        ir_msg, txid = self._make_ir(ca, priv)
+        handler.handle(ir_msg)
+
+        pending = ca.ra.list_pending()
+        req_id = pending[0]["request_id"]
+        ca.ra.deny(req_id, approver="admin", reason="policy violation")
+
+        poll_body = b"\x30\x00"
+        poll_msg = cmp_server.CMPv2ASN1.build_pki_message(
+            25, poll_body,
+            transaction_id=txid,
+            sender_nonce=os.urandom(16),
+            pvno=3,
+        )
+        resp = handler.handle(poll_msg)
+        status = self._parse_response_status(resp)
+        self.assertEqual(status, 2, f"Expected PKIStatus=2 (rejection), got {status}")
+
+    # ------------------------------------------------------------------
+    # §5.4 EST 202 Retry-After (RA integration)
+    # ------------------------------------------------------------------
+
+    def _make_est_csr(self, subject_cn="CN=est-ra-test"):
+        """Return (priv_key, CSR DER bytes) for EST tests."""
+        from cryptography.hazmat.primitives.asymmetric import rsa
+        from cryptography import x509 as _x509
+        from cryptography.x509.oid import NameOID
+        from cryptography.hazmat.primitives import hashes as _hashes
+        from cryptography.hazmat.primitives.serialization import Encoding
+        priv = rsa.generate_private_key(65537, 2048)
+        csr = (
+            _x509.CertificateSigningRequestBuilder()
+            .subject_name(_x509.Name([_x509.NameAttribute(NameOID.COMMON_NAME, subject_cn)]))
+            .sign(priv, _hashes.SHA256())
+        )
+        return priv, csr.public_bytes(Encoding.DER)
+
+    def _make_est_handler(self, ca):
+        import est_server
+        h = est_server.ESTHandler.__new__(est_server.ESTHandler)
+        h.ca = ca
+        return h
+
+    def test_est_simpleenroll_returns_202_when_ra_pending(self):
+        """EST simpleenroll returns HTTP 202 + Retry-After when RA requires review."""
+        import pki_server
+        p = pki_server.RAPolicy(auto_approve_all=False)
+        ca = self._make_ca_with_policy(p)
+        _, csr_b64 = self._make_est_csr()
+
+        sent, headers_sent, _ = self._call_est_handler(ca, csr_b64)
+
+        self.assertEqual(sent.get("code"), 202,
+                         f"Expected 202, got {sent.get('code')}")
+        self.assertEqual(headers_sent.get("Retry-After"), "60")
+
+    def _call_est_handler(self, ca, csr_b64, profile="default"):
+        """Invoke ESTHandler._handle_simpleenroll and return (sent, headers, body_chunks)."""
+        import est_server, base64
+        from unittest.mock import MagicMock
+        sent = {}
+        headers_sent = {}
+        body_written = []
+        wfile = MagicMock()
+        wfile.write = lambda d: body_written.append(d)
+        handler = est_server.ESTHandler.__new__(est_server.ESTHandler)
+        handler.ca = ca
+        handler.client_address = ("127.0.0.1", 0)
+        handler.send_response = lambda c: sent.__setitem__("code", c)
+        handler.end_headers = lambda: None
+        handler.wfile = wfile
+        handler.send_header = lambda k, v: headers_sent.__setitem__(k, v)
+        handler._send_error = lambda code, msg="": sent.__setitem__("error_code", code)
+        # _handle_simpleenroll(body, renew, client_cert, profile) — pass raw DER
+        est_server.ESTHandler._handle_simpleenroll(
+            handler, csr_b64, renew=False, client_cert=None, profile=profile
+        )
+        return sent, headers_sent, body_written
+
+    def test_est_simpleenroll_returns_202_when_ra_pending(self):
+        """EST simpleenroll returns HTTP 202 + Retry-After when RA requires review."""
+        import pki_server
+        p = pki_server.RAPolicy(auto_approve_all=False)
+        ca = self._make_ca_with_policy(p)
+        _, csr_b64 = self._make_est_csr()
+
+        sent, headers_sent, _ = self._call_est_handler(ca, csr_b64)
+
+        self.assertEqual(sent.get("code"), 202,
+                         f"Expected 202, got {sent.get('code')}")
+        self.assertEqual(headers_sent.get("Retry-After"), "60")
+
+    def test_est_simpleenroll_202_on_resubmit_same_csr(self):
+        """Re-submitting the same CSR returns 202 again while pending."""
+        import pki_server
+        p = pki_server.RAPolicy(auto_approve_all=False)
+        ca = self._make_ca_with_policy(p)
+        _, csr_b64 = self._make_est_csr(subject_cn="CN=resubmit-test")
+
+        sent1, hdrs1, _ = self._call_est_handler(ca, csr_b64)
+        self.assertEqual(sent1.get("code"), 202)
+        # Re-submit same CSR — still pending
+        sent2, hdrs2, _ = self._call_est_handler(ca, csr_b64)
+        self.assertEqual(sent2.get("code"), 202)
+        self.assertEqual(hdrs2.get("Retry-After"), "60")
+
+    def test_est_simpleenroll_issues_cert_after_ra_approval(self):
+        """After RA approves, re-submitting the CSR returns the issued cert."""
+        import pki_server
+        p = pki_server.RAPolicy(auto_approve_all=False)
+        ca = self._make_ca_with_policy(p)
+        _, csr_b64 = self._make_est_csr(subject_cn="CN=approval-test")
+
+        # First call → 202
+        sent1, _, _ = self._call_est_handler(ca, csr_b64)
+        self.assertEqual(sent1.get("code"), 202)
+
+        # Approve the pending request
+        pending = ca.ra.list_pending()
+        self.assertEqual(len(pending), 1)
+        ca.ra.approve(pending[0]["request_id"], approver="admin")
+
+        # Re-submit CSR → should now get a cert (200)
+        sent2, hdrs2, body2 = self._call_est_handler(ca, csr_b64)
+        self.assertIn(sent2.get("code"), (200, None),
+                      f"Expected 200 after approval, got {sent2}")
+        # body should contain DER bytes (base64-encoded PKCS#7)
+        body = b"".join(body2)
+        self.assertGreater(len(body), 50, "Expected cert data in response body")
 
 
 # ===========================================================================

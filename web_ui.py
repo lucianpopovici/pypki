@@ -1587,11 +1587,16 @@ class WebUIHandler(http.server.BaseHTTPRequestHandler):
             permitted_dns, excluded_dns, permitted_emails, excluded_ips,
         ])
 
+        export_format = data.get("export_format", "pem").lower()
+        p12_password  = data.get("p12_password", "")
+
         try:
             from cryptography.hazmat.primitives.asymmetric import rsa as _rsa
             from cryptography.hazmat.primitives.serialization import (
                 Encoding as _Enc, PrivateFormat, NoEncryption,
+                BestAvailableEncryption, pkcs12 as _pkcs12,
             )
+            import base64 as _b64
 
             if use_name_constraints:
                 # issue_certificate_with_name_constraints takes subject + public key
@@ -1616,12 +1621,6 @@ class WebUIHandler(http.server.BaseHTTPRequestHandler):
                     cn, validity_days, path_length=path_length,
                 )
 
-            cert_pem = sub_ca_cert.public_bytes(_Enc.PEM).decode()
-            # RFC 5958 — PKCS#8 PrivateKeyInfo (was TraditionalOpenSSL / PKCS#1)
-            key_pem = sub_ca_key.private_bytes(
-                _Enc.PEM, PrivateFormat.PKCS8, NoEncryption(),
-            ).decode()
-
             if self.audit_log:
                 nc_summary = ""
                 if use_name_constraints:
@@ -1633,17 +1632,46 @@ class WebUIHandler(http.server.BaseHTTPRequestHandler):
                     )
                 self.audit_log.record(
                     "issue_sub_ca",
-                    f"cn={cn} days={validity_days} path_length={path_length}{nc_summary}",
+                    f"cn={cn} days={validity_days} path_length={path_length}{nc_summary}"
+                    f" export_format={export_format}",
                     self.client_address[0],
                 )
 
-            self._send_json({
-                "ok":       True,
-                "serial":   sub_ca_cert.serial_number,
-                "subject":  sub_ca_cert.subject.rfc4514_string(),
-                "cert_pem": cert_pem,
-                "key_pem":  key_pem,
-            })
+            if export_format == "pkcs12":
+                # Build PKCS#12 bundle: sub-CA key + cert + issuing CA chain.
+                # Password is required unless the caller explicitly passes "".
+                friendly = cn.encode() or b"sub-ca"
+                ca_chain = [self.ca.ca_cert] + list(self.ca._parent_chain)
+                enc = (
+                    BestAvailableEncryption(p12_password.encode())
+                    if p12_password
+                    else NoEncryption()
+                )
+                p12_bytes = _pkcs12.serialize_key_and_certificates(
+                    name=friendly,
+                    key=sub_ca_key,
+                    cert=sub_ca_cert,
+                    cas=ca_chain,
+                    encryption_algorithm=enc,
+                )
+                self._send_json({
+                    "ok":      True,
+                    "serial":  sub_ca_cert.serial_number,
+                    "subject": sub_ca_cert.subject.rfc4514_string(),
+                    "p12_b64": _b64.b64encode(p12_bytes).decode(),
+                })
+            else:
+                cert_pem = sub_ca_cert.public_bytes(_Enc.PEM).decode()
+                key_pem = sub_ca_key.private_bytes(
+                    _Enc.PEM, PrivateFormat.PKCS8, NoEncryption(),
+                ).decode()
+                self._send_json({
+                    "ok":       True,
+                    "serial":   sub_ca_cert.serial_number,
+                    "subject":  sub_ca_cert.subject.rfc4514_string(),
+                    "cert_pem": cert_pem,
+                    "key_pem":  key_pem,
+                })
         except Exception as e:
             self._send_json({"error": str(e)}, 500)
 

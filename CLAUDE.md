@@ -1247,9 +1247,24 @@ HSM, and any vendor HSM via a vendor-supplied PKCS#11 module.
   `--ra-auto-approve-profiles PROFILE [...]`, `--ra-policy-file PATH`.
 - 22 tests in `TestRAWorkflow`.
 
+**Also shipped (this session):**
+- CMP `waiting` (PKIStatus=3) + `pollReq`/`pollRep` polling loop. When RA
+  requires approval, `ir`/`cr` returns status=3; client polls via
+  `pollReq`; server replies with `pollRep` (checkAfter=60) while pending
+  or `ip`/`cp` (status=0) once approved. `_ra_pending` dict keyed on
+  `transactionID`. 4 tests in `TestRAWorkflow`.
+- EST 202 Retry-After RA integration. `simpleenroll` returns HTTP 202
+  when RA is pending; re-submitted CSR (SHA-256 fingerprint as
+  `protocol_ref`) returns the cert once approved or 403 if denied.
+  3 tests in `TestRAWorkflow`.
+- Sub-CA PKCS#12 export: `POST /api/sub-ca` and `/api/issue-sub-ca`
+  accept `"export_format": "pkcs12"` + optional `"p12_password"`;
+  return `"p12_b64"` with key+cert+chain bundle. 2 tests in `TestHTTPAPI`.
+- Bug fix: `_parse_pki_header` now uses tag-based identification for
+  optional CMP header fields; `transactionID` is correctly extracted
+  from all messages (was previously always `os.urandom(16)`).
+
 **Outstanding (not yet implemented):**
-- CMP `waiting` status response while pending.
-- EST 202 Retry-After response while pending.
 - `web_ui.py` approver dashboard (in-browser approve/deny).
 
 ---
@@ -1541,7 +1556,7 @@ All Tier 5 items are now shipped. For reference, the order they were implemented
 3. ~~**5.2**~~ ✅ Postgres dual-backend + DAL + migration tooling
 4. ~~**5.5**~~ ✅ ACME EAB + per-account rate limiting
 5. ~~**5.3**~~ ✅ Offline root + key ceremony tooling
-6. ~~**5.4**~~ ✅ RA / approval workflow (ACME + REST complete; CMP/EST waiting states outstanding)
+6. ~~**5.4**~~ ✅ RA / approval workflow (ACME + REST + CMP PKIStatus=3/pollReq + EST 202 — fully shipped)
 7. ~~**5.10**~~, ~~**5.11**~~ ✅ Structured logging + Prometheus histograms
 8. ~~**5.9**~~ ✅ Lifecycle webhooks
 9. ~~**5.6**~~ ✅ Cross-signing, ~~**5.7**~~ ✅ OCSP prebuild, ~~**5.8**~~ ✅ SCEP OTP challenges

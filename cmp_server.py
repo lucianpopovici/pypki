@@ -212,34 +212,53 @@ class CMPv2ASN1:
 
     @classmethod
     def _parse_pki_header(cls, header_bytes: bytes) -> Dict[str, Any]:
+        """
+        Parse PKIHeader fields.  pvno / sender / recipient are positional
+        (always present, no context tag); the optional fields are identified
+        by their RFC 4210 context tag numbers:
+          [0] messageTime   [1] protectionAlg  [2] senderKID
+          [3] recipKID      [4] transactionID  [5] senderNonce
+          [6] recipNonce    [7] freeText        [8] generalInfo
+        """
+        _OPTIONAL = {
+            0x80: "messageTime",
+            0x81: "protectionAlg",
+            0x82: "senderKID",
+            0x83: "recipKID",
+            0x84: "transactionID",
+            0x85: "senderNonce",
+            0x86: "recipNonce",
+            0xA7: "freeText",
+            0xA8: "generalInfo",
+        }
         header = {}
         pos = 0
-        field_idx = 0
+        positional = 0  # counts pvno (0), sender (1), recipient (2)
 
         while pos < len(header_bytes):
             try:
                 tag_b, val, pos = cls._decode_tlv(header_bytes, pos)
-                if field_idx == 0:
+                if tag_b in _OPTIONAL:
+                    # Optional field — inner value may be a single wrapped TLV;
+                    # strip one layer for octet-string-like fields (transactionID,
+                    # senderNonce, recipNonce) so callers get raw bytes.
+                    inner_tag = val[0] if val else 0
+                    if inner_tag == 0x04 and len(val) >= 2:  # OCTET STRING
+                        _, inner_val, _ = cls._decode_tlv(val, 0)
+                        header[_OPTIONAL[tag_b]] = inner_val
+                    else:
+                        header[_OPTIONAL[tag_b]] = val
+                elif positional == 0:
                     header["pvno"] = int.from_bytes(val, "big") if val else 2
-                elif field_idx == 1:
+                    positional += 1
+                elif positional == 1:
                     header["sender"] = val
-                elif field_idx == 2:
+                    positional += 1
+                elif positional == 2:
                     header["recipient"] = val
-                elif field_idx == 3:
-                    header["messageTime"] = val
-                elif field_idx == 4:
-                    header["protectionAlg"] = val
-                elif field_idx == 5:
-                    header["senderKID"] = val
-                elif field_idx == 6:
-                    header["recipKID"] = val
-                elif field_idx == 7:
-                    header["transactionID"] = val
-                elif field_idx == 8:
-                    header["senderNonce"] = val
-                elif field_idx == 9:
-                    header["recipNonce"] = val
-                field_idx += 1
+                    positional += 1
+                else:
+                    positional += 1
             except Exception:
                 break
 
@@ -961,8 +980,35 @@ class CMPv2Handler:
                 # cryptography's load_der_public_key wants the full TLV.
                 spki_tlv = b"\x30" + CMPv2ASN1._encode_length(len(spki_der)) + spki_der
                 pub_key = serialization.load_der_public_key(spki_tlv)
-                cert = self.ca.issue_certificate(subject_str, pub_key, protocol="cmp")
-                cert_der = cert.public_bytes(Encoding.DER)
+
+                # §5.4 — route through RA if configured
+                if getattr(self.ca, "ra", None) is not None:
+                    ra_req_id, auto_approved, cert = self.ca.ra.submit(
+                        protocol="cmp",
+                        profile="default",
+                        subject_dn=subject_str,
+                        public_key_der=spki_tlv,  # full SubjectPublicKeyInfo TLV
+                        csr_der=certreq_der,
+                        requester_ip="",
+                        protocol_ref=txid.hex(),
+                        audit=getattr(self, "audit_log", None),
+                    )
+                    if not auto_approved:
+                        # PKIStatus=3 (waiting) — client should poll via pollReq
+                        body = CMPv2ASN1.build_ip_cp_body(b"", status=3, request_id=0)
+                        with self._ra_lock:
+                            self._ra_pending[txid] = (ra_req_id, resp_body_type, pvno)
+                        logger.info(
+                            f"CMP {req_type}: RA pending "
+                            f"ra_req_id={ra_req_id} txid={txid.hex()}"
+                        )
+                        return self._protected_response(
+                            resp_body_type, body, txid, os.urandom(16), snonce, pvno=pvno
+                        )
+                    cert_der = cert.public_bytes(Encoding.DER)
+                else:
+                    cert = self.ca.issue_certificate(subject_str, pub_key, protocol="cmp")
+                    cert_der = cert.public_bytes(Encoding.DER)
                 private_key_pem = None
             else:
                 # No public key provided — generate one server-side
@@ -1141,6 +1187,9 @@ class CMPv3Handler(CMPv2Handler):
         # txid -> {"status": "waiting"|"ready"|"error", "response": bytes, "deadline": float}
         self._polling_table: Dict[bytes, Dict] = {}
         self._poll_lock = threading.Lock()
+        # txid -> (ra_req_id, resp_body_type, pvno) for RA-pending CMP requests
+        self._ra_pending: Dict[bytes, tuple] = {}
+        self._ra_lock = threading.Lock()
 
     def handle(self, der_data: bytes) -> bytes:
         """Override: detect pvno=3 and route to CMPv3-aware handling."""
@@ -1417,6 +1466,48 @@ class CMPv3Handler(CMPv2Handler):
                 raw.insert(0, 0)
             return b"\x02" + CMPv2ASN1._encode_length(len(raw)) + bytes(raw)
 
+        # Check RA-pending requests first (§5.4 RA workflow)
+        with self._ra_lock:
+            ra_entry = self._ra_pending.get(txid)
+
+        if ra_entry is not None:
+            ra_req_id, ra_body_type, ra_pvno = ra_entry
+            ra = getattr(self.ca, "ra", None)
+            req = ra.get(ra_req_id) if ra else None
+            if req and req["status"] == "issued":
+                with self._ra_lock:
+                    self._ra_pending.pop(txid, None)
+                # _row_to_dict strips cert_der; fetch it directly from DB
+                row = ra._db.fetchone(
+                    "SELECT cert_der FROM pending_requests WHERE request_id=?",
+                    (ra_req_id,),
+                )
+                cert_der = bytes(row["cert_der"]) if row and row["cert_der"] else b""
+                body = CMPv2ASN1.build_ip_cp_body(cert_der, status=0, request_id=0)
+                with self._lock:
+                    self._pending_confirmations[txid] = cert_der
+                logger.info(f"pollReq: RA approved txid={txid.hex()!r}")
+                return self._protected_response(
+                    ra_body_type, body, txid, os.urandom(16), snonce, pvno=ra_pvno
+                )
+            if req and req["status"] == "denied":
+                with self._ra_lock:
+                    self._ra_pending.pop(txid, None)
+                logger.info(f"pollReq: RA denied txid={txid.hex()!r}")
+                body = CMPv2ASN1.build_ip_cp_body(b"", status=2, request_id=0)
+                return self._protected_response(
+                    ra_body_type, body, txid, os.urandom(16), snonce, pvno=ra_pvno
+                )
+            # Still pending — send pollRep
+            poll_entry = _seq(
+                _int_big(0)
+                + _int_big(self.POLL_PERIOD)
+            )
+            logger.info(f"pollReq: RA still pending txid={txid.hex()!r}")
+            return self._protected_response(
+                26, _seq(poll_entry), txid, os.urandom(16), snonce, pvno=pvno
+            )
+
         with self._poll_lock:
             entry = self._polling_table.get(txid)
 
@@ -1498,29 +1589,50 @@ class CMPv2HTTPHandler(http.server.BaseHTTPRequestHandler):
             self._send_json({"error": "invalid JSON"}, 400)
             return
 
-        if path == "/api/sub-ca":
+        if path in ("/api/sub-ca", "/api/issue-sub-ca"):
             cn = data.get("cn", "PyPKI Intermediate CA")
             validity_days = int(data.get("validity_days", 1825))
+            export_format = data.get("export_format", "pem").lower()
+            p12_password = data.get("p12_password", "")
             try:
                 key, cert = self.ca.issue_sub_ca(
                     cn=cn, validity_days=validity_days, audit=self.audit_log
                 )
-                cert_pem = cert.public_bytes(Encoding.PEM).decode()
-                # RFC 5958: emit PKCS#8 PrivateKeyInfo, not legacy PKCS#1.
-                key_pem = key.private_bytes(Encoding.PEM,
-                                            PrivateFormat.PKCS8,
-                                            NoEncryption()).decode()
                 if self.audit_log:
                     self.audit_log.record("issue_sub_ca",
                                           f"cn={cn} serial={cert.serial_number}",
                                           self.client_address[0])
-                self._send_json({
-                    "ok": True,
-                    "serial": cert.serial_number,
-                    "subject": cert.subject.rfc4514_string(),
-                    "cert_pem": cert_pem,
-                    "key_pem": key_pem,
-                })
+                if export_format == "pkcs12":
+                    from cryptography.hazmat.primitives.serialization import (
+                        pkcs12 as _pkcs12, BestAvailableEncryption,
+                    )
+                    import base64 as _b64
+                    enc = (BestAvailableEncryption(p12_password.encode())
+                           if p12_password else NoEncryption())
+                    ca_chain = [self.ca.ca_cert] + list(self.ca._parent_chain)
+                    p12_bytes = _pkcs12.serialize_key_and_certificates(
+                        name=cn.encode(), key=key, cert=cert,
+                        cas=ca_chain, encryption_algorithm=enc,
+                    )
+                    self._send_json({
+                        "ok": True,
+                        "serial": cert.serial_number,
+                        "subject": cert.subject.rfc4514_string(),
+                        "p12_b64": _b64.b64encode(p12_bytes).decode(),
+                    })
+                else:
+                    cert_pem = cert.public_bytes(Encoding.PEM).decode()
+                    # RFC 5958: emit PKCS#8 PrivateKeyInfo, not legacy PKCS#1.
+                    key_pem = key.private_bytes(Encoding.PEM,
+                                                PrivateFormat.PKCS8,
+                                                NoEncryption()).decode()
+                    self._send_json({
+                        "ok": True,
+                        "serial": cert.serial_number,
+                        "subject": cert.subject.rfc4514_string(),
+                        "cert_pem": cert_pem,
+                        "key_pem": key_pem,
+                    })
             except Exception as e:
                 self._send_json({"error": str(e)}, 500)
 

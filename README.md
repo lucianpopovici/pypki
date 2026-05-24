@@ -965,6 +965,15 @@ curl -X POST http://localhost:8080/api/sub-ca \
   -d '{"cn": "PyPKI Intermediate CA 1", "validity_days": 1825}'
 
 # Response includes cert_pem and key_pem
+
+# Export as a password-protected PKCS#12 bundle instead
+curl -X POST http://localhost:8080/api/sub-ca \
+  -H 'Content-Type: application/json' \
+  -d '{"cn": "PyPKI Intermediate CA 1", "validity_days": 1825,
+       "export_format": "pkcs12", "p12_password": "ChangeMeNow"}'
+
+# Response: {"ok": true, "serial": N, "subject": "...", "p12_b64": "..."}
+# Decode: echo "$p12_b64" | base64 -d > intermediate.p12
 ```
 
 Sub-CA certificates use the `sub_ca` profile automatically (4096-bit RSA, path length 0).
@@ -1648,8 +1657,8 @@ curl -u admin:PASS https://pypki.local/api/ra/recent
 |----------|--------------------------|
 | ACME     | Order in `processing` state; poll `GET /acme/order/<id>` |
 | REST     | HTTP 202 with `{"status": "pending", "request_id": "..."}` |
-| CMP      | *(PKIStatus waiting — future)* |
-| EST      | *(202 Retry-After — future)* |
+| CMP      | `PKIStatus=3` (waiting); client polls with `pollReq`, server replies with `pollRep` (checkAfter=60s) until approved |
+| EST      | HTTP 202 with `Retry-After: 60`; re-submit the same CSR to retrieve the issued cert |
 
 All approved requests flow through the standard `issue_certificate` path — the cert lands in the DB, is audited, and is returned to the waiting client on next poll.
 

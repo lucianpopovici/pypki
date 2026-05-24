@@ -531,21 +531,90 @@ class ESTHandler(http.server.BaseHTTPRequestHandler):
         except x509.ExtensionNotFound:
             pass
 
-        try:
-            cert = self.ca.issue_certificate(
-                subject_str=subject_str,
-                public_key=pub_key,
-                san_dns=san_dns or None,
-                san_emails=san_emails or None,
-                san_ips=san_ips or None,
-                san_uris=san_uris or None,
-                profile=profile,
-                protocol="est",
-            )
-        except Exception as e:
-            logger.error(f"EST issuance failed: {e}")
-            self._send_error(500, f"Certificate issuance failed: {e}")
-            return
+        # §5.4 — route through RA if configured.
+        # Use SHA-256 of the CSR DER as protocol_ref so re-submissions of the
+        # same CSR find the existing pending row (RFC 7030 §4.2.3 polling model).
+        import hashlib as _hashlib
+        ra = getattr(self.ca, "ra", None)
+        if ra is not None:
+            csr_der = csr.public_bytes(Encoding.DER)
+            protocol_ref = _hashlib.sha256(csr_der).hexdigest()
+            # Check for an existing RA request for this CSR
+            existing = ra.get_by_protocol_ref(protocol_ref)
+            if existing:
+                if existing["status"] == "issued":
+                    # Previously approved — load cert_der directly (not via _row_to_dict)
+                    req_id = existing["request_id"]
+                    row = ra._db.fetchone(
+                        "SELECT cert_der FROM pending_requests WHERE request_id=?",
+                        (req_id,),
+                    )
+                    cert_der_raw = bytes(row["cert_der"]) if row and row["cert_der"] else None
+                    if not cert_der_raw:
+                        self._send_error(500, "Approved certificate missing from store")
+                        return
+                    try:
+                        from cryptography import x509 as _x509
+                        cert = _x509.load_der_x509_certificate(cert_der_raw)
+                    except Exception as e:
+                        logger.error(f"EST: failed loading approved cert: {e}")
+                        self._send_error(500, "Certificate load failed")
+                        return
+                elif existing["status"] == "denied":
+                    self._send_error(403, existing.get("deny_reason") or "Request denied")
+                    return
+                else:
+                    # Still pending
+                    self.send_response(202)
+                    self.send_header("Content-Type", "text/plain")
+                    self.send_header("Retry-After", "60")
+                    self.end_headers()
+                    self.wfile.write(b"Request pending RA approval")
+                    return
+            else:
+                pub_key_der = pub_key.public_bytes(
+                    Encoding.DER, serialization.PublicFormat.SubjectPublicKeyInfo
+                )
+                ra_req_id, auto_approved, cert = ra.submit(
+                    protocol="est",
+                    profile=profile,
+                    subject_dn=subject_str,
+                    public_key_der=pub_key_der,
+                    san_dns=san_dns or None,
+                    san_ips=san_ips or None,
+                    san_emails=san_emails or None,
+                    san_uris=san_uris or None,
+                    csr_der=csr_der,
+                    requester_ip=self.client_address[0],
+                    protocol_ref=protocol_ref,
+                    audit=getattr(self.ca, "audit_log", None),
+                )
+                if not auto_approved:
+                    logger.info(
+                        f"EST {profile}: RA pending ra_req_id={ra_req_id}"
+                    )
+                    self.send_response(202)
+                    self.send_header("Content-Type", "text/plain")
+                    self.send_header("Retry-After", "60")
+                    self.end_headers()
+                    self.wfile.write(b"Request pending RA approval")
+                    return
+        else:
+            try:
+                cert = self.ca.issue_certificate(
+                    subject_str=subject_str,
+                    public_key=pub_key,
+                    san_dns=san_dns or None,
+                    san_emails=san_emails or None,
+                    san_ips=san_ips or None,
+                    san_uris=san_uris or None,
+                    profile=profile,
+                    protocol="est",
+                )
+            except Exception as e:
+                logger.error(f"EST issuance failed: {e}")
+                self._send_error(500, f"Certificate issuance failed: {e}")
+                return
 
         cert_der = cert.public_bytes(Encoding.DER)
         # Include the full CA chain so clients can verify the cert path end-to-end.

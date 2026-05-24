@@ -21,7 +21,8 @@ This project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   and README "Deployment-wide CPS URI" subsection added.
 
 - **§5.4 — Registration Authority / approval workflow** (`pki_server.py`,
-  `acme_server.py`, `cmp_server.py`, `db_migrations/pki/003_pending_requests.sql`).
+  `acme_server.py`, `cmp_server.py`, `est_server.py`,
+  `db_migrations/pki/003_pending_requests.sql`).
   New `RAPolicy` class evaluates auto-approval rules: `mode="all"` (approve
   everything), `mode="none"` (always require manual review), `mode="profile_list"`
   (per-profile list + `fnmatch` SAN patterns). New `RAWorkflow` class manages
@@ -37,6 +38,40 @@ This project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   CLI flags: `--ra-auto-approve`, `--ra-require-approval`,
   `--ra-auto-approve-profiles PROFILE [...]`, `--ra-policy-file PATH`.
   22 tests in `TestRAWorkflow`.
+
+- **§5.4 — CMP PKIStatus=3 (waiting) + pollReq/pollRep RA integration**
+  (`cmp_server.py`). When RA requires manual approval, `ir`/`cr` responses
+  carry `PKIStatus=3` (waiting) per RFC 4210 §5.2.8. Clients poll via
+  `pollReq` (body type 25); server responds with `pollRep` (body type 26,
+  `checkAfter=60s`) while the request is pending, or `ip`/`cp` with
+  `status=0` once approved. State is tracked in an in-memory
+  `_ra_pending` dict keyed by `transactionID`. 4 tests in `TestRAWorkflow`.
+
+- **§5.4 — EST HTTP 202 + Retry-After RA integration** (`est_server.py`).
+  When RA requires manual approval, `simpleenroll` returns `HTTP 202` with
+  `Retry-After: 60` per RFC 7030 §4.2.3. A re-submitted CSR (detected by
+  SHA-256 fingerprint of the CSR DER stored as `protocol_ref`) returns the
+  issued certificate once approved, or 403 if denied. 3 tests in
+  `TestRAWorkflow`.
+
+- **Sub-CA PKCS#12 bundle export** (`cmp_server.py`, `web_ui.py`). `POST
+  /api/sub-ca` (and `/api/issue-sub-ca`) now accept `"export_format":
+  "pkcs12"` and an optional `"p12_password"` field. When requested, the
+  response contains a base64-encoded PKCS#12 bundle (key + certificate +
+  issuer chain) under the `"p12_b64"` key instead of separate `cert_pem`/
+  `key_pem` fields. 2 tests in `TestHTTPAPI`.
+
+### Fixed
+
+- **CMP `_parse_pki_header` `transactionID` extraction** (`cmp_server.py`).
+  The header parser was assigning optional fields by sequential position
+  rather than by ASN.1 context tag number. As a result `transactionID`
+  (context tag [4]) was never extracted when preceding optional fields
+  (`senderKID`, `recipKID`) were absent — the transaction ID always fell
+  back to `os.urandom(16)`, breaking RA-pending state tracking,
+  `certConf` correlation, and any stateful CMP exchange. Fixed by
+  tag-based field identification using a mapping of context-tag byte
+  to field name.
 
 - **§5.11 — Prometheus histogram metrics** (`pki_server.py`,
   `ocsp_server.py`, `acme_server.py`). New `_Histogram` class and three
