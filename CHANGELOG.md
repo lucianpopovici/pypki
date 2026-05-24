@@ -11,6 +11,21 @@ This project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **RFC 8739 — ACME STAR (Short-Term Automatic Renewal)** (`acme_server.py`,
+  `pki_server.py`). Enables clients to request short-lived certificates that
+  are automatically renewed by the server before expiry. New `STARRenewalWorker`
+  background thread renews active STAR certs at the half-lifetime mark and
+  deactivates orders past `end-date`. Schema additions: four new columns on
+  `orders` (`star_end_date`, `star_lifetime`, `star_allow_cert_get`,
+  `star_active`). Directory advertises `meta.autoRenewal` with `minLifetime`,
+  `maxDuration`, and `allow-certificate-get`. New-order validation enforces
+  `end-date` (ISO 8601, future, within `maxDuration`) and `lifetime` (≥
+  `minLifetime`). Finalized STAR orders always use `short_lived` profile
+  (RFC 9608 `noRevAvail`). Order response echoes `auto-renewal` fields.
+  CLI flags: `--acme-star-enabled`, `--acme-star-min-lifetime` (default
+  86400 s), `--acme-star-max-duration` (default 7 776 000 s / 90 days).
+  13 tests in `TestRFC8739ACMESTAR`.
+
 - **RFC 3647 — Certificate Policy / CPS framework** (`docs/CPS.md`).
   CPS document follows the full RFC 3647 §6 nine-section outline,
   calibrated for self-hosted PyPKI deployments (homelab + small enterprise).

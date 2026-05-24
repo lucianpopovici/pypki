@@ -380,6 +380,19 @@ class ACMEDatabase:
             self._db.execute("ALTER TABLE orders ADD COLUMN ra_request_id TEXT")
         except Exception:
             pass
+        # RFC 8739 — STAR columns (idempotent)
+        for _col, _dflt in [
+            ("star_end_date",       "NULL"),
+            ("star_lifetime",       "NULL"),
+            ("star_allow_cert_get", "0"),
+            ("star_active",         "0"),
+        ]:
+            try:
+                self._db.execute(
+                    f"ALTER TABLE orders ADD COLUMN {_col} INTEGER DEFAULT {_dflt}"
+                )
+            except Exception:
+                pass
 
     # -- Nonces --
 
@@ -450,10 +463,19 @@ class ACMEDatabase:
 
     # -- Orders --
 
-    def create_order(self, account_kid: str, identifiers: list) -> dict:
+    def create_order(
+        self,
+        account_kid: str,
+        identifiers: list,
+        star_params: Optional[dict] = None,
+    ) -> dict:
         order_id = b64url_encode(os.urandom(12))
         now = time.time()
         expires = now + 86400  # 24 hours
+
+        star_end_date       = int(star_params["end_date"])       if star_params else None
+        star_lifetime       = int(star_params["lifetime"])       if star_params else None
+        star_allow_cert_get = 1 if star_params and star_params.get("allow_certificate_get") else 0
 
         # Create authorizations for each identifier. Challenge set varies
         # by identifier type per RFC 8738 §4: ip identifiers MUST NOT offer
@@ -461,10 +483,12 @@ class ACMEDatabase:
         with self._db.transaction():
             self._db.execute(
                 "INSERT INTO orders (id,account_kid,status,identifiers,not_before,"
-                "not_after,cert_id,created_at,expires_at,ra_request_id)"
-                " VALUES (?,?,?,?,?,?,?,?,?,?)",
+                "not_after,cert_id,created_at,expires_at,ra_request_id,"
+                "star_end_date,star_lifetime,star_allow_cert_get,star_active)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (order_id, account_kid, "pending",
-                 json.dumps(identifiers), None, None, None, now, expires, None)
+                 json.dumps(identifiers), None, None, None, now, expires, None,
+                 star_end_date, star_lifetime, star_allow_cert_get, 0)
             )
             auth_ids = []
             for ident in identifiers:
@@ -549,6 +573,23 @@ class ACMEDatabase:
     def get_certificate(self, cert_id: str) -> Optional[dict]:
         row = self._db.fetchone("SELECT * FROM certificates WHERE id=?", (cert_id,))
         return dict(row) if row else None
+
+    def update_certificate(self, cert_id: str, pem_chain: str, serial: int) -> None:
+        """Replace the PEM chain and serial for an existing cert record (STAR renewal)."""
+        self._db.execute(
+            "UPDATE certificates SET pem_chain=?, serial=?, created_at=? WHERE id=?",
+            (pem_chain, serial, time.time(), cert_id),
+        )
+
+    def list_active_star_orders(self) -> list:
+        """Return orders with star_active=1 joined to their current certificate."""
+        rows = self._db.fetchall(
+            "SELECT o.*, c.id AS cert_rec_id, c.pem_chain AS cert_pem_chain, "
+            "       c.created_at AS cert_issued_at "
+            "FROM orders o JOIN certificates c ON c.order_id = o.id "
+            "WHERE o.star_active = 1",
+        )
+        return [dict(r) for r in rows]
 
     def count_account_certs_since(self, account_kid: str, since_unix: float) -> int:
         """Return number of certificates issued for *account_kid* after *since_unix*."""
@@ -780,6 +821,103 @@ class ChallengeValidator:
 
 
 # ---------------------------------------------------------------------------
+# RFC 8739 — STAR background renewal worker
+# ---------------------------------------------------------------------------
+
+class STARRenewalWorker:
+    """
+    Background thread that re-issues STAR certificates before they expire.
+
+    Wakes every *interval* seconds.  For each active STAR order it checks
+    whether the current cert has passed the half-lifetime mark; if so it
+    re-uses the same public key (extracted from the stored PEM chain) and
+    issues a fresh short-lived cert, updating the certificate record in-place
+    so that GET /acme/cert/<id> always returns the current cert.
+
+    Orders whose ``star_end_date`` has passed are deactivated (status →
+    invalid, star_active → 0).
+    """
+
+    def __init__(self, db: "ACMEDatabase", ca, interval: int = 60):
+        self._db = db
+        self._ca = ca
+        self._interval = interval
+        self._stop = threading.Event()
+        self._thread = threading.Thread(
+            target=self._run, daemon=True, name="acme-star-renewer"
+        )
+
+    def start(self):
+        self._thread.start()
+        logger.info("ACME STAR renewal worker started (interval=%ds)", self._interval)
+
+    def stop(self):
+        self._stop.set()
+
+    def _run(self):
+        while not self._stop.wait(self._interval):
+            try:
+                self._tick()
+            except Exception as exc:
+                logger.error("STAR renewal tick error: %s", exc)
+
+    def _tick(self):
+        now = time.time()
+        for order in self._db.list_active_star_orders():
+            end_date = order.get("star_end_date") or 0
+            if end_date and end_date <= now:
+                self._db.update_order(order["id"], star_active=0, status="invalid")
+                logger.info("STAR order %s: past end-date, deactivated", order["id"])
+                continue
+            lifetime = order.get("star_lifetime") or 0
+            if not lifetime:
+                continue
+            cert_issued_at = order.get("cert_issued_at") or 0
+            renew_at = cert_issued_at + lifetime / 2
+            if now < renew_at:
+                continue
+            try:
+                self._renew(order)
+            except Exception as exc:
+                logger.error("STAR renewal failed for order %s: %s", order["id"], exc)
+
+    def _renew(self, order: dict):
+        from cryptography import x509 as _x509
+        from cryptography.hazmat.primitives.serialization import Encoding as _Enc
+
+        identifiers = json.loads(order["identifiers"])
+        domains = [i["value"] for i in identifiers if i["type"] == "dns"]
+        ips    = [i["value"] for i in identifiers if i["type"] == "ip"]
+        primary = domains[0] if domains else (ips[0] if ips else "star-client")
+
+        # Extract public key from the first PEM block in the stored chain
+        current_pem = order.get("cert_pem_chain", "")
+        end_marker = "-----END CERTIFICATE-----"
+        first_block = current_pem[: current_pem.index(end_marker) + len(end_marker)]
+        pub_key = _x509.load_pem_x509_certificate(first_block.encode()).public_key()
+
+        validity_days = max(1, order["star_lifetime"] // 86400)
+        new_cert = self._ca.issue_certificate(
+            subject_str=f"CN={primary}",
+            public_key=pub_key,
+            san_dns=domains if domains else None,
+            san_ips=ips if ips else None,
+            validity_days=validity_days,
+            profile="short_lived",
+            protocol="acme",
+        )
+        pem_chain = (
+            new_cert.public_bytes(_Enc.PEM).decode()
+            + self._ca.ca_cert.public_bytes(_Enc.PEM).decode()
+        )
+        self._db.update_certificate(order["cert_rec_id"], pem_chain, new_cert.serial_number)
+        logger.info(
+            "STAR order %s: renewed cert serial=%s validity=%dd",
+            order["id"], new_cert.serial_number, validity_days,
+        )
+
+
+# ---------------------------------------------------------------------------
 # ACME HTTP Request Handler
 # ---------------------------------------------------------------------------
 
@@ -804,6 +942,10 @@ class ACMEHandler(http.server.BaseHTTPRequestHandler):
     require_eab: bool = False           # RFC 8555 §7.3.4: gate account creation behind EAB
     per_account_cert_limit: int = 0     # max certs per account per window (0 = unlimited)
     per_account_window_days: int = 7    # rolling window for per-account limit
+    # RFC 8739 — STAR
+    star_enabled: bool = False
+    star_min_lifetime: int = 86400      # minimum cert lifetime in seconds (default 1 day)
+    star_max_duration: int = 7776000    # maximum auto-renewal window in seconds (default 90 days)
 
     def log_message(self, format, *args):
         logger.info(f"ACME {self.address_string()} - {format % args}")
@@ -1010,8 +1152,14 @@ class ACMEHandler(http.server.BaseHTTPRequestHandler):
                 "caaIdentities":  [],
                 "externalAccountRequired": self.require_eab,
             },
-
         }
+        # RFC 8739 §3.4.1 — advertise STAR capability in meta.autoRenewal
+        if self.star_enabled:
+            directory["meta"]["autoRenewal"] = {
+                "minLifetime":          self.star_min_lifetime,
+                "maxDuration":          self.star_max_duration,
+                "allow-certificate-get": True,
+            }
         # RFC 8555 §7.1.1 — directory response SHOULD include Replay-Nonce
         self._send_json(directory, 200, add_nonce=True)
 
@@ -1119,7 +1267,62 @@ class ACMEHandler(http.server.BaseHTTPRequestHandler):
                 self._send_error(400, err_type, detail)
                 return
 
-        order = self.db.create_order(account["kid"], identifiers)
+        # RFC 8739 — STAR auto-renewal
+        star_params = None
+        auto_renewal = payload.get("auto-renewal")
+        if auto_renewal is not None:
+            if not self.star_enabled:
+                self._send_error(400, "urn:ietf:params:acme:error:unsupportedIdentifier",
+                                 "STAR auto-renewal is not supported on this server")
+                return
+            # Validate end-date
+            end_date_str = auto_renewal.get("end-date")
+            if not end_date_str:
+                self._send_error(400, "urn:ietf:params:acme:error:malformed",
+                                 "auto-renewal.end-date is required")
+                return
+            try:
+                from datetime import datetime, timezone as _tz
+                end_dt = datetime.fromisoformat(end_date_str.replace("Z", "+00:00"))
+                end_ts = end_dt.timestamp()
+            except Exception:
+                self._send_error(400, "urn:ietf:params:acme:error:malformed",
+                                 "auto-renewal.end-date must be ISO 8601")
+                return
+            now_ts = time.time()
+            if end_ts <= now_ts:
+                self._send_error(400, "urn:ietf:params:acme:error:malformed",
+                                 "auto-renewal.end-date must be in the future")
+                return
+            if end_ts - now_ts > self.star_max_duration:
+                self._send_error(400, "urn:ietf:params:acme:error:malformed",
+                                 f"auto-renewal.end-date exceeds maxDuration of "
+                                 f"{self.star_max_duration}s")
+                return
+            # Validate lifetime
+            lifetime = auto_renewal.get("lifetime")
+            if lifetime is None:
+                self._send_error(400, "urn:ietf:params:acme:error:malformed",
+                                 "auto-renewal.lifetime is required")
+                return
+            try:
+                lifetime = int(lifetime)
+            except Exception:
+                self._send_error(400, "urn:ietf:params:acme:error:malformed",
+                                 "auto-renewal.lifetime must be an integer (seconds)")
+                return
+            if lifetime < self.star_min_lifetime:
+                self._send_error(400, "urn:ietf:params:acme:error:malformed",
+                                 f"auto-renewal.lifetime must be >= minLifetime "
+                                 f"({self.star_min_lifetime}s)")
+                return
+            star_params = {
+                "end_date":              int(end_ts),
+                "lifetime":              lifetime,
+                "allow_certificate_get": bool(auto_renewal.get("allow-certificate-get", False)),
+            }
+
+        order = self.db.create_order(account["kid"], identifiers, star_params=star_params)
         order_url = f"{self.base_url}/order/{order['id']}"
 
         resp = self._order_response(order)
@@ -1178,6 +1381,16 @@ class ACMEHandler(http.server.BaseHTTPRequestHandler):
         }
         if order.get("cert_id"):
             resp["certificate"] = f"{self.base_url}/cert/{order['cert_id']}"
+        # RFC 8739 — echo auto-renewal fields when this is a STAR order
+        if order.get("star_lifetime"):
+            from datetime import datetime, timezone as _tz
+            resp["auto-renewal"] = {
+                "end-date":               datetime.fromtimestamp(
+                    order["star_end_date"], tz=_tz.utc
+                ).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "lifetime":               order["star_lifetime"],
+                "allow-certificate-get":  bool(order.get("star_allow_cert_get")),
+            }
         return resp
 
     def _refresh_order_status(self, order_id: str):
@@ -1446,15 +1659,21 @@ class ACMEHandler(http.server.BaseHTTPRequestHandler):
             primary = domains[0] if domains else (csr_ip_strs[0] if csr_ip_strs else "acme-client")
             subject_str = f"CN={primary}"
 
-            validity = self.cert_validity_days
-            if validity <= self.short_lived_threshold_days:
+            # RFC 8739 — STAR orders always use star_lifetime for validity
+            star_lifetime = order.get("star_lifetime")
+            if star_lifetime:
+                validity = max(1, star_lifetime // 86400)
                 profile = "short_lived"
-                logger.info(
-                    f"ACME cert validity={validity}d <= threshold={self.short_lived_threshold_days}d: "
-                    "applying RFC 9608 noRevAvail (profile=short_lived)"
-                )
             else:
-                profile = "tls_server"
+                validity = self.cert_validity_days
+                if validity <= self.short_lived_threshold_days:
+                    profile = "short_lived"
+                    logger.info(
+                        f"ACME cert validity={validity}d <= threshold={self.short_lived_threshold_days}d: "
+                        "applying RFC 9608 noRevAvail (profile=short_lived)"
+                    )
+                else:
+                    profile = "tls_server"
 
             # §5.11: label by dominant identifier type for the histogram
             _challenge_type = "ip" if order_ips and not order_domains else "dns"
@@ -1507,12 +1726,17 @@ class ACMEHandler(http.server.BaseHTTPRequestHandler):
             pem_chain = cert_pem + ca_pem
 
             cert_id = self.db.store_certificate(order_id, pem_chain, cert.serial_number)
-            self.db.update_order(order_id, status="valid", cert_id=cert_id)
+            # RFC 8739 — activate STAR auto-renewal after first issuance
+            if star_lifetime:
+                self.db.update_order(order_id, status="valid", cert_id=cert_id, star_active=1)
+            else:
+                self.db.update_order(order_id, status="valid", cert_id=cert_id)
 
             logger.info(
                 f"ACME cert issued: serial={cert.serial_number} "
                 f"domains={domains} ips={csr_ip_strs} "
                 f"profile={profile} validity={validity}d"
+                + (f" star_lifetime={star_lifetime}s" if star_lifetime else "")
             )
         except Exception as e:
             logger.error(f"Certificate issuance failed: {e}")
@@ -1830,6 +2054,9 @@ def make_acme_handler(
     per_account_cert_limit: int = 0,
     per_account_window_days: int = 7,
     ra=None,
+    star_enabled: bool = False,
+    star_min_lifetime: int = 86400,
+    star_max_duration: int = 7776000,
 ):
     class BoundACMEHandler(ACMEHandler):
         pass
@@ -1844,6 +2071,9 @@ def make_acme_handler(
     BoundACMEHandler.require_eab                 = require_eab
     BoundACMEHandler.per_account_cert_limit      = per_account_cert_limit
     BoundACMEHandler.per_account_window_days     = per_account_window_days
+    BoundACMEHandler.star_enabled                = star_enabled
+    BoundACMEHandler.star_min_lifetime           = star_min_lifetime
+    BoundACMEHandler.star_max_duration           = star_max_duration
     return BoundACMEHandler
 
 
@@ -1864,6 +2094,9 @@ def start_acme_server(
     per_account_cert_limit: int = 0,
     per_account_window_days: int = 7,
     db_url: str = "",
+    star_enabled: bool = False,
+    star_min_lifetime: int = 86400,
+    star_max_duration: int = 7776000,
 ):
     """
     Register the ACME handler with *route_table* under *prefix*.
@@ -1922,10 +2155,18 @@ def start_acme_server(
         per_account_cert_limit=per_account_cert_limit,
         per_account_window_days=per_account_window_days,
         ra=getattr(ca, "ra", None),
+        star_enabled=star_enabled,
+        star_min_lifetime=star_min_lifetime,
+        star_max_duration=star_max_duration,
     )
 
     route_table.register(prefix, handler_cls)
     logger.info(f"ACME handler registered at prefix {prefix!r} (base_url={base_url!r})")
+
+    # RFC 8739 — start background STAR renewal worker
+    if star_enabled:
+        STARRenewalWorker(db, ca).start()
+
     return _RouteProxy(route_table, prefix, label="acme")
 
 

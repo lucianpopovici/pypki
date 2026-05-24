@@ -4357,6 +4357,18 @@ def main():
         "--acme-per-account-window-days", type=int, default=7, metavar="N",
         help="Rolling window in days for --acme-per-account-cert-limit (default: 7)"
     )
+    acme_group.add_argument(
+        "--acme-star-enabled", action="store_true", default=False,
+        help="Enable RFC 8739 ACME STAR (short-term auto-renewed certificates)"
+    )
+    acme_group.add_argument(
+        "--acme-star-min-lifetime", type=int, default=86400, metavar="SECONDS",
+        help="Minimum STAR certificate lifetime in seconds (default: 86400 = 1 day)"
+    )
+    acme_group.add_argument(
+        "--acme-star-max-duration", type=int, default=7776000, metavar="SECONDS",
+        help="Maximum STAR auto-renewal window in seconds (default: 7776000 = 90 days)"
+    )
 
     ct_group = parser.add_argument_group(
         "Certificate Transparency (RFC 6962 / RFC 9162)",
@@ -4874,6 +4886,9 @@ def main():
                 per_account_cert_limit=getattr(args, "acme_per_account_cert_limit", 0),
                 per_account_window_days=getattr(args, "acme_per_account_window_days", 7),
                 db_url=getattr(args, "acme_db_url", None) or "",
+                star_enabled=getattr(args, "acme_star_enabled", False),
+                star_min_lifetime=getattr(args, "acme_star_min_lifetime", 86400),
+                star_max_duration=getattr(args, "acme_star_max_duration", 7776000),
             )
 
     # Start SCEP server if requested

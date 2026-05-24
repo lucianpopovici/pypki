@@ -10017,6 +10017,285 @@ class TestMetricsDepth(unittest.TestCase):
 
 
 # ===========================================================================
+# RFC 8739 — ACME STAR (Short-Term Automatic Renewal)
+# ===========================================================================
+
+class TestRFC8739ACMESTAR(unittest.TestCase):
+    """Verify RFC 8739 ACME STAR implementation."""
+
+    def setUp(self):
+        try:
+            import acme_server
+            self.acme = acme_server
+        except ImportError:
+            self.skipTest("acme_server.py not importable")
+        self._tmp = tempfile.mkdtemp()
+        self.db = self.acme.ACMEDatabase(
+            os.path.join(self._tmp, "acme_star.db")
+        )
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self._tmp, ignore_errors=True)
+
+    # -- Database layer --
+
+    def test_update_certificate_updates_pem_chain_and_serial(self):
+        """update_certificate must overwrite pem_chain, serial, and created_at."""
+        kid = "kid-star-db"
+        identifiers = [{"type": "dns", "value": "star.example.com"}]
+        order = self.db.create_order(kid, identifiers)
+        cert_id = self.db.store_certificate(order["id"], "OLD_PEM", 100)
+        self.db.update_certificate(cert_id, "NEW_PEM", 200)
+        rec = self.db.get_certificate(cert_id)
+        self.assertEqual(rec["pem_chain"], "NEW_PEM")
+        self.assertEqual(rec["serial"], 200)
+
+    def test_list_active_star_orders_returns_star_orders_only(self):
+        """list_active_star_orders must only return orders with star_active=1."""
+        kid = "kid-star-list"
+        identifiers = [{"type": "dns", "value": "star2.example.com"}]
+        now = int(time.time())
+        star_params = {"end_date": now + 3600, "lifetime": 86400,
+                       "allow_certificate_get": False}
+        order = self.db.create_order(kid, identifiers, star_params=star_params)
+        # Before star_active is set, should not appear
+        active = self.db.list_active_star_orders()
+        self.assertFalse(any(o["id"] == order["id"] for o in active))
+        # Set star_active=1 and store a certificate
+        cert_id = self.db.store_certificate(order["id"], "SOME_PEM", 999)
+        self.db.update_order(order["id"], star_active=1, cert_id=cert_id)
+        active = self.db.list_active_star_orders()
+        self.assertTrue(any(o["id"] == order["id"] for o in active))
+
+    def test_create_order_with_star_params_stores_columns(self):
+        """create_order must persist star_end_date, star_lifetime, star_allow_cert_get."""
+        kid = "kid-star-cols"
+        identifiers = [{"type": "dns", "value": "cols.example.com"}]
+        now = int(time.time())
+        star_params = {"end_date": now + 7200, "lifetime": 3600,
+                       "allow_certificate_get": True}
+        order = self.db.create_order(kid, identifiers, star_params=star_params)
+        row = self.db._db.fetchone("SELECT * FROM orders WHERE id=?", (order["id"],))
+        self.assertEqual(dict(row)["star_lifetime"], 3600)
+        self.assertEqual(dict(row)["star_allow_cert_get"], 1)
+
+    # -- Handler class attributes --
+
+    def test_make_acme_handler_propagates_star_params(self):
+        """make_acme_handler must set star_enabled, star_min_lifetime, star_max_duration."""
+        cls = self.acme.make_acme_handler(
+            db=self.db, ca=None, validator=None, base_url="http://localhost",
+            star_enabled=True, star_min_lifetime=3600, star_max_duration=2592000,
+        )
+        self.assertTrue(cls.star_enabled)
+        self.assertEqual(cls.star_min_lifetime, 3600)
+        self.assertEqual(cls.star_max_duration, 2592000)
+
+    def test_make_acme_handler_star_disabled_by_default(self):
+        """star_enabled must default to False."""
+        cls = self.acme.make_acme_handler(
+            db=self.db, ca=None, validator=None, base_url="http://localhost",
+        )
+        self.assertFalse(cls.star_enabled)
+
+    # -- Directory advertisement --
+
+    def _make_handler(self, star_enabled=True, star_min_lifetime=86400,
+                      star_max_duration=7776000):
+        cls = self.acme.make_acme_handler(
+            db=self.db, ca=None, validator=None, base_url="http://localhost",
+            star_enabled=star_enabled,
+            star_min_lifetime=star_min_lifetime,
+            star_max_duration=star_max_duration,
+        )
+        return cls
+
+    def _build_handler_instance(self, star_enabled=True, star_min_lifetime=3600,
+                                  star_max_duration=86400):
+        cls = self._make_handler(star_enabled=star_enabled,
+                                 star_min_lifetime=star_min_lifetime,
+                                 star_max_duration=star_max_duration)
+        h = cls.__new__(cls)
+        h.db = self.db
+        h.base_url = "http://localhost"
+        h.star_enabled = star_enabled
+        h.star_min_lifetime = star_min_lifetime
+        h.star_max_duration = star_max_duration
+        h.require_eab = False
+        return h
+
+    def test_directory_includes_auto_renewal_when_star_enabled(self):
+        """Directory response must include meta.autoRenewal when star_enabled=True."""
+        h = self._build_handler_instance(star_enabled=True, star_min_lifetime=3600,
+                                         star_max_duration=86400)
+        captured = {}
+
+        def fake_send_json(data, code=200, headers=None, add_nonce=False):
+            captured["data"] = data
+
+        h._send_json = fake_send_json
+        h._handle_directory()
+        self.assertIn("meta", captured["data"])
+        auto_renewal = captured["data"]["meta"].get("autoRenewal")
+        self.assertIsNotNone(auto_renewal)
+        self.assertEqual(auto_renewal["minLifetime"], 3600)
+        self.assertEqual(auto_renewal["maxDuration"], 86400)
+        self.assertTrue(auto_renewal.get("allow-certificate-get"))
+
+    def test_directory_omits_auto_renewal_when_star_disabled(self):
+        """Directory response must NOT include meta.autoRenewal when star_enabled=False."""
+        h = self._build_handler_instance(star_enabled=False)
+        captured = {}
+
+        def fake_send_json(data, code=200, headers=None, add_nonce=False):
+            captured["data"] = data
+
+        h._send_json = fake_send_json
+        h._handle_directory()
+        self.assertNotIn("autoRenewal", captured["data"].get("meta", {}))
+
+    # -- _order_response echo --
+
+    def test_order_response_echoes_auto_renewal_for_star_order(self):
+        """_order_response must include auto-renewal key for STAR orders."""
+        h = self._build_handler_instance()
+
+        kid = "kid-resp-echo"
+        identifiers = [{"type": "dns", "value": "echo.example.com"}]
+        now = int(time.time())
+        star_params = {"end_date": now + 7200, "lifetime": 86400,
+                       "allow_certificate_get": True}
+        order = self.db.create_order(kid, identifiers, star_params=star_params)
+        resp = h._order_response(order)
+        self.assertIn("auto-renewal", resp)
+        self.assertEqual(resp["auto-renewal"]["lifetime"], 86400)
+        self.assertIn("end-date", resp["auto-renewal"])
+
+    def test_order_response_omits_auto_renewal_for_regular_order(self):
+        """_order_response must NOT include auto-renewal for normal orders."""
+        h = self._build_handler_instance()
+
+        kid = "kid-resp-normal"
+        identifiers = [{"type": "dns", "value": "normal.example.com"}]
+        order = self.db.create_order(kid, identifiers)
+        resp = h._order_response(order)
+        self.assertNotIn("auto-renewal", resp)
+
+    # -- Renewal worker --
+
+    def test_star_renewal_worker_deactivates_expired_order(self):
+        """Worker must set star_active=0 for orders past star_end_date."""
+        kid = "kid-expire"
+        identifiers = [{"type": "dns", "value": "expire.example.com"}]
+        past_ts = int(time.time()) - 3600
+        star_params = {"end_date": past_ts, "lifetime": 86400,
+                       "allow_certificate_get": False}
+        order = self.db.create_order(kid, identifiers, star_params=star_params)
+        cert_id = self.db.store_certificate(order["id"], "SOME_PEM", 1)
+        self.db.update_order(order["id"], star_active=1, status="valid",
+                             cert_id=cert_id)
+
+        worker = self.acme.STARRenewalWorker(self.db, ca=None, interval=9999)
+        worker._tick()  # single iteration
+
+        updated = self.db.get_order(order["id"])
+        self.assertEqual(updated["star_active"], 0)
+        self.assertEqual(updated["status"], "invalid")
+
+    def test_star_renewal_worker_does_not_renew_before_half_lifetime(self):
+        """Worker must not renew when less than half a lifetime has elapsed."""
+        tmp = tempfile.mkdtemp()
+        try:
+            ca = _make_ca(tmp)
+            kid = "kid-no-renew"
+            identifiers = [{"type": "dns", "value": "no-renew.example.com"}]
+            now = int(time.time())
+            star_params = {"end_date": now + 86400 * 30, "lifetime": 86400,
+                           "allow_certificate_get": False}
+            order = self.db.create_order(kid, identifiers, star_params=star_params)
+
+            # Issue a real cert to store in the database
+            from cryptography.hazmat.primitives.asymmetric import rsa as _rsa
+            key = _rsa.generate_private_key(65537, 2048)
+            cert = ca.issue_certificate("CN=no-renew.example.com",
+                                        key.public_key(), profile="short_lived")
+            from cryptography.hazmat.primitives.serialization import Encoding as _Enc
+            pem = cert.public_bytes(_Enc.PEM).decode()
+            cert_id = self.db.store_certificate(order["id"], pem, cert.serial_number)
+            # Make cert appear very recently issued (within half-lifetime)
+            self.db._db.execute(
+                "UPDATE certificates SET created_at=? WHERE id=?",
+                (time.time() - 100, cert_id),
+            )
+            self.db.update_order(order["id"], star_active=1, status="valid",
+                                 cert_id=cert_id)
+
+            original_serial = cert.serial_number
+            worker = self.acme.STARRenewalWorker(self.db, ca, interval=9999)
+            worker._tick()
+
+            rec = self.db.get_certificate(cert_id)
+            self.assertEqual(rec["serial"], original_serial,
+                             "Serial should be unchanged — renewal should not have fired")
+        finally:
+            import shutil
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_star_renewal_worker_renews_at_half_lifetime(self):
+        """Worker must renew when cert_issued_at + lifetime/2 has elapsed."""
+        tmp = tempfile.mkdtemp()
+        try:
+            ca = _make_ca(tmp)
+            kid = "kid-renew"
+            identifiers = [{"type": "dns", "value": "renew.example.com"}]
+            now = int(time.time())
+            star_params = {"end_date": now + 86400 * 30, "lifetime": 86400,
+                           "allow_certificate_get": False}
+            order = self.db.create_order(kid, identifiers, star_params=star_params)
+
+            from cryptography.hazmat.primitives.asymmetric import rsa as _rsa
+            key = _rsa.generate_private_key(65537, 2048)
+            cert = ca.issue_certificate("CN=renew.example.com",
+                                        key.public_key(), profile="short_lived")
+            from cryptography.hazmat.primitives.serialization import Encoding as _Enc
+            pem = cert.public_bytes(_Enc.PEM).decode()
+            cert_id = self.db.store_certificate(order["id"], pem, cert.serial_number)
+            # Age the cert record so renewal fires (> half-lifetime ago)
+            half_plus = 86400 / 2 + 3600
+            self.db._db.execute(
+                "UPDATE certificates SET created_at=? WHERE id=?",
+                (time.time() - half_plus, cert_id),
+            )
+            self.db.update_order(order["id"], star_active=1, status="valid",
+                                 cert_id=cert_id)
+
+            original_serial = cert.serial_number
+            worker = self.acme.STARRenewalWorker(self.db, ca, interval=9999)
+            worker._tick()
+
+            rec = self.db.get_certificate(cert_id)
+            self.assertNotEqual(rec["serial"], original_serial,
+                                "Serial must change after renewal")
+        finally:
+            import shutil
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    # -- CLI flags --
+
+    def test_start_acme_server_signature_includes_star_params(self):
+        """start_acme_server must accept star_enabled, star_min_lifetime, star_max_duration."""
+        import inspect
+        sig = inspect.signature(self.acme.start_acme_server)
+        self.assertIn("star_enabled", sig.parameters)
+        self.assertIn("star_min_lifetime", sig.parameters)
+        self.assertIn("star_max_duration", sig.parameters)
+        self.assertFalse(sig.parameters["star_enabled"].default)
+        self.assertEqual(sig.parameters["star_min_lifetime"].default, 86400)
+        self.assertEqual(sig.parameters["star_max_duration"].default, 7776000)
+
+
+# ===========================================================================
 # Entry point
 # ===========================================================================
 

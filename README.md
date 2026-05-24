@@ -114,6 +114,21 @@ multicast, reserved, and unspecified addresses are refused by default;
 pass `--acme-allow-private-ip` to permit them in homelab / internal-only
 deployments.
 
+**ACME STAR — short-term auto-renewed certificates (RFC 8739).** Enable with
+`--acme-star-enabled`. STAR orders carry an `auto-renewal` object specifying
+an `end-date` (ISO 8601, within `--acme-star-max-duration`) and a `lifetime`
+in seconds (≥ `--acme-star-min-lifetime`). The server issues a short-lived
+certificate (using the `short_lived` RFC 9608 profile — no OCSP, no CDP) and
+a background worker re-issues it when half a lifetime has elapsed, updating
+the certificate record in-place so `GET /acme/cert/<id>` always returns the
+current cert. The order is automatically invalidated when `end-date` passes.
+
+```
+--acme-star-enabled                Enable RFC 8739 STAR (default off)
+--acme-star-min-lifetime SECONDS   Minimum cert lifetime (default 86400 = 1 day)
+--acme-star-max-duration SECONDS   Maximum renewal window (default 7776000 = 90 days)
+```
+
 ### SCEP Protocol (RFC 8894)
 | Operation | Description |
 |---|---|
@@ -1899,6 +1914,7 @@ Every issued certificate includes:
 | RFC 3161 | Time-Stamp Protocol (TSA) | ✅ Full — `--tsa-prefix /tsa`; SHA-256/384/512 accepted; TSTInfo with nonce, serialNumber, accuracy; `--tsa-policy-oid`, `--tsa-accuracy-seconds`, pre-provisioned cert/key support |
 | RFC 5816 | ESSCertIDv2 in TSA SignedData | ✅ Full — `signingCertificateV2` signed attribute with SHA-256 ESSCertIDv2 in every TimeStampToken |
 | RFC 8738 | ACME IP Identifier | ✅ Full — `{type:"ip"}` orders, `http-01` + `tls-alpn-01` only (no `dns-01`), IPv4/IPv6 SANs, `--acme-allow-private-ip` for homelab |
+| RFC 8739 | ACME STAR — Short-Term Automatic Renewal | ✅ Full — `auto-renewal` in new-order, background `STARRenewalWorker` renews at half-lifetime, `meta.autoRenewal` directory advertisement, `short_lived` profile (RFC 9608), CLI flags `--acme-star-enabled` / `--acme-star-min-lifetime` / `--acme-star-max-duration` |
 | RFC 8894 | SCEP — Simple Certificate Enrolment Protocol | ✅ Full — including single-use OTP challenge passwords (`--scep-use-otp`; `POST /api/scep/otp`) |
 | RFC 5083 | CMS AuthEnvelopedData | ✅ Full — `CMSBuilder.auth_enveloped_data` (AES-256-GCM); `CMSParser` dispatches on `id-ct-authEnvelopedData`; SCEP `GetCACaps` advertises `AES-GCM` |
 | RFC 5084 | AES-GCM in CMS | ✅ Full — AES-256-GCM with 12-byte nonce, 16-byte auth tag, `GCMParameters` (nonce + `ICVlen=16`); eliminates CBC padding-oracle surface from SCEP |
