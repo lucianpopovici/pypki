@@ -136,6 +136,16 @@ except ImportError:
     _mldsa_mod = None
     HAS_MLDSA = False
 
+# Composite ML-DSA — gated behind --enable-composite-mldsa (default off)
+# OIDs from draft-ietf-lamps-pq-composite-sigs; re-verify before each release.
+HAS_COMPOSITE_MLDSA: bool = False  # toggled by --enable-composite-mldsa at startup
+try:
+    import composite as _composite_mod
+    _COMPOSITE_AVAILABLE = True
+except ImportError:
+    _composite_mod = None  # type: ignore[assignment]
+    _COMPOSITE_AVAILABLE = False
+
 # RFC 5280 §4.2.1.14 — Well-known CA/B Forum policy OIDs (for CertificatePolicies)
 OID_ANY_POLICY          = x509.ObjectIdentifier("2.5.29.32.0")
 OID_POLICY_DV           = x509.ObjectIdentifier("2.23.140.1.2.1")  # CA/B Forum DV
@@ -1222,6 +1232,11 @@ _CA_KEY_FACTORIES = {
     "ml-dsa-44": lambda: _mldsa_mod.MLDSA44PrivateKey.generate() if HAS_MLDSA else (_ for _ in ()).throw(ImportError("cryptography ≥ 44 required for ML-DSA")),
     "ml-dsa-65": lambda: _mldsa_mod.MLDSA65PrivateKey.generate() if HAS_MLDSA else (_ for _ in ()).throw(ImportError("cryptography ≥ 44 required for ML-DSA")),
     "ml-dsa-87": lambda: _mldsa_mod.MLDSA87PrivateKey.generate() if HAS_MLDSA else (_ for _ in ()).throw(ImportError("cryptography ≥ 44 required for ML-DSA")),
+    # Composite ML-DSA key types — gated behind --enable-composite-mldsa
+    "composite-mldsa44-rsa2048-pss":  lambda: _composite_mod.generate_composite_key("composite-mldsa44-rsa2048-pss") if HAS_COMPOSITE_MLDSA else (_ for _ in ()).throw(RuntimeError("--enable-composite-mldsa not set")),
+    "composite-mldsa44-ecdsa-p256":   lambda: _composite_mod.generate_composite_key("composite-mldsa44-ecdsa-p256") if HAS_COMPOSITE_MLDSA else (_ for _ in ()).throw(RuntimeError("--enable-composite-mldsa not set")),
+    "composite-mldsa65-ecdsa-p384":   lambda: _composite_mod.generate_composite_key("composite-mldsa65-ecdsa-p384") if HAS_COMPOSITE_MLDSA else (_ for _ in ()).throw(RuntimeError("--enable-composite-mldsa not set")),
+    "composite-mldsa87-ecdsa-p521":   lambda: _composite_mod.generate_composite_key("composite-mldsa87-ecdsa-p521") if HAS_COMPOSITE_MLDSA else (_ for _ in ()).throw(RuntimeError("--enable-composite-mldsa not set")),
 }
 
 
@@ -1632,6 +1647,20 @@ class CertProfile:
                               key_agreement=False, key_cert_sign=False,
                               crl_sign=False, encipher_only=False, decipher_only=False),
             "eku": [ExtendedKeyUsageOID.EMAIL_PROTECTION],
+            "san_required": False,
+            "bc_ca": False,
+        },
+        # Composite ML-DSA signing — draft-ietf-lamps-pq-composite-sigs.
+        # Subject holds a composite public key (ML-DSA + classical).
+        # Gate behind --enable-composite-mldsa; default off until RFC publishes.
+        "composite_signing": {
+            "key_usage": dict(digital_signature=True, content_commitment=True,
+                              key_encipherment=False, data_encipherment=False,
+                              key_agreement=False, key_cert_sign=False,
+                              crl_sign=False, encipher_only=False, decipher_only=False),
+            "allowed_algorithms": {"composite-mldsa44-rsa2048-pss", "composite-mldsa44-ecdsa-p256",
+                                   "composite-mldsa65-ecdsa-p384", "composite-mldsa87-ecdsa-p521"},
+            "eku": [],
             "san_required": False,
             "bc_ca": False,
         },
@@ -3033,6 +3062,119 @@ class CertificateAuthority:
         )
         classical_cert_pem = classical_cert.public_bytes(Encoding.PEM).decode()
         return classical_cert_pem, ml_dsa_cert_der
+
+    def issue_composite_certificate(
+        self,
+        subject_str: str,
+        composite_spki_der: bytes,
+        composite_name: str,
+        validity_days: int = 365,
+        profile: str = "composite_signing",
+        audit: Optional["AuditLog"] = None,
+        requester_ip: str = "",
+    ) -> bytes:
+        """
+        Issue an X.509 certificate with a composite ML-DSA + classical subject key.
+
+        The CA signs with its own key.  The subject holds the composite public key
+        encoded per draft-ietf-lamps-pq-composite-sigs §5.1.
+
+        Requires --enable-composite-mldsa and cryptography ≥ 44.0.0.
+
+        Args:
+            composite_spki_der: DER-encoded SubjectPublicKeyInfo for the composite key.
+            composite_name:     Algorithm name from composite.COMPOSITE_OIDS.
+        Returns:
+            DER bytes of the issued certificate.
+        """
+        if not HAS_COMPOSITE_MLDSA:
+            raise RuntimeError("Composite ML-DSA requires --enable-composite-mldsa")
+        if not _COMPOSITE_AVAILABLE:
+            raise RuntimeError("composite.py module not found")
+
+        prof = CertProfile.get(profile)
+
+        attrs = []
+        for part in subject_str.split(","):
+            part = part.strip()
+            if "=" not in part:
+                continue
+            key_s, _, val_s = part.partition("=")
+            oid_map = {
+                "CN": NameOID.COMMON_NAME, "O": NameOID.ORGANIZATION_NAME,
+                "OU": NameOID.ORGANIZATIONAL_UNIT_NAME, "C": NameOID.COUNTRY_NAME,
+                "L": NameOID.LOCALITY_NAME, "ST": NameOID.STATE_OR_PROVINCE_NAME,
+                "EMAIL": NameOID.EMAIL_ADDRESS,
+            }
+            k = key_s.strip().upper()
+            if k in oid_map:
+                attrs.append(x509.NameAttribute(oid_map[k], val_s.strip()))
+        if not attrs:
+            attrs = [x509.NameAttribute(NameOID.COMMON_NAME, subject_str or "Composite Entity")]
+        subject = x509.Name(attrs)
+
+        serial = self._next_serial()
+        now = datetime.datetime.now(datetime.timezone.utc)
+        not_before = now
+        not_after = now + datetime.timedelta(days=validity_days)
+
+        issuer_name_der = self.ca_cert.issuer.public_bytes()
+        subject_name_der = subject.public_bytes()
+        ca_ski_ext = self.ca_cert.extensions.get_extension_for_class(x509.SubjectKeyIdentifier)
+        ca_ski_bytes = ca_ski_ext.value.key_identifier
+        subject_ski = _ski_from_spki(composite_spki_der)
+
+        ku = prof["key_usage"]
+        ku_bits = 0
+        for bit_pos, flag_name in enumerate([
+            "digital_signature", "content_commitment", "key_encipherment",
+            "data_encipherment", "key_agreement", "key_cert_sign",
+            "crl_sign", "encipher_only", "decipher_only",
+        ]):
+            if ku.get(flag_name):
+                ku_bits |= (0x80 >> bit_pos)
+        ku_byte = bytes([ku_bits & 0xFF])
+        unused = 0
+        tmp = ku_bits
+        while tmp and not (tmp & 1):
+            unused += 1; tmp >>= 1
+        ku_der = _pder_tlv(0x03, bytes([unused]) + ku_byte)
+
+        extensions = [
+            ("2.5.29.19", _pder_seq(b""), True),
+            ("2.5.29.14", _pder_os(subject_ski), False),
+            ("2.5.29.35", _pder_seq(_pder_ctx(0, ca_ski_bytes, False)), False),
+            ("2.5.29.15", ku_der, True),
+        ]
+
+        tbs = _build_mldsa_tbs(
+            serial=serial,
+            ca_key=self.ca_key,
+            issuer_name_der=issuer_name_der,
+            not_before=not_before,
+            not_after=not_after,
+            subject_name_der=subject_name_der,
+            spki_der=composite_spki_der,
+            extensions=extensions,
+        )
+        cert_der = _build_cert_der_from_tbs(tbs, self.ca_key, rsa_pss=self._rsa_pss)
+
+        subject_str_out = subject.rfc4514_string()
+        self._pki_db.execute(
+            "INSERT OR REPLACE INTO certificates"
+            "(serial,subject,not_before,not_after,der,revoked,revoked_at,reason,profile) "
+            "VALUES(?,?,?,?,?,0,NULL,NULL,?)",
+            (serial, subject_str_out,
+             not_before.isoformat(), not_after.isoformat(),
+             cert_der, profile),
+        )
+        if audit:
+            audit.record("issue_composite",
+                         f"serial={serial} subject='{subject_str_out}' algo={composite_name}",
+                         requester_ip=requester_ip)
+        logger.info("Issued composite cert serial=%d subject='%s' algo=%s",
+                    serial, subject_str_out, composite_name)
+        return cert_der
 
     def get_certificate_by_serial(self, serial: int) -> Optional[str]:
         """Return PEM string for the certificate with the given serial number, or None."""
@@ -5004,7 +5146,25 @@ def main():
     validity_group.add_argument("--ca-days", type=int, default=None,
                                 metavar="DAYS", help="CA cert lifetime on first creation (default: 3650)")
 
+    pq_group = parser.add_argument_group(
+        "Post-quantum options",
+        "Enable experimental post-quantum algorithms. Gated until RFCs are published."
+    )
+    pq_group.add_argument(
+        "--enable-composite-mldsa", action="store_true", default=False,
+        help="Enable composite ML-DSA + classical certificates "
+             "(draft-ietf-lamps-pq-composite-sigs; default off until RFC publishes)"
+    )
+
     args = parser.parse_args()
+
+    # Enable composite ML-DSA if requested
+    if getattr(args, "enable_composite_mldsa", False):
+        global HAS_COMPOSITE_MLDSA
+        if not _COMPOSITE_AVAILABLE:
+            raise SystemExit("--enable-composite-mldsa: composite.py module not found")
+        HAS_COMPOSITE_MLDSA = True
+        logger.info("Composite ML-DSA enabled (draft-ietf-lamps-pq-composite-sigs)")
 
     configure_logging(args.log_level, getattr(args, "log_format", "text"))
 

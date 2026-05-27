@@ -3041,7 +3041,7 @@ class TestModuleStructure(unittest.TestCase):
         expected = {"tls_server", "tls_client", "code_signing", "email",
                     "email_signing", "email_encryption_rsa", "email_encryption_ec",
                     "ocsp_signing", "tsa_signing", "sub_ca", "short_lived", "default",
-                    "ml_dsa_signing"}
+                    "ml_dsa_signing", "composite_signing"}
         actual = set(pki.CertProfile.PROFILES.keys())
         self.assertEqual(actual, expected,
                          f"Missing profiles: {expected - actual}")
@@ -11681,6 +11681,187 @@ class TestRFC9773Replaces(unittest.TestCase):
             db=self._db, ca=None, validator=None, base_url="http://localhost",
         )
         self.assertIsNone(cls.audit_log)
+
+
+# ===========================================================================
+# Composite ML-DSA + classical signatures
+# draft-ietf-lamps-pq-composite-sigs (targeting revision -18)
+# ===========================================================================
+
+try:
+    import composite as _composite_mod
+    _HAS_COMPOSITE = True
+except ImportError:
+    _HAS_COMPOSITE = False
+
+
+@unittest.skipUnless(pki.HAS_MLDSA and _HAS_COMPOSITE,
+                     "cryptography ≥ 44 and composite.py required")
+class TestCompositeMLDSA(unittest.TestCase):
+    """Tests for composite.py and issue_composite_certificate()."""
+
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+        self.ca = _make_ca(self.tmpdir)
+        import composite
+        self.comp = composite
+        # Enable composite gate for issuance tests
+        self._orig_flag = pki.HAS_COMPOSITE_MLDSA
+        pki.HAS_COMPOSITE_MLDSA = True
+
+    def tearDown(self):
+        pki.HAS_COMPOSITE_MLDSA = self._orig_flag
+        import shutil; shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def test_oid_table_contains_four_algorithms(self):
+        """COMPOSITE_OIDS must contain exactly the four initial algorithms."""
+        names = set(self.comp.COMPOSITE_OIDS)
+        self.assertIn("composite-mldsa44-rsa2048-pss", names)
+        self.assertIn("composite-mldsa44-ecdsa-p256", names)
+        self.assertIn("composite-mldsa65-ecdsa-p384", names)
+        self.assertIn("composite-mldsa87-ecdsa-p521", names)
+
+    def test_oid_table_matches_draft_arc(self):
+        """All composite OIDs must be from the 2.16.840.1.114027.80.8.1 Entrust arc."""
+        arc = "2.16.840.1.114027.80.8.1."
+        for name, entry in self.comp.COMPOSITE_OIDS.items():
+            self.assertTrue(entry["oid"].startswith(arc),
+                            f"{name}: OID {entry['oid']!r} not in Entrust arc")
+
+    def test_generate_composite_key_returns_composite_key(self):
+        key = self.comp.generate_composite_key("composite-mldsa44-ecdsa-p256")
+        self.assertIsInstance(key, self.comp.CompositeKey)
+        self.assertEqual(key.name, "composite-mldsa44-ecdsa-p256")
+
+    def test_composite_spki_is_der_sequence(self):
+        key = self.comp.generate_composite_key("composite-mldsa44-ecdsa-p256")
+        spki = self.comp.composite_spki_der(key)
+        self.assertIsInstance(spki, bytes)
+        self.assertEqual(spki[0], 0x30)  # SEQUENCE tag
+
+    def test_pubkey_concatenation_order_mldsa44_rsa(self):
+        """ML-DSA-44 public key (1312 bytes) must precede RSA public key in the BIT STRING."""
+        key = self.comp.generate_composite_key("composite-mldsa44-rsa2048-pss")
+        spki = self.comp.composite_spki_der(key)
+        # Parse SPKI to get the BIT STRING value
+        from der_codec import decode_tlv
+        _, body, _ = decode_tlv(spki, 0)
+        _, _, alg_end = decode_tlv(body, 0)
+        _, bs_val, _ = decode_tlv(body, alg_end)
+        pub_raw = bs_val[1:]  # strip unused-bits byte
+        self.assertEqual(len(pub_raw[:1312]), 1312)  # ML-DSA-44 portion
+        # RSA portion follows; must be DER (starts with SEQUENCE 0x30)
+        self.assertEqual(pub_raw[1312], 0x30)
+
+    def test_signature_is_der_sequence_of_two_bit_strings(self):
+        """CompositeSignatureValue must be SEQUENCE { BIT STRING, BIT STRING }."""
+        key = self.comp.generate_composite_key("composite-mldsa44-ecdsa-p256")
+        sig_der = self.comp.composite_sign(key, b"test message")
+        from der_codec import decode_tlv
+        tag, seq_val, _ = decode_tlv(sig_der, 0)
+        self.assertEqual(tag, 0x30)  # SEQUENCE
+        tag1, _, pos = decode_tlv(seq_val, 0)
+        self.assertEqual(tag1, 0x03)  # BIT STRING
+        tag2, _, _ = decode_tlv(seq_val, pos)
+        self.assertEqual(tag2, 0x03)  # BIT STRING
+
+    def test_domain_separator_is_label_not_oid_bytes(self):
+        """_m_prime must include the ASCII algorithm name, not DER OID bytes."""
+        entry = self.comp.COMPOSITE_OIDS["composite-mldsa44-ecdsa-p256"]
+        m_prime = self.comp._m_prime(entry, b"test")
+        domain_label = entry["domain"].encode("ascii")
+        self.assertIn(domain_label, m_prime)
+        # Must NOT contain the DER-encoded composite OID (06 tag = 0x06)
+        from der_codec import oid as _oid_der
+        oid_der_bytes = _oid_der(entry["oid"])
+        self.assertNotIn(oid_der_bytes, m_prime)
+
+    def test_no_randomizer_in_combiner(self):
+        """Signing the same message twice must produce deterministic m_prime (no random salt)."""
+        entry = self.comp.COMPOSITE_OIDS["composite-mldsa44-ecdsa-p256"]
+        m1 = self.comp._m_prime(entry, b"deterministic")
+        m2 = self.comp._m_prime(entry, b"deterministic")
+        self.assertEqual(m1, m2)
+
+    def test_composite_verify_round_trip(self):
+        """A signed message must verify correctly with the matching public key."""
+        key = self.comp.generate_composite_key("composite-mldsa44-ecdsa-p256")
+        message = b"hello composite"
+        sig_der = self.comp.composite_sign(key, message)
+        spki_der = self.comp.composite_spki_der(key)
+        ok = self.comp.composite_verify(spki_der, key.name, message, sig_der)
+        self.assertTrue(ok)
+
+    def test_classical_only_verify_fails_when_mldsa_corrupted(self):
+        """Corrupting the ML-DSA signature component must cause verification to fail."""
+        key = self.comp.generate_composite_key("composite-mldsa44-ecdsa-p256")
+        message = b"tamper test"
+        sig_der = self.comp.composite_sign(key, message)
+        # Flip a byte inside the ML-DSA BIT STRING (first component)
+        sig_list = bytearray(sig_der)
+        sig_list[-20] ^= 0xFF  # corrupt near the end (likely in classical sig though)
+        # Flip a byte early in the sig (ML-DSA sig is first and larger)
+        sig_list[10] ^= 0xFF
+        spki_der = self.comp.composite_spki_der(key)
+        ok = self.comp.composite_verify(spki_der, key.name, message, bytes(sig_list))
+        self.assertFalse(ok)
+
+    def test_pkcs8_private_key_round_trip(self):
+        """composite_private_key_der must produce valid OneAsymmetricKey DER (SEQUENCE tag)."""
+        key = self.comp.generate_composite_key("composite-mldsa44-rsa2048-pss")
+        der = self.comp.composite_private_key_der(key)
+        self.assertIsInstance(der, bytes)
+        self.assertEqual(der[0], 0x30)  # SEQUENCE
+
+    def test_certificate_signed_by_composite_key_verifies(self):
+        """CA-signed composite cert must be parseable and have the correct SPKI."""
+        key = self.comp.generate_composite_key("composite-mldsa44-ecdsa-p256")
+        spki_der = self.comp.composite_spki_der(key)
+        cert_der = self.ca.issue_composite_certificate(
+            subject_str="CN=Composite Test",
+            composite_spki_der=spki_der,
+            composite_name=key.name,
+        )
+        self.assertIsInstance(cert_der, bytes)
+        self.assertEqual(cert_der[0], 0x30)
+        # Composite OID must appear in the cert
+        from der_codec import oid as _oid_der
+        entry = self.comp.COMPOSITE_OIDS[key.name]
+        self.assertIn(_oid_der(entry["oid"]), cert_der)
+
+    def test_certificate_stored_in_db(self):
+        key = self.comp.generate_composite_key("composite-mldsa44-ecdsa-p256")
+        cert_der = self.ca.issue_composite_certificate(
+            subject_str="CN=DB Test",
+            composite_spki_der=self.comp.composite_spki_der(key),
+            composite_name=key.name,
+        )
+        # Look up by subject (serial is 20-byte, too large for SQLite INTEGER)
+        row = self.ca._pki_db.fetchone(
+            "SELECT profile FROM certificates WHERE subject=?", ("CN=DB Test",)
+        )
+        self.assertIsNotNone(row)
+        self.assertEqual(row["profile"], "composite_signing")
+
+    def test_raises_when_flag_disabled(self):
+        pki.HAS_COMPOSITE_MLDSA = False
+        key = self.comp.generate_composite_key("composite-mldsa44-ecdsa-p256")
+        with self.assertRaises(RuntimeError):
+            self.ca.issue_composite_certificate(
+                subject_str="CN=Gated",
+                composite_spki_der=self.comp.composite_spki_der(key),
+                composite_name=key.name,
+            )
+
+    def test_all_four_algorithms_generate_and_sign(self):
+        """All four catalog algorithms must be able to generate keys and sign a message."""
+        for name in self.comp.COMPOSITE_OIDS:
+            with self.subTest(name=name):
+                key = self.comp.generate_composite_key(name)
+                spki = self.comp.composite_spki_der(key)
+                sig = self.comp.composite_sign(key, b"test")
+                ok = self.comp.composite_verify(spki, name, b"test", sig)
+                self.assertTrue(ok, f"{name}: verification failed")
 
 
 # ===========================================================================

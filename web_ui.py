@@ -986,6 +986,8 @@ class WebUIHandler(http.server.BaseHTTPRequestHandler):
                 self._api_cross_sign(data)
             elif path == "/api/paired-issue":
                 self._api_paired_issue(data)
+            elif path == "/api/composite-issue":
+                self._api_composite_issue(data)
             elif path.startswith("/api/ra/approve/"):
                 req_id = path.split("/api/ra/approve/", 1)[1].strip("/")
                 self._api_ra_approve(req_id)
@@ -2024,6 +2026,41 @@ class WebUIHandler(http.server.BaseHTTPRequestHandler):
             "ml_dsa_private_key_b64": _b64.b64encode(mldsa_key_der).decode(),
             "ml_dsa_variant": ml_dsa_variant,
             "classical_key_type": classical_key_type,
+        })
+
+    def _api_composite_issue(self, data: dict) -> None:
+        """POST /api/composite-issue — Composite ML-DSA certificate issuance."""
+        import pki_server as _pki_mod
+        if not _pki_mod.HAS_COMPOSITE_MLDSA:
+            self._send_json({"error": "Composite ML-DSA not enabled (requires --enable-composite-mldsa)"}, 501)
+            return
+        import composite as _comp
+        import base64 as _b64
+
+        composite_name = data.get("composite_name", "composite-mldsa44-ecdsa-p256")
+        if composite_name not in _comp.COMPOSITE_OIDS:
+            self._send_json({"error": f"composite_name must be one of {list(_comp.COMPOSITE_OIDS)}"}, 400)
+            return
+
+        subject = data.get("subject", "CN=Composite Entity")
+        validity_days = int(data.get("validity_days", 365))
+
+        key = _comp.generate_composite_key(composite_name)
+        spki_der = _comp.composite_spki_der(key)
+
+        cert_der = self.ca.issue_composite_certificate(
+            subject_str=subject,
+            composite_spki_der=spki_der,
+            composite_name=composite_name,
+            validity_days=validity_days,
+            audit=self.audit_log,
+            requester_ip=self.client_address[0] if self.client_address else "",
+        )
+        private_key_der = _comp.composite_private_key_der(key)
+        self._send_json({
+            "cert_b64": _b64.b64encode(cert_der).decode(),
+            "private_key_b64": _b64.b64encode(private_key_der).decode(),
+            "composite_name": composite_name,
         })
 
     # ------------------------------------------------------------------
