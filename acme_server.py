@@ -111,6 +111,67 @@ def b64url_decode(s: str) -> bytes:
 
 
 # ---------------------------------------------------------------------------
+# RFC 9773 — ARI helpers
+# ---------------------------------------------------------------------------
+
+_ARI_DEFAULT_RETRY_AFTER = 21600  # 6 hours in steady state
+
+
+def cert_id_from_cert(cert: "x509.Certificate") -> Optional[str]:
+    """RFC 9773 §4.1: base64url(AKI keyIdentifier) + '.' + base64url(serial DER bytes)."""
+    try:
+        aki_ext = cert.extensions.get_extension_for_class(x509.AuthorityKeyIdentifier)
+        aki_bytes = aki_ext.value.key_identifier
+    except x509.ExtensionNotFound:
+        return None
+    if aki_bytes is None:
+        return None
+    n = cert.serial_number
+    byte_len = max(1, (n.bit_length() + 8) // 8)
+    serial_bytes = n.to_bytes(byte_len, "big")
+    while len(serial_bytes) > 1 and serial_bytes[0] == 0 and not (serial_bytes[1] & 0x80):
+        serial_bytes = serial_bytes[1:]
+    return b64url_encode(aki_bytes) + "." + b64url_encode(serial_bytes)
+
+
+def _parse_cert_id(cert_id_str: str) -> Optional[Tuple[bytes, bytes]]:
+    """Parse certId into (aki_bytes, serial_bytes). Returns None on error."""
+    parts = cert_id_str.split(".", 1)
+    if len(parts) != 2:
+        return None
+    try:
+        return b64url_decode(parts[0]), b64url_decode(parts[1])
+    except Exception:
+        return None
+
+
+def _suggested_window(
+    cert: "x509.Certificate",
+) -> Tuple[datetime.datetime, datetime.datetime]:
+    """Compute the default RFC 9773 suggested renewal window.
+
+    start = notAfter - lifetime/3 + jitter (stable per serial via SHA-256)
+    end   = start + lifetime/24
+    Both clamped to [now, notAfter].
+    """
+    nb = cert.not_valid_before_utc
+    na = cert.not_valid_after_utc
+    lifetime = na - nb
+    total_secs = lifetime.total_seconds()
+    serial_bytes = cert.serial_number.to_bytes(
+        max(1, (cert.serial_number.bit_length() + 7) // 8), "big"
+    )
+    jitter_seed = int.from_bytes(
+        hashlib.sha256(serial_bytes).digest()[:4], "big"
+    )
+    jitter = datetime.timedelta(seconds=jitter_seed % max(1, int(total_secs / 48)))
+    start = na - lifetime / 3 + jitter
+    end = start + lifetime / 24
+    now = datetime.datetime.now(datetime.timezone.utc)
+    return max(start, now), min(end, na)
+
+
+# ---------------------------------------------------------------------------
 # RFC 8738 — IP identifier validation
 # ---------------------------------------------------------------------------
 
@@ -393,6 +454,33 @@ class ACMEDatabase:
                 )
             except Exception:
                 pass
+        # RFC 9773 — ARI: replaces column on orders (idempotent)
+        try:
+            self._db.execute("ALTER TABLE orders ADD COLUMN replaces TEXT")
+        except Exception:
+            pass
+        # RFC 9773 — ARI tables (idempotent)
+        self._db.execute("""CREATE TABLE IF NOT EXISTS acme_renewal_overrides (
+            cert_id      TEXT PRIMARY KEY,
+            window_start TEXT NOT NULL,
+            window_end   TEXT NOT NULL,
+            retry_after  INTEGER NOT NULL DEFAULT 21600,
+            explanation  TEXT,
+            set_at       INTEGER NOT NULL,
+            set_by       TEXT NOT NULL
+        )""")
+        self._db.execute("""CREATE TABLE IF NOT EXISTS acme_replacements (
+            new_serial   TEXT NOT NULL,
+            old_serial   TEXT NOT NULL,
+            account_id   TEXT NOT NULL,
+            replaced_at  INTEGER NOT NULL,
+            PRIMARY KEY (new_serial),
+            UNIQUE (old_serial)
+        )""")
+        self._db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_acme_repl_old "
+            "ON acme_replacements(old_serial)"
+        )
 
     # -- Nonces --
 
@@ -493,6 +581,7 @@ class ACMEDatabase:
         account_kid: str,
         identifiers: list,
         star_params: Optional[dict] = None,
+        replaces: Optional[str] = None,
     ) -> dict:
         order_id = b64url_encode(os.urandom(12))
         now = time.time()
@@ -509,11 +598,11 @@ class ACMEDatabase:
             self._db.execute(
                 "INSERT INTO orders (id,account_kid,status,identifiers,not_before,"
                 "not_after,cert_id,created_at,expires_at,ra_request_id,"
-                "star_end_date,star_lifetime,star_allow_cert_get,star_active)"
-                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                "star_end_date,star_lifetime,star_allow_cert_get,star_active,replaces)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (order_id, account_kid, "pending",
                  json.dumps(identifiers), None, None, None, now, expires, None,
-                 star_end_date, star_lifetime, star_allow_cert_get, 0)
+                 star_end_date, star_lifetime, star_allow_cert_get, 0, replaces)
             )
             auth_ids = []
             for ident in identifiers:
@@ -625,6 +714,70 @@ class ACMEDatabase:
             (account_kid, since_unix),
         )
         return row[0] if row else 0
+
+    # -- RFC 9773 ARI --
+
+    def get_cert_by_serial(self, serial: int) -> Optional[dict]:
+        """Return the certificate record matching *serial*."""
+        row = self._db.fetchone(
+            "SELECT * FROM certificates WHERE serial=?", (serial,)
+        )
+        return dict(row) if row else None
+
+    def get_renewal_override(self, cert_id_str: str) -> Optional[dict]:
+        """Return the admin-set window override for *cert_id_str*, or None."""
+        row = self._db.fetchone(
+            "SELECT * FROM acme_renewal_overrides WHERE cert_id=?", (cert_id_str,)
+        )
+        return dict(row) if row else None
+
+    def set_renewal_override(
+        self,
+        cert_id_str: str,
+        window_start: str,
+        window_end: str,
+        retry_after: int = _ARI_DEFAULT_RETRY_AFTER,
+        explanation: Optional[str] = None,
+        set_by: str = "admin",
+    ) -> None:
+        """Upsert an admin renewal-window override."""
+        self._db.execute(
+            "INSERT INTO acme_renewal_overrides "
+            "(cert_id, window_start, window_end, retry_after, explanation, set_at, set_by) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?) "
+            "ON CONFLICT(cert_id) DO UPDATE SET "
+            "window_start=excluded.window_start, window_end=excluded.window_end, "
+            "retry_after=excluded.retry_after, explanation=excluded.explanation, "
+            "set_at=excluded.set_at, set_by=excluded.set_by",
+            (cert_id_str, window_start, window_end, retry_after,
+             explanation, int(time.time()), set_by),
+        )
+
+    def record_replacement(
+        self, new_serial_str: str, old_serial_str: str, account_id: str
+    ) -> bool:
+        """Record that *new_serial_str* replaced *old_serial_str*.
+
+        Returns True on success, False if *old_serial_str* was already replaced
+        by a different cert (UNIQUE constraint violation).
+        """
+        try:
+            self._db.execute(
+                "INSERT INTO acme_replacements "
+                "(new_serial, old_serial, account_id, replaced_at) "
+                "VALUES (?, ?, ?, ?)",
+                (new_serial_str, old_serial_str, account_id, int(time.time())),
+            )
+            return True
+        except Exception:
+            return False
+
+    def get_replacement_by_old_serial(self, old_serial_str: str) -> Optional[dict]:
+        """Return the replacement record whose old_serial matches, or None."""
+        row = self._db.fetchone(
+            "SELECT * FROM acme_replacements WHERE old_serial=?", (old_serial_str,)
+        )
+        return dict(row) if row else None
 
 
 # ---------------------------------------------------------------------------
@@ -959,6 +1112,7 @@ class ACMEHandler(http.server.BaseHTTPRequestHandler):
     db: ACMEDatabase = None
     ca = None             # CertificateAuthority instance
     ra = None             # RAWorkflow instance (§5.4); None = auto-issue without RA
+    audit_log = None      # AuditLog instance (optional); set by make_acme_handler
     validator: ChallengeValidator = None
     base_url: str = ""    # e.g. "http://localhost:8888"
     cert_validity_days: int = 90        # validity for ACME-issued certs
@@ -1064,11 +1218,11 @@ class ACMEHandler(http.server.BaseHTTPRequestHandler):
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
-        elif path == "/renewal-info" or path.startswith("/renewal-info/"):
-            # draft-ietf-acme-ari — return 404 with proper JSON to signal not supported
-            # certbot treats a 404 here as "no renewal info available" and continues
-            self._send_error(404, "urn:ietf:params:acme:error:malformed",
-                             "Renewal information not available")
+        elif path == "/renewal-info":
+            self._send_error(400, "urn:ietf:params:acme:error:malformed",
+                             "certId required: GET /renewal-info/{certId}")
+        elif re.match(r"^/renewal-info/[^/]+$", path):
+            self._handle_renewal_info(path.split("/", 2)[-1])
 
         # ------------------------------------------------------------------
         # Unauthenticated GET for order/authz/cert resources.
@@ -1189,6 +1343,66 @@ class ACMEHandler(http.server.BaseHTTPRequestHandler):
             }
         # RFC 8555 §7.1.1 — directory response SHOULD include Replay-Nonce
         self._send_json(directory, 200, add_nonce=True)
+
+    # ------------------------------------------------------------------
+    # RFC 9773 — Renewal Information
+    # ------------------------------------------------------------------
+
+    def _handle_renewal_info(self, cert_id_str: str) -> None:
+        """GET /acme/renewal-info/{certId} — RFC 9773 §4.2.
+
+        No authentication required. Returns a suggestedWindow (and optional
+        explanationURL) for the certificate identified by *cert_id_str*.
+        """
+        parsed = _parse_cert_id(cert_id_str)
+        if parsed is None:
+            self._send_error(404, "urn:ietf:params:acme:error:malformed",
+                             "Invalid certId format")
+            return
+
+        _aki_bytes, serial_bytes = parsed
+        serial_int = int.from_bytes(serial_bytes, "big")
+
+        cert_rec = self.db.get_cert_by_serial(serial_int)
+        if cert_rec is None:
+            self._send_error(404, "urn:ietf:params:acme:error:malformed",
+                             "Certificate not found")
+            return
+
+        pem_chain = cert_rec["pem_chain"]
+        end_marker = "-----END CERTIFICATE-----"
+        cert_pem = pem_chain.split(end_marker)[0].strip() + "\n" + end_marker
+        cert = x509.load_pem_x509_certificate(cert_pem.encode())
+
+        override = self.db.get_renewal_override(cert_id_str)
+        if override:
+            window_start = override["window_start"]
+            window_end = override["window_end"]
+            retry_after = int(override["retry_after"])
+            explanation = override.get("explanation")
+        else:
+            start_dt, end_dt = _suggested_window(cert)
+            window_start = start_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+            window_end = end_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+            retry_after = _ARI_DEFAULT_RETRY_AFTER
+            explanation = None
+
+        body: Dict[str, Any] = {
+            "suggestedWindow": {
+                "start": window_start,
+                "end":   window_end,
+            },
+        }
+        if explanation:
+            body["explanationURL"] = explanation
+
+        self._send_json(
+            body, 200,
+            headers={
+                "Retry-After":   str(retry_after),
+                "Cache-Control": f"public, max-age={retry_after}",
+            },
+        )
 
     # ------------------------------------------------------------------
     # Nonce
@@ -1349,7 +1563,30 @@ class ACMEHandler(http.server.BaseHTTPRequestHandler):
                 "allow_certificate_get": bool(auto_renewal.get("allow-certificate-get", False)),
             }
 
-        order = self.db.create_order(account["kid"], identifiers, star_params=star_params)
+        # RFC 9773 — optional `replaces` field
+        replaces = payload.get("replaces")
+        if replaces is not None:
+            parsed = _parse_cert_id(replaces)
+            if parsed is None:
+                self._send_error(400, "urn:ietf:params:acme:error:malformed",
+                                 "replaces: invalid certId format")
+                return
+            _, serial_bytes = parsed
+            old_serial_int = int.from_bytes(serial_bytes, "big")
+            old_cert_rec = self.db.get_cert_by_serial(old_serial_int)
+            if old_cert_rec is None:
+                self._send_error(400, "urn:ietf:params:acme:error:malformed",
+                                 "replaces: certificate not found in this CA")
+                return
+            old_order = self.db.get_order(old_cert_rec["order_id"])
+            if old_order is None or old_order.get("account_kid") != account["kid"]:
+                self._send_error(403, "urn:ietf:params:acme:error:unauthorized",
+                                 "replaces: certificate was not issued to this account")
+                return
+
+        order = self.db.create_order(
+            account["kid"], identifiers, star_params=star_params, replaces=replaces
+        )
         order_url = f"{self.base_url}/order/{order['id']}"
 
         resp = self._order_response(order)
@@ -1654,8 +1891,29 @@ class ACMEHandler(http.server.BaseHTTPRequestHandler):
                              f"IP identifiers {order_ip_strs}")
             return
 
-        # Per-account rate limit check
-        if self.per_account_cert_limit > 0:
+        # RFC 9773 — resolve replaces serial before rate-limit check so the
+        # pre-check and post-issuance replacement share the same parsed value.
+        replaces_serial_int: Optional[int] = None
+        if order.get("replaces"):
+            _parsed = _parse_cert_id(order["replaces"])
+            if _parsed:
+                _, _sb = _parsed
+                replaces_serial_int = int.from_bytes(_sb, "big")
+                # Reject early if old cert is already replaced by another order.
+                existing_repl = self.db.get_replacement_by_old_serial(
+                    str(replaces_serial_int)
+                )
+                if existing_repl:
+                    self._send_error(
+                        409,
+                        "urn:ietf:params:acme:error:malformed",
+                        "The certificate identified by 'replaces' has already been replaced",
+                    )
+                    return
+
+        # Per-account rate limit check — exempt orders that use `replaces`
+        # (RFC 9773 §5: SHOULD exempt to avoid penalising compliant clients).
+        if self.per_account_cert_limit > 0 and replaces_serial_int is None:
             account_kid = order["account_kid"]
             window_secs = self.per_account_window_days * 86400
             since = time.time() - window_secs
@@ -1765,6 +2023,33 @@ class ACMEHandler(http.server.BaseHTTPRequestHandler):
                 f"profile={profile} validity={validity}d"
                 + (f" star_lifetime={star_lifetime}s" if star_lifetime else "")
             )
+
+            # RFC 9773 — revoke predecessor and record replacement
+            if replaces_serial_int is not None:
+                inserted = self.db.record_replacement(
+                    str(cert.serial_number),
+                    str(replaces_serial_int),
+                    order["account_kid"],
+                )
+                if inserted:
+                    try:
+                        self.ca.revoke_certificate(replaces_serial_int, 4)
+                    except Exception as _re:
+                        logger.warning(
+                            f"ARI: predecessor revocation failed "
+                            f"old_serial={replaces_serial_int}: {_re}"
+                        )
+                    if self.audit_log is not None:
+                        self.audit_log.record(
+                            "cert_replaced",
+                            f"new_serial={cert.serial_number} "
+                            f"old_serial={replaces_serial_int} "
+                            f"account={order['account_kid']}",
+                        )
+                    logger.info(
+                        f"ARI replacement: new={cert.serial_number} "
+                        f"old={replaces_serial_int} account={order['account_kid']}"
+                    )
         except Exception as e:
             logger.error(f"Certificate issuance failed: {e}")
             self._send_error(500, "urn:ietf:params:acme:error:serverInternal",
@@ -2084,12 +2369,14 @@ def make_acme_handler(
     star_enabled: bool = False,
     star_min_lifetime: int = 86400,
     star_max_duration: int = 7776000,
+    audit_log=None,
 ):
     class BoundACMEHandler(ACMEHandler):
         pass
     BoundACMEHandler.db                          = db
     BoundACMEHandler.ca                          = ca
     BoundACMEHandler.ra                          = ra
+    BoundACMEHandler.audit_log                   = audit_log
     BoundACMEHandler.validator                   = validator
     BoundACMEHandler.base_url                    = base_url
     BoundACMEHandler.cert_validity_days          = cert_validity_days

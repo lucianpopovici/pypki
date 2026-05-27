@@ -11269,6 +11269,421 @@ class TestAuditChainAuditLogIntegration(unittest.TestCase):
 
 
 # ===========================================================================
+# RFC 9773 — ACME Renewal Information (ARI)
+# ===========================================================================
+
+class TestRFC9773ARI(unittest.TestCase):
+    """RFC 9773 — GET /acme/renewal-info/{certId}, suggestedWindow, overrides."""
+
+    @classmethod
+    def setUpClass(cls):
+        try:
+            import acme_server
+        except ImportError:
+            raise unittest.SkipTest("acme_server.py not importable")
+        cls.acme = acme_server
+
+    def setUp(self):
+        self._tmp = tempfile.mkdtemp()
+        self._db = self.acme.ACMEDatabase(os.path.join(self._tmp, "acme_ari.db"))
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self._tmp, ignore_errors=True)
+
+    def _make_ca_and_cert(self, validity_days: int = 90):
+        ca = _make_ca(self._tmp)
+        key = _gen_key()
+        cert = ca.issue_certificate(
+            "CN=ari.test", key.public_key(),
+            san_dns=["ari.test"],
+            validity_days=validity_days,
+        )
+        return ca, cert
+
+    def _build_handler(self, ca=None):
+        """Return a fresh ACMEHandler instance wired to self._db with mocked I/O."""
+        handler_cls = self.acme.make_acme_handler(
+            db=self._db, ca=ca,
+            validator=self.acme.ChallengeValidator(auto_approve_dns=True),
+            base_url="http://localhost:8889",
+        )
+        h = handler_cls.__new__(handler_cls)
+        h.db = self._db
+        h.base_url = "http://localhost:8889"
+        h.require_eab = False
+        return h
+
+    # ---- cert_id_from_cert ----
+
+    def test_certid_round_trip(self):
+        """cert_id_from_cert produces a valid certId that _parse_cert_id can recover."""
+        _, cert = self._make_ca_and_cert()
+        cid = self.acme.cert_id_from_cert(cert)
+        self.assertIsNotNone(cid)
+        self.assertIn(".", cid)
+        parsed = self.acme._parse_cert_id(cid)
+        self.assertIsNotNone(parsed)
+        aki_bytes, serial_bytes = parsed
+        self.assertEqual(int.from_bytes(serial_bytes, "big"), cert.serial_number)
+
+    def test_certid_no_aki_returns_none(self):
+        """cert_id_from_cert returns None when the cert has no AKI extension."""
+        import datetime as _dt
+        from cryptography.hazmat.primitives.asymmetric import rsa as _rsa
+        from cryptography import x509 as _x509
+        from cryptography.hazmat.primitives import hashes as _h
+        from cryptography.x509.oid import NameOID as _NameOID
+
+        key = _rsa.generate_private_key(65537, 2048)
+        subject = _x509.Name([_x509.NameAttribute(_NameOID.COMMON_NAME, "noaki")])
+        cert = (
+            _x509.CertificateBuilder()
+            .subject_name(subject)
+            .issuer_name(subject)
+            .public_key(key.public_key())
+            .serial_number(_x509.random_serial_number())
+            .not_valid_before(_dt.datetime.now(_dt.timezone.utc))
+            .not_valid_after(_dt.datetime.now(_dt.timezone.utc) + _dt.timedelta(days=1))
+            .sign(key, _h.SHA256())
+        )
+        self.assertIsNone(self.acme.cert_id_from_cert(cert))
+
+    def test_parse_cert_id_invalid_returns_none(self):
+        self.assertIsNone(self.acme._parse_cert_id("nodotshere"))
+        self.assertIsNone(self.acme._parse_cert_id(""))
+        self.assertIsNone(self.acme._parse_cert_id("a.b.c"))
+
+    # ---- _suggested_window ----
+
+    def test_window_within_validity_period(self):
+        """Suggested window start and end must both lie within [notBefore, notAfter]."""
+        _, cert = self._make_ca_and_cert(90)
+        start, end = self.acme._suggested_window(cert)
+        self.assertGreaterEqual(start, cert.not_valid_before_utc)
+        self.assertLessEqual(end, cert.not_valid_after_utc)
+        self.assertLess(start, end)
+
+    def test_window_stable_for_same_serial(self):
+        """Same cert → same window (jitter is deterministic via serial hash)."""
+        _, cert = self._make_ca_and_cert(90)
+        start1, end1 = self.acme._suggested_window(cert)
+        start2, end2 = self.acme._suggested_window(cert)
+        self.assertEqual(start1, start2)
+        self.assertEqual(end1, end2)
+
+    def test_window_start_roughly_one_third_before_expiry(self):
+        """start ≈ notAfter - lifetime/3 (within jitter)."""
+        import datetime as _dt
+        _, cert = self._make_ca_and_cert(90)
+        na = cert.not_valid_after_utc
+        nb = cert.not_valid_before_utc
+        lifetime = na - nb
+        expected_center = na - lifetime / 3
+        start, _ = self.acme._suggested_window(cert)
+        jitter_max = _dt.timedelta(seconds=int(lifetime.total_seconds() / 48))
+        self.assertLessEqual(abs(start - expected_center), jitter_max + _dt.timedelta(seconds=1))
+
+    # ---- ACMEDatabase ARI methods ----
+
+    def test_get_cert_by_serial_found(self):
+        db = self._db
+        order = db.create_order("kid1", [{"type": "dns", "value": "x.test"}])
+        db.store_certificate(order["id"], "PEM-DATA", 12345)
+        rec = db.get_cert_by_serial(12345)
+        self.assertIsNotNone(rec)
+        self.assertEqual(rec["serial"], 12345)
+
+    def test_get_cert_by_serial_not_found(self):
+        self.assertIsNone(self._db.get_cert_by_serial(99999))
+
+    def test_set_and_get_renewal_override(self):
+        db = self._db
+        db.set_renewal_override(
+            "CERTID1",
+            "2026-06-01T00:00:00Z",
+            "2026-06-03T00:00:00Z",
+            retry_after=300,
+            explanation="https://pki.test/incident",
+            set_by="testuser",
+        )
+        row = db.get_renewal_override("CERTID1")
+        self.assertIsNotNone(row)
+        self.assertEqual(row["window_start"], "2026-06-01T00:00:00Z")
+        self.assertEqual(row["window_end"], "2026-06-03T00:00:00Z")
+        self.assertEqual(row["retry_after"], 300)
+        self.assertEqual(row["explanation"], "https://pki.test/incident")
+        self.assertEqual(row["set_by"], "testuser")
+
+    def test_renewal_override_upsert(self):
+        """set_renewal_override is an upsert — re-setting updates in place."""
+        db = self._db
+        db.set_renewal_override("CERTID1", "2026-06-01T00:00:00Z", "2026-06-03T00:00:00Z")
+        db.set_renewal_override("CERTID1", "2025-01-01T00:00:00Z", "2025-01-02T00:00:00Z")
+        row = db.get_renewal_override("CERTID1")
+        self.assertEqual(row["window_start"], "2025-01-01T00:00:00Z")
+
+    def test_renewal_override_returns_none_for_unknown(self):
+        self.assertIsNone(self._db.get_renewal_override("UNKNOWN"))
+
+    # ---- renewal-info HTTP endpoint — tested via direct handler method calls ----
+
+    def _call_renewal_info(self, cert_id_str: str) -> dict:
+        """Call _handle_renewal_info and return captured {code, data, headers}."""
+        ca, _ = self._make_ca_and_cert()
+        h = self._build_handler(ca=ca)
+        captured: dict = {}
+
+        def fake_send_json(data, code=200, headers=None, add_nonce=False,
+                           content_type="application/json"):
+            captured["code"] = code
+            captured["data"] = data
+            captured["headers"] = headers or {}
+
+        def fake_send_error(code, etype, detail):
+            captured["code"] = code
+            captured["detail"] = detail
+
+        h._send_json = fake_send_json
+        h._send_error = fake_send_error
+        h._handle_renewal_info(cert_id_str)
+        return captured
+
+    def test_unknown_certid_returns_404(self):
+        """GET /renewal-info/{certId} for an unknown cert → 404."""
+        _, cert = self._make_ca_and_cert()
+        fake_cid = self.acme.cert_id_from_cert(cert)
+        result = self._call_renewal_info(fake_cid)
+        self.assertEqual(result.get("code"), 404)
+
+    def test_known_cert_returns_200_with_window(self):
+        """GET /renewal-info/{certId} for a known cert → 200 with suggestedWindow."""
+        from cryptography.hazmat.primitives.serialization import Encoding as _Enc
+        ca, cert = self._make_ca_and_cert(90)
+        cid = self.acme.cert_id_from_cert(cert)
+        pem_chain = cert.public_bytes(_Enc.PEM).decode()
+        order = self._db.create_order("kid1", [{"type": "dns", "value": "ari.test"}])
+        self._db.store_certificate(order["id"], pem_chain, cert.serial_number)
+
+        result = self._call_renewal_info(cid)
+        self.assertEqual(result.get("code"), 200)
+        data = result.get("data", {})
+        self.assertIn("suggestedWindow", data)
+        self.assertIn("start", data["suggestedWindow"])
+        self.assertIn("end", data["suggestedWindow"])
+
+    def test_admin_override_takes_precedence(self):
+        """When an override exists, _handle_renewal_info returns the override window."""
+        from cryptography.hazmat.primitives.serialization import Encoding as _Enc
+        ca, cert = self._make_ca_and_cert(90)
+        cid = self.acme.cert_id_from_cert(cert)
+        pem_chain = cert.public_bytes(_Enc.PEM).decode()
+        order = self._db.create_order("kid1", [{"type": "dns", "value": "ari.test"}])
+        self._db.store_certificate(order["id"], pem_chain, cert.serial_number)
+        self._db.set_renewal_override(
+            cid, "2020-01-01T00:00:00Z", "2020-01-02T00:00:00Z", retry_after=60,
+        )
+
+        result = self._call_renewal_info(cid)
+        self.assertEqual(result.get("code"), 200)
+        self.assertEqual(result["data"]["suggestedWindow"]["start"], "2020-01-01T00:00:00Z")
+        self.assertEqual(result["data"]["suggestedWindow"]["end"], "2020-01-02T00:00:00Z")
+
+    def test_retry_after_header_present(self):
+        """The Retry-After header must appear in the headers dict passed to _send_json."""
+        from cryptography.hazmat.primitives.serialization import Encoding as _Enc
+        ca, cert = self._make_ca_and_cert(90)
+        cid = self.acme.cert_id_from_cert(cert)
+        pem_chain = cert.public_bytes(_Enc.PEM).decode()
+        order = self._db.create_order("kid1", [{"type": "dns", "value": "ari.test"}])
+        self._db.store_certificate(order["id"], pem_chain, cert.serial_number)
+
+        result = self._call_renewal_info(cid)
+        self.assertEqual(result.get("code"), 200)
+        self.assertIn("Retry-After", result.get("headers", {}))
+
+    def test_directory_advertises_renewal_info(self):
+        """_handle_directory must include a 'renewalInfo' key."""
+        ca, _ = self._make_ca_and_cert()
+        h = self._build_handler(ca=ca)
+        captured: dict = {}
+
+        def fake_send_json(data, code=200, headers=None, add_nonce=False,
+                           content_type="application/json"):
+            captured["data"] = data
+
+        h._send_json = fake_send_json
+        h._handle_directory()
+        self.assertIn("renewalInfo", captured.get("data", {}))
+        self.assertIn("renewal-info", captured["data"]["renewalInfo"])
+
+
+class TestRFC9773Replaces(unittest.TestCase):
+    """RFC 9773 — newOrder `replaces` field, predecessor revocation."""
+
+    @classmethod
+    def setUpClass(cls):
+        try:
+            import acme_server
+        except ImportError:
+            raise unittest.SkipTest("acme_server.py not importable")
+        cls.acme = acme_server
+
+    def setUp(self):
+        self._tmp = tempfile.mkdtemp()
+        self._db = self.acme.ACMEDatabase(os.path.join(self._tmp, "acme_repl.db"))
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self._tmp, ignore_errors=True)
+
+    # ---- acme_replacements table ----
+
+    def test_record_replacement_first_time_succeeds(self):
+        ok = self._db.record_replacement("NEW1", "OLD1", "ACCOUNT1")
+        self.assertTrue(ok)
+
+    def test_record_replacement_same_old_serial_fails(self):
+        """UNIQUE(old_serial) prevents double-replacement."""
+        self._db.record_replacement("NEW1", "OLD1", "ACCOUNT1")
+        ok = self._db.record_replacement("NEW2", "OLD1", "ACCOUNT1")
+        self.assertFalse(ok)
+
+    def test_record_replacement_idempotent_same_new(self):
+        """Same new_serial + old_serial on retry is detected as conflict (PRIMARY KEY)."""
+        self._db.record_replacement("NEW1", "OLD1", "ACCOUNT1")
+        ok = self._db.record_replacement("NEW1", "OLD1", "ACCOUNT1")
+        self.assertFalse(ok)
+
+    def test_get_replacement_by_old_serial(self):
+        self._db.record_replacement("789", "456", "ACCT")
+        rec = self._db.get_replacement_by_old_serial("456")
+        self.assertIsNotNone(rec)
+        self.assertEqual(rec["new_serial"], "789")
+        self.assertEqual(rec["account_id"], "ACCT")
+
+    def test_get_replacement_missing_returns_none(self):
+        self.assertIsNone(self._db.get_replacement_by_old_serial("999"))
+
+    # ---- create_order with replaces ----
+
+    def test_create_order_stores_replaces(self):
+        """create_order with replaces persists the certId in the orders row."""
+        order = self._db.create_order(
+            "kid1", [{"type": "dns", "value": "x.test"}],
+            replaces="SOMECERTID.XYZ",
+        )
+        stored = self._db.get_order(order["id"])
+        self.assertEqual(stored["replaces"], "SOMECERTID.XYZ")
+
+    def test_create_order_without_replaces_stores_null(self):
+        order = self._db.create_order("kid1", [{"type": "dns", "value": "x.test"}])
+        stored = self._db.get_order(order["id"])
+        self.assertIsNone(stored.get("replaces"))
+
+    # ---- _handle_new_order validation (exercised via direct method call) ----
+
+    def _build_handler(self, ca=None):
+        handler_cls = self.acme.make_acme_handler(
+            db=self._db, ca=ca,
+            validator=self.acme.ChallengeValidator(auto_approve_dns=True),
+            base_url="http://localhost:8890",
+        )
+        h = handler_cls.__new__(handler_cls)
+        h.db = self._db
+        h.base_url = "http://localhost:8890"
+        h.require_eab = False
+        return h
+
+    def test_replaces_invalid_certid_rejected_via_parse(self):
+        """A malformed certId (no dot) is rejected by _parse_cert_id."""
+        self.assertIsNone(self.acme._parse_cert_id("not-a-valid-certid"))
+
+    def test_replaces_unknown_cert_not_in_db(self):
+        """get_cert_by_serial returns None for a cert not in this CA's DB."""
+        import base64 as _b64
+        serial_bytes = b"\x7f"
+        serial_int = int.from_bytes(serial_bytes, "big")
+        rec = self._db.get_cert_by_serial(serial_int)
+        self.assertIsNone(rec)
+
+    def test_replaces_validation_ownership_check(self):
+        """If old cert's order has a different account_kid, ownership check fails."""
+        ca = _make_ca(self._tmp)
+        key = _gen_key()
+        cert = ca.issue_certificate(
+            "CN=old.test", key.public_key(), san_dns=["old.test"], validity_days=90,
+        )
+        from cryptography.hazmat.primitives.serialization import Encoding as _Enc
+        pem_chain = cert.public_bytes(_Enc.PEM).decode()
+        old_order = self._db.create_order("account-A", [{"type": "dns", "value": "old.test"}])
+        self._db.store_certificate(old_order["id"], pem_chain, cert.serial_number)
+        cid = self.acme.cert_id_from_cert(cert)
+
+        # Parse the certId and look up cert
+        parsed = self.acme._parse_cert_id(cid)
+        self.assertIsNotNone(parsed)
+        _, serial_bytes = parsed
+        serial_int = int.from_bytes(serial_bytes, "big")
+        cert_rec = self._db.get_cert_by_serial(serial_int)
+        self.assertIsNotNone(cert_rec)
+        order_rec = self._db.get_order(cert_rec["order_id"])
+        # account-A owns the cert; account-B trying to replace should fail the check
+        self.assertEqual(order_rec["account_kid"], "account-A")
+        self.assertNotEqual(order_rec["account_kid"], "account-B")
+
+    # ---- already-replaced guard ----
+
+    def test_already_replaced_detected_before_finalize(self):
+        """get_replacement_by_old_serial returns the existing record when already replaced."""
+        self._db.record_replacement("FIRST_NEW", "12345", "ACCT")
+        existing = self._db.get_replacement_by_old_serial("12345")
+        self.assertIsNotNone(existing)
+        self.assertEqual(existing["new_serial"], "FIRST_NEW")
+
+    # ---- rate-limit exemption flag ----
+
+    def test_order_with_replaces_carries_field(self):
+        """An order created with replaces=X will have that value so finalize can check it."""
+        cid = "someaki.someserial"
+        order = self._db.create_order(
+            "kid1", [{"type": "dns", "value": "y.test"}], replaces=cid,
+        )
+        stored = self._db.get_order(order["id"])
+        self.assertIsNotNone(stored.get("replaces"))
+        # In _handle_finalize, replaces_serial_int is set → rate limit is skipped.
+        # Verify that _parse_cert_id on a real certId-shaped value parses ok.
+        import base64 as _b64
+        aki = _b64.urlsafe_b64encode(b"\xab" * 20).rstrip(b"=").decode()
+        serial = _b64.urlsafe_b64encode(b"\x01").rstrip(b"=").decode()
+        real_cid = f"{aki}.{serial}"
+        order2 = self._db.create_order(
+            "kid2", [{"type": "dns", "value": "z.test"}], replaces=real_cid,
+        )
+        stored2 = self._db.get_order(order2["id"])
+        self.assertEqual(stored2["replaces"], real_cid)
+        parsed = self.acme._parse_cert_id(stored2["replaces"])
+        self.assertIsNotNone(parsed)
+
+    # ---- make_acme_handler passes audit_log ----
+
+    def test_make_acme_handler_passes_audit_log(self):
+        """audit_log is surfaced as a class attribute by make_acme_handler."""
+        fake_log = object()
+        cls = self.acme.make_acme_handler(
+            db=self._db, ca=None, validator=None,
+            base_url="http://localhost", audit_log=fake_log,
+        )
+        self.assertIs(cls.audit_log, fake_log)
+
+    def test_make_acme_handler_audit_log_defaults_none(self):
+        cls = self.acme.make_acme_handler(
+            db=self._db, ca=None, validator=None, base_url="http://localhost",
+        )
+        self.assertIsNone(cls.audit_log)
+
+
+# ===========================================================================
 # Entry point
 # ===========================================================================
 

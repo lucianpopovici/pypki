@@ -471,6 +471,59 @@ def build_parser() -> argparse.ArgumentParser:
                     choices=["DEBUG", "INFO", "WARNING", "ERROR"])
     ae.set_defaults(func=cmd_audit_export)
 
+    asw = sub.add_parser(
+        "ari-set-window",
+        help="Set or override the ARI renewal window for a specific certificate.",
+        description=(
+            "Write an admin override for the suggestedWindow returned by "
+            "GET /acme/renewal-info/{certId}. Use this during incident response "
+            "to force clients to renew immediately (set end in the past) or "
+            "to extend the normal window."
+        ),
+    )
+    asw.add_argument("cert_id", metavar="CERT_ID",
+                     help="RFC 9773 certId: base64url(AKI).base64url(serial).")
+    asw.add_argument("--start", required=True, metavar="ISO8601",
+                     help="Window start (ISO-8601 UTC, e.g. 2026-06-01T00:00:00Z).")
+    asw.add_argument("--end", required=True, metavar="ISO8601",
+                     help="Window end (ISO-8601 UTC).")
+    asw.add_argument("--retry-after", type=int, default=21600, metavar="SECONDS",
+                     help="Retry-After seconds for clients (default: 21600).")
+    asw.add_argument("--explanation", default=None, metavar="URL",
+                     help="Optional explanationURL to include in the response.")
+    asw.add_argument("--set-by", default="admin", metavar="USER",
+                     help="Who set the override (audit trail, default: admin).")
+    asw.add_argument("--ca-dir", default="./ca", metavar="DIR")
+    asw.add_argument("--acme-db-url", default=None, metavar="URL",
+                     help="Explicit ACME DB URL (overrides ca-dir default).")
+    asw.add_argument("--log-level", default="WARNING",
+                     choices=["DEBUG", "INFO", "WARNING", "ERROR"])
+    asw.set_defaults(func=cmd_ari_set_window)
+
+    abs_ = sub.add_parser(
+        "ari-bulk-shorten",
+        help="Force immediate renewal for all matching certificates (incident response).",
+        description=(
+            "Set the suggestedWindow.end to now (or a specified time) for all "
+            "certificates whose certId matches the given SQL LIKE pattern. "
+            "Used when a CA must revoke a population of certs on a deadline."
+        ),
+    )
+    abs_.add_argument("--filter", required=True, metavar="PATTERN",
+                      help="SQL LIKE pattern matched against certId (e.g. 'abc123.%%').")
+    abs_.add_argument("--end", default=None, metavar="ISO8601",
+                      help="Override window end (default: now — forces immediate renewal).")
+    abs_.add_argument("--retry-after", type=int, default=300, metavar="SECONDS",
+                      help="Retry-After seconds during incident (default: 300).")
+    abs_.add_argument("--explanation", default=None, metavar="URL",
+                      help="Incident explanation URL to surface to clients.")
+    abs_.add_argument("--set-by", default="admin", metavar="USER")
+    abs_.add_argument("--ca-dir", default="./ca", metavar="DIR")
+    abs_.add_argument("--acme-db-url", default=None, metavar="URL")
+    abs_.add_argument("--log-level", default="WARNING",
+                      choices=["DEBUG", "INFO", "WARNING", "ERROR"])
+    abs_.set_defaults(func=cmd_ari_bulk_shorten)
+
     return root
 
 
@@ -598,6 +651,119 @@ def cmd_audit_export(args: argparse.Namespace) -> int:
         from pathlib import Path as _P
         _P(args.out).write_text(text, encoding="utf-8")
         print(f"Exported {len(payload['rows'])} row(s) to {args.out}")
+    return 0
+
+
+def _acme_db(args: argparse.Namespace):
+    """Return an open ACME Database object from args."""
+    from pathlib import Path as _P
+    url = getattr(args, "acme_db_url", None)
+    if not url:
+        ca_dir = _P(getattr(args, "ca_dir", "./ca"))
+        url = f"sqlite:///{ca_dir / 'acme.db'}"
+    try:
+        import acme_server
+    except ImportError:
+        print("ERROR: acme_server.py not found — place it in the same directory.")
+        raise SystemExit(1)
+    return acme_server.ACMEDatabase(url)
+
+
+def cmd_ari_set_window(args: argparse.Namespace) -> int:
+    """Set or update the ARI renewal-window override for one certificate."""
+    _setup_logging(args.log_level)
+    try:
+        acme_db = _acme_db(args)
+    except SystemExit:
+        return 1
+
+    acme_db.set_renewal_override(
+        cert_id_str=args.cert_id,
+        window_start=args.start,
+        window_end=args.end,
+        retry_after=args.retry_after,
+        explanation=args.explanation,
+        set_by=args.set_by,
+    )
+    print(
+        f"Override set for {args.cert_id}: "
+        f"window=[{args.start}, {args.end}] retry_after={args.retry_after}s"
+    )
+    return 0
+
+
+def cmd_ari_bulk_shorten(args: argparse.Namespace) -> int:
+    """Force immediate renewal for all certificates matching a certId pattern."""
+    import datetime as _dt
+    _setup_logging(args.log_level)
+    try:
+        acme_db = _acme_db(args)
+    except SystemExit:
+        return 1
+
+    now_str = _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    end_str = args.end if args.end else now_str
+
+    # Find all certIds matching the pattern (LIKE query on overrides + certs tables)
+    rows = acme_db._db.fetchall(
+        "SELECT DISTINCT cert_id FROM acme_renewal_overrides WHERE cert_id LIKE ?",
+        (args.filter,),
+    )
+    cert_ids_from_overrides = {r["cert_id"] for r in rows}
+
+    # Also search the certificates table by constructing certIds
+    # for certs whose serial matches the AKI pattern portion.
+    # Simpler: bulk-set overrides for cert_ids already in the override table,
+    # then let the operator also pass explicit cert_ids for new ones.
+    count = 0
+    for row in rows:
+        cid = row["cert_id"]
+        acme_db.set_renewal_override(
+            cert_id_str=cid,
+            window_start=now_str,
+            window_end=end_str,
+            retry_after=args.retry_after,
+            explanation=args.explanation,
+            set_by=args.set_by,
+        )
+        count += 1
+
+    # Also update any certs not yet in overrides whose cert_id matches the pattern.
+    # We scan acme_replacements.new_serial and certificates.serial to compute certIds.
+    try:
+        import acme_server as _acme
+        from cryptography import x509 as _x509
+        cert_rows = acme_db._db.fetchall("SELECT pem_chain, serial FROM certificates")
+        for cr in cert_rows:
+            end_marker = "-----END CERTIFICATE-----"
+            pem = cr["pem_chain"].split(end_marker)[0].strip() + "\n" + end_marker
+            try:
+                cert_obj = _x509.load_pem_x509_certificate(pem.encode())
+                cid = _acme.cert_id_from_cert(cert_obj)
+            except Exception:
+                continue
+            if cid is None:
+                continue
+            # Apply LIKE matching (simple: use SQL fnmatch-style %)
+            import fnmatch
+            pat = args.filter.replace("%", "*").replace("_", "?")
+            if not fnmatch.fnmatch(cid, pat):
+                continue
+            if cid in cert_ids_from_overrides:
+                continue  # already updated above
+            acme_db.set_renewal_override(
+                cert_id_str=cid,
+                window_start=now_str,
+                window_end=end_str,
+                retry_after=args.retry_after,
+                explanation=args.explanation,
+                set_by=args.set_by,
+            )
+            count += 1
+    except Exception as e:
+        print(f"WARNING: cert scan failed: {e}")
+
+    print(f"Bulk-shorten: set window_end={end_str} on {count} certificate(s).")
     return 0
 
 
