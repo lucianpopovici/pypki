@@ -1523,12 +1523,12 @@ class AuditLog:
         )
         runner.apply_pending()
 
+        import audit_chain as _ac
+        _ac.backfill_chain(self._db)
+
     def record(self, event: str, detail: str = "", ip: str = "") -> None:
-        ts = datetime.datetime.now(datetime.timezone.utc).isoformat()
-        self._db.execute(
-            "INSERT INTO audit(ts, event, detail, ip) VALUES (?, ?, ?, ?)",
-            (ts, event, detail, ip),
-        )
+        import audit_chain as _ac
+        _ac.append(event, detail, ip, self._db)
         logger.info(f"AUDIT [{event}] {detail}")
 
     def recent(self, n: int = 100) -> List[Dict[str, Any]]:

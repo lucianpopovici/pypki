@@ -423,6 +423,54 @@ def build_parser() -> argparse.ArgumentParser:
     )
     op.set_defaults(func=cmd_ocsp_prebuild)
 
+    # ------------------------------------------------------------------
+    # Audit-chain subcommands
+    # ------------------------------------------------------------------
+
+    av = sub.add_parser(
+        "audit-verify",
+        help="Verify the hash chain integrity of the audit log.",
+        description=(
+            "Walk audit rows in insertion order and recompute each hash. "
+            "Exit code 0 = chain intact; 2 = breaks detected. "
+            "Breaks indicate tampering, deletion, or a concurrency bug."
+        ),
+    )
+    av.add_argument("--ca-dir", default="./ca", metavar="DIR",
+                    help="CA data directory (default: ./ca).")
+    av.add_argument("--audit-db-url", default=None, metavar="URL",
+                    help="Explicit audit DB URL (overrides ca-dir default).")
+    av.add_argument("--from-id", type=int, default=1, metavar="N",
+                    help="Start verification at row id N (default 1).")
+    av.add_argument("--to-id", type=int, default=None, metavar="M",
+                    help="Stop at row id M inclusive (default: last row).")
+    av.add_argument("--json", dest="json_output", action="store_true",
+                    help="Emit JSON instead of human-readable output.")
+    av.add_argument("--log-level", default="WARNING",
+                    choices=["DEBUG", "INFO", "WARNING", "ERROR"])
+    av.set_defaults(func=cmd_audit_verify)
+
+    ae = sub.add_parser(
+        "audit-export",
+        help="Export a chain segment with its final hash.",
+        description=(
+            "Write a JSON document containing the requested audit rows plus "
+            "the final_hash so operators can publish an external anchor "
+            "(git commit, S3 object, transparency log entry)."
+        ),
+    )
+    ae.add_argument("--ca-dir", default="./ca", metavar="DIR")
+    ae.add_argument("--audit-db-url", default=None, metavar="URL")
+    ae.add_argument("--since", default=None, metavar="ISO8601",
+                    help="Include rows with ts >= this ISO-8601 timestamp.")
+    ae.add_argument("--from-id", type=int, default=1, metavar="N")
+    ae.add_argument("--to-id", type=int, default=None, metavar="M")
+    ae.add_argument("--out", default="-", metavar="FILE",
+                    help="Output path; '-' writes to stdout (default).")
+    ae.add_argument("--log-level", default="WARNING",
+                    choices=["DEBUG", "INFO", "WARNING", "ERROR"])
+    ae.set_defaults(func=cmd_audit_export)
+
     return root
 
 
@@ -457,6 +505,99 @@ def cmd_ocsp_prebuild(args: argparse.Namespace) -> int:
         validity_hours=args.validity_hours,
     )
     print(f"Wrote {count} OCSP response(s) to {out}")
+    return 0
+
+
+def _audit_db(args: argparse.Namespace):
+    """Return an open Database for the audit log."""
+    from pathlib import Path as _P
+    url = getattr(args, "audit_db_url", None)
+    if not url:
+        ca_dir = _P(getattr(args, "ca_dir", "./ca"))
+        url = f"sqlite:///{ca_dir / 'audit.db'}"
+    return db.make_db(url)
+
+
+def cmd_audit_verify(args: argparse.Namespace) -> int:
+    """Verify hash chain integrity. Exit 0 = ok; 2 = breaks found."""
+    import json as _json
+    import time as _time
+    _setup_logging(args.log_level)
+    try:
+        import audit_chain
+    except ImportError:
+        print("ERROR: audit_chain.py not found.")
+        return 1
+
+    d = _audit_db(args)
+    try:
+        t0 = _time.monotonic()
+        report = audit_chain.verify_chain(d, start_id=args.from_id, end_id=args.to_id)
+        elapsed = _time.monotonic() - t0
+    finally:
+        d.close()
+
+    end_id_str = str(args.to_id) if args.to_id else "last"
+    if args.json_output:
+        out = {
+            "rows_checked": report.rows_checked,
+            "ok": report.ok,
+            "elapsed_s": round(elapsed, 3),
+            "final_hash": report.final_hash,
+            "breaks": [
+                {"id": b.id, "kind": b.kind, "expected": b.expected, "found": b.found}
+                for b in report.breaks
+            ],
+        }
+        print(_json.dumps(out, indent=2))
+    else:
+        print(f"Verified rows {args.from_id}..{end_id_str} in {elapsed:.1f}s")
+        if report.ok:
+            print("Chain intact.")
+            print(f"Final hash: {report.final_hash[:16]}...{report.final_hash[-4:]}")
+        else:
+            first = report.breaks[0]
+            print(f"CHAIN BROKEN at row {first.id}:")
+            print(f"  {first.kind}: expected {first.expected[:16]}..., "
+                  f"found {first.found[:16] if first.found else '(null)'}...")
+            subsequent = sum(
+                1 for b in report.breaks[1:] if b.id > first.id
+            )
+            if subsequent:
+                print(f"{subsequent} subsequent row(s) are unverifiable from this point.")
+
+    return 0 if report.ok else 2
+
+
+def cmd_audit_export(args: argparse.Namespace) -> int:
+    """Export a chain segment as JSON."""
+    import json as _json
+    import sys as _sys
+    _setup_logging(args.log_level)
+    try:
+        import audit_chain
+    except ImportError:
+        print("ERROR: audit_chain.py not found.")
+        return 1
+
+    d = _audit_db(args)
+    try:
+        payload = audit_chain.export_chain(
+            d,
+            since=args.since,
+            start_id=args.from_id,
+            end_id=args.to_id,
+        )
+    finally:
+        d.close()
+
+    text = _json.dumps(payload, indent=2)
+    if args.out == "-":
+        print(text)
+    else:
+        from pathlib import Path as _P
+        _P(args.out).write_text(text, encoding="utf-8")
+        print(f"Exported {len(payload['rows'])} row(s) to {args.out}")
     return 0
 
 

@@ -918,8 +918,8 @@ class TestAuditLogDAL(unittest.TestCase):
                 row = d.fetchone(
                     "SELECT MAX(version) AS v FROM schema_migrations"
                 )
-                self.assertEqual(row["v"], 1,
-                                 "audit/001_initial.sql must be recorded as applied")
+                self.assertGreaterEqual(row["v"], 1,
+                                       "at least audit/001_initial.sql must be recorded")
             finally:
                 d.close()
         finally:
@@ -10946,6 +10946,326 @@ class TestACMEEABWebUI(unittest.TestCase):
     def test_acme_eab_nav_link_present_on_dashboard(self):
         _, body = self._get("/")
         self.assertIn("/acme-eab", body)
+
+
+# ===========================================================================
+# Audit chain tests
+# ===========================================================================
+
+import audit_chain as _ac
+
+
+def _make_audit_db(tmp: str):
+    """Return a fresh AuditLog-backed database at tmp, with chain columns."""
+    import db as _db
+    from migrations import MigrationRunner
+    from pathlib import Path as _P
+    url = f"sqlite:///{_P(tmp) / 'audit_chain_test.db'}"
+    d = _db.make_db(url)
+    mig_root = str(_P(__file__).resolve().parent / "db_migrations")
+    runner = MigrationRunner(d, _P(mig_root) / "audit", namespace="audit")
+    runner.apply_pending()
+    return d
+
+
+class TestAuditChainAppend(unittest.TestCase):
+    """Verify that append() writes correct hash fields."""
+
+    def setUp(self):
+        self._tmp = tempfile.mkdtemp(prefix="ac-append-")
+        self._db = _make_audit_db(self._tmp)
+
+    def tearDown(self):
+        self._db.close()
+        import shutil
+        shutil.rmtree(self._tmp, ignore_errors=True)
+
+    def test_first_row_has_zero_prev_hash(self):
+        _ac.append("issue", "serial=1", "1.2.3.4", self._db)
+        row = self._db.fetchone("SELECT prev_hash, this_hash FROM audit ORDER BY id ASC LIMIT 1")
+        self.assertEqual(row["prev_hash"], "0" * 64)
+        self.assertIsNotNone(row["this_hash"])
+        self.assertEqual(len(row["this_hash"]), 64)
+
+    def test_subsequent_rows_chain_correctly(self):
+        _ac.append("issue", "serial=1", "1.2.3.4", self._db)
+        _ac.append("revoke", "serial=1", "1.2.3.4", self._db)
+        rows = self._db.fetchall(
+            "SELECT id, prev_hash, this_hash FROM audit ORDER BY id ASC"
+        )
+        self.assertEqual(rows[1]["prev_hash"], rows[0]["this_hash"])
+
+    def test_canonical_serialization_is_deterministic(self):
+        b1 = _ac.canonical_row_bytes("2026-01-01T00:00:00+00:00", "issue", "x", "1.1.1.1")
+        b2 = _ac.canonical_row_bytes("2026-01-01T00:00:00+00:00", "issue", "x", "1.1.1.1")
+        self.assertEqual(b1, b2)
+
+    def test_canonical_serialization_handles_null_fields(self):
+        b = _ac.canonical_row_bytes("2026-01-01T00:00:00+00:00", "startup", "", "")
+        self.assertIsInstance(b, bytes)
+        self.assertGreater(len(b), 0)
+
+    def test_canonical_serialization_handles_unicode(self):
+        b = _ac.canonical_row_bytes("2026-01-01T00:00:00+00:00", "issue", "CN=Ünïcödé", "")
+        self.assertIsInstance(b, bytes)
+
+    def test_details_sorted_keys_produces_consistent_hash(self):
+        import json as _json
+        d1 = _json.dumps({"b": 2, "a": 1}, sort_keys=True, separators=(",", ":"))
+        d2 = _json.dumps({"a": 1, "b": 2}, sort_keys=True, separators=(",", ":"))
+        self.assertEqual(d1, d2)
+
+    def test_length_prefix_prevents_concat_ambiguity(self):
+        b1 = _ac.canonical_row_bytes("ts", "ab", "c", "")
+        b2 = _ac.canonical_row_bytes("ts", "a", "bc", "")
+        self.assertNotEqual(b1, b2)
+
+    def test_this_hash_matches_manual_computation(self):
+        import hashlib as _hl
+        _ac.append("test", "detail", "127.0.0.1", self._db)
+        row = self._db.fetchone(
+            "SELECT ts, event, detail, ip, prev_hash, this_hash FROM audit "
+            "ORDER BY id ASC LIMIT 1"
+        )
+        row_bytes = _ac.canonical_row_bytes(
+            row["ts"], row["event"], row["detail"] or "", row["ip"] or ""
+        )
+        expected = _hl.sha256(row["prev_hash"].encode() + row_bytes).hexdigest()
+        self.assertEqual(row["this_hash"], expected)
+
+
+class TestAuditChainVerify(unittest.TestCase):
+    """Verify that verify_chain() correctly detects intact and broken chains."""
+
+    def setUp(self):
+        self._tmp = tempfile.mkdtemp(prefix="ac-verify-")
+        self._db = _make_audit_db(self._tmp)
+        for i in range(5):
+            _ac.append("event", f"i={i}", "127.0.0.1", self._db)
+
+    def tearDown(self):
+        self._db.close()
+        import shutil
+        shutil.rmtree(self._tmp, ignore_errors=True)
+
+    def test_intact_chain_passes(self):
+        report = _ac.verify_chain(self._db)
+        self.assertTrue(report.ok)
+        self.assertEqual(report.rows_checked, 5)
+
+    def test_modified_row_detected(self):
+        self._db.execute(
+            "UPDATE audit SET detail = 'tampered' WHERE id = 2"
+        )
+        report = _ac.verify_chain(self._db)
+        self.assertFalse(report.ok)
+        broken_ids = {b.id for b in report.breaks}
+        self.assertIn(2, broken_ids)
+
+    def test_modified_this_hash_detected(self):
+        self._db.execute(
+            "UPDATE audit SET this_hash = ? WHERE id = 3",
+            ("a" * 64,),
+        )
+        report = _ac.verify_chain(self._db)
+        self.assertFalse(report.ok)
+        broken_ids = {b.id for b in report.breaks}
+        self.assertIn(3, broken_ids)
+
+    def test_verify_subset_with_from_to(self):
+        report = _ac.verify_chain(self._db, start_id=2, end_id=4)
+        self.assertTrue(report.ok)
+        self.assertEqual(report.rows_checked, 3)
+
+    def test_first_break_reported(self):
+        self._db.execute(
+            "UPDATE audit SET detail = 'tampered' WHERE id = 1"
+        )
+        report = _ac.verify_chain(self._db)
+        self.assertFalse(report.ok)
+        # Row 1 should be among the reported breaks.
+        self.assertTrue(any(b.id == 1 for b in report.breaks))
+
+    def test_break_dataclass_fields(self):
+        self._db.execute(
+            "UPDATE audit SET detail = 'bad' WHERE id = 2"
+        )
+        report = _ac.verify_chain(self._db)
+        b = next(x for x in report.breaks if x.id == 2)
+        self.assertIn(b.kind, ("prev_hash_mismatch", "this_hash_mismatch"))
+        self.assertEqual(len(b.expected), 64)
+
+    def test_verify_report_final_hash(self):
+        report = _ac.verify_chain(self._db)
+        last = self._db.fetchone(
+            "SELECT this_hash FROM audit ORDER BY id DESC LIMIT 1"
+        )
+        self.assertEqual(report.final_hash, last["this_hash"])
+
+
+class TestAuditChainBackfill(unittest.TestCase):
+    """Verify that backfill_chain() correctly hashes pre-chain rows."""
+
+    def setUp(self):
+        self._tmp = tempfile.mkdtemp(prefix="ac-backfill-")
+        self._db = _make_audit_db(self._tmp)
+
+    def tearDown(self):
+        self._db.close()
+        import shutil
+        shutil.rmtree(self._tmp, ignore_errors=True)
+
+    def _insert_legacy(self, n: int):
+        import datetime as _dt
+        for i in range(n):
+            ts = _dt.datetime.now(_dt.timezone.utc).isoformat()
+            self._db.execute(
+                "INSERT INTO audit(ts, event, detail, ip) VALUES (?, ?, ?, ?)",
+                (ts, "legacy", f"i={i}", ""),
+            )
+
+    def test_backfill_produces_intact_chain(self):
+        self._insert_legacy(10)
+        count = _ac.backfill_chain(self._db)
+        self.assertEqual(count, 10)
+        report = _ac.verify_chain(self._db)
+        self.assertTrue(report.ok)
+
+    def test_backfill_is_idempotent(self):
+        self._insert_legacy(5)
+        _ac.backfill_chain(self._db)
+        count2 = _ac.backfill_chain(self._db)
+        self.assertEqual(count2, 0)
+        report = _ac.verify_chain(self._db)
+        self.assertTrue(report.ok)
+
+    def test_backfill_then_new_appends_chain_intact(self):
+        self._insert_legacy(3)
+        _ac.backfill_chain(self._db)
+        _ac.append("new", "after-backfill", "10.0.0.1", self._db)
+        report = _ac.verify_chain(self._db)
+        self.assertTrue(report.ok)
+        self.assertEqual(report.rows_checked, 4)
+
+
+class TestAuditChainConcurrency(unittest.TestCase):
+    """Verify that concurrent appends don't fork the chain."""
+
+    def setUp(self):
+        self._tmp = tempfile.mkdtemp(prefix="ac-concur-")
+        self._db = _make_audit_db(self._tmp)
+
+    def tearDown(self):
+        self._db.close()
+        import shutil
+        shutil.rmtree(self._tmp, ignore_errors=True)
+
+    def test_concurrent_appends_produce_intact_chain(self):
+        import concurrent.futures
+        import db as _db
+        from pathlib import Path as _P
+        from migrations import MigrationRunner
+
+        db_path = str(_P(self._tmp) / "audit_chain_test.db")
+        db_url = f"sqlite:///{db_path}"
+        n_threads = 20
+        errors: list[Exception] = []
+
+        def worker(i: int):
+            d = _db.make_db(db_url)
+            try:
+                _ac.append("concurrent", f"thread={i}", "", d)
+            except Exception as e:
+                errors.append(e)
+            finally:
+                d.close()
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=n_threads) as ex:
+            list(ex.map(worker, range(n_threads)))
+
+        self.assertEqual(errors, [], f"Thread errors: {errors}")
+        d = _db.make_db(db_url)
+        try:
+            report = _ac.verify_chain(d)
+        finally:
+            d.close()
+        self.assertTrue(report.ok, f"Chain broken after concurrent appends: {report.breaks}")
+        self.assertEqual(report.rows_checked, n_threads)
+
+    def test_advisory_lock_prevents_split_chain(self):
+        import concurrent.futures
+        import db as _db
+        from pathlib import Path as _P
+
+        db_url = f"sqlite:///{_P(self._tmp) / 'audit_chain_test.db'}"
+        n = 30
+
+        def worker(i: int):
+            d = _db.make_db(db_url)
+            try:
+                _ac.append("lock_test", f"i={i}", "", d)
+            finally:
+                d.close()
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=10) as ex:
+            list(ex.map(worker, range(n)))
+
+        d = _db.make_db(db_url)
+        try:
+            rows = d.fetchall("SELECT prev_hash FROM audit ORDER BY id ASC")
+        finally:
+            d.close()
+
+        # Each row's prev_hash must be unique (no two rows can share a prev_hash,
+        # which would indicate a fork from a shared ancestor).
+        prev_hashes = [r["prev_hash"] for r in rows]
+        self.assertEqual(len(prev_hashes), len(set(prev_hashes)),
+                         "Two rows share a prev_hash — advisory lock failed to serialize")
+
+
+class TestAuditChainAuditLogIntegration(unittest.TestCase):
+    """Verify that AuditLog.record() writes chain columns via audit_chain."""
+
+    def setUp(self):
+        self._tmp = tempfile.mkdtemp(prefix="ac-integration-")
+        self._log = pki.AuditLog(Path(self._tmp))
+
+    def tearDown(self):
+        self._log.close()
+        import shutil
+        shutil.rmtree(self._tmp, ignore_errors=True)
+
+    def test_record_writes_hash_columns(self):
+        self._log.record("startup", "port=8080", "")
+        import db as _db
+        d = _db.make_db(f"sqlite:///{Path(self._tmp) / 'audit.db'}")
+        try:
+            row = d.fetchone(
+                "SELECT prev_hash, this_hash FROM audit ORDER BY id ASC LIMIT 1"
+            )
+        finally:
+            d.close()
+        self.assertIsNotNone(row["this_hash"])
+        self.assertEqual(len(row["this_hash"]), 64)
+        self.assertEqual(row["prev_hash"], "0" * 64)
+
+    def test_chain_intact_after_multiple_records(self):
+        for i in range(5):
+            self._log.record("event", f"i={i}", "127.0.0.1")
+        import db as _db
+        d = _db.make_db(f"sqlite:///{Path(self._tmp) / 'audit.db'}")
+        try:
+            report = _ac.verify_chain(d)
+        finally:
+            d.close()
+        self.assertTrue(report.ok)
+        self.assertEqual(report.rows_checked, 5)
+
+    def test_recent_still_returns_events(self):
+        self._log.record("issue", "serial=42", "10.0.0.1")
+        events = self._log.recent(10)
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]["event"], "issue")
 
 
 # ===========================================================================
