@@ -67,123 +67,19 @@ from cryptography.x509.oid import NameOID
 
 logger = logging.getLogger("tsa")
 
-# ---------------------------------------------------------------------------
-# DER / ASN.1 helpers (mirrors ocsp_server.py)
-# ---------------------------------------------------------------------------
-
-def _enc_len(n: int) -> bytes:
-    if n < 0x80:
-        return bytes([n])
-    lb = []
-    while n:
-        lb.append(n & 0xFF)
-        n >>= 8
-    lb.reverse()
-    return bytes([0x80 | len(lb)]) + bytes(lb)
-
-def _dec_len(data: bytes, pos: int) -> Tuple[int, int]:
-    b = data[pos]
-    if b < 0x80:
-        return b, pos + 1
-    nb = b & 0x7F
-    return int.from_bytes(data[pos+1:pos+1+nb], "big"), pos + 1 + nb
-
-def _dec_tlv(data: bytes, pos: int) -> Tuple[int, bytes, int]:
-    tag = data[pos]
-    l, vstart = _dec_len(data, pos + 1)
-    return tag, data[vstart:vstart+l], vstart + l
-
-def _seq(c: bytes) -> bytes:
-    return b"\x30" + _enc_len(len(c)) + c
-
-def _set(c: bytes) -> bytes:
-    return b"\x31" + _enc_len(len(c)) + c
-
-def _oid(dotted: str) -> bytes:
-    parts = list(map(int, dotted.split(".")))
-    enc = bytes([40 * parts[0] + parts[1]])
-    for p in parts[2:]:
-        if p == 0:
-            enc += b"\x00"
-        else:
-            buf = []
-            while p:
-                buf.append(p & 0x7F)
-                p >>= 7
-            buf.reverse()
-            enc += bytes([(b | 0x80) if i < len(buf)-1 else b
-                          for i, b in enumerate(buf)])
-    return b"\x06" + _enc_len(len(enc)) + enc
-
-def _int_der(v: int) -> bytes:
-    if v == 0:
-        return b"\x02\x01\x00"
-    raw = []
-    n = abs(v)
-    while n:
-        raw.append(n & 0xFF)
-        n >>= 8
-    raw.reverse()
-    if raw[0] & 0x80:
-        raw.insert(0, 0)
-    return b"\x02" + _enc_len(len(raw)) + bytes(raw)
-
-def _oct(v: bytes) -> bytes:
-    return b"\x04" + _enc_len(len(v)) + v
-
-def _bit(v: bytes, unused: int = 0) -> bytes:
-    return b"\x03" + _enc_len(len(v) + 1) + bytes([unused]) + v
-
-def _ctx(n: int, c: bytes, constructed: bool = True) -> bytes:
-    tag = (0xA0 | n) if constructed else (0x80 | n)
-    return bytes([tag]) + _enc_len(len(c)) + c
-
-def _null() -> bytes:
-    return b"\x05\x00"
-
-def _utf8str(v: str) -> bytes:
-    b = v.encode("utf-8")
-    return b"\x0c" + _enc_len(len(b)) + b
-
-def _generalized_time(dt: datetime.datetime) -> bytes:
-    s = dt.strftime("%Y%m%d%H%M%SZ").encode()
-    return b"\x18" + _enc_len(len(s)) + s
-
-def _decode_oid_bytes(data: bytes) -> str:
-    if not data:
-        return ""
-    parts = [data[0] // 40, data[0] % 40]
-    i, cur = 1, 0
-    while i < len(data):
-        cur = (cur << 7) | (data[i] & 0x7F)
-        if not (data[i] & 0x80):
-            parts.append(cur)
-            cur = 0
-        i += 1
-    return ".".join(map(str, parts))
-
-
-# ---------------------------------------------------------------------------
-# OID constants
-# ---------------------------------------------------------------------------
-
-OID_SHA1             = "1.3.14.3.2.26"
-OID_SHA256           = "2.16.840.1.101.3.4.2.1"
-OID_SHA384           = "2.16.840.1.101.3.4.2.2"
-OID_SHA512           = "2.16.840.1.101.3.4.2.3"
-OID_RSA_ENC          = "1.2.840.113549.1.1.1"
-OID_SHA256_WITH_RSA  = "1.2.840.113549.1.1.11"
-OID_SHA384_WITH_RSA  = "1.2.840.113549.1.1.12"
-OID_SHA512_WITH_RSA  = "1.2.840.113549.1.1.13"
-OID_ECDSA_SHA256     = "1.2.840.10045.4.3.2"
-OID_ECDSA_SHA384     = "1.2.840.10045.4.3.3"
-OID_ECDSA_SHA512     = "1.2.840.10045.4.3.4"
-OID_SIGNED_DATA      = "1.2.840.113549.1.7.2"
-OID_TST_INFO         = "1.2.840.113549.1.9.16.1.4"   # id-ct-TSTInfo
-OID_CONTENT_TYPE     = "1.2.840.113549.1.9.3"         # id-contentType
-OID_MESSAGE_DIGEST   = "1.2.840.113549.1.9.4"         # id-messageDigest
-OID_SIGNING_CERT_V2  = "1.2.840.113549.1.9.16.2.47"  # id-aa-signingCertificateV2 (RFC 5816)
-OID_EKU_TIMESTAMPING = "1.3.6.1.5.5.7.3.8"           # id-kp-timeStamping (RFC 3161 §2.3)
+from der_codec import (
+    encode_length as _enc_len, decode_length as _dec_len, decode_tlv as _dec_tlv,
+    seq as _seq, set_ as _set, ctx as _ctx, oid as _oid,
+    integer as _int_der, octet_string as _oct, bit_string as _bit,
+    null as _null, utf8_string as _utf8str, generalized_time as _generalized_time,
+    decode_oid_bytes as _decode_oid_bytes,
+    OID_SHA1, OID_SHA256, OID_SHA384, OID_SHA512,
+    OID_SHA256_WITH_RSA, OID_SHA384_WITH_RSA, OID_SHA512_WITH_RSA,
+    OID_ECDSA_SHA256, OID_ECDSA_SHA384, OID_ECDSA_SHA512,
+    OID_SIGNED_DATA, OID_TST_INFO, OID_CONTENT_TYPE, OID_MESSAGE_DIGEST,
+    OID_SIGNING_CERT_V2, OID_EKU_TIMESTAMPING,
+    OID_RSA_ENCRYPTION as OID_RSA_ENC,
+)
 
 # Placeholder policy OID — operators SHOULD supply a real PEN-based OID via
 # --tsa-policy-oid (see docs/CPS.md §7.2 for guidance on policy OID assignment)

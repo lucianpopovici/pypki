@@ -1106,100 +1106,14 @@ def _sign_data(key, data: bytes, *, rsa_pss: bool = False) -> bytes:
     raise TypeError(f"Unsupported private-key type for signing: {type(key).__name__}")
 
 
-# ---------------------------------------------------------------------------
-# Minimal DER helpers for hand-rolled X.509 TBSCertificate construction.
-# Used only for ML-DSA certs — CertificateBuilder doesn't accept ML-DSA keys
-# yet (cryptography 48.0.0). All classical certs continue to use the builder.
-# ---------------------------------------------------------------------------
-
-def _pder_len(n: int) -> bytes:
-    if n < 0x80:
-        return bytes([n])
-    if n < 0x100:
-        return bytes([0x81, n])
-    return bytes([0x82, n >> 8, n & 0xFF])
-
-
-def _pder_tlv(tag: int, body: bytes) -> bytes:
-    return bytes([tag]) + _pder_len(len(body)) + body
-
-
-def _pder_seq(body: bytes) -> bytes:
-    return _pder_tlv(0x30, body)
-
-
-def _pder_oid(dotted: str) -> bytes:
-    parts = [int(x) for x in dotted.split(".")]
-    enc = bytes([40 * parts[0] + parts[1]])
-    for p in parts[2:]:
-        if p == 0:
-            enc += b"\x00"
-        else:
-            buf: list[int] = []
-            while p:
-                buf.append(p & 0x7F); p >>= 7
-            buf.reverse()
-            for i, x in enumerate(buf):
-                enc += bytes([x | (0x80 if i < len(buf) - 1 else 0)])
-    return _pder_tlv(0x06, enc)
-
-
-def _pder_int(n: int) -> bytes:
-    raw = n.to_bytes((n.bit_length() + 8) // 8, "big")
-    return _pder_tlv(0x02, raw)
-
-
-def _pder_os(b: bytes) -> bytes:
-    return _pder_tlv(0x04, b)
-
-
-def _pder_bitstring(b: bytes) -> bytes:
-    return _pder_tlv(0x03, b"\x00" + b)
-
-
-def _pder_null() -> bytes:
-    return b"\x05\x00"
-
-
-def _pder_ctx(n: int, body: bytes, constructed: bool = True) -> bytes:
-    tag = (0xA0 if constructed else 0x80) | n
-    return bytes([tag]) + _pder_len(len(body)) + body
-
-
-def _pder_decode_tlv(data: bytes, pos: int = 0):
-    """Return (tag, value_bytes, next_pos)."""
-    tag = data[pos]; pos += 1
-    first = data[pos]
-    if first < 0x80:
-        length = first; pos += 1
-    elif first == 0x81:
-        length = data[pos + 1]; pos += 2
-    else:
-        length = (data[pos + 1] << 8) | data[pos + 2]; pos += 3
-    return tag, data[pos: pos + length], pos + length
-
-
-def _pder_ext(oid_dotted: str, value_der: bytes, critical: bool = False) -> bytes:
-    """Build DER for a single X.509 Extension TLV."""
-    body = _pder_oid(oid_dotted)
-    if critical:
-        body += b"\x01\x01\xff"  # BOOLEAN TRUE
-    body += _pder_os(value_der)
-    return _pder_seq(body)
-
-
-def _pder_utctime(dt: "datetime.datetime") -> bytes:
-    return _pder_tlv(0x17, dt.strftime("%y%m%d%H%M%SZ").encode())
-
-
-def _pder_gentime(dt: "datetime.datetime") -> bytes:
-    return _pder_tlv(0x18, dt.strftime("%Y%m%d%H%M%SZ").encode())
-
-
-def _pder_validity(not_before: "datetime.datetime", not_after: "datetime.datetime") -> bytes:
-    enc = _pder_utctime if not_before.year < 2050 else _pder_gentime
-    enc2 = _pder_utctime if not_after.year < 2050 else _pder_gentime
-    return _pder_seq(enc(not_before) + enc2(not_after))
+from der_codec import (
+    encode_length as _pder_len, tlv as _pder_tlv, seq as _pder_seq,
+    oid as _pder_oid, integer as _pder_int, octet_string as _pder_os,
+    bit_string as _pder_bitstring, null as _pder_null, ctx as _pder_ctx,
+    decode_tlv as _pder_decode_tlv, ext as _pder_ext,
+    utc_time as _pder_utctime, generalized_time as _pder_gentime,
+    validity as _pder_validity,
+)
 
 
 def _sig_alg_der_for_key(key) -> bytes:

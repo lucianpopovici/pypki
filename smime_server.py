@@ -35,24 +35,18 @@ from cryptography.hazmat.primitives.serialization import pkcs7 as _pkcs7lib
 
 logger = logging.getLogger("smime")
 
-# ---------------------------------------------------------------------------
-# OID constants
-# ---------------------------------------------------------------------------
-OID_DATA           = "1.2.840.113549.1.7.1"
-OID_SIGNED_DATA    = "1.2.840.113549.1.7.2"
-OID_ENVELOPED_DATA = "1.2.840.113549.1.7.3"
-OID_AES_256_CBC    = "2.16.840.1.101.3.4.1.42"
-OID_AES_256_GCM    = "2.16.840.1.101.3.4.1.46"
-OID_AES_256_WRAP   = "2.16.840.1.101.3.4.1.45"
-OID_RSA_ENCRYPTION = "1.2.840.113549.1.1.1"
-OID_RSAES_OAEP     = "1.2.840.113549.1.1.7"  # RFC 8551 MUST key-transport
-OID_MGF1           = "1.2.840.113549.1.1.8"
-OID_SHA256         = "2.16.840.1.101.3.4.2.1"
-OID_EC_PUBLIC_KEY  = "1.2.840.10045.2.1"
-OID_ECDH_SHA256KDF = "1.3.132.1.11"  # dhSinglePass-stdDH-sha256kdf-scheme
-OID_SECP256R1      = "1.2.840.10045.3.1.7"
-OID_SECP384R1      = "1.3.132.0.34"
-OID_SECP521R1      = "1.3.132.0.35"
+from der_codec import (
+    encode_length as _encode_length, tlv as _tlv,
+    seq as _seq, set_ as _set, ctx as _ctx, oid as _oid,
+    integer as _integer, octet_string as _octet_string,
+    bit_string as _bitstring, null as _null,
+    decode_tlv as _decode_tlv, decode_oid_bytes as _decode_oid_value,
+    OID_DATA, OID_SIGNED_DATA, OID_ENVELOPED_DATA,
+    OID_AES_256_CBC, OID_AES_256_GCM, OID_AES_256_WRAP,
+    OID_RSA_ENCRYPTION, OID_RSAES_OAEP, OID_MGF1, OID_SHA256,
+    OID_EC_PUBLIC_KEY, OID_ECDH_SHA256KDF,
+    OID_SECP256R1, OID_SECP384R1, OID_SECP521R1,
+)
 
 _CURVE_TO_OID = {
     "secp256r1":  OID_SECP256R1,
@@ -60,103 +54,6 @@ _CURVE_TO_OID = {
     "secp384r1":  OID_SECP384R1,
     "secp521r1":  OID_SECP521R1,
 }
-
-
-# ---------------------------------------------------------------------------
-# Minimal self-contained DER helpers
-# ---------------------------------------------------------------------------
-
-def _encode_length(n: int) -> bytes:
-    if n < 0x80:
-        return bytes([n])
-    if n < 0x100:
-        return bytes([0x81, n])
-    return bytes([0x82, n >> 8, n & 0xFF])
-
-
-def _tlv(tag: int, content: bytes) -> bytes:
-    return bytes([tag]) + _encode_length(len(content)) + content
-
-
-def _seq(c: bytes) -> bytes:
-    return _tlv(0x30, c)
-
-
-def _set(c: bytes) -> bytes:
-    return _tlv(0x31, c)
-
-
-def _oid(dotted: str) -> bytes:
-    parts = [int(x) for x in dotted.split(".")]
-    enc = bytes([40 * parts[0] + parts[1]])
-    for p in parts[2:]:
-        if p == 0:
-            enc += b"\x00"
-        else:
-            buf: list[int] = []
-            while p:
-                buf.append(p & 0x7F)
-                p >>= 7
-            buf.reverse()
-            for i, x in enumerate(buf):
-                enc += bytes([x | (0x80 if i < len(buf) - 1 else 0)])
-    return _tlv(0x06, enc)
-
-
-def _integer(n: int) -> bytes:
-    raw = n.to_bytes((n.bit_length() + 8) // 8, "big")
-    return _tlv(0x02, raw)
-
-
-def _octet_string(b: bytes) -> bytes:
-    return _tlv(0x04, b)
-
-
-def _bitstring(b: bytes) -> bytes:
-    return _tlv(0x03, b"\x00" + b)
-
-
-def _null() -> bytes:
-    return b"\x05\x00"
-
-
-def _ctx(n: int, c: bytes, constructed: bool = True) -> bytes:
-    tag = (0xA0 if constructed else 0x80) | n
-    return bytes([tag]) + _encode_length(len(c)) + c
-
-
-def _decode_tlv(data: bytes, pos: int = 0):
-    """Return (tag, value_bytes, next_pos)."""
-    tag = data[pos]
-    pos += 1
-    first = data[pos]
-    if first < 0x80:
-        length = first
-        pos += 1
-    elif first == 0x81:
-        length = data[pos + 1]
-        pos += 2
-    elif first == 0x82:
-        length = (data[pos + 1] << 8) | data[pos + 2]
-        pos += 3
-    else:
-        raise ValueError(f"Unsupported DER length at offset {pos}")
-    return tag, data[pos: pos + length], pos + length
-
-
-def _decode_oid_value(raw: bytes) -> str:
-    """Decode DER OID value bytes to dotted string (without tag/length)."""
-    out = []
-    first = raw[0]
-    out.append(str(first // 40))
-    out.append(str(first % 40))
-    val = 0
-    for b in raw[1:]:
-        val = (val << 7) | (b & 0x7F)
-        if not (b & 0x80):
-            out.append(str(val))
-            val = 0
-    return ".".join(out)
 
 
 # ---------------------------------------------------------------------------

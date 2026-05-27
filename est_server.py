@@ -60,87 +60,21 @@ from cryptography.x509.oid import NameOID, ExtendedKeyUsageOID
 
 logger = logging.getLogger("est")
 
-# ---------------------------------------------------------------------------
-# ASN.1 / DER helpers (subset — kept local to avoid coupling)
-# ---------------------------------------------------------------------------
-
-def _encode_length(n: int) -> bytes:
-    if n < 0x80:
-        return bytes([n])
-    lb = []
-    while n:
-        lb.append(n & 0xFF)
-        n >>= 8
-    lb.reverse()
-    return bytes([0x80 | len(lb)]) + bytes(lb)
-
-def _seq(content: bytes) -> bytes:
-    return b"\x30" + _encode_length(len(content)) + content
-
-def _set(content: bytes) -> bytes:
-    return b"\x31" + _encode_length(len(content)) + content
-
-def _oid(dotted: str) -> bytes:
-    parts = list(map(int, dotted.split(".")))
-    enc = bytes([40 * parts[0] + parts[1]])
-    for p in parts[2:]:
-        if p == 0:
-            enc += b"\x00"
-        else:
-            buf = []
-            while p:
-                buf.append(p & 0x7F)
-                p >>= 7
-            buf.reverse()
-            enc += bytes([(b | 0x80) if i < len(buf) - 1 else b for i, b in enumerate(buf)])
-    return b"\x06" + _encode_length(len(enc)) + enc
-
-def _octet_string(v: bytes) -> bytes:
-    return b"\x04" + _encode_length(len(v)) + v
-
-def _integer(val: int) -> bytes:
-    if val == 0:
-        return b"\x02\x01\x00"
-    raw = []
-    n = val
-    while n:
-        raw.append(n & 0xFF)
-        n >>= 8
-    raw.reverse()
-    if raw[0] & 0x80:
-        raw.insert(0, 0)
-    return b"\x02" + _encode_length(len(raw)) + bytes(raw)
-
-def _ctx(n: int, content: bytes, constructed: bool = True) -> bytes:
-    tag = (0xA0 | n) if constructed else (0x80 | n)
-    return bytes([tag]) + _encode_length(len(content)) + content
-
-def _utf8_string(v: str) -> bytes:
-    b = v.encode("utf-8")
-    return b"\x0c" + _encode_length(len(b)) + b
-
-def _ia5_string(v: str) -> bytes:
-    b = v.encode("ascii")
-    return b"\x16" + _encode_length(len(b)) + b
-
-# Well-known OIDs
-OID_SIGNED_DATA      = "1.2.840.113549.1.7.2"
-OID_DATA             = "1.2.840.113549.1.7.1"
-OID_SHA256           = "2.16.840.1.101.3.4.2.1"
-OID_SHA256_WITH_RSA  = "1.2.840.113549.1.1.11"
-OID_RSA_ENCRYPTION   = "1.2.840.113549.1.1.1"
-OID_CONTENT_TYPE     = "1.2.840.113549.1.9.3"
-OID_MESSAGE_DIGEST   = "1.2.840.113549.1.9.4"
-OID_SMIME_CAPS       = "1.2.840.113549.1.9.15"
-OID_EXTENSION_REQUEST = "1.2.840.113549.1.9.14"
-# RFC 7030 csrattrs hints
-OID_EC_PUBLIC_KEY    = "1.2.840.10045.2.1"
-OID_P256             = "1.2.840.10045.3.1.7"
-OID_CHALLENGE_PW     = "1.2.840.113549.1.9.7"
+from der_codec import (
+    encode_length as _encode_length, seq as _seq, set_ as _set, ctx as _ctx,
+    oid as _oid, integer as _integer, octet_string as _octet_string,
+    utf8_string as _utf8_string, ia5_string as _ia5_string,
+    OID_SIGNED_DATA, OID_DATA, OID_SHA256, OID_SHA256_WITH_RSA,
+    OID_RSA_ENCRYPTION, OID_CONTENT_TYPE, OID_MESSAGE_DIGEST,
+    OID_EXTENSION_REQUEST, OID_EC_PUBLIC_KEY,
+    OID_SMIME_CAP as OID_SMIME_CAPS,
+    OID_CHALLENGE_PASSWORD as OID_CHALLENGE_PW,
+    OID_SECP256R1 as OID_P256,
+    OID_EXTENDED_KEY_USAGE as OID_EKU,
+)
 OID_BASIC_CONSTRAINTS = "2.5.29.19"
 OID_KEY_USAGE        = "2.5.29.15"
 OID_SUBJECT_ALT_NAME = "2.5.29.17"
-OID_EKU              = "2.5.29.37"
 OID_CLIENT_AUTH      = "1.3.6.1.5.5.7.3.2"
 OID_SERVER_AUTH      = "1.3.6.1.5.5.7.3.1"
 OID_CODE_SIGNING     = "1.3.6.1.5.5.7.3.3"

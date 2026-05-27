@@ -74,134 +74,22 @@ from cryptography.x509.oid import NameOID
 
 logger = logging.getLogger("scep")
 
-# ---------------------------------------------------------------------------
-# ASN.1 / DER / CMS helpers (no external ASN.1 lib required)
-# ---------------------------------------------------------------------------
-
-def _encode_length(n: int) -> bytes:
-    if n < 0x80:
-        return bytes([n])
-    length_bytes = []
-    while n:
-        length_bytes.append(n & 0xFF)
-        n >>= 8
-    length_bytes.reverse()
-    return bytes([0x80 | len(length_bytes)]) + bytes(length_bytes)
-
-
-def _decode_length(data: bytes, pos: int) -> Tuple[int, int]:
-    """Return (length, next_pos)."""
-    b = data[pos]
-    if b < 0x80:
-        return b, pos + 1
-    n_bytes = b & 0x7F
-    length = int.from_bytes(data[pos + 1: pos + 1 + n_bytes], "big")
-    return length, pos + 1 + n_bytes
-
-
-def _decode_tlv(data: bytes, pos: int) -> Tuple[int, bytes, int]:
-    """Return (tag, value_bytes, next_pos)."""
-    tag = data[pos]
-    length, vstart = _decode_length(data, pos + 1)
-    return tag, data[vstart: vstart + length], vstart + length
-
-
-def _seq(content: bytes) -> bytes:
-    return b"\x30" + _encode_length(len(content)) + content
-
-
-def _set(content: bytes) -> bytes:
-    return b"\x31" + _encode_length(len(content)) + content
-
-
-def _ctx(n: int, content: bytes, constructed: bool = True) -> bytes:
-    tag = (0xA0 | n) if constructed else (0x80 | n)
-    return bytes([tag]) + _encode_length(len(content)) + content
-
-
-def _oid(dotted: str) -> bytes:
-    parts = list(map(int, dotted.split(".")))
-    encoded = bytes([40 * parts[0] + parts[1]])
-    for p in parts[2:]:
-        if p == 0:
-            encoded += b"\x00"
-        else:
-            buf = []
-            while p:
-                buf.append(p & 0x7F)
-                p >>= 7
-            buf.reverse()
-            for i, b_ in enumerate(buf):
-                encoded += bytes([b_ | (0x80 if i < len(buf) - 1 else 0)])
-    return b"\x06" + _encode_length(len(encoded)) + encoded
-
-
-def _integer(val: int) -> bytes:
-    if val == 0:
-        return b"\x02\x01\x00"
-    n = val
-    raw = []
-    while n:
-        raw.append(n & 0xFF)
-        n >>= 8
-    raw.reverse()
-    if raw[0] & 0x80:
-        raw.insert(0, 0)
-    return b"\x02" + _encode_length(len(raw)) + bytes(raw)
-
-
-def _octet_string(val: bytes) -> bytes:
-    return b"\x04" + _encode_length(len(val)) + val
-
-
-def _printable_string(val: str) -> bytes:
-    b = val.encode("ascii")
-    return b"\x13" + _encode_length(len(b)) + b
-
-
-def _utf8_string(val: str) -> bytes:
-    b = val.encode("utf-8")
-    return b"\x0c" + _encode_length(len(b)) + b
-
-
-def _null() -> bytes:
-    return b"\x05\x00"
-
-
-def _bool(val: bool) -> bytes:
-    return b"\x01\x01" + (b"\xff" if val else b"\x00")
-
-
-# Well-known OIDs
-OID_RSA_ENCRYPTION        = "1.2.840.113549.1.1.1"
-OID_SHA1_WITH_RSA         = "1.2.840.113549.1.1.5"
-OID_SHA256_WITH_RSA       = "1.2.840.113549.1.1.11"
-OID_MD5_WITH_RSA          = "1.2.840.113549.1.1.4"
-OID_DATA                  = "1.2.840.113549.1.7.1"
-OID_SIGNED_DATA           = "1.2.840.113549.1.7.2"
-OID_ENVELOPED_DATA        = "1.2.840.113549.1.7.3"
-OID_CONTENT_TYPE          = "1.2.840.113549.1.9.3"
-OID_MESSAGE_DIGEST        = "1.2.840.113549.1.9.4"
-OID_SIGNING_TIME          = "1.2.840.113549.1.9.5"
-OID_SMIME_CAP             = "1.2.840.113549.1.9.15"
-OID_TRANSACTION_ID        = "2.16.840.1.113733.1.9.7"
-OID_SENDER_NONCE          = "2.16.840.1.113733.1.9.5"
-OID_RECIPIENT_NONCE       = "2.16.840.1.113733.1.9.6"
-OID_PKI_STATUS            = "2.16.840.1.113733.1.9.3"
-OID_FAIL_INFO             = "2.16.840.1.113733.1.9.4"
-OID_MESSAGE_TYPE          = "2.16.840.1.113733.1.9.2"
-OID_CHALLENGE_PASSWORD    = "1.2.840.113549.1.9.7"
-OID_DES_CBC               = "1.3.14.3.2.7"
-OID_DES_EDE3_CBC          = "1.2.840.113549.3.7"
-OID_AES_128_CBC           = "2.16.840.1.101.3.4.1.2"
-OID_AES_192_CBC           = "2.16.840.1.101.3.4.1.22"
-OID_AES_256_CBC           = "2.16.840.1.101.3.4.1.42"
-OID_AES_128_GCM           = "2.16.840.1.101.3.4.1.6"   # RFC 5084
-OID_AES_256_GCM           = "2.16.840.1.101.3.4.1.46"  # RFC 5084
-OID_AUTH_ENVELOPED_DATA   = "1.2.840.113549.1.9.16.1.23"  # id-ct-authEnvelopedData (RFC 5083)
-OID_SHA1                  = "1.3.14.3.2.26"
-OID_SHA256                = "2.16.840.1.101.3.4.2.1"
-OID_COMMON_NAME           = "2.5.4.3"
+from der_codec import (
+    encode_length as _encode_length, decode_length as _decode_length,
+    decode_tlv as _decode_tlv, seq as _seq, set_ as _set, ctx as _ctx,
+    oid as _oid, integer as _integer, octet_string as _octet_string,
+    printable_string as _printable_string, utf8_string as _utf8_string,
+    null as _null, bool_ as _bool, decode_oid_bytes as _decode_oid_bytes,
+    OID_RSA_ENCRYPTION, OID_SHA1_WITH_RSA, OID_SHA256_WITH_RSA, OID_MD5_WITH_RSA,
+    OID_DATA, OID_SIGNED_DATA, OID_ENVELOPED_DATA, OID_AUTH_ENVELOPED_DATA,
+    OID_CONTENT_TYPE, OID_MESSAGE_DIGEST, OID_SIGNING_TIME, OID_SMIME_CAP,
+    OID_TRANSACTION_ID, OID_SENDER_NONCE, OID_RECIPIENT_NONCE,
+    OID_PKI_STATUS, OID_FAIL_INFO, OID_MESSAGE_TYPE, OID_CHALLENGE_PASSWORD,
+    OID_DES_CBC, OID_DES_EDE3_CBC,
+    OID_AES_128_CBC, OID_AES_192_CBC, OID_AES_256_CBC,
+    OID_AES_128_GCM, OID_AES_256_GCM,
+    OID_SHA1, OID_SHA256, OID_COMMON_NAME,
+)
 
 # SCEP message type codes (PrintableString)
 MSG_PKCSREQ     = "19"
@@ -540,20 +428,6 @@ class CMSParser:
         aesgcm = AESGCM(cek[:key_size])
         # Reassemble ciphertext + auth tag for library decryption
         return aesgcm.decrypt(nonce, ec_val + mac_tag, None)
-
-
-def _decode_oid_bytes(data: bytes) -> str:
-    if not data:
-        return ""
-    parts = [data[0] // 40, data[0] % 40]
-    i, cur = 1, 0
-    while i < len(data):
-        cur = (cur << 7) | (data[i] & 0x7F)
-        if not (data[i] & 0x80):
-            parts.append(cur)
-            cur = 0
-        i += 1
-    return ".".join(map(str, parts))
 
 
 def _cms_content_type(der: bytes) -> str:

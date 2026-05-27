@@ -62,98 +62,16 @@ def _get_hist_ocsp():
     from pki_server import _hist_ocsp  # noqa: PLC0415
     return _hist_ocsp
 
-# ---------------------------------------------------------------------------
-# DER / ASN.1 helpers
-# ---------------------------------------------------------------------------
-
-def _enc_len(n: int) -> bytes:
-    if n < 0x80:
-        return bytes([n])
-    lb = []
-    while n:
-        lb.append(n & 0xFF)
-        n >>= 8
-    lb.reverse()
-    return bytes([0x80 | len(lb)]) + bytes(lb)
-
-def _dec_len(data: bytes, pos: int) -> Tuple[int, int]:
-    b = data[pos]
-    if b < 0x80:
-        return b, pos + 1
-    nb = b & 0x7F
-    return int.from_bytes(data[pos+1:pos+1+nb], "big"), pos + 1 + nb
-
-def _dec_tlv(data: bytes, pos: int) -> Tuple[int, bytes, int]:
-    tag = data[pos]
-    l, vstart = _dec_len(data, pos + 1)
-    return tag, data[vstart:vstart+l], vstart + l
-
-def _seq(c: bytes) -> bytes:
-    return b"\x30" + _enc_len(len(c)) + c
-
-def _set(c: bytes) -> bytes:
-    return b"\x31" + _enc_len(len(c)) + c
-
-def _oid(dotted: str) -> bytes:
-    parts = list(map(int, dotted.split(".")))
-    enc = bytes([40 * parts[0] + parts[1]])
-    for p in parts[2:]:
-        if p == 0:
-            enc += b"\x00"
-        else:
-            buf = []
-            while p:
-                buf.append(p & 0x7F)
-                p >>= 7
-            buf.reverse()
-            enc += bytes([(b | 0x80) if i < len(buf)-1 else b for i, b in enumerate(buf)])
-    return b"\x06" + _enc_len(len(enc)) + enc
-
-def _int(v: int) -> bytes:
-    if v == 0:
-        return b"\x02\x01\x00"
-    raw = []
-    n = v
-    while n:
-        raw.append(n & 0xFF)
-        n >>= 8
-    raw.reverse()
-    if raw[0] & 0x80:
-        raw.insert(0, 0)
-    return b"\x02" + _enc_len(len(raw)) + bytes(raw)
-
-def _oct(v: bytes) -> bytes:
-    return b"\x04" + _enc_len(len(v)) + v
-
-def _bit(v: bytes, unused: int = 0) -> bytes:
-    return b"\x03" + _enc_len(len(v) + 1) + bytes([unused]) + v
-
-def _ctx(n: int, c: bytes, constructed: bool = True) -> bytes:
-    tag = (0xA0 | n) if constructed else (0x80 | n)
-    return bytes([tag]) + _enc_len(len(c)) + c
-
-def _null() -> bytes:
-    return b"\x05\x00"
-
-def _generalized_time(dt: datetime.datetime) -> bytes:
-    s = dt.strftime("%Y%m%d%H%M%SZ").encode()
-    return b"\x18" + _enc_len(len(s)) + s
-
-def _ia5(v: str) -> bytes:
-    b = v.encode("ascii")
-    return b"\x16" + _enc_len(len(b)) + b
-
-# OID constants
-OID_SHA1               = "1.3.14.3.2.26"
-OID_SHA256             = "2.16.840.1.101.3.4.2.1"
-OID_RSA_ENCRYPTION     = "1.2.840.113549.1.1.1"
-OID_SHA256_WITH_RSA    = "1.2.840.113549.1.1.11"
-OID_BASIC_OCSP_RESP    = "1.3.6.1.5.5.7.48.1.1"
-OID_OCSP_NONCE         = "1.3.6.1.5.5.7.48.1.2"
-OID_OCSP_NOCHECK       = "1.3.6.1.5.5.7.48.1.5"
-OID_ID_PKIX_OCSP       = "1.3.6.1.5.5.7.48.1"
-OID_EXTENDED_KEY_USAGE = "2.5.29.37"
-OID_EKU_OCSP_SIGNING   = "1.3.6.1.5.5.7.3.9"
+from der_codec import (
+    encode_length as _enc_len, decode_length as _dec_len, decode_tlv as _dec_tlv,
+    seq as _seq, set_ as _set, ctx as _ctx, oid as _oid,
+    integer as _int, octet_string as _oct, bit_string as _bit,
+    null as _null, generalized_time as _generalized_time, ia5_string as _ia5,
+    decode_oid_bytes as _decode_oid_bytes,
+    OID_SHA1, OID_SHA256, OID_RSA_ENCRYPTION, OID_SHA256_WITH_RSA,
+    OID_BASIC_OCSP_RESP, OID_OCSP_NONCE, OID_OCSP_NOCHECK, OID_ID_PKIX_OCSP,
+    OID_EXTENDED_KEY_USAGE, OID_EKU_OCSP_SIGNING,
+)
 
 # OCSP response status codes
 RESP_SUCCESSFUL        = 0
@@ -263,20 +181,6 @@ class OCSPRequestParser:
         except Exception as e:
             logger.debug(f"OCSP parse error: {e}")
             return None
-
-
-def _decode_oid_bytes(data: bytes) -> str:
-    if not data:
-        return ""
-    parts = [data[0] // 40, data[0] % 40]
-    i, cur = 1, 0
-    while i < len(data):
-        cur = (cur << 7) | (data[i] & 0x7F)
-        if not (data[i] & 0x80):
-            parts.append(cur)
-            cur = 0
-        i += 1
-    return ".".join(map(str, parts))
 
 
 # ---------------------------------------------------------------------------
