@@ -10,7 +10,7 @@ Tests every endpoint across all seven servers:
   • scep_server.py  (SCEP)       — default http://localhost:8889
   • est_server.py   (EST)        — default https://localhost:8444
   • ocsp_server.py  (OCSP)       — default http://localhost:8082
-  • ipsec_server.py (IPsec PKI)  — default https://localhost:8445
+  • ipsec_server.py (IPsec PKI)  — default https://localhost:8085
   • web_ui.py       (Web UI)     — default http://localhost:8090
 
 Usage
@@ -1498,8 +1498,8 @@ def parse_args() -> argparse.Namespace:
                    help="OCSP server base URL (default: http://localhost:8082)")
     p.add_argument("--web-url",   default="http://localhost:8090",
                    help="Web UI base URL (default: http://localhost:8090)")
-    p.add_argument("--ipsec-url", default="https://localhost:8445",
-                   help="IPsec PKI server base URL (default: https://localhost:8445)")
+    p.add_argument("--ipsec-url", default="https://localhost:8085",
+                   help="IPsec PKI server base URL (default: https://localhost:8085)")
     p.add_argument("--ca-cert",  default=None, metavar="PATH",
                    help="CA certificate PEM for TLS verification (default: system bundle)")
     p.add_argument("--no-verify", action="store_true",

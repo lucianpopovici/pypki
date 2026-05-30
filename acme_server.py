@@ -2585,7 +2585,7 @@ if __name__ == "__main__":
     import importlib.util
 
     parser = argparse.ArgumentParser(description="ACME Server (RFC 8555)")
-    parser.add_argument("--host", default="localhost")
+    parser.add_argument("--host", default="localhost", help="Bind address (default: localhost; use 0.0.0.0 for remote/container access)")
     parser.add_argument("--port", type=int, default=8888)
     parser.add_argument("--ca-dir", default="./ca")
     parser.add_argument("--base-url", default=None,

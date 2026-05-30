@@ -5131,7 +5131,7 @@ def _build_hsm_cfg(args):
 
 def main():
     parser = argparse.ArgumentParser(description="PKI Server with CMPv2 Support + mTLS")
-    parser.add_argument("--host", default="localhost", help="Bind address (default: localhost)")
+    parser.add_argument("--host", default="localhost", help="Bind address (default: localhost; use 0.0.0.0 for remote/container access)")
     parser.add_argument("--port", type=int, default=8080, help="Port (default: 8080)")
     parser.add_argument("--cmp-prefix", default="/cmp", metavar="PREFIX",
                         help="Path prefix for CMP handler (default: /cmp)")

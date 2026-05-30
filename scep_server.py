@@ -1497,7 +1497,7 @@ def start_scep_server(
 
 def main():
     parser = argparse.ArgumentParser(description="SCEP Server (RFC 8894)")
-    parser.add_argument("--host", default="localhost")
+    parser.add_argument("--host", default="localhost", help="Bind address (default: localhost; use 0.0.0.0 for remote/container access)")
     parser.add_argument("--port", type=int, default=8889)
     parser.add_argument("--ca-dir", default="./ca")
     parser.add_argument("--challenge", default="",

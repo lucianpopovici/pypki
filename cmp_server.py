@@ -2688,7 +2688,7 @@ def _standalone_main():
     parser = argparse.ArgumentParser(
         description="CMPv2/CMPv3 server — RFC 4210 / RFC 9480"
     )
-    parser.add_argument("--host",      default="localhost")
+    parser.add_argument("--host",      default="localhost", help="Bind address (default: localhost; use 0.0.0.0 for remote/container access)")
     parser.add_argument("--port",      type=int, default=8080)
     parser.add_argument("--ca-dir",    default="./ca")
     parser.add_argument(
