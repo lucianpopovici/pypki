@@ -1,337 +1,679 @@
-# CLAUDE.md — PyPKI Development Guide
+# CLAUDE.md — PyPKI Canonical Design Document
 
-This file gives Claude (and any engineer picking up the work) the context and
-conventions needed to extend PyPKI. All planned RFC work through Tier 5 is
-now shipped; see the active roadmap for what remains open.
+This file is the contract between PyPKI maintainers (including future
+Claude instances) and the codebase. Sidecar specs (`CLAUDE-<slug>.md`)
+carry per-feature design; this file carries the cross-cutting rules,
+patterns, and state that apply to every change.
 
----
-
-## Project conventions (read first)
-
-Follow these across every change:
-
-- **No new pip dependencies** unless absolutely required. PyPKI leans hard on
-  `cryptography` + stdlib. ASN.1 primitives are hand-rolled in
-  `scep_server.py` (`_seq`, `_set`, `_oid`, `_integer`, `_octet_string`,
-  `_ctx`, `_encode_length`, `_decode_tlv`); reuse them.
-- **Datetimes**: always `datetime.now(timezone.utc)`, never naive `utcnow()`.
-- **Serials**: use `x509.random_serial_number()` for new issuance paths.
-- **Audit log**: every issuance, revocation, config change, and admin action
-  must be recorded via the existing audit logger in `pki_server.py`.
-- **Rate limiting**: new public endpoints go through the existing token-bucket
-  limiter.
-- **Tests**: `test_pki_server.py` uses `unittest.TestCase` with one class per
-  RFC / feature area (e.g., `TestRFC5280CRL`, `TestRFC9608NoRevAvail`). Follow
-  that pattern: `TestRFC<nnnn><shortname>`.
-- **README**: every RFC we claim to implement gets a row in the Protocol
-  compliance table and, where user-visible, a feature section and/or CLI flag
-  documented.
-- **CHANGELOG**: add entries under `## [Unreleased]` grouped by
-  `### Added` / `### Fixed` / `### Changed` / `### Security` /
-  `### Documentation`.
-- **CLI flags** stay additive and namespaced (e.g., `--tsa-port`, `--ct-log-url`).
-  Secrets go through existing auth/config patterns, never positional args.
-- **Profiles**: new key/EKU combinations belong in the `CertProfile` catalog in
-  `pki_server.py` near line 606. Current profiles: `tls_server`, `tls_client`,
-  `code_signing`, `email`, `email_signing`, `email_encryption_rsa`,
-  `email_encryption_ec`, `ocsp_signing`, `tsa_signing`, `sub_ca`,
-  `short_lived`, `default`, `ml_dsa_signing`.
-- **No browser storage / no external network calls from servers** — PyPKI is
-  offline-capable; any new outbound call must be optional and toggleable.
-- **DB schema**: columns in `certificates` are exactly `serial`, `subject`,
-  `not_before`, `not_after`, `der`, `revoked`, `revoked_at`, `reason`,
-  `profile`. No `cn`, `status`, `requester_ip`, or `created_at` columns.
-  Dates stored as ISO-8601 strings. See `db_migrations/pki/001_initial.sql`.
+**If you are a Claude instance reading this for the first time in a
+session, read sections 1–4 in full before touching code.** Sections
+5–8 are reference material; consult on demand.
 
 ---
 
-## Shipped feature inventory
+## 1. Load-bearing rules
 
-### RFC compliance (Tiers 1–4)
+Hard rules. Violating any of these breaks something important.
 
-| Feature | RFC | Key files | CLI flags / endpoints |
-|---------|-----|-----------|----------------------|
-| CRL `cRLNumber` + AKI extensions | RFC 6818 / 5280 | `pki_server.py` | — |
-| OCSP nonce 1–32 byte enforcement | RFC 8954 | `ocsp_server.py` | `--ocsp-require-nonce` |
-| RSASSA-PSS CA signing | RFC 4055 | `pki_server.py` | `--sig-algorithm rsa-pss` |
-| Strict PEM bundle validation | RFC 7468 | `pki_server.py` | — |
-| CMP response signature protection | RFC 4210 | `cmp_server.py` | — |
-| CRMF POPO verification | RFC 4211 | `cmp_server.py` | — |
-| PKCS#8 key output everywhere | RFC 5958 | all server modules | — |
-| Sub-CA path_length + NameConstraints | — | `pki_server.py`, `web_ui.py` | `POST /api/issue-sub-ca` |
-| EST CSR SAN passthrough + profile routing | RFC 7030 | `est_server.py` | label paths |
-| Time-Stamp Authority | RFC 3161 + 5816 | `tsa_server.py` | `--tsa-prefix`, `--tsa-policy-oid` |
-| ACME IP identifier | RFC 8738 | `acme_server.py` | `--acme-allow-private-ip` |
-| Ed25519 / Ed448 CA keys | RFC 8410 | `pki_server.py` | `--ca-key-type ed25519\|ed448` |
-| ECDSA CA keys (P-256/384/521) | RFC 5480 + 5758 | `pki_server.py` | `--ca-key-type ec-p256\|p384\|p521` |
-| PKCS#12 hardening | RFC 7292 | `pki_server.py` | `--p12-allow-unencrypted` |
-| CT pre-cert flow + SCT verification | RFC 6962 | `pki_server.py` | `--ct-log-url`, `--ct-require-n` |
-| AES-GCM AuthEnvelopedData in SCEP | RFC 5083 + 5084 | `scep_server.py` | — |
-| CMP algorithm advertisement | RFC 9481 | `cmp_server.py` | — |
-| CMP pvno echo | RFC 9482 | `cmp_server.py` | — |
-| CMS `contentType` attribute always present | RFC 8933 | `scep_server.py`, `tsa_server.py` | — |
-| EST `serverkeygen` + profile-aware `csrattrs` | RFC 8295 | `est_server.py` | label paths |
-| No Revocation Available extension | RFC 9608 | `pki_server.py` | — |
-| CPS framework (docs + wiring) | RFC 3647 | `pki_server.py`, `docs/CPS.md` | `--cps-uri`, `--cps-policy-oid` |
-| ACME STAR short-term auto-renewal | RFC 8739 | `acme_server.py` | `--acme-star-enabled` |
-| S/MIME v4 (sign / encrypt / key agree) | RFC 8551 | `smime_server.py` | `--smime-prefix` |
-| ML-DSA (FIPS 204) X.509 issuance | FIPS 204 | `pki_server.py` | `--ca-key-type ml-dsa-44/65/87`, `POST /api/paired-issue` |
-| Related Certificates extension | RFC 9763 | `pki_server.py`, `web_ui.py` | `POST /api/paired-issue` |
+### 1.1 Source-verify before claiming
 
-### Operational maturity (Tier 5)
+Never assert "X is not implemented," "X works like Y," or "X is
+missing" without `view`-ing the file and quoting the actual code.
+Soft-recall is wrong often enough that *every* such assertion needs
+verification. Past mistakes — all caught by the user, all avoidable —
+include claiming revocation reason codes weren't implemented, claiming
+Web UI cert search didn't exist, claiming OpenTelemetry tracing wasn't
+present, claiming the expiry monitor wasn't shipped. All were wrong.
+All were stated with false confidence.
 
-| Feature | Key files |
-|---------|-----------|
-| PKCS#11 / HSM support | `hsm_backend.py`, `pki_server.py` |
-| Postgres dual-backend + versioned migrations | `db.py`, `migrations.py`, `pypki_admin.py` |
-| Offline root + key ceremony tooling | `ceremony.py`, `pypki_admin.py` |
-| RA approval workflow (REST, CMP, EST, web UI) | `pki_server.py`, `acme_server.py`, `cmp_server.py`, `web_ui.py` |
-| ACME EAB + per-account rate limiting | `acme_server.py` |
-| Cross-signing | `pki_server.py`, `web_ui.py` |
-| OCSP pre-generated static responses | `ocsp_server.py`, `pypki_admin.py` |
-| SCEP one-time challenge passwords | `scep_server.py`, `web_ui.py` |
-| Lifecycle webhooks | `hooks.py`, `pki_server.py` |
-| Structured JSON logging + request IDs | `pki_server.py`, `dispatcher_server.py` |
-| Prometheus histograms + gauges | `pki_server.py`, `ocsp_server.py`, `acme_server.py` |
-| Documentation (CPS, threat model, deployment guides) | `docs/` |
+The protocol:
+
+1. State what you're about to claim.
+2. Identify the file(s) that would prove or disprove it.
+3. `view` them.
+4. Quote the line that settles the question.
+5. Then make the claim.
+
+If step 4 doesn't produce a quote, the answer is "I don't know yet;
+let me grep further" — not a guess.
+
+### 1.2 Stop-and-confirm triggers
+
+Before any of the following, stop and confirm with the user. These
+are operations where being wrong is expensive:
+
+- **Key material**: anything touching CA private keys, HSM/KMS
+  references, Shamir shares, key backend selection, key rotation,
+  or key export logic.
+- **Wire-format code**: handlers in `cmp_server.py`, `scep_server.py`,
+  `acme_server.py`, `est_server.py`, `ocsp_server.py`, `tsa_server.py`,
+  `smime_server.py`. Wire-bit changes affect external clients.
+- **Audit-chain canonical serialization**: any change to
+  `canonical_row_bytes()` (once `CLAUDE-audit-chain.md` ships) or its
+  predecessor `AuditLog` row format. Changing the bytes invalidates
+  every chain hash.
+- **DAL query rewriter**: changes to `db.py:TenantScopedConnection`,
+  `_inject_tenant_filter()`, or the `TENANT_SCOPED_TABLES` allowlist.
+  Bugs here are cross-tenant data leaks.
+- **Advisory lock keys**: the *string values* passed to
+  `advisory_lock()`. Different keys across processes don't serialize.
+  Changing one without coordinating with running peers is a silent
+  correctness break.
+- **Schema migrations that aren't pure-additive**: column renames,
+  drops, type changes, NOT NULL additions without defaults. These
+  break rolling upgrades.
+- **CertProfile defaults that affect existing certs**: validity_days,
+  allowed_algorithms, EKU lists. Changing a default re-issues affect
+  the security posture of every cert in that profile.
+- **Cryptographic primitives**: introducing a new algorithm, changing
+  signature parameters, modifying ASN.1 encoding, altering OID tables.
+
+When in doubt, ask. The cost of one clarifying message is much lower
+than the cost of one wire-format regression.
+
+### 1.3 No new pip dependencies without explicit approval
+
+PyPKI is stdlib-first by design. The only runtime deps are
+`cryptography` and `psycopg3`. New deps require:
+
+1. Explicit user approval after a stated alternative ("we could
+   implement X in N LoC using stdlib").
+2. A documented reason in `CHANGELOG.md`.
+3. The dep being optional (lazy import + clear error) if it serves a
+   single backend.
+
+Examples of dependencies you might think are needed and aren't:
+`boto3` (use SigV4 + `urllib.request`), `python-systemd` (use a 40-LoC
+`sd_notify` shim), `python-saml` (implement the SP we need), `requests`
+(stdlib `urllib.request` is fine), `pyyaml` (JSON is acceptable for
+config; or write a flat-YAML parser).
+
+### 1.4 Audit-log every state change
+
+No exceptions. Issuance, revocation, sub-CA creation, config reload,
+TLS rotation, policy reload, backup, restore, upgrade, tenant
+creation, admin role grant — all must call into the audit log via
+`AuditLog.append(...)`. Reads don't need to be audited (too noisy);
+writes always do.
+
+Audit-log details payloads must never contain secrets (passphrases,
+private keys, OIDC client secrets, HMAC keys). Truncate, hash, or
+omit. If you're tempted to put a secret in the audit log "just for
+debugging," log a content hash instead.
+
+### 1.5 Source paths are not file paths
+
+All source files live at `/mnt/user-data/outputs/` in Claude's
+working environment. This directory maps to the actual repository
+in the user's filesystem. Reads via `view` are non-destructive;
+writes via `create_file` / `str_replace` modify the canonical
+source. Don't create files in `/tmp` or `/home/claude` and expect
+them to persist — they don't survive between sessions.
+
+When proposing a multi-file change, do all the writes inside one
+session and call `present_files` at the end so the user can see
+the deltas in their UI.
 
 ---
 
-## Active roadmap
+## 2. Source-verification protocol
 
-### PQC — what remains
+When a question of fact comes up about the code:
 
-- **ML-DSA (FIPS 204) ✅ shipped** — `issue_ml_dsa_certificate()`,
-  `issue_paired_certs()`, `POST /api/paired-issue`. Hand-rolls TBSCertificate
-  DER because `cryptography` 48.0.0 `CertificateBuilder` does not yet accept
-  ML-DSA public keys. Revisit once library support lands.
-- **RFC 9763 ✅ shipped** — `RelatedCertificate` extension (OID
-  `1.3.6.1.5.5.7.1.36`), one-directional SHA-512 hash link from ML-DSA cert
-  to classical cert to avoid circular dependency.
-- **Composite signatures** (`draft-ietf-lamps-pq-composite-sigs`) — classical
-  + PQC in a single signature structure; cleaner migration than RFC 9763
-  pairing for some deployments. Wait for RFC status before implementing.
+1. **State the question precisely.** "Does PyPKI implement RFC 5280
+   §5.3.1 revocation reason codes?" not "is revocation supported?"
 
-### Protocol extras — deferred
+2. **List candidate files.** For the revocation example: `pki_server.py`
+   (issuance/revocation surface), `ocsp_server.py` (response generation),
+   any CRL builder.
 
-- **RFC 9148** — EST over CoAP: only worth it for IoT; adds `aiocoap`
-  dependency. Defer unless a concrete user need appears.
+3. **`view` each candidate.** Default to viewing the whole file unless
+   it's massive; for very large files, search-then-view with a range.
 
----
+4. **Quote.** When stating the finding, quote the relevant line(s)
+   with `path:lineno`. Example: "`pki_server.py:842` enumerates
+   `RevocationReason.key_compromise`, `superseded`, etc., mapping to
+   RFC 5280 §5.3.1 codes 1, 4, ...".
 
-## Skip list (low ROI — do not implement without explicit user need)
+5. **Note absence honestly.** If the search came back empty, say so:
+   "I searched X, Y, Z and found no reference to <feature>; it
+   appears unimplemented" — not "X is not implemented."
 
-- RFC 5055 — SCVP (effectively dead)
-- RFC 6402 — CMC (CMP covers the same ground)
-- RFC 3709 — logotype (vanity)
-- RFC 5544 / 6019 / 6283 — niche timestamp formats
-- RFC 5755 — Attribute Certificates (OAuth, SAML, and Kerberos PAC ate this space)
+The protocol is mandatory before any factual claim. It is also the
+mechanism for resolving disagreements: if the user says "X exists,"
+the resolution is `grep` + `view` + quote, not back-and-forth assertion.
 
 ---
 
-## Per-change checklist
+## 3. Code conventions
 
-Every RFC addition MUST update:
+### 3.1 Language and style
 
-- [ ] Source module(s)
-- [ ] `test_pki_server.py` (or dedicated test file if a new module)
-- [ ] `README.md` Protocol compliance table
-- [ ] `README.md` feature/CLI documentation if user-visible
-- [ ] `CHANGELOG.md` under `## [Unreleased]`
-- [ ] `pypki-flows.html` if it introduces a new protocol flow
+- **Python 3.12+**. Use modern syntax: `match` statements when
+  pattern-matching makes structure clearer, `:=` walrus where it
+  eliminates a redundant variable, PEP 604 `X | Y` union types, PEP
+  695 type aliases where appropriate.
+- **`datetime.now(timezone.utc)`** everywhere. `datetime.utcnow()` is
+  deprecated in 3.12+ and gives naive datetimes — a footgun for cert
+  validity arithmetic.
+- **`pathlib.Path`** for new code paths. String paths only where an
+  external API (subprocess, sqlite3 connection string) requires them.
+- **`dataclass(frozen=True)`** for value types. Reduces accidental
+  mutation; required for things passed to hash-chain serialization.
+- **Type hints on every public function and method.** Internal
+  helpers can elide, but anything reachable from another module or
+  another file must annotate.
+- **No `Any` without justification.** A comment explaining why is
+  required when `Any` appears in a signature. `object` is usually
+  what's wanted.
+- **No `from x import *`.** Explicit imports only.
+- **No module-level mutable state.** Configuration is passed in;
+  singletons are constructed in `pki_server.py:main()` and threaded
+  through.
 
-Run `./run_tests.sh` before presenting any change.
+### 3.2 Database access
+
+- **`?` placeholders, always.** Even in Postgres-only DAL code. The
+  DAL rewrites to `%s` for psycopg3 internally. Hand-writing
+  Postgres-style placeholders breaks SQLite tests.
+- **ISO-8601 strings** for any timestamp column. The DAL converts
+  on the way in and out for the appropriate backend.
+- **Token substitution** for cross-backend SQL: `{{auto_pk}}` for
+  autoincrementing primary keys, `{{blob}}` for binary BLOB columns.
+- **`advisory_lock("<key>")`** for cross-process serialization.
+  Lock keys are short stable strings (`"serial-allocation"`,
+  `"audit-chain"`, `"codesign-merkle"`). See section 5.4 for the
+  load-bearing list.
+- **Transactions are explicit.** `with db.transaction() as tx:` or
+  the equivalent. No autocommit-with-implicit-rollback.
+- **No new `sqlite3.connect()` calls.** The DAL migration is in
+  progress (section 7); add new code through `db.py`, not bare
+  sqlite3.
+
+### 3.3 ASN.1 and wire formats
+
+PyPKI hand-rolls DER encoding for two reasons:
+
+1. **Algorithms `cryptography` doesn't support yet** (ML-DSA,
+   SLH-DSA, composite signatures).
+2. **Bit-exact output for interop** with finicky external clients
+   (some SCEP / CMP implementations are sensitive to encoding choices
+   the library makes differently between versions).
+
+Use the helpers in `scep_server.py`: `_seq`, `_set`, `_oid`,
+`_integer`, `_octet_string`, `_ctx`, `_encode_length`,
+`_decode_tlv`, `_bit_string` (add when needed). Don't reinvent.
+
+When adding a new algorithm, the rule of thumb: if `cryptography`
+ships it and `CertificateBuilder` accepts the key type, use the
+library. If not, hand-roll TBSCertificate DER directly. Document
+the decision in the change's commit message.
+
+### 3.4 Errors and logging
+
+- **No catch-and-swallow** in issuance paths. An exception
+  generating a cert should propagate to the caller, get audit-logged
+  at the boundary, and produce a 500 with a request ID.
+- **No `print()` in library code.** Use `logging`. `pki_server.py`
+  configures the root logger; modules import `log =
+  logging.getLogger(__name__)` and use that.
+- **Request IDs.** Every inbound request gets a UUID logged in every
+  audit entry and surfaced in error responses. Operators correlate
+  via the ID.
+
+### 3.5 Threading and I/O
+
+- **Thread-safety is a property, not a hope.** Any class shared
+  across requests must say so in its docstring and document the
+  thread-safety story.
+- **No new sync I/O in the OCSP hot path.** OCSP responses are
+  served per-request; sync HTTP / KMS / DB calls in that path tank
+  latency. Pre-compute and cache where the response shape allows.
+- **No `time.sleep()` in tests.** Use a test clock (the existing
+  `test_pki_server.py` has helpers; reuse them). Sleeps make tests
+  flaky and slow.
 
 ---
 
-## Database design — SQLite + Postgres
+## 4. What NOT to do
 
-This section is the canonical reference for the DAL (`db.py`). The decisions
-here govern schema shape, migration files, and connection management across
-the whole codebase. Goal: **two backends, one codebase, one schema**.
+A non-exhaustive but battle-tested list. Each entry is here because
+breaking it caused a real problem.
 
-### Hard requirements (non-negotiable)
+- **Do not introduce an ORM.** SQLAlchemy, Tortoise, Peewee — none of
+  them. The hand-rolled DAL with explicit SQL is a feature.
+- **Do not catch `Exception` to hide errors.** Catch the specific
+  exception you can handle; let the rest propagate.
+- **Do not `sleep()` in tests.** Use the test clock.
+- **Do not put secrets in audit log details.** Hash, truncate, or
+  omit.
+- **Do not write schema migrations that are non-reversible without
+  documenting why.** Reversibility is the default; irreversibility
+  is the exception that must be justified.
+- **Do not change advisory lock keys without a coordinated cutover.**
+  Two processes using different keys for the "same" lock don't
+  serialize. See section 5.4.
+- **Do not bypass `AuditLog.append()`.** The audit chain (when it
+  ships) depends on a single funnel. Direct INSERTs into `audit_log`
+  break the chain.
+- **Do not add `sqlite3.connect()`.** Go through `db.py`.
+- **Do not reproduce the cert's DER outside the issuance path.** Load
+  via `x509.load_der_x509_certificate` from the stored bytes; don't
+  rebuild from fields.
+- **Do not write to `/mnt/user-data/uploads/`.** That directory is
+  read-only for user-provided files. Outputs go to
+  `/mnt/user-data/outputs/`.
+- **Do not skip `present_files` after creating outputs.** Without it,
+  the user can't see the new files.
+- **Do not fragment tests across files.** All tests go in
+  `test_pki_server.py`. Per-feature test classes (`TestRFC9773ARI`,
+  `TestCompositeMLDSA`, etc.) are how you organize.
+- **Do not introduce real-implementation interop tests as optional.**
+  Every protocol feature ships with a subprocess test against the
+  real client (`certbot`, `ssh-keygen -L`, `wg-quick`, etc.). Failure
+  to add one blocks merge.
+- **Do not generate certs with `notBefore == notAfter`.** Some
+  validators choke; some don't. Minimum validity is 60 seconds.
+- **Do not assume the user's environment.** Don't run `apt`, `pip`,
+  `systemctl`, etc., implicitly. Propose; let the user execute.
+- **Do not edit files in `/mnt/user-data/uploads/`** even if asked.
+  Read-only mount; copy to `/home/claude` or `/mnt/user-data/outputs/`
+  first.
 
-1. **Atomic serial-number allocation.** RFC 5280 §4.1.2.2 requires uniqueness.
-   Use `advisory_lock("serial-allocation")` — `BEGIN IMMEDIATE` on SQLite,
-   `pg_advisory_xact_lock` on Postgres.
-2. **Durable commits.** SQLite WAL with `synchronous=FULL`; Postgres default
-   `synchronous_commit=on`. Never advise turning these off.
-3. **Single writer or proper transactions.** Two CA instances must not
-   duplicate serials.
-4. **Backup + point-in-time recovery.** Losing the audit log loses the ability
-   to answer "did we issue this cert?"
+---
 
-### Architecture — thin DAL, no ORM
+## 5. Architectural map
+
+Concrete landmarks. Update on every meaningful refactor; stale
+landmarks here are a bug.
+
+### 5.1 Module index
+
+| Module                  | Role                                                          |
+| ----------------------- | ------------------------------------------------------------- |
+| `pki_server.py`         | Main HTTP server, CertProfile catalog, issuance, lifecycle     |
+| `db.py`                 | DAL: connection management, query helpers, advisory locks      |
+| `migrations.py`         | Schema migration runner (SQLite + Postgres)                    |
+| `db_migrations/`        | SQL migration files, per logical DB                            |
+| `acme_server.py`        | RFC 8555 ACME server                                           |
+| `scep_server.py`        | SCEP server; also home to ASN.1 encoding helpers               |
+| `est_server.py`         | RFC 7030 EST server                                            |
+| `cmp_server.py`         | CMPv2/v3 server                                                |
+| `ocsp_server.py`        | OCSP responder (pre-computed + on-demand)                      |
+| `tsa_server.py`         | RFC 3161 timestamp authority                                   |
+| `smime_server.py`       | S/MIME signing for `email_signing` profile                     |
+| `dispatcher_server.py`  | Front-door dispatcher; routes by URL prefix                    |
+| `hsm_backend.py`        | PKCS#11 key backend (cloud-KMS extension planned)              |
+| `ceremony.py`           | Offline root key ceremony tooling                              |
+| `hooks.py`              | Webhook lifecycle hooks                                        |
+| `pypki_admin.py`        | Admin CLI: revocation, migration, backup, etc.                 |
+| `web_ui.py`             | HTML admin UI                                                  |
+| `test_pki_server.py`    | All tests; per-feature test classes                            |
+| `ssh_ca.py`             | SSH certificate builder, KRL generation, key classification    |
+| `ssh_wire.py`           | SSH binary wire-format primitives (RFC 4251 §5)                |
+| `onion.py`              | Tor v3 address decode + ACME onion-csr-01 CSR validation       |
+
+Additional modules are added per sidecar spec (`policy.py`,
+`audit_chain.py`, `tls_manager.py`, etc.). Each spec lists the module
+it introduces.
+
+### 5.2 Key code locations
+
+These line numbers drift; if the line you find isn't what's described,
+`grep` for the named symbol.
+
+| Symbol                              | Location                              |
+| ----------------------------------- | ------------------------------------- |
+| `CertProfile` catalog               | `pki_server.py:~606`                  |
+| `issue_certificate()`               | `pki_server.py`                       |
+| `issue_sub_ca()`                    | `pki_server.py`                       |
+| `issue_ml_dsa_certificate()`        | `pki_server.py`                       |
+| `AuditLog` (the funnel)             | `pki_server.py`                       |
+| `advisory_lock()`                   | `db.py`                               |
+| `_seq`, `_set`, `_oid`, `_integer`  | `scep_server.py`                      |
+| `_encode_length`, `_decode_tlv`     | `scep_server.py`                      |
+| `Row` class (dict + int indexing)   | `db.py`                               |
+| `migration runner`                  | `migrations.py`                       |
+
+### 5.3 Database structure
+
+Four logical DBs, each with its own migrations directory:
+
+- `db_migrations/pki/` — main: certificates, CA keys, audit, profiles
+- `db_migrations/acme/` — ACME accounts, orders, authorizations
+- `db_migrations/scep/` — SCEP enrollments, transactions
+- `db_migrations/est/` — EST enrollments
+
+Logical DBs map to separate SQLite files in single-instance
+deployments and to separate schemas (or the same schema with
+prefixes — operator's choice) in Postgres.
+
+### 5.4 Load-bearing patterns
+
+Patterns whose change is a coordinated cutover, not a single-PR fix.
+If you need to modify one, plan the migration first.
+
+| Pattern                                                   | Why load-bearing                                  |
+| --------------------------------------------------------- | ------------------------------------------------- |
+| `?` placeholders + `{{auto_pk}}` / `{{blob}}` substitution | Every migration; backends rely on the rewriter   |
+| `AuditLog.append()` as the single audit funnel             | Audit chain integrity                            |
+| `advisory_lock("serial-allocation")` string key            | Serial allocation across processes                |
+| `advisory_lock("audit-chain")` string key                  | Hash chain append serialization                   |
+| `Row` class supporting `row["name"]` and `row[0]`          | Mixed-use across codebase; breaking it hits hard  |
+| Thread-local SQLite connections                            | sqlite3's thread-affinity rules                   |
+| CertProfile is immutable at runtime                        | Issuance assumes profiles don't shift mid-request |
+| Cert serial space (20-byte random)                         | RFC 5280 compliance; collision math               |
+| SSH cert serial (uint64 monotonic, separate counter)        | SSH spec requires uint64                          |
+| ASN.1 helper signatures (`_seq(*items)`)                  | Called from many sites                            |
+
+**Do not change any of these without a sidecar PR documenting the
+cutover plan.**
+
+---
+
+## 6. Test discipline
+
+- **All tests in `test_pki_server.py`.** Per-feature test classes.
+  Don't create `test_<feature>.py`; consolidation is intentional.
+- **Test class naming**: `TestRFC<nnnn><shortname>` for protocol
+  features (e.g. `TestRFC9773ARI`), `Test<FeatureName>` otherwise
+  (e.g. `TestPortalIsolation`).
+- **Every protocol spec ships with a real-implementation interop
+  test.** Subprocess against `certbot`, `ssh-keygen`, `openssl`,
+  `wg`, etc. These are non-negotiable for protocol changes.
+- **Postgres tests skip cleanly** when `PYPKI_TEST_POSTGRES_DSN`
+  isn't set. The main suite stays hermetic.
+- **No `time.sleep()`**. Use the test clock helpers.
+- **Coverage isn't the metric**; behavior-against-spec is. A test
+  that exercises a line but doesn't assert the right behavior is
+  worse than no test (false confidence).
+
+Run via `./run_tests.sh`. CI runs the same script plus the workflows
+described in sidecar specs (systemd-security, topology-smoke,
+upgrade-matrix, openapi-drift).
+
+---
+
+## 7. DAL migration (in progress)
+
+The DAL replaces direct `sqlite3.connect()` calls with `db.py`
+abstractions over two backends (SQLite, Postgres). Currently:
+
+- ✅ `db.py`, `migrations.py`, four `db_migrations/*/001_initial.sql`
+- ✅ `AuditLog` in `pki_server.py` — first DAL conversion site
+- ✅ SQLite→Postgres data migration tool with `migrate-data` and
+  `verify-migration` subcommands
+
+Pending conversions, in order of risk (low → high):
+
+1. `SCEPDatabase` in `scep_server.py`
+2. `ACMEDatabase` in `acme_server.py`
+3. `ESTDatabase` in `est_server.py`
+4. `CMPDatabase` in `cmp_server.py`
+5. `OCSPDatabase` in `ocsp_server.py`
+6. Remaining sites in `pki_server.py` not part of `AuditLog`
+7. `CertificateAuthority` serial-allocation sites — **highest
+   stakes**; requires `advisory_lock("serial-allocation")` to be
+   correct under Postgres semantics
+
+A `grep -n "sqlite3.connect" *.py` should produce a shrinking list.
+When it hits zero, the DAL migration is complete.
+
+---
+
+## 8. Normative references
+
+What PyPKI claims to implement. Verify the spec version on every
+release.
+
+| Reference                                | Topic                       | Status |
+| ---------------------------------------- | --------------------------- | ------ |
+| RFC 5280                                 | X.509 certificate profile   | core   |
+| RFC 6960                                 | OCSP                        | core   |
+| RFC 5019                                 | Lightweight OCSP profile    | core   |
+| RFC 3161 + RFC 5816                      | Time Stamp Protocol         | core   |
+| RFC 8555                                 | ACME                        | core   |
+| RFC 8737                                 | ACME tls-alpn-01            | core   |
+| RFC 8738                                 | ACME for IP identifiers     | core   |
+| RFC 8739                                 | ACME STAR (short-term auto-renewal) | core |
+| RFC 7030                                 | EST                         | core   |
+| RFC 4210 + RFC 4211 + RFC 9480           | CMPv2 / CMPv3               | core   |
+| RFC 9481                                 | CMP algorithm requirements  | core   |
+| draft-nourse-scep + de-facto SCEP        | SCEP                        | core   |
+| RFC 8551                                 | S/MIME 4.0                  | core   |
+| RFC 5958                                 | Asymmetric Key Packages     | core (PKCS#8 wrapper) |
+| FIPS 204                                 | ML-DSA                      | shipped |
+| RFC 9763                                 | Paired hybrid certificates  | shipped |
+| draft-ietf-lamps-pq-composite-sigs (-18) | Composite signatures        | spec'd, gated |
+| FIPS 205                                 | SLH-DSA                     | spec'd, gated |
+| draft-ietf-lamps-x509-slhdsa             | SLH-DSA in X.509            | spec'd, gated |
+| RFC 9773                                 | ACME Renewal Information    | spec'd  |
+| RFC 9799                                 | ACME for .onion             | shipped, gated (--acme-onion-enabled) |
+| OpenSSH PROTOCOL.certkeys                | SSH certificates + KRL      | shipped, gated (--ssh-ca-enabled) |
+
+"core" = implemented and tested. "shipped" = implemented but
+algorithm space still settling. "spec'd" = sidecar `CLAUDE-*.md`
+exists; not yet implemented. "gated" = code may exist behind a
+`--enable-X` flag; default off.
+
+Update this table on every release. Re-verify the spec versions
+at https://datatracker.ietf.org annually; sidecar specs note the
+draft revision they target.
+
+---
+
+## 9. Sidecar specs
+
+Per-feature design documents live next to this file as
+`CLAUDE-<slug>.md`. When implementing a feature, the sidecar is
+authoritative for that feature; this file is cross-cutting context.
+
+Current sidecars:
+
+**Protocol additions**
+
+- `CLAUDE-ari.md` — RFC 9773 ACME Renewal Information
+- `CLAUDE-composite-mldsa.md` — Composite ML-DSA in X.509
+- `CLAUDE-slh-dsa.md` — SLH-DSA (FIPS 205) in X.509
+- `CLAUDE-acme-onion.md` — RFC 9799 ACME for .onion
+
+**Platform features**
+
+- `CLAUDE-ssh-ca.md` — SSH certificate authority
+- `CLAUDE-sso.md` — OIDC and SAML SSO for admin
+- `CLAUDE-portal.md` — Self-service end-user portal
+- `CLAUDE-policy-engine.md` — Policy-as-code for issuance
+- `CLAUDE-audit-chain.md` — Tamper-evident hash-chained audit log
+- `CLAUDE-terraform-provider.md` — Terraform provider
+
+**Differentiated capabilities**
+
+- `CLAUDE-cloud-kms.md` — AWS / GCP / Azure KMS backends
+- `CLAUDE-backup-restore.md` — Backup, restore, Shamir-shared root
+- `CLAUDE-multitenancy.md` — Tenant isolation
+- `CLAUDE-code-signing-portal.md` — Code signing with build attestations
+- `CLAUDE-crypto-agility-dashboard.md` — PQ migration tracker
+- `CLAUDE-embedded-enrollment.md` — WireGuard + Matter device identities
+
+**Deployment and operations**
+
+- `CLAUDE-bootstrap-cli.md` — First-run `pypki init`
+- `CLAUDE-systemd-hardening.md` — systemd unit with hardening
+- `CLAUDE-db-bootstrap.md` — Database bootstrap automation
+- `CLAUDE-tls-bootstrap.md` — TLS self-bootstrap
+- `CLAUDE-deployment-topologies.md` — Four reference topologies
+- `CLAUDE-os-hardening-firewall.md` — Host hardening + firewall
+- `CLAUDE-upgrade-tooling.md` — In-place upgrade with auto-rollback
+- `CLAUDE-preflight-check.md` — Diagnostic preflight CLI
+
+When adding a feature, create a new sidecar following the same
+structure: What this is / Wire surface (if applicable) / Implementation
+/ CLI flags / Tests / Per-change checklist / Open questions.
+
+---
+
+## 10. Glossary
+
+- **DAL** — Database Abstraction Layer (`db.py` + `migrations.py`).
+- **Sidecar spec** — A `CLAUDE-<slug>.md` file documenting one feature.
+- **The data migration tool** — `pypki_admin.py migrate-data` /
+  `verify-migration`. Moves rows from SQLite to Postgres.
+- **Tier 5** — Operator-maturity features (HSM, RA workflow, offline
+  ceremony, etc.). Successor to tiers 1–4 of RFC compliance.
+- **Stop-and-confirm** — The interaction pattern from section 1.2.
+- **Source-verify** — The protocol from section 2.
+- **Load-bearing pattern** — A code pattern whose change is a
+  coordinated cutover. Listed in section 5.4.
+- **CertProfile** — A named bundle of issuance rules
+  (`tls_server`, `code_signing`, `ssh_user`, etc.). Catalog in
+  `pki_server.py`.
+- **Cert serial** — A 20-byte random integer for X.509 certs;
+  uint64 monotonic for SSH certs. Different spaces, different
+  allocators, both serialized via `advisory_lock()`.
+- **Pre-issuance hook** / **lifecycle hook** — Callable point in
+  `hooks.py` invoked at known moments in cert lifecycle.
+
+---
+
+## 11. Known issues and historical lessons
+
+Bugs caught in past sessions. Each is here so a future Claude reads
+them once and doesn't recreate them.
+
+| Bug                                                       | Cause                                  | Lesson |
+| --------------------------------------------------------- | -------------------------------------- | ------ |
+| Sub-CA key export used PKCS#1 instead of PKCS#8           | Misreading RFC 5958                    | RFC 5958 wraps the key; always use OneAsymmetricKey for export |
+| `path_length` silently ignored in `issue_sub_ca()`        | Field accepted, never threaded through | Trace every parameter from API to cert; write a test |
+| Name constraints not exposed via REST API                 | API surface incomplete                 | When adding a cert field internally, add the API surface in the same PR |
+| EST `_handle_simpleenroll` silently dropped all SANs      | CSR parsing extracted Subject, skipped extensions | When porting CSR fields, audit *all* extensions, not just SAN |
+| Soft claims about implementation state                    | Trusting memory over source            | Source-verify (section 1.1 and section 2) |
+
+Mermaid rendering pitfall: `startOnLoad: false` + expose all sections
+before `mermaid.run()` + restore visibility is the correct pattern for
+tab-based diagram pages. If you see Mermaid diagrams in tabs not
+rendering, this is the fix.
+
+---
+
+## 12. Current state
+
+Update at the end of each significant session. Append to section 13
+(session log) rather than rewriting this section unless the prior
+state is no longer accurate.
+
+**DAL migration**: in progress. `AuditLog` converted; ~14 more
+`sqlite3.connect()` sites remain. Next planned: `SCEPDatabase`.
+
+**Security baseline**: CA key passphrase encryption, admin API
+authentication, HTML escaping (XSS), CSRF protection, SQLite
+connection leak fixes shipped. Serial number race condition
+identified; mitigation is `advisory_lock("serial-allocation")` which
+is in place for `AuditLog` and pending for `CertificateAuthority`.
+
+**PQC posture**: ML-DSA shipped, RFC 9763 shipped, SLH-DSA and
+composite ML-DSA spec'd but not implemented. Crypto-agility dashboard
+spec'd but not implemented.
+
+**Infrastructure**: Docker Compose with PyPKI + nginx; PAM auth with
+brute-force lockout; configurable `base_path` for Web UI. Helm chart
+and per-cloud Terraform spec'd but not implemented.
+
+**SSH CA**: shipped. `ssh_ca.py`, `ssh_wire.py` implement Ed25519/ECDSA/RSA
+user and host cert issuance, KRL generation, and `ssh-keygen -L`/`-Q`
+interop. Enabled via `--ssh-ca-enabled`. ML-DSA CA keys rejected. Web UI
+at `/ssh`. Admin CLI: `ssh-revoke`, `ssh-list`, `ssh-krl-export`.
+
+**ACME for .onion**: shipped, gated. `onion.py` implements Tor v3
+address decode and `onion-csr-01` challenge validation per RFC 9799.
+Enabled via `--acme-onion-enabled`. `onion_eligible` CertProfile added.
+
+**Test suite**: `test_pki_server.py`, 835+ tests passing, 2 Postgres
+tests correctly skipping without env var.
+
+**Observability**: Prometheus metrics + Grafana dashboard JSON
+shipped; alerting rules defined; OpenTelemetry tracing present.
+
+---
+
+## 13. Session log
+
+Each significant session appends a 5-line entry. Format:
 
 ```
-db.py
-├── class Database(ABC)
-│   ├── execute(sql, params)
-│   ├── fetchone(sql, params)
-│   ├── fetchall(sql, params)
-│   ├── transaction()           # context manager
-│   ├── advisory_lock(name)     # context manager — for serial/CRL allocation
-│   └── now()                   # current unix-seconds; centralized for tests
-│
-├── class SQLiteDB(Database)
-│   └── sqlite3 stdlib, WAL mode, BEGIN IMMEDIATE for advisory_lock
-│
-└── class PostgresDB(Database)
-    └── psycopg 3, ConnectionPool, pg_advisory_xact_lock for advisory_lock
+### YYYY-MM-DD — <one-line summary>
+- Decided: <what was decided>
+- Done: <what was implemented>
+- Pending: <what's still open>
+- Deferred: <what was explicitly punted and why>
+- Landmarks changed: <files / functions / line numbers that moved>
 ```
 
-`--db-url` selects the backend:
+Past entries (reconstructed from memory; future sessions append):
 
-| URL prefix | Backend |
-|------------|---------|
-| `sqlite:///path/to/db.sqlite` | SQLiteDB |
-| `postgresql://user:pass@host/db` | PostgresDB |
-| `postgres://...` | PostgresDB |
+### 2026-04 — DAL bootstrap
+- Decided: hand-rolled DAL over two backends; no ORM
+- Done: `db.py`, `migrations.py`, four `001_initial.sql`, `Row` class,
+  thread-local SQLite, advisory_lock primitive, SQLite→Postgres
+  migrate-data tool
+- Pending: ~14 `sqlite3.connect()` sites to convert
+- Deferred: ORM evaluation (philosophical no)
+- Landmarks changed: `db.py` (new), `migrations.py` (new),
+  `pki_server.py:AuditLog` (DAL-backed)
 
-### SQL portability — key decisions
+### 2026-05 — Roadmap completion + spec drafting
+- Decided: existing roadmap is shipped; future work routes through
+  sidecar specs
+- Done: 24 `CLAUDE-<slug>.md` sidecars drafted across four batches:
+  protocol additions (ARI, composite ML-DSA, SLH-DSA, ACME-onion),
+  platform features (SSH CA, SSO, portal, policy engine, audit chain,
+  Terraform provider), differentiated capabilities (cloud KMS,
+  backup-restore, multi-tenancy, code-signing portal, agility
+  dashboard, embedded enrollment), deployment (bootstrap CLI, systemd
+  hardening, db bootstrap, TLS bootstrap, topologies, OS hardening,
+  upgrade tooling, preflight)
+- Pending: implementation of any sidecar
+- Deferred: SAML phase 2 of SSO until OIDC ships and a user asks
+- Landmarks changed: none; sidecars are new files alongside CLAUDE.md
 
-1. **Parameter style**: write all SQL with `?`; `PostgresDB.execute` translates
-   to `%s` at execution time.
-2. **RETURNING**: require SQLite ≥ 3.35 (March 2021); no fallback complexity.
-3. **Upsert**: `INSERT ... ON CONFLICT (col) DO UPDATE SET ...` — identical
-   syntax on both.
-4. **Time / dates**: store unix-seconds as `INTEGER` everywhere. Convert to/from
-   `datetime` at the application boundary. Never `TIMESTAMP WITH TIME ZONE`.
-5. **JSON**: store as plain `TEXT`; `json.dumps`/`json.loads` at the boundary.
-   Never use `JSONB` or JSON1 engine-specific types.
-6. **Auto-increment**: SQLite `INTEGER PRIMARY KEY AUTOINCREMENT` vs Postgres
-   `BIGSERIAL`. Hide behind a DDL helper using `{{auto_pk}}` token in shared
-   migration files.
+### 2026-05-30 — RFC 9799 ACME for .onion + SSH CA implementation
+- Decided: unsigned KRLs (OpenSSH generates unsigned KRLs; sig format is
+  version-specific); audit via `audit.record()` parameter pattern (not a
+  classmethod), matching existing `issue_certificate()` convention
+- Done: `onion.py` (Tor v3 decode, onion-csr-01 validation); `ssh_wire.py`
+  (RFC 4251 §5 primitives); `ssh_ca.py` (cert builder, KRL, profile catalog);
+  `db_migrations/acme/003_onion.sql`; `db_migrations/pki/004_ssh.sql`;
+  `onion_eligible` CertProfile; SSH CA methods on `CertificateAuthority`;
+  CLI flags `--acme-onion-*` and `--ssh-ca-*`; Web UI `/ssh` routes;
+  admin CLI `ssh-revoke` / `ssh-list` / `ssh-krl-export`; 47 new tests
+  (6 test classes) covering wire format, interop, and profile enforcement
+- Pending: portal, SSO, SLH-DSA, composite ML-DSA implementation
+- Deferred: KRL signing (format is unclear across OpenSSH versions)
+- Landmarks changed: `onion.py` (new), `ssh_wire.py` (new), `ssh_ca.py`
+  (new), `acme_server.py` (onion-csr-01 support), `pki_server.py` (SSH CA
+  methods + onion_eligible profile), `web_ui.py` (/ssh routes),
+  `pypki_admin.py` (ssh-* subcommands)
 
-### The serial-number race
+---
 
-```python
-# SQLite — BEGIN IMMEDIATE acquires the write lock
-@contextmanager
-def advisory_lock(self, name: str):
-    self.conn.execute("BEGIN IMMEDIATE")
-    try: yield
-    except: self.conn.rollback(); raise
-    else:   self.conn.commit()
+## 14. How to update this file
 
-# Postgres — pg_advisory_xact_lock auto-released on tx end
-@contextmanager
-def advisory_lock(self, name: str):
-    lock_id = stable_int_hash(name)
-    with self.conn.transaction():
-        self.conn.execute("SELECT pg_advisory_xact_lock(%s)", (lock_id,))
-        yield
-```
+- **Rules sections (1–4)** change rarely. When they do, the change
+  needs explicit justification in the commit message.
+- **Map section (5)** should be updated whenever a file is added,
+  removed, renamed, or substantially refactored. Stale landmarks
+  here are a bug; treat updating them as part of the refactor PR.
+- **Test discipline (6)** changes only when the project's testing
+  approach shifts.
+- **DAL migration (7)** updates as conversion sites complete. Each
+  conversion PR ticks one item.
+- **References (8)** updates per release.
+- **Sidecars (9)** updates when a new sidecar is added or removed.
+- **Glossary (10)** grows as terminology accumulates. Prune when
+  terms become universally understood within the project.
+- **Known issues (11)** is append-only. Add bugs as they're found,
+  even after they're fixed — the lesson outlives the bug.
+- **Current state (12)** and **session log (13)** update every
+  significant session.
 
-### Schema — core tables
-
-```sql
-CREATE TABLE certificates (
-    id              {{auto_pk}},
-    serial          TEXT NOT NULL UNIQUE,   -- decimal string; 20-byte RFC 5280 serials
-    subject         TEXT NOT NULL,
-    not_before      TEXT NOT NULL,          -- ISO-8601 string
-    not_after       TEXT NOT NULL,          -- ISO-8601 string
-    der             BLOB NOT NULL,          -- DER cert as source of truth
-    revoked         INTEGER NOT NULL DEFAULT 0,
-    revoked_at      TEXT,
-    reason          INTEGER,                -- RFC 5280 §5.3.1 numeric code
-    profile         TEXT NOT NULL
-);
-CREATE INDEX idx_certs_not_after ON certificates(not_after);
-CREATE INDEX idx_certs_subject   ON certificates(subject);
-
-CREATE TABLE audit_log (
-    id              {{auto_pk}},
-    timestamp       INTEGER NOT NULL,       -- unix seconds
-    event_type      TEXT NOT NULL,
-    subject         TEXT,
-    serial          TEXT,
-    requester_ip    TEXT,
-    details_json    TEXT
-);
-CREATE INDEX idx_audit_ts     ON audit_log(timestamp);
-CREATE INDEX idx_audit_serial ON audit_log(serial);
-```
-
-> Note: `certificates` schema above reflects the actual shipped schema in
-> `db_migrations/pki/001_initial.sql`. The design-phase schema in earlier
-> drafts of this document used different column names (`serial_hex`, `cn`,
-> `subject_dn`, etc.) — those were superseded. Always read the migration files
-> as the authoritative schema.
-
-**Key choices:**
-- `serial TEXT` — accommodates full 20-byte RFC 5280 serials as decimal strings.
-- `der BLOB` — DER cert is the source of truth; other columns are projections.
-- **Soft delete only.** Never hard-delete cert rows; set `revoked=1`. Hard-delete
-  only ephemeral state (ACME nonces, CMP replay nonces) on a TTL basis.
-- **ISO-8601 strings** for `not_before`/`not_after` (the shipped schema uses
-  text, not unix-seconds, for date columns in the certificates table).
-
-### Connection management
-
-**SQLite**: thread-local connections via `threading.local()`. Do not share
-a connection across threads.
-
-**Postgres**: connection pool via `psycopg_pool.ConnectionPool`
-(`min_size=2, max_size=20`). Every handler acquires from pool, returns on
-completion via context manager.
-
-**Critical**: do NOT hold a connection across an RSA signing operation (10–50ms
-for RSA-2048). Sign first, then take a connection to write the result.
-
-### Connection-string parsing
-
-```python
-def make_db(url: str) -> Database:
-    if url.startswith("sqlite://"):
-        path = url.removeprefix("sqlite:///")
-        return SQLiteDB(path)
-    if url.startswith(("postgresql://", "postgres://")):
-        return PostgresDB(url)
-    raise ValueError(f"Unsupported DB URL scheme: {url!r}")
-```
-
-Postgres options ride inside the URL: `?sslmode=require`,
-`?target_session_attrs=read-only`, etc.
-
-### Deployment shapes
-
-**Homelab — SQLite (default)**
-```bash
-python pypki.py --ca-dir ./ca           # default sqlite:///./pki.db
-```
-Add Litestream for continuous replication to S3 (no code changes).
-
-**Small business — single-node Postgres**
-```bash
-python pypki.py --ca-dir ./ca \
-  --pki-db-url  postgresql://pypki:pass@localhost/pypki_pki \
-  --acme-db-url postgresql://pypki:pass@localhost/pypki_acme \
-  --scep-db-url postgresql://pypki:pass@localhost/pypki_scep
-```
-
-**HA cluster — multi-node Postgres**
-```bash
-python pypki.py --ca-dir ./ca \
-  --pki-db-url 'postgresql://pypki:pass@pgbouncer.internal/pypki?sslmode=require'
-```
-Serial + CRL number allocation is serialized via advisory locks — race-free
-at any scale. OCSP responders can safely use a read replica.
-
-### Migrations
-
-Migration files live in `db_migrations/pki/` (numbered SQL files). The runner
-in `migrations.py` reads the `schema_migrations` table, applies pending files
-in order, rolls back on failure. Idempotent — safe to run on every startup.
-
-`pypki_admin.py` provides `migrate-data` and `verify-migration` subcommands
-for SQLite → Postgres data migration. See `docs/MIGRATION.md` for the operator
-runbook.
-
-### Version requirements
-
-- **SQLite ≥ 3.35** (March 2021) — for `RETURNING` and improved upsert.
-- **Postgres ≥ 13** (September 2020) — advisory locks, online index creation.
-- **psycopg 3.x** — `pip install 'psycopg[binary]'`. psycopg2 is not supported.
+Do not let this file grow past ~2000 lines. If it does, content
+belongs in a sidecar or has gone stale. Prune ruthlessly.

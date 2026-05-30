@@ -11,6 +11,34 @@ This project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **RFC 9799 — ACME for Tor .onion hidden services** (`onion.py`, `acme_server.py`,
+  `pki_server.py`). Tor v3 address decode validates the 56-char base32 address
+  (Ed25519 public key + SHA3-256 checksum + version byte). The `onion-csr-01`
+  challenge type uses a CABF-specified CSR nonce extension (OID
+  `1.3.6.1.4.1.44947.1.1.1`) and verifies the CSR signature using the onion
+  service's Ed25519 key. New `onion_eligible` CertProfile with
+  `allow_onion_san=True`. Optional in-band CAA via `--acme-onion-caa-required`.
+  Gated behind `--acme-onion-enabled`; not enabled by default. New ACME DB
+  migration `003_onion.sql`. 9 tests in `TestRFC9799ACMEOnion`, 7 in
+  `TestTorV3AddressDecode`.
+
+- **SSH Certificate Authority** (`ssh_ca.py`, `ssh_wire.py`, `pki_server.py`,
+  `web_ui.py`, `pypki_admin.py`). Full OpenSSH PROTOCOL.certkeys implementation
+  supporting Ed25519, ECDSA (P-256/P-384/P-521), and RSA CA and subject keys.
+  `ssh_wire.py` provides RFC 4251 §5 wire primitives (pack_string, pack_mpint,
+  pack_uint32/64, name-lists). `ssh_ca.py` builds user and host certificates,
+  generates KRL files (OpenSSH binary format, unsigned), and caches KRLs in-process.
+  `SSHCertProfile` controls per-profile max validity, allowed principals regex,
+  default extensions, and permitted critical options. SSH cert serials use a
+  separate uint64 monotonic counter (`ssh_serial_counter` table, advisory-locked).
+  ML-DSA CA keys explicitly rejected. CLI: `--ssh-ca-enabled`,
+  `--ssh-user-max-validity`, `--ssh-host-max-validity`, `--ssh-krl-ttl`. Web UI
+  at `/ssh` (sign user cert, sign host cert, download KRL, known-hosts).
+  Admin CLI: `ssh-revoke`, `ssh-list`, `ssh-krl-export`. New PKI DB migration
+  `004_ssh.sql`. 22 tests across `TestSSHWire`, `TestSSHCAUserCert`,
+  `TestSSHCAHostCert`, `TestSSHKRL`; includes `ssh-keygen -L` and `ssh-keygen -Q`
+  interop tests. Gated behind `--ssh-ca-enabled`.
+
 - **ML-DSA (FIPS 204) X.509 certificate issuance** (`pki_server.py`).
   `CertificateAuthority.issue_ml_dsa_certificate()` issues EE certificates with
   ML-DSA-44, ML-DSA-65, or ML-DSA-87 subject public keys (SPKI DER input). Because

@@ -928,6 +928,15 @@ class WebUIHandler(http.server.BaseHTTPRequestHandler):
                 self._api_services_status()
             elif path.startswith("/api/certs/"):
                 self._route_api_cert(path)
+            elif path == "/ssh":
+                self._ssh_page()
+            elif path.startswith("/api/ssh/krl/"):
+                ca_fpr = path.split("/api/ssh/krl/", 1)[1].strip("/")
+                self._api_ssh_krl(ca_fpr)
+            elif path == "/api/ssh/known-hosts":
+                self._api_ssh_known_hosts()
+            elif path == "/api/ssh/certs":
+                self._api_ssh_list()
             elif path in ("/ca/cert.pem", "/ca/cert"):
                 # Serve full chain PEM (leaf + intermediates) for intermediate CA mode.
                 self._send_raw(200, "application/x-pem-file", self.ca.ca_chain_pem)
@@ -988,6 +997,10 @@ class WebUIHandler(http.server.BaseHTTPRequestHandler):
                 self._api_paired_issue(data)
             elif path == "/api/composite-issue":
                 self._api_composite_issue(data)
+            elif path == "/api/ssh/sign":
+                self._api_ssh_sign(data)
+            elif path == "/api/ssh/host-cert":
+                self._api_ssh_host_cert(data)
             elif path.startswith("/api/ra/approve/"):
                 req_id = path.split("/api/ra/approve/", 1)[1].strip("/")
                 self._api_ra_approve(req_id)
@@ -2231,6 +2244,199 @@ class WebUIHandler(http.server.BaseHTTPRequestHandler):
             return
         token = scep_mod.mint_otp(self.ca.ca_dir, ttl)
         self._send_json({"otp": token, "ttl_seconds": ttl})
+
+    # ------------------------------------------------------------------
+    # SSH CA — issuance, KRL, known-hosts
+    # ------------------------------------------------------------------
+
+    def _ssh_page(self):
+        body = """
+<h2>SSH Certificate Authority</h2>
+<p>Issue short-lived SSH user and host certificates signed by this CA.</p>
+<h3>Sign User Key</h3>
+<form id='user-form'>
+  <div style='margin-bottom:8px'>
+    <label>Public key (authorized_keys format):</label><br>
+    <textarea id='pubkey' rows='3' style='width:100%;font-family:monospace'></textarea>
+  </div>
+  <div style='margin-bottom:8px'>
+    <label>Key ID (audit label):</label>
+    <input id='key_id' type='text' style='width:100%'>
+  </div>
+  <div style='margin-bottom:8px'>
+    <label>Principals (comma-separated):</label>
+    <input id='principals' type='text' style='width:100%'>
+  </div>
+  <div style='margin-bottom:8px'>
+    <label>Valid seconds (max 86400):</label>
+    <input id='valid_seconds' type='number' value='3600' min='60' max='86400'>
+  </div>
+  <button class='btn' onclick='signUser(event)'>Sign User Cert</button>
+</form>
+<pre id='user-result' style='background:#111;color:#0f0;padding:12px;margin-top:12px;
+  white-space:pre-wrap;display:none'></pre>
+<h3 style='margin-top:24px'>Sign Host Key</h3>
+<form id='host-form'>
+  <div style='margin-bottom:8px'>
+    <label>Public key:</label><br>
+    <textarea id='host-pubkey' rows='3' style='width:100%;font-family:monospace'></textarea>
+  </div>
+  <div style='margin-bottom:8px'>
+    <label>Key ID:</label>
+    <input id='host-key_id' type='text' style='width:100%'>
+  </div>
+  <div style='margin-bottom:8px'>
+    <label>Principals (hostnames, comma-separated):</label>
+    <input id='host-principals' type='text' style='width:100%'>
+  </div>
+  <button class='btn' onclick='signHost(event)'>Sign Host Cert</button>
+</form>
+<pre id='host-result' style='background:#111;color:#0f0;padding:12px;margin-top:12px;
+  white-space:pre-wrap;display:none'></pre>
+<h3 style='margin-top:24px'>CA Known-Hosts Line</h3>
+<button class='btn btn-outline' onclick='getKnownHosts()'>Get @cert-authority line</button>
+<pre id='kh-result' style='background:#111;color:#0f0;padding:12px;margin-top:12px;
+  white-space:pre-wrap;display:none'></pre>
+<script>
+async function signUser(e) {
+  e.preventDefault();
+  const p = document.getElementById('principals').value.split(',').map(s => s.trim()).filter(Boolean);
+  const r = await fetch('/api/ssh/sign', {method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({
+      public_key: document.getElementById('pubkey').value.trim(),
+      key_id: document.getElementById('key_id').value.trim(),
+      principals: p,
+      valid_seconds: parseInt(document.getElementById('valid_seconds').value),
+    })
+  });
+  const j = await r.json();
+  const el = document.getElementById('user-result');
+  el.style.display = 'block';
+  el.textContent = j.certificate || j.error;
+}
+async function signHost(e) {
+  e.preventDefault();
+  const p = document.getElementById('host-principals').value.split(',').map(s => s.trim()).filter(Boolean);
+  const r = await fetch('/api/ssh/host-cert', {method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({
+      public_key: document.getElementById('host-pubkey').value.trim(),
+      key_id: document.getElementById('host-key_id').value.trim(),
+      principals: p,
+    })
+  });
+  const j = await r.json();
+  const el = document.getElementById('host-result');
+  el.style.display = 'block';
+  el.textContent = j.certificate || j.error;
+}
+async function getKnownHosts() {
+  const r = await fetch('/api/ssh/known-hosts');
+  const j = await r.json();
+  const el = document.getElementById('kh-result');
+  el.style.display = 'block';
+  el.textContent = j.line || j.error;
+}
+</script>"""
+        self._send_html(200, _page("SSH CA", body, "ssh"))
+
+    def _api_ssh_sign(self, data: dict):
+        """POST /api/ssh/sign — issue an SSH user certificate."""
+        if not getattr(self.ca, "_ssh_enabled", False):
+            self._send_json({"error": "SSH CA not enabled on this server"}, 503)
+            return
+        pubkey_str   = data.get("public_key", "")
+        key_id       = data.get("key_id", "")
+        principals   = data.get("principals", [])
+        valid_seconds = int(data.get("valid_seconds", 3600))
+        critical_opts = data.get("critical_options", {})
+        extensions    = data.get("extensions")
+        profile       = data.get("profile", "ssh_user")
+
+        if not pubkey_str:
+            self._send_json({"error": "public_key required"}, 400)
+            return
+        if not key_id:
+            self._send_json({"error": "key_id required"}, 400)
+            return
+
+        try:
+            cert_line = self.ca.issue_ssh_user_cert(
+                public_key_str=pubkey_str,
+                key_id=key_id,
+                principals=principals,
+                valid_seconds=valid_seconds,
+                critical_options=critical_opts or None,
+                extensions=extensions,
+                profile_name=profile,
+            )
+            self._send_json({"certificate": cert_line})
+        except Exception as exc:
+            self._send_json({"error": str(exc)}, 400)
+
+    def _api_ssh_host_cert(self, data: dict):
+        """POST /api/ssh/host-cert — issue an SSH host certificate."""
+        if not getattr(self.ca, "_ssh_enabled", False):
+            self._send_json({"error": "SSH CA not enabled on this server"}, 503)
+            return
+        pubkey_str    = data.get("public_key", "")
+        key_id        = data.get("key_id", "")
+        principals    = data.get("principals", [])
+        valid_seconds = int(data.get("valid_seconds", 2592000))
+        profile       = data.get("profile", "ssh_host")
+
+        if not pubkey_str:
+            self._send_json({"error": "public_key required"}, 400)
+            return
+        if not key_id:
+            self._send_json({"error": "key_id required"}, 400)
+            return
+
+        try:
+            cert_line = self.ca.issue_ssh_host_cert(
+                public_key_str=pubkey_str,
+                key_id=key_id,
+                principals=principals,
+                valid_seconds=valid_seconds,
+                profile_name=profile,
+            )
+            self._send_json({"certificate": cert_line})
+        except Exception as exc:
+            self._send_json({"error": str(exc)}, 400)
+
+    def _api_ssh_krl(self, ca_fpr: str):
+        """GET /api/ssh/krl/<ca-key-fpr> — download the current signed KRL."""
+        if not getattr(self.ca, "_ssh_enabled", False):
+            self._send_json({"error": "SSH CA not enabled"}, 503)
+            return
+        try:
+            krl_bytes = self.ca.build_ssh_krl()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/octet-stream")
+            self.send_header("Content-Disposition", 'attachment; filename="krl"')
+            self.send_header("Content-Length", str(len(krl_bytes)))
+            self.end_headers()
+            self.wfile.write(krl_bytes)
+        except Exception as exc:
+            self._send_json({"error": str(exc)}, 500)
+
+    def _api_ssh_known_hosts(self):
+        """GET /api/ssh/known-hosts — CA public key in @cert-authority format."""
+        if not getattr(self.ca, "_ssh_enabled", False):
+            self._send_json({"error": "SSH CA not enabled"}, 503)
+            return
+        try:
+            line = self.ca.ssh_known_hosts_line()
+            self._send_json({"line": line})
+        except Exception as exc:
+            self._send_json({"error": str(exc)}, 500)
+
+    def _api_ssh_list(self):
+        """GET /api/ssh/certs — list issued SSH certificates."""
+        if not getattr(self.ca, "_ssh_enabled", False):
+            self._send_json({"error": "SSH CA not enabled"}, 503)
+            return
+        certs = self.ca.list_ssh_certs(include_revoked=True)
+        self._send_json({"certs": certs})
 
     # ------------------------------------------------------------------
     # JSON API — service management

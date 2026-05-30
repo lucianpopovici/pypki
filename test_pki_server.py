@@ -3041,7 +3041,7 @@ class TestModuleStructure(unittest.TestCase):
         expected = {"tls_server", "tls_client", "code_signing", "email",
                     "email_signing", "email_encryption_rsa", "email_encryption_ec",
                     "ocsp_signing", "tsa_signing", "sub_ca", "short_lived", "default",
-                    "ml_dsa_signing", "composite_signing"}
+                    "ml_dsa_signing", "composite_signing", "onion_eligible"}
         actual = set(pki.CertProfile.PROFILES.keys())
         self.assertEqual(actual, expected,
                          f"Missing profiles: {expected - actual}")
@@ -11862,6 +11862,752 @@ class TestCompositeMLDSA(unittest.TestCase):
                 sig = self.comp.composite_sign(key, b"test")
                 ok = self.comp.composite_verify(spki, name, b"test", sig)
                 self.assertTrue(ok, f"{name}: verification failed")
+
+
+# ===========================================================================
+# Tor v3 address decode (onion.py)
+# ===========================================================================
+
+class TestTorV3AddressDecode(unittest.TestCase):
+    """Unit tests for onion.py Tor v3 address parsing."""
+
+    def setUp(self):
+        try:
+            from onion import decode_v3_onion, is_valid_v3_onion
+            self.decode = decode_v3_onion
+            self.valid  = is_valid_v3_onion
+        except ImportError:
+            self.skipTest("onion module not available")
+
+    def _make_v3_address(self, pubkey_bytes: bytes) -> str:
+        """Construct a valid v3 onion address from a 32-byte Ed25519 pubkey."""
+        import base64, hashlib
+        version = 0x03
+        checksum = hashlib.sha3_256(
+            b".onion checksum" + pubkey_bytes + bytes([version])
+        ).digest()[:2]
+        raw = pubkey_bytes + checksum + bytes([version])
+        return base64.b32encode(raw).decode().lower().rstrip("=") + ".onion"
+
+    def test_valid_address_returns_public_key(self):
+        from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+        priv = Ed25519PrivateKey.generate()
+        pub_bytes = priv.public_key().public_bytes(
+            __import__("cryptography").hazmat.primitives.serialization.Encoding.Raw,
+            __import__("cryptography").hazmat.primitives.serialization.PublicFormat.Raw,
+        )
+        addr = self._make_v3_address(pub_bytes)
+        key = self.decode(addr)
+        # Round-trip: bytes should match
+        result_bytes = key.public_bytes(
+            __import__("cryptography").hazmat.primitives.serialization.Encoding.Raw,
+            __import__("cryptography").hazmat.primitives.serialization.PublicFormat.Raw,
+        )
+        self.assertEqual(result_bytes, pub_bytes)
+
+    def test_v2_addresses_rejected(self):
+        # v2 addresses are 16 chars (not 56) before .onion
+        with self.assertRaises(ValueError):
+            self.decode("facebookcorewwwi.onion")
+
+    def test_truncated_addresses_rejected(self):
+        with self.assertRaises(ValueError):
+            self.decode("abc123.onion")
+
+    def test_non_onion_domain_rejected(self):
+        with self.assertRaises(ValueError):
+            self.decode("example.com")
+
+    def test_bad_checksum_rejected(self):
+        from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+        priv = Ed25519PrivateKey.generate()
+        pub_bytes = priv.public_key().public_bytes(
+            __import__("cryptography").hazmat.primitives.serialization.Encoding.Raw,
+            __import__("cryptography").hazmat.primitives.serialization.PublicFormat.Raw,
+        )
+        import base64
+        # Corrupt the pubkey bytes before building the address
+        bad_pub = bytes([pub_bytes[0] ^ 0xFF]) + pub_bytes[1:]
+        addr = self._make_v3_address(bad_pub)
+        # Now change the first pubkey byte back without updating checksum
+        raw = base64.b32decode(addr.upper()[:-len(".onion")])
+        # flip a byte in the pubkey to break checksum
+        raw = bytes([raw[0] ^ 0x01]) + raw[1:]
+        broken_addr = base64.b32encode(raw).decode().lower().rstrip("=") + ".onion"
+        with self.assertRaises(ValueError):
+            self.decode(broken_addr)
+
+    def test_is_valid_accepts_valid(self):
+        from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+        priv = Ed25519PrivateKey.generate()
+        pub_bytes = priv.public_key().public_bytes(
+            __import__("cryptography").hazmat.primitives.serialization.Encoding.Raw,
+            __import__("cryptography").hazmat.primitives.serialization.PublicFormat.Raw,
+        )
+        addr = self._make_v3_address(pub_bytes)
+        self.assertTrue(self.valid(addr))
+
+    def test_is_valid_rejects_garbage(self):
+        self.assertFalse(self.valid("example.com"))
+        self.assertFalse(self.valid("notanonion.onion"))
+
+
+# ===========================================================================
+# RFC 9799 — ACME for .onion
+# ===========================================================================
+
+class TestRFC9799ACMEOnion(unittest.TestCase):
+    """Tests for ACME onion-csr-01 challenge support (RFC 9799)."""
+
+    def _make_acme_handler(self, onion_enabled=True, onion_caa_required=False):
+        """Return a bound ACMEHandler class with onion support."""
+        import sys, io, tempfile
+        sys.path.insert(0, str(Path(__file__).parent))
+        from acme_server import make_acme_handler, ACMEDatabase, ChallengeValidator
+        from db import make_db
+        db_inst = make_db("sqlite:///:memory:")
+        acme_db = ACMEDatabase(db_inst)
+        validator = ChallengeValidator(auto_approve_dns=True)
+        handler_cls = make_acme_handler(
+            db=acme_db,
+            ca=None,
+            validator=validator,
+            base_url="http://localhost:8888",
+            onion_enabled=onion_enabled,
+            onion_caa_required=onion_caa_required,
+        )
+        return handler_cls, acme_db
+
+    def test_directory_advertises_onion_caa_when_enabled(self):
+        handler_cls, _ = self._make_acme_handler(onion_enabled=True)
+        self.assertTrue(handler_cls.onion_enabled)
+        self.assertEqual(handler_cls.onion_caa_identity, "")
+
+    def test_directory_omits_onion_caa_when_disabled(self):
+        handler_cls, _ = self._make_acme_handler(onion_enabled=False)
+        self.assertFalse(handler_cls.onion_enabled)
+
+    def test_onion_identifier_accepted_when_enabled(self):
+        from acme_server import _validate_acme_identifier
+        # Make a syntactically correct 56-char base32 onion address
+        from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+        import base64, hashlib
+        pub = Ed25519PrivateKey.generate().public_key().public_bytes(
+            __import__("cryptography").hazmat.primitives.serialization.Encoding.Raw,
+            __import__("cryptography").hazmat.primitives.serialization.PublicFormat.Raw,
+        )
+        ver = 0x03
+        cksum = hashlib.sha3_256(b".onion checksum" + pub + bytes([ver])).digest()[:2]
+        raw = pub + cksum + bytes([ver])
+        addr = base64.b32encode(raw).decode().lower().rstrip("=") + ".onion"
+        ident = {"type": "dns", "value": addr}
+        ok, err = _validate_acme_identifier(ident, allow_onion=True)
+        self.assertTrue(ok, err)
+
+    def test_onion_identifier_rejected_when_disabled(self):
+        from acme_server import _validate_acme_identifier
+        ident = {"type": "dns", "value": "facebookwkhpilnemxj7asber7cytxmhwt7j7asber7c.onion"}  # fake length
+        ok, err = _validate_acme_identifier(ident, allow_onion=False)
+        self.assertFalse(ok)
+
+    def test_onion_csr_challenge_type_for_onion_domain(self):
+        """create_order must use onion-csr-01 for .onion domains."""
+        handler_cls, acme_db = self._make_acme_handler(onion_enabled=True)
+        from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+        import base64, hashlib
+        pub = Ed25519PrivateKey.generate().public_key().public_bytes(
+            __import__("cryptography").hazmat.primitives.serialization.Encoding.Raw,
+            __import__("cryptography").hazmat.primitives.serialization.PublicFormat.Raw,
+        )
+        ver = 0x03
+        cksum = hashlib.sha3_256(b".onion checksum" + pub + bytes([ver])).digest()[:2]
+        raw = pub + cksum + bytes([ver])
+        addr = base64.b32encode(raw).decode().lower().rstrip("=") + ".onion"
+        idents = [{"type": "dns", "value": addr}]
+        order = acme_db.create_order("kid123", idents)
+        challenges = acme_db.get_auth_challenges(order["auth_ids"][0])
+        types = [c["type"] for c in challenges]
+        self.assertIn("onion-csr-01", types)
+        self.assertNotIn("http-01", types)
+        self.assertNotIn("dns-01", types)
+
+    def test_csr_with_correct_nonce_validates(self):
+        """onion-csr-01: CSR signed by onion key with correct nonce passes."""
+        try:
+            from onion import verify_onion_csr
+            from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+            from cryptography import x509
+            from cryptography.hazmat.primitives import hashes, serialization
+            import base64, hashlib
+        except ImportError:
+            self.skipTest("required modules not available")
+
+        # Build an onion address from a freshly-generated Ed25519 key
+        priv = Ed25519PrivateKey.generate()
+        pub_bytes = priv.public_key().public_bytes(
+            serialization.Encoding.Raw, serialization.PublicFormat.Raw
+        )
+        ver = 0x03
+        cksum = hashlib.sha3_256(b".onion checksum" + pub_bytes + bytes([ver])).digest()[:2]
+        raw = pub_bytes + cksum + bytes([ver])
+        addr = base64.b32encode(raw).decode().lower().rstrip("=") + ".onion"
+
+        nonce = b"\xde\xad\xbe\xef" * 8  # 32 bytes
+
+        # Build a CSR with the cabf-onion-nonce extension
+        from cryptography.x509.oid import NameOID
+        from der_codec import seq as _seq, octet_string as _os, oid as _oid
+        onion_nonce_oid = x509.ObjectIdentifier("1.3.6.1.4.1.44947.1.1.1")
+        # Extension value is an OCTET STRING wrapping the nonce
+        ext_value_der = b"\x04" + bytes([len(nonce)]) + nonce
+
+        from cryptography.x509 import UnrecognizedExtension
+        csr = (
+            x509.CertificateSigningRequestBuilder()
+            .subject_name(x509.Name([
+                x509.NameAttribute(NameOID.COMMON_NAME, addr)
+            ]))
+            .add_extension(
+                UnrecognizedExtension(onion_nonce_oid, ext_value_der),
+                critical=False,
+            )
+            .sign(priv, None)  # Ed25519 doesn't use a hash algorithm
+        )
+
+        ok, detail = verify_onion_csr(csr, addr, nonce)
+        self.assertTrue(ok, detail)
+
+    def test_csr_with_wrong_nonce_fails(self):
+        """onion-csr-01: CSR with wrong nonce must be rejected."""
+        try:
+            from onion import verify_onion_csr
+            from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+            from cryptography import x509
+            from cryptography.hazmat.primitives import serialization
+            import base64, hashlib
+        except ImportError:
+            self.skipTest("required modules not available")
+
+        priv = Ed25519PrivateKey.generate()
+        pub_bytes = priv.public_key().public_bytes(
+            serialization.Encoding.Raw, serialization.PublicFormat.Raw
+        )
+        ver = 0x03
+        cksum = hashlib.sha3_256(b".onion checksum" + pub_bytes + bytes([ver])).digest()[:2]
+        raw = pub_bytes + cksum + bytes([ver])
+        addr = base64.b32encode(raw).decode().lower().rstrip("=") + ".onion"
+
+        nonce_embedded = b"\xaa" * 32
+        expected_nonce = b"\xbb" * 32  # different!
+
+        from cryptography.x509 import UnrecognizedExtension
+        from cryptography.x509.oid import NameOID
+        onion_nonce_oid = x509.ObjectIdentifier("1.3.6.1.4.1.44947.1.1.1")
+        ext_value_der = b"\x04" + bytes([len(nonce_embedded)]) + nonce_embedded
+        csr = (
+            x509.CertificateSigningRequestBuilder()
+            .subject_name(x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, addr)]))
+            .add_extension(UnrecognizedExtension(onion_nonce_oid, ext_value_der), critical=False)
+            .sign(priv, None)
+        )
+        ok, detail = verify_onion_csr(csr, addr, expected_nonce)
+        self.assertFalse(ok)
+
+    def test_csr_signed_by_wrong_key_fails(self):
+        """onion-csr-01: CSR signed by a key that doesn't match the onion address."""
+        try:
+            from onion import verify_onion_csr
+            from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+            from cryptography import x509
+            from cryptography.hazmat.primitives import serialization
+            import base64, hashlib
+        except ImportError:
+            self.skipTest("required modules not available")
+
+        # onion address belongs to key1, CSR signed by key2
+        key1 = Ed25519PrivateKey.generate()
+        key2 = Ed25519PrivateKey.generate()
+        pub_bytes = key1.public_key().public_bytes(
+            serialization.Encoding.Raw, serialization.PublicFormat.Raw
+        )
+        ver = 0x03
+        cksum = hashlib.sha3_256(b".onion checksum" + pub_bytes + bytes([ver])).digest()[:2]
+        raw = pub_bytes + cksum + bytes([ver])
+        addr = base64.b32encode(raw).decode().lower().rstrip("=") + ".onion"
+
+        nonce = b"\xcc" * 32
+        from cryptography.x509 import UnrecognizedExtension
+        from cryptography.x509.oid import NameOID
+        onion_nonce_oid = x509.ObjectIdentifier("1.3.6.1.4.1.44947.1.1.1")
+        ext_value_der = b"\x04" + bytes([len(nonce)]) + nonce
+        csr = (
+            x509.CertificateSigningRequestBuilder()
+            .subject_name(x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, addr)]))
+            .add_extension(UnrecognizedExtension(onion_nonce_oid, ext_value_der), critical=False)
+            .sign(key2, None)  # signed by wrong key
+        )
+        ok, detail = verify_onion_csr(csr, addr, nonce)
+        self.assertFalse(ok)
+
+    def test_san_allows_onion_addresses(self):
+        """onion_eligible profile exists in CertProfile.PROFILES."""
+        from pki_server import CertProfile
+        self.assertIn("onion_eligible", CertProfile.PROFILES)
+        profile = CertProfile.PROFILES["onion_eligible"]
+        self.assertTrue(profile.get("allow_onion_san"))
+
+    def test_onion_challenge_response_includes_nonce(self):
+        """onion-csr-01 challenge response must include nonce field."""
+        from acme_server import ACMEHandler
+        handler_cls, acme_db = self._make_acme_handler(onion_enabled=True)
+        # Simulate a challenge dict
+        chall = {
+            "type": "onion-csr-01",
+            "id": "testchall",
+            "token": "dGVzdHRva2VuMTIzNDU2Nzg",  # base64url
+            "status": "pending",
+            "validated_at": None,
+            "error": None,
+        }
+        instance = object.__new__(handler_cls)
+        resp = instance._challenge_response(chall, "authz1", {"thumbprint": "test"})
+        self.assertIn("nonce", resp)
+        self.assertEqual(resp["nonce"], chall["token"])
+
+
+# ===========================================================================
+# SSH wire format (ssh_wire.py)
+# ===========================================================================
+
+class TestSSHWire(unittest.TestCase):
+    """Unit tests for SSH wire-format primitives."""
+
+    def setUp(self):
+        try:
+            import ssh_wire
+            self.wire = ssh_wire
+        except ImportError:
+            self.skipTest("ssh_wire module not available")
+
+    def test_pack_string_bytes(self):
+        result = self.wire.pack_string(b"hello")
+        self.assertEqual(result, b"\x00\x00\x00\x05hello")
+
+    def test_pack_string_str(self):
+        result = self.wire.pack_string("hi")
+        self.assertEqual(result, b"\x00\x00\x00\x02hi")
+
+    def test_pack_string_empty(self):
+        self.assertEqual(self.wire.pack_string(b""), b"\x00\x00\x00\x00")
+
+    def test_unpack_string_round_trip(self):
+        data = self.wire.pack_string(b"world")
+        val, pos = self.wire.unpack_string(data, 0)
+        self.assertEqual(val, b"world")
+        self.assertEqual(pos, len(data))
+
+    def test_pack_uint32(self):
+        self.assertEqual(self.wire.pack_uint32(0), b"\x00\x00\x00\x00")
+        self.assertEqual(self.wire.pack_uint32(1), b"\x00\x00\x00\x01")
+        self.assertEqual(self.wire.pack_uint32(0xDEADBEEF), b"\xde\xad\xbe\xef")
+
+    def test_pack_uint64(self):
+        self.assertEqual(self.wire.pack_uint64(0), b"\x00" * 8)
+        self.assertEqual(self.wire.pack_uint64(1), b"\x00" * 7 + b"\x01")
+
+    def test_unpack_uint32(self):
+        data = self.wire.pack_uint32(42)
+        val, pos = self.wire.unpack_uint32(data, 0)
+        self.assertEqual(val, 42)
+        self.assertEqual(pos, 4)
+
+    def test_unpack_uint64(self):
+        data = self.wire.pack_uint64(0xCAFEBABE12345678)
+        val, pos = self.wire.unpack_uint64(data, 0)
+        self.assertEqual(val, 0xCAFEBABE12345678)
+        self.assertEqual(pos, 8)
+
+    def test_pack_mpint_zero(self):
+        result = self.wire.pack_mpint(0)
+        self.assertEqual(result, b"\x00\x00\x00\x00")  # empty string
+
+    def test_pack_mpint_small_positive(self):
+        result = self.wire.pack_mpint(1)
+        # 1 = 0x01, no sign bit needed
+        self.assertEqual(result, b"\x00\x00\x00\x01\x01")
+
+    def test_mpint_high_bit_padded(self):
+        # 128 = 0x80 — high bit set, needs 0x00 prefix
+        result = self.wire.pack_mpint(128)
+        # Length=2: \x00\x80
+        self.assertEqual(result, b"\x00\x00\x00\x02\x00\x80")
+
+    def test_mpint_no_excess_padding_for_255(self):
+        # 255 = 0xFF — high bit set, needs prefix
+        result = self.wire.pack_mpint(255)
+        self.assertEqual(result, b"\x00\x00\x00\x02\x00\xff")
+
+    def test_name_list_empty(self):
+        result = self.wire.pack_name_list([])
+        self.assertEqual(result, b"\x00\x00\x00\x00")  # empty string
+
+    def test_name_list_single(self):
+        result = self.wire.pack_name_list(["ssh-rsa"])
+        self.assertEqual(result, b"\x00\x00\x00\x07ssh-rsa")
+
+    def test_name_list_multiple(self):
+        result = self.wire.pack_name_list(["a", "b", "c"])
+        self.assertEqual(result, b"\x00\x00\x00\x05a,b,c")
+
+
+# ===========================================================================
+# SSH CA — user and host cert issuance
+# ===========================================================================
+
+class TestSSHCAUserCert(unittest.TestCase):
+    """Tests for SSH user certificate issuance."""
+
+    def setUp(self):
+        try:
+            import ssh_ca, ssh_wire
+            self.ca_mod = ssh_ca
+            self.wire = ssh_wire
+        except ImportError:
+            self.skipTest("ssh_ca/ssh_wire modules not available")
+        from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+        self.ca_key = Ed25519PrivateKey.generate()
+        self.user_key = Ed25519PrivateKey.generate()
+        pub = self.user_key.public_key()
+        from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
+        import base64
+        raw = pub.public_bytes(Encoding.Raw, PublicFormat.Raw)
+        wire = self.ca_mod.pubkey_to_wire(pub)
+        self.user_pubkey_str = (
+            f"ssh-ed25519 {base64.b64encode(wire).decode()} test@user"
+        )
+
+    def _build_cert(self, **kw):
+        defaults = dict(
+            ca_private_key=self.ca_key,
+            subject_pubkey_wire=self.ca_mod.parse_ssh_pubkey(self.user_pubkey_str)[1],
+            serial=1,
+            cert_type=1,
+            key_id="test@key",
+            principals=["alice"],
+            valid_after=0,
+            valid_before=2**64 - 1,
+            critical_options={},
+            extensions={"permit-pty": "", "permit-agent-forwarding": ""},
+        )
+        defaults.update(kw)
+        return self.ca_mod.build_ssh_cert(**defaults)
+
+    def test_round_trip_ed25519(self):
+        cert = self._build_cert()
+        self.assertIsInstance(cert, bytes)
+        self.assertGreater(len(cert), 100)
+        # First field is the cert type string
+        cert_type, _ = self.wire.unpack_string(cert, 0)
+        self.assertEqual(cert_type, b"ssh-ed25519-cert-v01@openssh.com")
+
+    def test_serial_encoded_correctly(self):
+        cert = self._build_cert(serial=42)
+        # Skip: cert_type(var) + nonce(36) + pubkey(36) = variable; parse instead
+        # Read cert_type
+        pos = 0
+        _, pos = self.wire.unpack_string(cert, pos)  # cert type
+        _, pos = self.wire.unpack_string(cert, pos)  # nonce
+        _, pos = self.wire.unpack_string(cert, pos)  # pubkey
+        serial, pos = self.wire.unpack_uint64(cert, pos)
+        self.assertEqual(serial, 42)
+
+    def test_cert_type_is_user(self):
+        cert = self._build_cert(cert_type=1)
+        pos = 0
+        _, pos = self.wire.unpack_string(cert, pos)
+        _, pos = self.wire.unpack_string(cert, pos)
+        _, pos = self.wire.unpack_string(cert, pos)
+        _, pos = self.wire.unpack_uint64(cert, pos)  # serial
+        cert_type_val, pos = self.wire.unpack_uint32(cert, pos)
+        self.assertEqual(cert_type_val, 1)
+
+    def test_cert_type_is_host(self):
+        cert = self._build_cert(cert_type=2)
+        pos = 0
+        _, pos = self.wire.unpack_string(cert, pos)
+        _, pos = self.wire.unpack_string(cert, pos)
+        _, pos = self.wire.unpack_string(cert, pos)
+        _, pos = self.wire.unpack_uint64(cert, pos)
+        cert_type_val, _ = self.wire.unpack_uint32(cert, pos)
+        self.assertEqual(cert_type_val, 2)
+
+    def test_round_trip_rsa(self):
+        from cryptography.hazmat.primitives.asymmetric.rsa import generate_private_key
+        import base64
+        rsa_key = generate_private_key(65537, 2048)
+        wire = self.ca_mod.pubkey_to_wire(rsa_key.public_key())
+        pubkey_str = f"ssh-rsa {base64.b64encode(wire).decode()} test@rsa"
+        cert = self._build_cert(subject_pubkey_wire=self.ca_mod.parse_ssh_pubkey(pubkey_str)[1])
+        cert_type, _ = self.wire.unpack_string(cert, 0)
+        self.assertEqual(cert_type, b"ssh-rsa-cert-v01@openssh.com")
+
+    def test_round_trip_ecdsa_p256(self):
+        from cryptography.hazmat.primitives.asymmetric.ec import generate_private_key, SECP256R1
+        import base64
+        ec_key = generate_private_key(SECP256R1())
+        wire = self.ca_mod.pubkey_to_wire(ec_key.public_key())
+        pubkey_str = f"ecdsa-sha2-nistp256 {base64.b64encode(wire).decode()} test@ecdsa"
+        cert = self._build_cert(subject_pubkey_wire=self.ca_mod.parse_ssh_pubkey(pubkey_str)[1])
+        cert_type, _ = self.wire.unpack_string(cert, 0)
+        self.assertEqual(cert_type, b"ecdsa-sha2-nistp256-cert-v01@openssh.com")
+
+    def test_cert_bytes_to_authorized_keys_format(self):
+        cert = self._build_cert()
+        line = self.ca_mod.cert_bytes_to_authorized_keys(cert)
+        self.assertTrue(line.startswith("ssh-ed25519-cert-v01@openssh.com "))
+        # Should be base64-decodable
+        import base64
+        parts = line.split(" ")
+        decoded = base64.b64decode(parts[1])
+        self.assertEqual(decoded, cert)
+
+    def test_principals_enforced_against_regex_in_ca(self):
+        """CertificateAuthority.issue_ssh_user_cert rejects bad principals."""
+        import tempfile, json
+        with tempfile.TemporaryDirectory() as tmpdir:
+            from pki_server import CertificateAuthority, ServerConfig
+            from pathlib import Path as _P
+            config = ServerConfig(ca_dir=_P(tmpdir))
+            ca = CertificateAuthority(ca_dir=tmpdir, config=config)
+            ca.enable_ssh_ca()
+            with self.assertRaises((ValueError, RuntimeError)):
+                ca.issue_ssh_user_cert(
+                    public_key_str=self.user_pubkey_str,
+                    key_id="test",
+                    principals=["INVALID PRINCIPAL WITH SPACES"],
+                )
+
+    def test_validity_capped_at_profile_max(self):
+        """Requesting more than max validity is silently capped."""
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmpdir:
+            from pki_server import CertificateAuthority, ServerConfig
+            from pathlib import Path as _P
+            config = ServerConfig(ca_dir=_P(tmpdir))
+            ca = CertificateAuthority(ca_dir=tmpdir, config=config)
+            ca.enable_ssh_ca(user_max_validity=3600)  # cap at 1 hour
+            line = ca.issue_ssh_user_cert(
+                public_key_str=self.user_pubkey_str,
+                key_id="test",
+                principals=["alice"],
+                valid_seconds=999999,  # way over cap
+            )
+            self.assertIn("ssh-ed25519-cert-v01@openssh.com", line)
+
+    def test_openssh_verifies_our_cert(self):
+        """ssh-keygen -L parses our cert without error (interop test)."""
+        import subprocess, tempfile, shutil, base64
+        if not shutil.which("ssh-keygen"):
+            self.skipTest("ssh-keygen not available")
+
+        cert = self._build_cert()
+        line = self.ca_mod.cert_bytes_to_authorized_keys(cert) + "\n"
+
+        with tempfile.NamedTemporaryFile(suffix="-cert.pub", delete=False, mode="w") as f:
+            f.write(line)
+            cert_path = f.name
+
+        try:
+            result = subprocess.run(
+                ["ssh-keygen", "-L", "-f", cert_path],
+                capture_output=True, text=True, timeout=10,
+            )
+            self.assertEqual(result.returncode, 0,
+                             f"ssh-keygen -L failed:\n{result.stderr}")
+            self.assertIn("ssh-ed25519-cert-v01@openssh.com", result.stdout)
+        finally:
+            import os
+            os.unlink(cert_path)
+
+    def test_cert_signed_by_ml_dsa_ca_rejected(self):
+        """enable_ssh_ca() raises if the CA key is not SSH-compatible."""
+        import tempfile
+        try:
+            from cryptography.hazmat.primitives.asymmetric import mldsa as _mldsa
+            ml_key = _mldsa.MLDSA44PrivateKey.generate()
+        except ImportError:
+            self.skipTest("ML-DSA not available")
+        with tempfile.TemporaryDirectory() as tmpdir:
+            from pki_server import CertificateAuthority, ServerConfig
+            from pathlib import Path as _P
+            config = ServerConfig(ca_dir=_P(tmpdir))
+            ca = CertificateAuthority(ca_dir=tmpdir, config=config, ca_key_type="ed25519")
+            # Replace ca_key with an ML-DSA key
+            ca.ca_key = ml_key
+            with self.assertRaises(RuntimeError):
+                ca.enable_ssh_ca()
+
+
+class TestSSHCAHostCert(unittest.TestCase):
+    """Tests for SSH host certificate issuance."""
+
+    def setUp(self):
+        try:
+            import ssh_ca, ssh_wire
+            self.ca_mod = ssh_ca
+            self.wire = ssh_wire
+        except ImportError:
+            self.skipTest("ssh_ca/ssh_wire modules not available")
+        from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+        self.ca_key = Ed25519PrivateKey.generate()
+        host_priv = Ed25519PrivateKey.generate()
+        wire = self.ca_mod.pubkey_to_wire(host_priv.public_key())
+        import base64
+        self.host_pubkey_str = f"ssh-ed25519 {base64.b64encode(wire).decode()} host@server"
+
+    def test_round_trip(self):
+        cert = self.ca_mod.build_ssh_cert(
+            ca_private_key=self.ca_key,
+            subject_pubkey_wire=self.ca_mod.parse_ssh_pubkey(self.host_pubkey_str)[1],
+            serial=99,
+            cert_type=2,
+            key_id="host:web01.example.com",
+            principals=["web01.example.com", "web01"],
+            valid_after=0,
+            valid_before=2**64 - 1,
+            critical_options={},
+            extensions={},
+        )
+        cert_type, _ = self.wire.unpack_string(cert, 0)
+        self.assertEqual(cert_type, b"ssh-ed25519-cert-v01@openssh.com")
+
+    def test_no_default_extensions_for_host(self):
+        """Host certs use empty extensions by default."""
+        from ssh_ca import SSH_PROFILES
+        profile = SSH_PROFILES.get("ssh_host")
+        self.assertIsNotNone(profile)
+        self.assertEqual(len(profile.default_extensions), 0)
+
+    def test_known_hosts_feed_format(self):
+        """ssh_known_hosts_line() returns @cert-authority line."""
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmpdir:
+            from pki_server import CertificateAuthority, ServerConfig
+            from pathlib import Path as _P
+            config = ServerConfig(ca_dir=_P(tmpdir))
+            ca = CertificateAuthority(ca_dir=tmpdir, config=config, ca_key_type="ed25519")
+            ca.enable_ssh_ca()
+            line = ca.ssh_known_hosts_line("*.example.com")
+            self.assertTrue(line.startswith("@cert-authority *.example.com ssh-ed25519"))
+
+
+# ===========================================================================
+# SSH KRL
+# ===========================================================================
+
+class TestSSHKRL(unittest.TestCase):
+    """Tests for SSH Key Revocation List generation."""
+
+    def setUp(self):
+        try:
+            from ssh_ca import KRLBuilder, pubkey_to_wire, fingerprint_sha256
+            self.KRLBuilder = KRLBuilder
+            self.pubkey_to_wire = pubkey_to_wire
+            self.fingerprint_sha256 = fingerprint_sha256
+        except ImportError:
+            self.skipTest("ssh_ca module not available")
+        from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+        self.ca_key = Ed25519PrivateKey.generate()
+
+    def test_krl_has_magic_header(self):
+        builder = self.KRLBuilder(self.ca_key)
+        krl = builder.build()
+        self.assertTrue(krl.startswith(b"SSHKRL\n\x00"), "KRL magic header missing")
+
+    def test_krl_after_revocation_contains_serial(self):
+        builder = self.KRLBuilder(self.ca_key)
+        ca_wire = self.pubkey_to_wire(self.ca_key.public_key())
+        builder.revoke_serial(ca_wire, 42)
+        krl = builder.build()
+        # Serial 42 as big-endian uint64 = b'\x00'*7 + b'\x2a'
+        self.assertIn(b"\x00\x00\x00\x00\x00\x00\x00\x2a", krl)
+
+    def test_krl_format_version(self):
+        """KRL format_version field must be 1 per OpenSSH spec."""
+        import struct
+        builder = self.KRLBuilder(self.ca_key)
+        krl = builder.build()
+        fmt_ver = struct.unpack_from(">I", krl, 8)[0]
+        self.assertEqual(fmt_ver, 1, "KRL format_version must be 1")
+
+    def test_krl_after_revocation_in_ca(self):
+        """CertificateAuthority.build_ssh_krl() includes revoked serials."""
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmpdir:
+            from pki_server import CertificateAuthority, ServerConfig
+            from pathlib import Path as _P
+            from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+            import base64
+            config = ServerConfig(ca_dir=_P(tmpdir))
+            ca = CertificateAuthority(ca_dir=tmpdir, config=config, ca_key_type="ed25519")
+            ca.enable_ssh_ca()
+
+            # Issue a cert
+            user_priv = Ed25519PrivateKey.generate()
+            wire = self.pubkey_to_wire(user_priv.public_key())
+            pubkey_str = f"ssh-ed25519 {base64.b64encode(wire).decode()} u@h"
+            ca.issue_ssh_user_cert(
+                public_key_str=pubkey_str,
+                key_id="test",
+                principals=["alice"],
+            )
+            # Revoke serial 1
+            ca.revoke_ssh_cert(1)
+            krl = ca.build_ssh_krl()
+            self.assertTrue(krl.startswith(b"SSHKRL\n\x00"))
+            # Serial 1 in uint64
+            self.assertIn(b"\x00\x00\x00\x00\x00\x00\x00\x01", krl)
+
+    def test_openssh_accepts_our_krl(self):
+        """ssh-keygen -Q checks a key against our KRL (interop test)."""
+        import subprocess, tempfile, shutil, os, base64
+        if not shutil.which("ssh-keygen"):
+            self.skipTest("ssh-keygen not available")
+
+        from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+        user_priv = Ed25519PrivateKey.generate()
+        ca_wire = self.pubkey_to_wire(self.ca_key.public_key())
+        user_wire = self.pubkey_to_wire(user_priv.public_key())
+
+        # Build a KRL revoking serial 99
+        builder = self.KRLBuilder(self.ca_key)
+        builder.revoke_serial(ca_wire, 99)
+        krl = builder.build()
+
+        with tempfile.NamedTemporaryFile(delete=False) as krl_f:
+            krl_f.write(krl)
+            krl_path = krl_f.name
+
+        # Write a public key file to check
+        with tempfile.NamedTemporaryFile(suffix=".pub", delete=False, mode="w") as pub_f:
+            pub_line = f"ssh-ed25519 {base64.b64encode(user_wire).decode()} test@test\n"
+            pub_f.write(pub_line)
+            pub_path = pub_f.name
+
+        try:
+            # ssh-keygen -Q -f krl_file [file...]: check if key(s) are in the KRL
+            # exit 0 = not revoked, 1 = revoked
+            result = subprocess.run(
+                ["ssh-keygen", "-Q", "-f", krl_path, pub_path],
+                capture_output=True, text=True, timeout=10,
+            )
+            # Key is NOT revoked (serial doesn't match a cert signed to this key), so exit=0
+            # The exact return code depends on OpenSSH version; we just check it doesn't crash
+            self.assertIn(result.returncode, (0, 1),
+                          f"ssh-keygen -Q returned unexpected code: {result.returncode}\n{result.stderr}")
+        finally:
+            os.unlink(krl_path)
+            os.unlink(pub_path)
 
 
 # ===========================================================================

@@ -146,6 +146,19 @@ except ImportError:
     _composite_mod = None  # type: ignore[assignment]
     _COMPOSITE_AVAILABLE = False
 
+# SSH CA — gated behind --ssh-ca-enabled (default off)
+try:
+    import ssh_ca as _ssh_ca_mod
+    from ssh_ca import (
+        SSH_PROFILES, SSHCertProfile, build_ssh_cert, pubkey_to_wire,
+        parse_ssh_pubkey, cert_bytes_to_authorized_keys, fingerprint_sha256,
+        wire_to_authorized_keys, KRLBuilder, KRLCache,
+    )
+    HAS_SSH = True
+except ImportError:
+    _ssh_ca_mod = None  # type: ignore[assignment]
+    HAS_SSH = False
+
 # RFC 5280 §4.2.1.14 — Well-known CA/B Forum policy OIDs (for CertificatePolicies)
 OID_ANY_POLICY          = x509.ObjectIdentifier("2.5.29.32.0")
 OID_POLICY_DV           = x509.ObjectIdentifier("2.23.140.1.2.1")  # CA/B Forum DV
@@ -1664,6 +1677,19 @@ class CertProfile:
             "san_required": False,
             "bc_ca": False,
         },
+        # RFC 9799 — Onion-eligible TLS server cert.
+        # .onion SAN values are allowed; otherwise identical to tls_server.
+        # Gate via --acme-onion-enabled; only issued through the ACME onion-csr-01 path.
+        "onion_eligible": {
+            "key_usage": dict(digital_signature=True, content_commitment=False,
+                              key_encipherment=True, data_encipherment=False,
+                              key_agreement=False, key_cert_sign=False,
+                              crl_sign=False, encipher_only=False, decipher_only=False),
+            "eku": [ExtendedKeyUsageOID.SERVER_AUTH],
+            "san_required": True,
+            "bc_ca": False,
+            "allow_onion_san": True,  # permits .onion dNSName SANs
+        },
         # RFC 9608 — Short-lived end-entity cert.
         # id-ce-noRevAvail (2.5.29.56) is added; CDP and AIA-OCSP are suppressed.
         # RFC 9608 §4: MUST NOT be a CA cert; MUST NOT have CDP or OCSP AIA.
@@ -1775,6 +1801,12 @@ class CertificateAuthority:
         # §5.4 — RA workflow: set by configure_ra() after CLI arg parsing;
         # defaults to auto-approve-all (backwards-compatible behaviour).
         self.ra: Optional[RAWorkflow] = None
+        # SSH CA — configured by enable_ssh_ca(); disabled by default
+        self._ssh_enabled: bool = False
+        self._ssh_user_max_validity: int = 86400
+        self._ssh_host_max_validity: int = 2592000
+        self._ssh_krl_ttl: int = 300
+        self._ssh_krl_cache: Optional["KRLCache"] = None
         self._init_db()
         self._load_or_create_ca()
         self._load_parent_chain(parent_chain_path)
@@ -4459,6 +4491,300 @@ class CertificateAuthority:
 
 
     # ------------------------------------------------------------------
+    # SSH Certificate Authority
+    # ------------------------------------------------------------------
+
+    def enable_ssh_ca(
+        self,
+        user_max_validity: int = 86400,
+        host_max_validity: int = 2592000,
+        krl_ttl: int = 300,
+    ) -> None:
+        """Enable SSH CA issuance on this CertificateAuthority instance."""
+        if not HAS_SSH:
+            raise RuntimeError("ssh_ca module not available; cannot enable SSH CA")
+        try:
+            from ssh_ca import _classify_key  # validates the CA key is SSH-compatible
+            _classify_key(self.ca_key)
+        except ValueError as exc:
+            raise RuntimeError(f"SSH CA requires Ed25519, ECDSA, or RSA CA key: {exc}") from exc
+        self._ssh_enabled = True
+        self._ssh_user_max_validity = user_max_validity
+        self._ssh_host_max_validity = host_max_validity
+        self._ssh_krl_ttl = krl_ttl
+        self._ssh_krl_cache = KRLCache(ttl_seconds=krl_ttl)
+
+    def _ssh_next_serial(self) -> int:
+        """Allocate and return the next SSH cert serial (uint64 monotonic)."""
+        with self._pki_db.advisory_lock("serial-allocation"):
+            row = self._pki_db.fetchone("SELECT counter FROM ssh_serial_counter WHERE id=1")
+            if row is None:
+                self._pki_db.execute(
+                    "INSERT INTO ssh_serial_counter(id,counter) VALUES(1,1)"
+                )
+                return 1
+            next_val = int(row[0]) + 1
+            self._pki_db.execute(
+                "UPDATE ssh_serial_counter SET counter=? WHERE id=1", (next_val,)
+            )
+            return next_val
+
+    def issue_ssh_user_cert(
+        self,
+        public_key_str: str,
+        key_id: str,
+        principals: List[str],
+        valid_seconds: Optional[int] = None,
+        critical_options: Optional[Dict[str, str]] = None,
+        extensions: Optional[Dict[str, str]] = None,
+        profile_name: str = "ssh_user",
+        audit: Optional["AuditLog"] = None,
+    ) -> str:
+        """Issue an SSH user certificate.
+
+        Returns the certificate as a single-line string suitable for writing to
+        ~/.ssh/id_ed25519-cert.pub or authorized_keys.
+        """
+        if not self._ssh_enabled:
+            raise RuntimeError("SSH CA not enabled; start server with --ssh-ca-enabled")
+        if not HAS_SSH:
+            raise RuntimeError("ssh_ca module not available")
+
+        import re
+        profile = SSH_PROFILES.get(profile_name)
+        if profile is None:
+            raise ValueError(f"unknown SSH profile {profile_name!r}")
+        if profile.cert_type != 1:
+            raise ValueError(f"profile {profile_name!r} is not a user cert profile")
+
+        max_validity = self._ssh_user_max_validity
+        if valid_seconds is None:
+            valid_seconds = profile.default_validity_seconds
+        valid_seconds = min(valid_seconds, max_validity)
+
+        for p in (principals or []):
+            if not re.match(profile.allowed_principals_regex, p):
+                raise ValueError(
+                    f"principal {p!r} does not match allowed pattern "
+                    f"for profile {profile_name!r}"
+                )
+
+        if critical_options:
+            bad = set(critical_options) - profile.allowed_critical_options
+            if bad:
+                raise ValueError(f"critical options {bad!r} not allowed by profile {profile_name!r}")
+
+        effective_extensions = dict(
+            (ext, "") for ext in profile.default_extensions
+        )
+        if extensions is not None:
+            effective_extensions = dict((ext, "") for ext in extensions)
+
+        key_type, subject_wire = parse_ssh_pubkey(public_key_str)
+        pubkey_fpr = fingerprint_sha256(subject_wire)
+        ca_pubkey_wire = pubkey_to_wire(self.ca_key.public_key())
+        ca_fpr = fingerprint_sha256(ca_pubkey_wire)
+
+        now = int(time.time())
+        serial = self._ssh_next_serial()
+
+        cert_bytes = build_ssh_cert(
+            ca_private_key=self.ca_key,
+            subject_pubkey_wire=subject_wire,
+            serial=serial,
+            cert_type=1,
+            key_id=key_id,
+            principals=principals or [],
+            valid_after=now,
+            valid_before=now + valid_seconds,
+            critical_options=critical_options or {},
+            extensions=effective_extensions,
+        )
+
+        self._pki_db.execute(
+            "INSERT INTO ssh_certificates "
+            "(serial,key_id,cert_type,principals,valid_after,valid_before,"
+            "public_key_fpr,ca_key_fpr,cert_blob,revoked,profile,issued_at) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+            (serial, key_id, 1, json.dumps(principals or []),
+             now, now + valid_seconds, pubkey_fpr, ca_fpr,
+             cert_bytes, 0, profile_name, now)
+        )
+
+        if audit:
+            audit.record("ssh_cert_issued",
+                         f"serial={serial} key_id={key_id!r} profile={profile_name} "
+                         f"principals={principals or []} pubkey_fpr={pubkey_fpr}")
+
+        if self._webhook:
+            self._webhook.emit("ssh_cert.issued", {
+                "serial": serial,
+                "key_id": key_id,
+                "profile": profile_name,
+                "principals": principals or [],
+            })
+
+        return cert_bytes_to_authorized_keys(cert_bytes)
+
+    def issue_ssh_host_cert(
+        self,
+        public_key_str: str,
+        key_id: str,
+        principals: List[str],
+        valid_seconds: Optional[int] = None,
+        profile_name: str = "ssh_host",
+        audit: Optional["AuditLog"] = None,
+    ) -> str:
+        """Issue an SSH host certificate.
+
+        Returns the certificate as a single-line string.
+        """
+        if not self._ssh_enabled:
+            raise RuntimeError("SSH CA not enabled; start server with --ssh-ca-enabled")
+        if not HAS_SSH:
+            raise RuntimeError("ssh_ca module not available")
+
+        profile = SSH_PROFILES.get(profile_name)
+        if profile is None:
+            raise ValueError(f"unknown SSH profile {profile_name!r}")
+        if profile.cert_type != 2:
+            raise ValueError(f"profile {profile_name!r} is not a host cert profile")
+
+        max_validity = self._ssh_host_max_validity
+        if valid_seconds is None:
+            valid_seconds = profile.default_validity_seconds
+        valid_seconds = min(valid_seconds, max_validity)
+
+        key_type, subject_wire = parse_ssh_pubkey(public_key_str)
+        pubkey_fpr = fingerprint_sha256(subject_wire)
+        ca_pubkey_wire = pubkey_to_wire(self.ca_key.public_key())
+        ca_fpr = fingerprint_sha256(ca_pubkey_wire)
+
+        now = int(time.time())
+        serial = self._ssh_next_serial()
+
+        cert_bytes = build_ssh_cert(
+            ca_private_key=self.ca_key,
+            subject_pubkey_wire=subject_wire,
+            serial=serial,
+            cert_type=2,
+            key_id=key_id,
+            principals=principals or [],
+            valid_after=now,
+            valid_before=now + valid_seconds,
+            critical_options={},
+            extensions={},
+        )
+
+        self._pki_db.execute(
+            "INSERT INTO ssh_certificates "
+            "(serial,key_id,cert_type,principals,valid_after,valid_before,"
+            "public_key_fpr,ca_key_fpr,cert_blob,revoked,profile,issued_at) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+            (serial, key_id, 2, json.dumps(principals or []),
+             now, now + valid_seconds, pubkey_fpr, ca_fpr,
+             cert_bytes, 0, profile_name, now)
+        )
+
+        if audit:
+            audit.record("ssh_host_cert_issued",
+                         f"serial={serial} key_id={key_id!r} profile={profile_name} "
+                         f"principals={principals or []} pubkey_fpr={pubkey_fpr}")
+
+        return cert_bytes_to_authorized_keys(cert_bytes)
+
+    def revoke_ssh_cert(self, serial: int, reason: str = "",
+                        audit: Optional["AuditLog"] = None) -> bool:
+        """Revoke an SSH certificate by serial. Returns True if the cert existed."""
+        now = int(time.time())
+        self._pki_db.execute(
+            "UPDATE ssh_certificates SET revoked=1, revoked_at=?, revoke_reason=? "
+            "WHERE serial=? AND revoked=0",
+            (now, reason, serial)
+        )
+        row = self._pki_db.fetchone(
+            "SELECT serial FROM ssh_certificates WHERE serial=? AND revoked=1", (serial,)
+        )
+        if row is None:
+            return False
+
+        if audit:
+            audit.record("ssh_cert_revoked", f"serial={serial} reason={reason!r}")
+
+        if self._webhook:
+            self._webhook.emit("ssh_cert.revoked", {
+                "serial": serial, "reason": reason,
+            })
+
+        if self._ssh_krl_cache:
+            ca_pubkey_wire = pubkey_to_wire(self.ca_key.public_key())
+            self._ssh_krl_cache.invalidate(fingerprint_sha256(ca_pubkey_wire))
+
+        return True
+
+    def list_ssh_certs(
+        self,
+        principal: Optional[str] = None,
+        include_revoked: bool = False,
+    ) -> List[dict]:
+        """List SSH certificates, optionally filtered by principal."""
+        where_parts = []
+        params: List = []
+        if not include_revoked:
+            where_parts.append("revoked=0")
+        if principal:
+            where_parts.append("principals LIKE ?")
+            params.append(f"%{principal}%")
+        where = ("WHERE " + " AND ".join(where_parts)) if where_parts else ""
+        rows = self._pki_db.fetchall(
+            f"SELECT serial,key_id,cert_type,principals,valid_before,revoked,"
+            f"revoked_at,profile,public_key_fpr,issued_at FROM ssh_certificates {where} "
+            f"ORDER BY issued_at DESC",
+            params
+        )
+        return [dict(r) for r in (rows or [])]
+
+    def build_ssh_krl(self) -> bytes:
+        """Build and sign a KRL for all revoked SSH certs issued by this CA.
+
+        Result is cached for ssh_krl_ttl seconds.
+        """
+        if not HAS_SSH:
+            raise RuntimeError("ssh_ca module not available")
+        ca_pubkey_wire = pubkey_to_wire(self.ca_key.public_key())
+        ca_fpr = fingerprint_sha256(ca_pubkey_wire)
+
+        if self._ssh_krl_cache:
+            cached = self._ssh_krl_cache.get(ca_fpr)
+            if cached:
+                return cached
+
+        rows = self._pki_db.fetchall(
+            "SELECT serial FROM ssh_certificates WHERE revoked=1 AND ca_key_fpr=?",
+            (ca_fpr,)
+        )
+        builder = KRLBuilder(self.ca_key)
+        for row in (rows or []):
+            builder.revoke_serial(ca_pubkey_wire, int(row[0]))
+
+        krl_bytes = builder.build()
+        if self._ssh_krl_cache:
+            self._ssh_krl_cache.set(ca_fpr, krl_bytes)
+        return krl_bytes
+
+    def ssh_known_hosts_line(self, domain_pattern: str = "*") -> str:
+        """Return a @cert-authority line for /etc/ssh/ssh_known_hosts."""
+        if not HAS_SSH:
+            raise RuntimeError("ssh_ca module not available")
+        ca_pubkey_wire = pubkey_to_wire(self.ca_key.public_key())
+        # Parse the key type from the wire format
+        from ssh_wire import unpack_string as _ustr
+        key_type_bytes, _ = _ustr(ca_pubkey_wire, 0)
+        key_type = key_type_bytes.decode("ascii")
+        b64 = __import__("base64").b64encode(ca_pubkey_wire).decode()
+        return f"@cert-authority {domain_pattern} {key_type} {b64}"
+
+    # ------------------------------------------------------------------
     # Feature 1 — OCSP Stapling (RFC 6961 / RFC 8446)
     # ------------------------------------------------------------------
     #
@@ -4871,6 +5197,39 @@ def main():
     acme_group.add_argument(
         "--acme-star-max-duration", type=int, default=7776000, metavar="SECONDS",
         help="Maximum STAR auto-renewal window in seconds (default: 7776000 = 90 days)"
+    )
+    acme_group.add_argument(
+        "--acme-onion-enabled", action="store_true", default=False,
+        help="Enable RFC 9799 ACME for .onion hidden services (onion-csr-01 challenge)"
+    )
+    acme_group.add_argument(
+        "--acme-onion-caa-required", action="store_true", default=False,
+        help="Require in-band CAA assertion from onion-csr-01 clients"
+    )
+    acme_group.add_argument(
+        "--acme-onion-caa-identity", default="", metavar="IDENTITY",
+        help="This CA's identity string for in-band CAA validation (RFC 9799 §5)"
+    )
+
+    ssh_group = parser.add_argument_group(
+        "SSH Certificate Authority",
+        "Issue OpenSSH certificates signed by this CA. Disabled by default."
+    )
+    ssh_group.add_argument(
+        "--ssh-ca-enabled", action="store_true", default=False,
+        help="Enable SSH certificate authority (POST /api/ssh/sign, /api/ssh/host-cert)"
+    )
+    ssh_group.add_argument(
+        "--ssh-user-max-validity", type=int, default=86400, metavar="SECONDS",
+        help="Maximum validity for SSH user certificates in seconds (default: 86400 = 1 day)"
+    )
+    ssh_group.add_argument(
+        "--ssh-host-max-validity", type=int, default=2592000, metavar="SECONDS",
+        help="Maximum validity for SSH host certificates in seconds (default: 2592000 = 30 days)"
+    )
+    ssh_group.add_argument(
+        "--ssh-krl-ttl", type=int, default=300, metavar="SECONDS",
+        help="KRL signing cache TTL in seconds (default: 300)"
     )
 
     ct_group = parser.add_argument_group(
@@ -5439,7 +5798,25 @@ def main():
                 star_enabled=getattr(args, "acme_star_enabled", False),
                 star_min_lifetime=getattr(args, "acme_star_min_lifetime", 86400),
                 star_max_duration=getattr(args, "acme_star_max_duration", 7776000),
+                onion_enabled=getattr(args, "acme_onion_enabled", False),
+                onion_caa_required=getattr(args, "acme_onion_caa_required", False),
+                onion_caa_identity=getattr(args, "acme_onion_caa_identity", ""),
             )
+
+    # Enable SSH CA if requested
+    if getattr(args, "ssh_ca_enabled", False):
+        if not HAS_SSH:
+            print("WARNING: ssh_ca.py not found — SSH CA support disabled.")
+        else:
+            try:
+                ca.enable_ssh_ca(
+                    user_max_validity=getattr(args, "ssh_user_max_validity", 86400),
+                    host_max_validity=getattr(args, "ssh_host_max_validity", 2592000),
+                    krl_ttl=getattr(args, "ssh_krl_ttl", 300),
+                )
+                logger.info("SSH CA enabled")
+            except Exception as exc:
+                logger.error("Failed to enable SSH CA: %s", exc)
 
     # Start SCEP server if requested
     scep_srv = None

@@ -524,6 +524,45 @@ def build_parser() -> argparse.ArgumentParser:
                       choices=["DEBUG", "INFO", "WARNING", "ERROR"])
     abs_.set_defaults(func=cmd_ari_bulk_shorten)
 
+    # ------------------------------------------------------------------
+    # SSH CA subcommands
+    # ------------------------------------------------------------------
+
+    ssh_rev = sub.add_parser(
+        "ssh-revoke",
+        help="Revoke an SSH certificate by serial.",
+    )
+    ssh_rev.add_argument("serial", type=int, metavar="SERIAL",
+                         help="SSH cert serial number (uint64 integer).")
+    ssh_rev.add_argument("--reason", default="", metavar="REASON",
+                         help="Optional revocation reason string.")
+    ssh_rev.add_argument("--ca-dir", default="./ca", metavar="DIR",
+                         help="CA data directory (default: ./ca).")
+    ssh_rev.add_argument("--pki-db-url", default=None, metavar="URL")
+    ssh_rev.set_defaults(func=cmd_ssh_revoke)
+
+    ssh_list = sub.add_parser(
+        "ssh-list",
+        help="List issued SSH certificates.",
+    )
+    ssh_list.add_argument("--principal", default=None, metavar="NAME",
+                          help="Filter by principal name.")
+    ssh_list.add_argument("--include-revoked", action="store_true",
+                          help="Include revoked certs in output.")
+    ssh_list.add_argument("--ca-dir", default="./ca", metavar="DIR")
+    ssh_list.add_argument("--pki-db-url", default=None, metavar="URL")
+    ssh_list.set_defaults(func=cmd_ssh_list)
+
+    ssh_krl = sub.add_parser(
+        "ssh-krl-export",
+        help="Build and export a signed KRL for all revoked SSH certs.",
+    )
+    ssh_krl.add_argument("--out", default="-", metavar="FILE",
+                         help="Output path; '-' writes to stdout (default).")
+    ssh_krl.add_argument("--ca-dir", default="./ca", metavar="DIR")
+    ssh_krl.add_argument("--pki-db-url", default=None, metavar="URL")
+    ssh_krl.set_defaults(func=cmd_ssh_krl_export)
+
     return root
 
 
@@ -764,6 +803,79 @@ def cmd_ari_bulk_shorten(args: argparse.Namespace) -> int:
         print(f"WARNING: cert scan failed: {e}")
 
     print(f"Bulk-shorten: set window_end={end_str} on {count} certificate(s).")
+    return 0
+
+
+def _pki_db_for_args(args: argparse.Namespace):
+    """Open the PKI database for SSH admin subcommands."""
+    url = getattr(args, "pki_db_url", None)
+    if not url:
+        ca_dir = Path(getattr(args, "ca_dir", "./ca"))
+        url = f"sqlite:///{ca_dir / 'certificates.db'}"
+    return db.make_db(url)
+
+
+def _pki_ca_for_args(args: argparse.Namespace):
+    """Instantiate a CertificateAuthority for SSH admin subcommands."""
+    try:
+        from pki_server import CertificateAuthority, ServerConfig
+    except ImportError as exc:
+        raise SystemExit(f"ERROR: pki_server.py not available: {exc}")
+    ca_dir = Path(getattr(args, "ca_dir", "./ca"))
+    if not ca_dir.is_dir():
+        raise SystemExit(f"ERROR: CA directory not found: {ca_dir}")
+    config = ServerConfig(ca_dir=ca_dir)
+    pki_db_url = getattr(args, "pki_db_url", None) or ""
+    ca = CertificateAuthority(ca_dir=str(ca_dir), config=config, pki_db_url=pki_db_url)
+    ca.enable_ssh_ca()
+    return ca
+
+
+def cmd_ssh_revoke(args: argparse.Namespace) -> int:
+    """Revoke an SSH certificate by serial number."""
+    try:
+        ca = _pki_ca_for_args(args)
+    except SystemExit as exc:
+        print(exc)
+        return 1
+    ok = ca.revoke_ssh_cert(args.serial, reason=args.reason)
+    if ok:
+        print(f"SSH cert serial={args.serial} revoked.")
+        return 0
+    print(f"ERROR: SSH cert serial={args.serial} not found or already revoked.")
+    return 1
+
+
+def cmd_ssh_list(args: argparse.Namespace) -> int:
+    """List issued SSH certificates."""
+    import json as _json
+    try:
+        ca = _pki_ca_for_args(args)
+    except SystemExit as exc:
+        print(exc)
+        return 1
+    certs = ca.list_ssh_certs(
+        principal=args.principal,
+        include_revoked=args.include_revoked,
+    )
+    print(_json.dumps(certs, indent=2))
+    return 0
+
+
+def cmd_ssh_krl_export(args: argparse.Namespace) -> int:
+    """Build and export a signed KRL for all revoked SSH certs."""
+    import sys as _sys
+    try:
+        ca = _pki_ca_for_args(args)
+    except SystemExit as exc:
+        print(exc)
+        return 1
+    krl_bytes = ca.build_ssh_krl()
+    if args.out == "-":
+        _sys.stdout.buffer.write(krl_bytes)
+    else:
+        Path(args.out).write_bytes(krl_bytes)
+        print(f"KRL written to {args.out} ({len(krl_bytes)} bytes)")
     return 0
 
 
