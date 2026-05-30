@@ -38,7 +38,6 @@ import logging
 import os
 import re
 import socket
-import sqlite3
 import ssl
 import struct
 import tempfile

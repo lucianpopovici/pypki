@@ -1,0 +1,36 @@
+#!/bin/sh
+### BEGIN INIT INFO
+# Provides:          pypki
+# Required-Start:    $network $remote_fs $syslog
+# Required-Stop:     $network $remote_fs $syslog
+# Default-Start:     2 3 4 5
+# Default-Stop:      0 1 6
+# Short-Description: PyPKI Certificate Authority
+### END INIT INFO
+
+. /lib/lsb/init-functions
+
+DAEMON=/usr/bin/pypki-server
+DAEMON_ARGS="--config /etc/pypki/config.yaml"
+PIDFILE=/var/run/pypki.pid
+USER=pypki
+
+case "$1" in
+  start)
+    log_daemon_msg "Starting PyPKI" "pypki"
+    start-stop-daemon --start --quiet --background \
+      --pidfile $PIDFILE --make-pidfile \
+      --chuid $USER --exec $DAEMON -- $DAEMON_ARGS
+    log_end_msg $?
+    ;;
+  stop)
+    log_daemon_msg "Stopping PyPKI" "pypki"
+    start-stop-daemon --stop --quiet --retry=TERM/30/KILL/5 \
+      --pidfile $PIDFILE
+    log_end_msg $?
+    rm -f $PIDFILE
+    ;;
+  restart) $0 stop && sleep 2 && $0 start ;;
+  status) status_of_proc -p $PIDFILE $DAEMON pypki ;;
+  *) echo "Usage: $0 {start|stop|restart|status}"; exit 1 ;;
+esac

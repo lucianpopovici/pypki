@@ -1746,6 +1746,19 @@ class CertProfile:
             "suppress_cdp": True,   # RFC 9608 §4: MUST NOT include CDP
             "suppress_ocsp_aia": True,  # RFC 9608 §4: MUST NOT include AIA OCSP
         },
+        # CLAUDE-tls-bootstrap.md — PyPKI's own admin/API TLS cert.
+        # Validity 90 days to exercise the rotation path in real deployments.
+        "pypki_self_tls": {
+            "key_usage": dict(digital_signature=True, content_commitment=False,
+                              key_encipherment=True, data_encipherment=False,
+                              key_agreement=False, key_cert_sign=False,
+                              crl_sign=False, encipher_only=False, decipher_only=False),
+            "eku": [ExtendedKeyUsageOID.SERVER_AUTH, ExtendedKeyUsageOID.CLIENT_AUTH],
+            "san_required": True,
+            "bc_ca": False,
+            "validity_days": 90,
+            "allowed_algorithms": {"ecdsa-p256", "ecdsa-p384"},
+        },
     }
 
     @classmethod
@@ -5692,6 +5705,42 @@ def main():
              "Warning: signatures are 8–50 KB depending on parameter set."
     )
 
+    # --- Deployment / operations ---
+    parser.add_argument(
+        "--topology-hint", default=None,
+        choices=["homelab", "single-vm", "ha-enterprise", "kubernetes"],
+        help=(
+            "Deployment topology hint. Sets reasonable defaults for thread counts, "
+            "log verbosity, and metrics scrape interval. Does not change functional "
+            "behaviour. See docs/topologies/ for topology descriptions."
+        ),
+    )
+    parser.add_argument(
+        "--skip-preflight", action="store_true", default=False,
+        help=(
+            "Skip startup preflight checks. USE WITH CARE — preflight blocks startup "
+            "on critical failures (broken DB, expired certs). Only use for emergency "
+            "recovery. A loud warning is logged every minute while this flag is active."
+        ),
+    )
+    parser.add_argument(
+        "--upgrade-in-progress", action="store_true", default=False,
+        help=(
+            "Run in upgrade-health-check mode: issues a canary cert every 30s, "
+            "verifies all CA backends, checks audit chain, and reports p99 latency. "
+            "Cleared by pypki_admin.py upgrade after the health window passes."
+        ),
+    )
+    parser.add_argument(
+        "--tls-mode", default="self-bootstrap",
+        choices=["self-bootstrap", "external-frontend", "external-cert"],
+        help=(
+            "TLS termination mode. self-bootstrap: PyPKI issues its own admin cert "
+            "(default). external-frontend: nginx/proxy terminates TLS (PyPKI serves "
+            "plaintext on loopback). external-cert: operator-provided cert+key."
+        ),
+    )
+
     args = parser.parse_args()
 
     # Enable composite ML-DSA if requested
@@ -6256,6 +6305,23 @@ def main():
     if 'bootstrap_srv' not in dir():
         bootstrap_srv = None
 
+    # --- systemd integration (CLAUDE-systemd-hardening.md) ---
+    try:
+        import notify as _notify
+        _notify.ready()
+        _notify.status(f"Serving {scheme}://{args.host}:{args.port}")
+        # Start watchdog heartbeat (posts WATCHDOG=1 every 30s)
+        _wdt = _notify.WatchdogThread(interval=30)
+        _wdt.start()
+    except Exception:
+        _wdt = None
+
+    if getattr(args, "skip_preflight", False):
+        logger.warning(
+            "WARNING: --skip-preflight is active. Critical deployment checks are suppressed. "
+            "This is an emergency mode only."
+        )
+
     try:
         # Dispatcher server runs in its own daemon thread.
         # Block the main thread here so the process stays alive.
@@ -6263,6 +6329,13 @@ def main():
             time.sleep(1)
     except KeyboardInterrupt:
         print("\nShutting down PKI server...")
+        try:
+            import notify as _n
+            _n.stopping()
+        except Exception:
+            pass
+        if _wdt is not None:
+            _wdt.stop()
         # Stop TLS cert watcher on the dispatcher server
         _w = getattr(server, "_tls_watcher", None)
         if _w is not None:

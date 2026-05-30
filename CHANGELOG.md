@@ -11,6 +11,62 @@ This project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Deployment infrastructure** (`notify.py`, `tls_manager.py`, `db_bootstrap.py`,
+  `pg_tuning.py`, `pgbouncer.py`, `preflight.py`, `upgrade.py`, `wizard.py`,
+  `pypki_init.py`, `bootstrap/`, `checks/`, `packaging/`). Eight deployment sidecar
+  specs shipped as working code:
+  - **Bootstrap CLI** (`pypki_init.py`, `wizard.py`, `bootstrap/`): `pypki init`
+    first-run tool with `--homelab` (unattended, 6-step: DB→CA→TLS→answers.yaml→systemd→firewall)
+    and `--enterprise` (interactive 8-question wizard with resume). Answers written to
+    `init-answers.yaml` (no secrets stored). `--from-answers` replays idempotently.
+    `--dry-run`, `--force-reset --i-understand`, `--print-defaults` flags.
+  - **Systemd hardening** (`packaging/systemd/pypki.service`, `notify.py`): `Type=notify`,
+    `WatchdogSec=120s`, `MemoryDenyWriteExecute=true`, `NoNewPrivileges=true`,
+    `ProtectSystem=strict`, empty `CapabilityBoundingSet`, `SystemCallFilter=@system-service ~@privileged`,
+    `LimitCORE=0`, `UMask=0077`. Templated `pypki@.service` for HA. No python-systemd dep:
+    pure stdlib sd_notify shim via `AF_UNIX SOCK_DGRAM`. `WatchdogThread` posts keepalive
+    every 30 s; stops automatically if liveness fails. `notify.py` also ships a periodic
+    preflight timer (`pypki-preflight.service/timer`) and OpenRC/SysV init scripts.
+  - **DB bootstrap** (`db_bootstrap.py`, `pg_tuning.py`, `pgbouncer.py`): `init_sqlite()`
+    with WAL mode, `synchronous=NORMAL`, `foreign_keys=ON`, 0600 file perms, 0700 parent.
+    `init_postgres()` creates role with `NOSUPERUSER/NOCREATEDB/NOBYPASSRLS`, `CONNECTION LIMIT 100`,
+    narrow schema grants, idempotent check-then-act. `pg_tuning.py` emits RAM-based
+    `shared_buffers`/`effective_cache_size` recommendations; handles managed-Postgres
+    `ALTER SYSTEM` denial gracefully. `pgbouncer.py` emits transaction-mode sample config.
+    `pypki_admin.py db-init` subcommand.
+  - **TLS bootstrap** (`tls_manager.py`, `bootstrap/tls_setup.py`, `pki_server.py`):
+    `TLSManager` provides atomic `ssl.SSLContext` hot-swap under `threading.Lock`;
+    in-flight connections keep the old context. `check_and_rotate_if_needed()` triggers
+    renewal at 1/3 remaining validity. `generate_self_signed_bootstrap()` for first-run
+    before the CA is online. New `pypki_self_tls` CertProfile (90-day, ECDSA P-256/P-384,
+    SERVER_AUTH+CLIENT_AUTH EKU, san_required). `pypki_admin.py tls-rotate/tls-status/tls-replace`.
+  - **OS hardening and firewall** (`packaging/`): nftables default-deny template with
+    per-role address sets, ufw setup script, firewalld service XML. AppArmor profile
+    (complain mode). Security sysctl (`kernel.randomize_va_space=2`, `yama.ptrace_scope=1`,
+    `kptr_restrict=2`, BPF restrictions). `ulimits` (`memlock unlimited`, `core 0`,
+    `nofile 65536`). Cron job writing Prometheus textfile metrics every 30 min.
+    `pypki_admin.py hardening-status/hardening-apply/hardening-validate`.
+  - **Preflight check** (`preflight.py`, `checks/`): `@register_check` decorator populates
+    `CHECK_CATALOG`. Eight check modules: `secrets` (CA key permissions), `runtime`
+    (time sync, entropy, disk), `tls` (cert expiry), `hardening` (systemd score, sysctl),
+    `backup` (recency), `issuance` (CA cert expiry), `audit` (chain integrity), `backends`
+    (key backend reachability). `ThreadPoolExecutor` with per-check timeout; timed-out
+    checks emit `Status.ERROR`. Three output formats: human (colorized), JSON (schema v1),
+    Prometheus (gauge per check). Exit code reflects highest-severity failing check.
+    `pypki_admin.py preflight` with `--quick` and `--ci` convenience flags.
+  - **Upgrade tooling** (`upgrade.py`): 11-state upgrade state machine stored in
+    `/var/lib/pypki/.upgrade-state.json`. `check_version_compatibility()` validates
+    `supported_upgrade_from`/`blocked_upgrade_from` with `x` wildcard. Transactional
+    migrations with per-migration savepoints; auto-rollback on any failure. Health-check
+    window with canary issuance. `fetch_available_versions()` queries GitHub API (pinned
+    channel → no-op). `pypki_admin.py upgrade/upgrade-check/upgrade-status/upgrade-rollback`.
+  - **Deployment topologies** (`packaging/topologies/`): Four reference topology docs
+    (homelab, single-VM, HA enterprise, Kubernetes), each with nftables rules,
+    `pypki_server.py` flags, and IaC snippets.
+  - `pki_server.py` integrated: `--topology-hint`, `--skip-preflight`, `--upgrade-in-progress`,
+    `--tls-mode` CLI flags; sd_notify `READY=1` after bind + `WatchdogThread`; graceful
+    `STOPPING=1` on `KeyboardInterrupt`. 65 new tests across 15 test classes.
+
 - **SLH-DSA (FIPS 205) leaf certificates** (`slh_dsa.py`, `pki_server.py`,
   `web_ui.py`). All 12 parameter sets from draft-ietf-lamps-x509-slhdsa-09
   supported: SHA-2 and SHAKE families at 128/192/256-bit security, small (`s`)

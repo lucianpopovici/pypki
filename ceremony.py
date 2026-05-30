@@ -268,35 +268,37 @@ def cmd_export_root(args) -> int:
     ca_key_pem = key_path.read_bytes()
     ca_crt_pem = crt_path.read_bytes()
 
-    # Read counters from SQLite
-    import sqlite3
+    # Read counters from DB
+    from db import make_db
     last_serial = 0
     crl_number = 0
     if db_path.exists():
-        conn = sqlite3.connect(str(db_path))
-        row = conn.execute("SELECT MAX(serial) FROM certificates").fetchone()
-        if row and row[0]:
-            last_serial = int(row[0])
-        conn.close()
+        _db = make_db(f"sqlite:///{db_path}")
+        row = _db.fetchone("SELECT MAX(serial) AS m FROM certificates")
+        if row and row["m"]:
+            last_serial = int(row["m"])
+        _db.close()
     crl_db = ca_dir / "crl_number.db"
     if crl_db.exists():
-        conn = sqlite3.connect(str(crl_db))
-        row = conn.execute("SELECT crl_number FROM crl_counter WHERE id=1").fetchone()
+        _db = make_db(f"sqlite:///{crl_db}")
+        row = _db.fetchone("SELECT crl_number FROM crl_counter WHERE id=1")
         if row:
-            crl_number = int(row[0])
-        conn.close()
+            crl_number = int(row["crl_number"])
+        _db.close()
 
     # Audit tail (last 200 lines)
     audit_tail = ""
     if audit_path.exists():
         try:
-            import sqlite3 as _sq
-            conn = _sq.connect(str(audit_path))
-            rows = conn.execute(
+            _db = make_db(f"sqlite:///{audit_path}")
+            rows = _db.fetchall(
                 "SELECT ts, event, detail, ip FROM audit ORDER BY id DESC LIMIT 200"
-            ).fetchall()
-            conn.close()
-            lines = [f"{r[0]} {r[1]} {r[2] or ''} {r[3] or ''}" for r in rows]
+            )
+            _db.close()
+            lines = [
+                f"{r['ts']} {r['event']} {r['detail'] or ''} {r['ip'] or ''}"
+                for r in rows
+            ]
             audit_tail = "\n".join(reversed(lines))
         except Exception as exc:
             logger.warning("Could not read audit log: %s", exc)

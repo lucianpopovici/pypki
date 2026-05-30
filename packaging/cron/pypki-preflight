@@ -1,0 +1,1 @@
+*/30 * * * * pypki /usr/bin/pypki_admin.py preflight --format prometheus --output /var/lib/node_exporter/textfile_collector/pypki-preflight.prom --exit-on-warning medium

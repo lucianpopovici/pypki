@@ -1,0 +1,13 @@
+#!/sbin/openrc-run
+
+name="PyPKI Certificate Authority"
+command="/usr/bin/pypki-server"
+command_args="--config /etc/pypki/config.yaml"
+command_user="pypki:pypki"
+pidfile="/run/pypki.pid"
+command_background="yes"
+
+depend() {
+    need net
+    after postgresql
+}

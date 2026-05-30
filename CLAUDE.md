@@ -313,10 +313,24 @@ landmarks here are a bug.
 | `ssh_wire.py`           | SSH binary wire-format primitives (RFC 4251 §5)                |
 | `onion.py`              | Tor v3 address decode + ACME onion-csr-01 CSR validation       |
 | `slh_dsa.py`            | SLH-DSA (FIPS 205) key gen, SPKI/PKCS#8 DER, sign/verify      |
+| `notify.py`             | Stdlib sd_notify shim; `WatchdogThread` for `WatchdogSec=`     |
+| `tls_manager.py`        | Hot-swap `ssl.SSLContext` under lock; TLS renewal logic         |
+| `db_bootstrap.py`       | SQLite WAL init, Postgres role/schema bootstrap, idempotent     |
+| `pg_tuning.py`          | RAM-based Postgres parameter recommendations + `ALTER SYSTEM`   |
+| `pgbouncer.py`          | PgBouncer sample config emit + connectivity verify              |
+| `preflight.py`          | Check registry, parallel runner, human/JSON/Prometheus output   |
+| `checks/`               | Eight check modules: secrets, runtime, tls, hardening, backup,  |
+|                         | issuance, audit, backends                                       |
+| `upgrade.py`            | 11-state upgrade state machine; transactional migrations        |
+| `wizard.py`             | Interactive enterprise wizard; stdlib-only YAML writer          |
+| `pypki_init.py`         | First-run bootstrap CLI (`--homelab` / `--enterprise`)          |
+| `bootstrap/`            | Sub-package: ca_setup, tls_setup, db_setup, systemd_setup,     |
+|                         | firewall_setup                                                  |
+| `packaging/`            | systemd units, nftables/ufw/firewalld, AppArmor, sysctl,       |
+|                         | ulimits, cron, topology reference docs                          |
 
 Additional modules are added per sidecar spec (`policy.py`,
-`audit_chain.py`, `tls_manager.py`, etc.). Each spec lists the module
-it introduces.
+`audit_chain.py`, etc.). Each spec lists the module it introduces.
 
 ### 5.2 Key code locations
 
@@ -395,30 +409,21 @@ upgrade-matrix, openapi-drift).
 
 ---
 
-## 7. DAL migration (in progress)
+## 7. DAL migration (complete)
 
 The DAL replaces direct `sqlite3.connect()` calls with `db.py`
-abstractions over two backends (SQLite, Postgres). Currently:
+abstractions over two backends (SQLite, Postgres). Migration is complete.
 
-- ✅ `db.py`, `migrations.py`, four `db_migrations/*/001_initial.sql`
-- ✅ `AuditLog` in `pki_server.py` — first DAL conversion site
-- ✅ SQLite→Postgres data migration tool with `migrate-data` and
-  `verify-migration` subcommands
+All application modules (`scep_server.py`, `acme_server.py`, `est_server.py`,
+`cmp_server.py`, `ocsp_server.py`, `ceremony.py`, `pki_server.py`) go through
+`make_db()` and the `Database` interface.
 
-Pending conversions, in order of risk (low → high):
+The only intentional `sqlite3.connect()` calls remaining are:
+- `db.py` — the implementation itself
+- `db_bootstrap.py` — bootstrap-time PRAGMA setup that runs before the DAL
+  is initialized (`init_sqlite`, `verify_sqlite`)
 
-1. `SCEPDatabase` in `scep_server.py`
-2. `ACMEDatabase` in `acme_server.py`
-3. `ESTDatabase` in `est_server.py`
-4. `CMPDatabase` in `cmp_server.py`
-5. `OCSPDatabase` in `ocsp_server.py`
-6. Remaining sites in `pki_server.py` not part of `AuditLog`
-7. `CertificateAuthority` serial-allocation sites — **highest
-   stakes**; requires `advisory_lock("serial-allocation")` to be
-   correct under Postgres semantics
-
-A `grep -n "sqlite3.connect" *.py` should produce a shrinking list.
-When it hits zero, the DAL migration is complete.
+`grep -n "sqlite3.connect" *.py` now returns only these two files.
 
 ---
 
@@ -448,7 +453,7 @@ release.
 | draft-ietf-lamps-pq-composite-sigs (-18) | Composite signatures        | spec'd, gated |
 | FIPS 205                                 | SLH-DSA                     | shipped, gated (--enable-slh-dsa) |
 | draft-ietf-lamps-x509-slhdsa-09          | SLH-DSA in X.509            | shipped, gated (--enable-slh-dsa) |
-| RFC 9773                                 | ACME Renewal Information    | spec'd  |
+| RFC 9773                                 | ACME Renewal Information    | shipped |
 | RFC 9799                                 | ACME for .onion             | shipped, gated (--acme-onion-enabled) |
 | OpenSSH PROTOCOL.certkeys                | SSH certificates + KRL      | shipped, gated (--ssh-ca-enabled) |
 
@@ -484,7 +489,7 @@ Current sidecars:
 - `CLAUDE-sso.md` — OIDC and SAML SSO for admin
 - `CLAUDE-portal.md` — Self-service end-user portal
 - `CLAUDE-policy-engine.md` — Policy-as-code for issuance
-- `CLAUDE-audit-chain.md` — Tamper-evident hash-chained audit log
+- `CLAUDE-audit-chain.md` — Tamper-evident hash-chained audit log (**shipped**)
 - `CLAUDE-terraform-provider.md` — Terraform provider
 
 **Differentiated capabilities**
@@ -562,8 +567,9 @@ Update at the end of each significant session. Append to section 13
 (session log) rather than rewriting this section unless the prior
 state is no longer accurate.
 
-**DAL migration**: in progress. `AuditLog` converted; ~14 more
-`sqlite3.connect()` sites remain. Next planned: `SCEPDatabase`.
+**DAL migration**: complete. All application modules go through `make_db()`.
+Only `db.py` (implementation) and `db_bootstrap.py` (pre-DAL PRAGMA setup)
+retain `sqlite3.connect()`.
 
 **Security baseline**: CA key passphrase encryption, admin API
 authentication, HTML escaping (XSS), CSRF protection, SQLite
@@ -589,7 +595,17 @@ at `/ssh`. Admin CLI: `ssh-revoke`, `ssh-list`, `ssh-krl-export`.
 address decode and `onion-csr-01` challenge validation per RFC 9799.
 Enabled via `--acme-onion-enabled`. `onion_eligible` CertProfile added.
 
-**Test suite**: `test_pki_server.py`, 866+ tests passing, 2 Postgres
+**Deployment infrastructure**: All 8 deployment sidecar specs implemented.
+`notify.py` (sd_notify shim), `tls_manager.py` (hot-swap TLS), `db_bootstrap.py`
+(SQLite WAL + Postgres bootstrap), `pg_tuning.py`, `pgbouncer.py`, `preflight.py`
+(parallel check runner, 3 output formats), `checks/` (8 check modules), `upgrade.py`
+(11-state machine, transactional migrations), `wizard.py` (enterprise wizard),
+`pypki_init.py` (first-run CLI), `bootstrap/` package, `packaging/` (systemd units,
+nftables/ufw/firewalld, AppArmor, sysctl, cron, topology reference docs).
+`pypki_admin.py` extended with: `db-init`, `tls-rotate/status/replace`,
+`hardening-status/apply/validate`, `preflight`, `upgrade/upgrade-check/status/rollback`.
+
+**Test suite**: `test_pki_server.py`, 930+ tests, 2 Postgres
 tests correctly skipping without env var.
 
 **Observability**: Prometheus metrics + Grafana dashboard JSON
@@ -672,6 +688,31 @@ Past entries (reconstructed from memory; future sessions append):
 - Landmarks changed: `slh_dsa.py` (new), `pki_server.py` (HAS_SLHDSA +
   `issue_slh_dsa_certificate` + slh_dsa_signing profile), `web_ui.py`
   (`_api_slh_dsa_issue`)
+
+### 2026-05-30 — All 8 deployment sidecar specs implemented
+- Decided: all deployment tests go in `test_pki_server.py` (not `test_pypki_init.py`
+  as sidecars suggested); stdlib-only YAML writer in `wizard.py` (no pyyaml dep);
+  `pypki_self_tls` CertProfile for hot-rotated server TLS (ECDSA P-256/P-384, 90 d)
+- Done: `notify.py` (sd_notify shim + `WatchdogThread`); `tls_manager.py` (atomic
+  `ssl.SSLContext` hot-swap); `db_bootstrap.py` (SQLite WAL + Postgres idempotent
+  bootstrap); `pg_tuning.py` (RAM-based params + managed-Postgres graceful fallback);
+  `pgbouncer.py` (sample config emit); `preflight.py` (parallel runner, 3 output
+  formats, `@register_check` registry); `checks/` (8 modules: secrets, runtime, tls,
+  hardening, backup, issuance, audit, backends); `upgrade.py` (11-state machine,
+  transactional migrations with per-migration savepoints, canary issuance health
+  window); `wizard.py` (8-question enterprise wizard, `?` help, resume); `pypki_init.py`
+  (homelab 6-step + enterprise wizard + `--from-answers` replay); `bootstrap/` package
+  (ca_setup, tls_setup, db_setup, systemd_setup, firewall_setup); `packaging/`
+  (systemd units + hardening, nftables/ufw/firewalld templates, AppArmor profile,
+  sysctl+ulimits, cron, topology docs); `pypki_admin.py` extended with 12 new
+  subcommands; `pki_server.py` sd_notify + CLI flags; 65 new tests (15 test classes)
+- Pending: portal, SSO, composite ML-DSA, ARI implementation
+- Deferred: CI workflow YAML files (`.github/workflows/systemd-security.yml` etc.) —
+  structure is clear, not worth generating without a real CI target
+- Landmarks changed: `notify.py`, `tls_manager.py`, `db_bootstrap.py`, `pg_tuning.py`,
+  `pgbouncer.py`, `preflight.py`, `checks/`, `upgrade.py`, `wizard.py`, `pypki_init.py`,
+  `bootstrap/`, `packaging/` (all new); `pki_server.py` (pypki_self_tls profile +
+  sd_notify + CLI flags); `pypki_admin.py` (12 new subcommands)
 
 ---
 

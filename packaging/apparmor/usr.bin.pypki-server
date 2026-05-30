@@ -1,0 +1,56 @@
+#include <tunables/global>
+
+# PyPKI AppArmor profile.
+# Start in complain mode; switch to enforce after one week of clean logs.
+# See docs/HARDENING.md for the workflow.
+
+profile pypki-server /usr/bin/pypki-server flags=(complain) {
+    #include <abstractions/base>
+    #include <abstractions/openssl>
+    #include <abstractions/python>
+    #include <abstractions/nameservice>
+    #include <abstractions/ssl_certs>
+
+    capability net_bind_service,
+
+    /usr/bin/pypki-server mr,
+    /usr/bin/python3* ix,
+    /usr/lib/python3.*/** mr,
+    /usr/local/lib/python3.*/** mr,
+
+    /etc/pypki/** r,
+    /etc/pypki/secrets/** r,
+    /var/lib/pypki/** rw,
+    /var/log/pypki/** rw,
+    /run/pypki/** rw,
+
+    # CA keys: never executable
+    deny /var/lib/pypki/ca/** mx,
+    deny /etc/pypki/secrets/** mx,
+
+    # No reading other users' homes or system secrets
+    deny /home/** r,
+    deny /root/** r,
+    deny /etc/shadow r,
+    deny /etc/gshadow r,
+
+    # Network: TCP only (no raw sockets)
+    network inet stream,
+    network inet6 stream,
+    network unix stream,
+    deny network raw,
+    deny network packet,
+
+    # No ptrace
+    deny ptrace,
+
+    # systemd notify socket
+    /run/systemd/notify w,
+
+    # PKCS#11 module access (if HSM)
+    /usr/lib/x86_64-linux-gnu/libsofthsm2.so mr,
+    /usr/lib/x86_64-linux-gnu/pkcs11/** mr,
+    /var/lib/softhsm/** rwk,
+
+    signal (receive) peer=unconfined,
+}

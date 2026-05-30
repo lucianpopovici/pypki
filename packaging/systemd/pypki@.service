@@ -1,0 +1,69 @@
+[Unit]
+Description=PyPKI Certificate Authority (instance %i)
+Documentation=https://github.com/lucianpopovici/pypki
+After=network-online.target postgresql.service
+Wants=network-online.target
+
+[Service]
+Type=notify
+ExecStart=/usr/bin/pypki-server --config /etc/pypki/%i.yaml
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+RestartSec=5s
+TimeoutStartSec=60
+TimeoutStopSec=30
+WatchdogSec=120s
+
+User=pypki
+Group=pypki
+
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectHostname=true
+ProtectClock=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectProc=invisible
+ProcSubset=pid
+
+ReadWritePaths=/var/lib/pypki/%i
+ReadWritePaths=/var/log/pypki/%i
+RuntimeDirectory=pypki/%i
+
+NoNewPrivileges=true
+RestrictSUIDSGID=true
+RestrictNamespaces=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+RestrictRealtime=true
+RemoveIPC=true
+KeyringMode=private
+UMask=0077
+
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+IPAddressDeny=any
+IPAddressAllow=localhost
+
+CapabilityBoundingSet=
+AmbientCapabilities=
+
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources @mount @reboot @swap @raw-io @cpu-emulation @debug
+SystemCallArchitectures=native
+SystemCallErrorNumber=EPERM
+
+LimitNOFILE=65536
+LimitNPROC=4096
+LimitCORE=0
+TasksMax=4096
+
+Environment=PYTHONHASHSEED=random
+Environment=PYTHONDONTWRITEBYTECODE=1
+EnvironmentFile=-/etc/pypki/%i.env
+
+[Install]
+WantedBy=multi-user.target

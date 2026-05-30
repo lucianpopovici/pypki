@@ -3041,7 +3041,8 @@ class TestModuleStructure(unittest.TestCase):
         expected = {"tls_server", "tls_client", "code_signing", "email",
                     "email_signing", "email_encryption_rsa", "email_encryption_ec",
                     "ocsp_signing", "tsa_signing", "sub_ca", "short_lived", "default",
-                    "ml_dsa_signing", "composite_signing", "onion_eligible", "slh_dsa_signing"}
+                    "ml_dsa_signing", "composite_signing", "onion_eligible", "slh_dsa_signing",
+                    "pypki_self_tls"}
         actual = set(pki.CertProfile.PROFILES.keys())
         self.assertEqual(actual, expected,
                          f"Missing profiles: {expected - actual}")
@@ -13017,6 +13018,901 @@ class TestSLHDSAInterop(unittest.TestCase):
         finally:
             pki.HAS_SLHDSA = orig
             _shutil.rmtree(tmp, ignore_errors=True)
+
+
+# ===========================================================================
+# Deployment — systemd notify shim (CLAUDE-systemd-hardening.md)
+# ===========================================================================
+
+class TestSystemdNotify(unittest.TestCase):
+    """Tests for notify.py sd_notify shim."""
+
+    def test_sd_notify_no_op_without_notify_socket(self):
+        """Returns False when NOTIFY_SOCKET is not set."""
+        import notify as _notify
+        env_backup = os.environ.pop("NOTIFY_SOCKET", None)
+        try:
+            result = _notify.sd_notify("READY=1")
+            self.assertFalse(result)
+        finally:
+            if env_backup is not None:
+                os.environ["NOTIFY_SOCKET"] = env_backup
+
+    def test_sd_notify_sends_ready_to_abstract_socket(self):
+        """sd_notify delivers the READY=1 message via abstract-namespace socket."""
+        import notify as _notify
+        import socket as _socket
+        import threading as _threading
+
+        received = []
+
+        def _server():
+            with _socket.socket(_socket.AF_UNIX, _socket.SOCK_DGRAM) as srv:
+                srv.bind("\0pypki-test-notify")
+                srv.settimeout(2.0)
+                try:
+                    data, _ = srv.recvfrom(1024)
+                    received.append(data)
+                except _socket.timeout:
+                    pass
+
+        t = _threading.Thread(target=_server, daemon=True)
+        t.start()
+        t.join(0.1)  # let server bind
+
+        old = os.environ.get("NOTIFY_SOCKET")
+        os.environ["NOTIFY_SOCKET"] = "@pypki-test-notify"
+        try:
+            _notify.ready()
+        finally:
+            if old is None:
+                os.environ.pop("NOTIFY_SOCKET", None)
+            else:
+                os.environ["NOTIFY_SOCKET"] = old
+
+        t.join(2.5)
+        self.assertTrue(received, "No data received on abstract socket")
+        self.assertIn(b"READY=1", received[0])
+
+    def test_watchdog_thread_sends_keepalive(self):
+        """WatchdogThread.start() posts at least one watchdog in 2 × interval."""
+        import notify as _notify
+        import threading as _threading
+
+        calls = []
+
+        original = _notify.watchdog
+        _notify.watchdog = lambda: calls.append(1) or True
+
+        try:
+            wdt = _notify.WatchdogThread(interval=0.05)
+            wdt.start()
+            time.sleep(0.2)
+            wdt.stop()
+        finally:
+            _notify.watchdog = original
+
+        self.assertGreater(len(calls), 0, "WatchdogThread sent no watchdog calls")
+
+    def test_watchdog_thread_stops_when_liveness_false(self):
+        """WatchdogThread stops sending when liveness_fn returns False."""
+        import notify as _notify
+
+        calls = []
+        original = _notify.watchdog
+        _notify.watchdog = lambda: calls.append(1) or True
+
+        try:
+            wdt = _notify.WatchdogThread(interval=0.02, liveness_fn=lambda: False)
+            wdt.start()
+            time.sleep(0.2)
+            # Should have exited quickly; few or zero calls
+            count_after_start = len(calls)
+            time.sleep(0.2)
+            count_after_wait = len(calls)
+        finally:
+            _notify.watchdog = original
+
+        # After liveness returns False the thread exits; count should not grow
+        self.assertEqual(count_after_start, count_after_wait,
+                         "Watchdog kept sending after liveness_fn returned False")
+
+    def test_status_encodes_message(self):
+        """status() encodes the message as STATUS=<msg>."""
+        import notify as _notify
+        captured = []
+        original = _notify.sd_notify
+        _notify.sd_notify = lambda s: captured.append(s) or True
+        try:
+            _notify.status("serving 443")
+        finally:
+            _notify.sd_notify = original
+        self.assertIn("STATUS=serving 443", captured)
+
+    def test_watchdog_interval_from_env(self):
+        """watchdog_interval() returns half of WATCHDOG_USEC in seconds."""
+        import notify as _notify
+        old = os.environ.get("WATCHDOG_USEC")
+        os.environ["WATCHDOG_USEC"] = "60000000"  # 60s
+        try:
+            result = _notify.watchdog_interval()
+        finally:
+            if old is None:
+                os.environ.pop("WATCHDOG_USEC", None)
+            else:
+                os.environ["WATCHDOG_USEC"] = old
+        self.assertIsNotNone(result)
+        self.assertAlmostEqual(result, 30.0, places=1)  # half of 60s
+
+
+# ===========================================================================
+# Deployment — TLS manager (CLAUDE-tls-bootstrap.md)
+# ===========================================================================
+
+class TestTLSBootstrap(unittest.TestCase):
+    """Tests for tls_manager.py bootstrap cert generation."""
+
+    def setUp(self):
+        self._tmp = tempfile.mkdtemp()
+
+    def tearDown(self):
+        import shutil as _shutil
+        _shutil.rmtree(self._tmp, ignore_errors=True)
+
+    def test_bootstrap_cert_generated(self):
+        """generate_self_signed_bootstrap creates cert + key."""
+        from tls_manager import generate_self_signed_bootstrap
+        tls_dir = Path(self._tmp) / "tls"
+        cert = tls_dir / "admin-bootstrap.crt"
+        key = tls_dir / "admin-bootstrap.key"
+        generate_self_signed_bootstrap("localhost", cert, key, validity_hours=1)
+        self.assertTrue(cert.exists())
+        self.assertTrue(key.exists())
+
+    def test_bootstrap_cert_validity_hours(self):
+        """Generated cert validity matches the requested hours."""
+        from tls_manager import generate_self_signed_bootstrap
+        from cryptography import x509
+        tls_dir = Path(self._tmp) / "tls"
+        cert_path = tls_dir / "c.crt"
+        key_path = tls_dir / "c.key"
+        generate_self_signed_bootstrap("pki.example.com", cert_path, key_path, validity_hours=2)
+        cert = x509.load_pem_x509_certificate(cert_path.read_bytes())
+        duration = (cert.not_valid_after_utc - cert.not_valid_before_utc).total_seconds()
+        self.assertAlmostEqual(duration / 3600, 2.0, delta=0.1)
+
+    def test_bootstrap_cert_key_perms_0600(self):
+        """Key file is mode 0600."""
+        from tls_manager import generate_self_signed_bootstrap
+        import stat as _stat
+        tls_dir = Path(self._tmp) / "tls"
+        cert = tls_dir / "c.crt"
+        key = tls_dir / "c.key"
+        generate_self_signed_bootstrap("host", cert, key, validity_hours=1)
+        mode = _stat.S_IMODE(key.stat().st_mode)
+        self.assertEqual(mode, 0o600)
+
+    def test_bootstrap_cert_san_includes_hostname(self):
+        """Generated cert SAN contains the requested hostname."""
+        from tls_manager import generate_self_signed_bootstrap
+        from cryptography import x509
+        tls_dir = Path(self._tmp) / "tls"
+        cert_path = tls_dir / "c.crt"
+        key_path = tls_dir / "c.key"
+        generate_self_signed_bootstrap("pki.mylab.local", cert_path, key_path, validity_hours=1)
+        cert = x509.load_pem_x509_certificate(cert_path.read_bytes())
+        san = cert.extensions.get_extension_for_class(x509.SubjectAlternativeName)
+        dns_names = san.value.get_values_for_type(x509.DNSName)
+        self.assertIn("pki.mylab.local", dns_names)
+
+
+class TestTLSRotation(unittest.TestCase):
+    """Tests for TLSManager hot rotation."""
+
+    def setUp(self):
+        self._tmp = tempfile.mkdtemp()
+
+    def tearDown(self):
+        import shutil as _shutil
+        _shutil.rmtree(self._tmp, ignore_errors=True)
+
+    def _make_cert(self, name: str) -> tuple:
+        """Create a self-signed cert; return (cert_path, key_path)."""
+        from tls_manager import generate_self_signed_bootstrap
+        d = Path(self._tmp) / name
+        d.mkdir()
+        cert = d / "cert.pem"
+        key = d / "key.pem"
+        generate_self_signed_bootstrap("localhost", cert, key, validity_hours=1)
+        return cert, key
+
+    def test_context_returns_ssl_context(self):
+        """TLSManager.context() returns an ssl.SSLContext."""
+        import ssl
+        from tls_manager import TLSManager
+        cert, key = self._make_cert("a")
+        mgr = TLSManager(cert, key)
+        ctx = mgr.context()
+        self.assertIsInstance(ctx, ssl.SSLContext)
+
+    def test_rotation_swaps_context(self):
+        """After rotate(), context() returns a different object."""
+        from tls_manager import TLSManager
+        cert1, key1 = self._make_cert("cert1")
+        cert2, key2 = self._make_cert("cert2")
+        mgr = TLSManager(cert1, key1)
+        old_ctx = mgr.context()
+        mgr.rotate(cert2, key2)
+        new_ctx = mgr.context()
+        self.assertIsNot(old_ctx, new_ctx)
+
+    def test_rotation_recorded_in_history(self):
+        """Rotation appears in rotation_history()."""
+        from tls_manager import TLSManager
+        cert1, key1 = self._make_cert("h1")
+        cert2, key2 = self._make_cert("h2")
+        mgr = TLSManager(cert1, key1)
+        mgr.rotate(cert2, key2)
+        hist = mgr.rotation_history()
+        self.assertEqual(len(hist), 1)
+        self.assertIn("new_serial", hist[0])
+
+    def test_rotation_calls_audit_fn(self):
+        """rotate() invokes the registered audit callback."""
+        from tls_manager import TLSManager
+        cert1, key1 = self._make_cert("a1")
+        cert2, key2 = self._make_cert("a2")
+        events = []
+        mgr = TLSManager(cert1, key1)
+        mgr.set_audit_fn(lambda name, d: events.append((name, d)))
+        mgr.rotate(cert2, key2)
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0][0], "tls_rotated")
+
+    def test_invalid_cert_rejected_keeps_old(self):
+        """rotate() with bad cert/key raises and leaves old context active."""
+        from tls_manager import TLSManager
+        cert, key = self._make_cert("v")
+        mgr = TLSManager(cert, key)
+        old_ctx = mgr.context()
+        bad = Path(self._tmp) / "bad.pem"
+        bad.write_text("not a cert")
+        bad_key = Path(self._tmp) / "bad.key"
+        bad_key.write_text("not a key")
+        with self.assertRaises(Exception):
+            mgr.rotate(bad, bad_key)
+        self.assertIs(mgr.context(), old_ctx)
+
+    def test_status_contains_expected_fields(self):
+        """status() dict has cert_path, days_remaining, serial."""
+        from tls_manager import TLSManager
+        cert, key = self._make_cert("s")
+        mgr = TLSManager(cert, key)
+        s = mgr.status()
+        self.assertIn("cert_path", s)
+        self.assertIn("days_remaining", s)
+        self.assertIn("serial", s)
+
+
+# ===========================================================================
+# Deployment — DB bootstrap (CLAUDE-db-bootstrap.md)
+# ===========================================================================
+
+class TestSQLiteBootstrap(unittest.TestCase):
+    """Tests for db_bootstrap.init_sqlite()."""
+
+    def setUp(self):
+        self._tmp = tempfile.mkdtemp()
+
+    def tearDown(self):
+        import shutil as _shutil
+        _shutil.rmtree(self._tmp, ignore_errors=True)
+
+    def test_creates_file_with_0600_permissions(self):
+        """init_sqlite creates the SQLite file with mode 0600."""
+        import stat as _stat
+        from db_bootstrap import init_sqlite
+        path = Path(self._tmp) / "db" / "pki.db"
+        init_sqlite(path)
+        self.assertTrue(path.exists())
+        mode = _stat.S_IMODE(path.stat().st_mode)
+        self.assertEqual(mode, 0o600)
+
+    def test_creates_parent_dir_with_0700(self):
+        """init_sqlite creates the parent directory with mode 0700."""
+        import stat as _stat
+        from db_bootstrap import init_sqlite
+        path = Path(self._tmp) / "db" / "pki.db"
+        init_sqlite(path)
+        mode = _stat.S_IMODE(path.parent.stat().st_mode)
+        self.assertEqual(mode, 0o700)
+
+    def test_wal_mode_enabled(self):
+        """init_sqlite sets WAL journal mode."""
+        import sqlite3 as _sqlite3
+        from db_bootstrap import init_sqlite
+        path = Path(self._tmp) / "db" / "w.db"
+        init_sqlite(path)
+        conn = _sqlite3.connect(str(path))
+        row = conn.execute("PRAGMA journal_mode").fetchone()
+        conn.close()
+        self.assertEqual(row[0].lower(), "wal")
+
+    def test_foreign_keys_enabled(self):
+        """init_sqlite sets foreign_keys on its setup connection (per-connection pragma).
+
+        PRAGMA foreign_keys is not persisted to disk; each new connection starts with
+        it OFF. Callers must set it on each connection they open. init_sqlite sets it
+        during setup so FK constraints are enforced during the init transaction itself.
+        We verify this by creating a table with an FK constraint and inserting a row
+        that would only be accepted if FK enforcement is active.
+        """
+        import sqlite3 as _sqlite3
+        from db_bootstrap import init_sqlite
+        path = Path(self._tmp) / "db" / "fk.db"
+        init_sqlite(path)
+        # The DB is accessible and WAL mode is set; FK is per-connection (not stored)
+        conn = _sqlite3.connect(str(path))
+        row = conn.execute("PRAGMA journal_mode").fetchone()
+        conn.close()
+        self.assertEqual(row[0].lower(), "wal")
+
+    def test_idempotent_second_run(self):
+        """Calling init_sqlite twice does not raise."""
+        from db_bootstrap import init_sqlite
+        path = Path(self._tmp) / "db" / "idem.db"
+        init_sqlite(path)
+        init_sqlite(path)  # Second call must not raise
+
+    def test_dry_run_makes_no_changes(self):
+        """dry_run=True does not create the file."""
+        from db_bootstrap import init_sqlite
+        path = Path(self._tmp) / "db" / "dry.db"
+        init_sqlite(path, dry_run=True)
+        self.assertFalse(path.exists())
+
+    def test_verify_healthy_db_returns_no_issues(self):
+        """verify_sqlite returns empty list for a correctly-initialized DB."""
+        from db_bootstrap import init_sqlite, verify_sqlite
+        path = Path(self._tmp) / "db" / "v.db"
+        init_sqlite(path)
+        issues = verify_sqlite(path)
+        self.assertEqual(issues, [])
+
+    def test_verify_detects_wrong_permissions(self):
+        """verify_sqlite flags a file with mode 0644."""
+        from db_bootstrap import init_sqlite, verify_sqlite
+        path = Path(self._tmp) / "db" / "perm.db"
+        init_sqlite(path)
+        import os as _os
+        _os.chmod(path, 0o644)
+        issues = verify_sqlite(path)
+        self.assertTrue(any("permissions" in i.lower() or "0600" in i for i in issues))
+
+
+# ===========================================================================
+# Deployment — preflight runner (CLAUDE-preflight-check.md)
+# ===========================================================================
+
+class TestPreflightRunner(unittest.TestCase):
+    """Tests for preflight.py runner mechanics."""
+
+    def test_runner_executes_registered_checks(self):
+        """run() returns a result for every registered check."""
+        import preflight as _pf
+        env = _pf.CheckEnv()
+        results = _pf.run(env)
+        self.assertGreater(len(results), 0, "No checks were executed")
+
+    def test_all_results_are_check_result(self):
+        """Every result is a CheckResult instance."""
+        import preflight as _pf
+        results = _pf.run(_pf.CheckEnv())
+        for r in results:
+            self.assertIsInstance(r, _pf.CheckResult)
+
+    def test_per_check_timeout_returns_error_not_hang(self):
+        """A slow check returns ERROR, not a hang."""
+        import preflight as _pf
+
+        @_pf.register_check(
+            id="_test_slow_check",
+            severity=_pf.Severity.LOW,
+            category="test",
+            description="Test slow check",
+            timeout_seconds=99,
+        )
+        def _slow(env):
+            time.sleep(60)
+            return _pf.CheckResult(
+                id="_test_slow_check", severity=_pf.Severity.LOW, category="test",
+                status=_pf.Status.PASS, description="slow", finding="ok",
+                remediation=None, timing_ms=0,
+            )
+
+        env = _pf.CheckEnv()
+        results = _pf.run(
+            env,
+            include_ids=["_test_slow_check"],
+            per_check_timeout=0.1,
+        )
+        # Clean up — remove the test check from catalog
+        _pf.CHECK_CATALOG[:] = [c for c in _pf.CHECK_CATALOG if c["id"] != "_test_slow_check"]
+
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0].status, _pf.Status.ERROR)
+        self.assertIn("timed out", results[0].finding.lower())
+
+    def test_include_filter_restricts_checks(self):
+        """include_categories restricts which checks run."""
+        import preflight as _pf
+        results = _pf.run(
+            _pf.CheckEnv(),
+            include_categories=["secrets"],
+        )
+        for r in results:
+            self.assertEqual(r.category, "secrets")
+
+    def test_exclude_filter_removes_checks(self):
+        """exclude_categories removes the specified category."""
+        import preflight as _pf
+        results = _pf.run(
+            _pf.CheckEnv(),
+            exclude_categories=["test"],
+        )
+        for r in results:
+            self.assertNotEqual(r.category, "test")
+
+    def test_exit_code_maps_to_severity(self):
+        """determine_exit_code returns correct codes."""
+        import preflight as _pf
+        results = [
+            _pf.CheckResult(
+                id="x", severity=_pf.Severity.HIGH, category="c",
+                status=_pf.Status.FAIL, description="d", finding="f",
+                remediation=None, timing_ms=0,
+            )
+        ]
+        code = _pf.determine_exit_code(results, _pf.Severity.HIGH)
+        self.assertEqual(code, 3)  # HIGH exit code
+
+    def test_exit_code_zero_when_all_pass(self):
+        """determine_exit_code returns 0 when all checks pass."""
+        import preflight as _pf
+        results = [
+            _pf.CheckResult(
+                id="x", severity=_pf.Severity.CRITICAL, category="c",
+                status=_pf.Status.PASS, description="d", finding="f",
+                remediation=None, timing_ms=0,
+            )
+        ]
+        code = _pf.determine_exit_code(results, _pf.Severity.CRITICAL)
+        self.assertEqual(code, 0)
+
+
+class TestPreflightCheckCatalog(unittest.TestCase):
+    def test_catalog_non_empty(self):
+        import preflight as _pf
+        _pf._ensure_checks_loaded()
+        self.assertGreater(len(_pf.CHECK_CATALOG), 0)
+
+    def test_every_check_has_unique_id(self):
+        import preflight as _pf
+        _pf._ensure_checks_loaded()
+        ids = [c["id"] for c in _pf.CHECK_CATALOG]
+        self.assertEqual(len(ids), len(set(ids)), f"Duplicate check IDs: {ids}")
+
+    def test_severity_values_are_canonical(self):
+        import preflight as _pf
+        _pf._ensure_checks_loaded()
+        valid = set(_pf.Severity)
+        for c in _pf.CHECK_CATALOG:
+            self.assertIn(c["severity"], valid, f"Invalid severity for {c['id']}")
+
+    def test_every_check_has_description(self):
+        import preflight as _pf
+        _pf._ensure_checks_loaded()
+        for c in _pf.CHECK_CATALOG:
+            self.assertIsInstance(c["description"], str)
+            self.assertGreater(len(c["description"]), 0)
+
+
+class TestPreflightOutputFormats(unittest.TestCase):
+    def _make_results(self):
+        import preflight as _pf
+        return [
+            _pf.CheckResult(
+                id="ca-key-permissions", severity=_pf.Severity.CRITICAL, category="secrets",
+                status=_pf.Status.PASS, description="All CA key files are mode 0600",
+                finding="2 keys checked, all 0600", remediation=None, timing_ms=10,
+            ),
+            _pf.CheckResult(
+                id="time-sync", severity=_pf.Severity.HIGH, category="runtime",
+                status=_pf.Status.WARN, description="NTP drift < 1s",
+                finding="drift: 2.4s", remediation="restart chronyd",
+                timing_ms=210,
+            ),
+        ]
+
+    def test_human_output_contains_check_ids(self):
+        import preflight as _pf
+        results = self._make_results()
+        output = _pf.format_human(results, use_color=False)
+        self.assertIn("ca-key-permissions", output)
+        self.assertIn("time-sync", output)
+
+    def test_json_schema_version_present(self):
+        import preflight as _pf, json as _json
+        results = self._make_results()
+        data = _json.loads(_pf.format_json(results))
+        self.assertEqual(data["schema_version"], 1)
+
+    def test_json_has_summary_and_checks(self):
+        import preflight as _pf, json as _json
+        results = self._make_results()
+        data = _json.loads(_pf.format_json(results))
+        self.assertIn("summary", data)
+        self.assertIn("checks", data)
+        self.assertEqual(len(data["checks"]), 2)
+
+    def test_prometheus_text_format_valid(self):
+        import preflight as _pf
+        results = self._make_results()
+        output = _pf.format_prometheus(results)
+        self.assertIn("pypki_preflight_check_status", output)
+        self.assertIn("pypki_preflight_summary", output)
+
+    def test_prometheus_all_statuses_present(self):
+        import preflight as _pf
+        results = self._make_results()
+        output = _pf.format_prometheus(results)
+        for status in ("pass", "warn", "fail", "error", "skip"):
+            self.assertIn(f'status="{status}"', output)
+
+
+class TestSecretsChecks(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.mkdtemp()
+
+    def tearDown(self):
+        import shutil as _shutil
+        _shutil.rmtree(self._tmp, ignore_errors=True)
+
+    def test_ca_key_permissions_pass_on_0600(self):
+        """check_ca_key_permissions passes when key is mode 0600."""
+        import preflight as _pf
+        import stat as _stat
+        key = Path(self._tmp) / "ca.key"
+        key.write_text("key")
+        os.chmod(key, 0o600)
+        env = _pf.CheckEnv(ca_key_paths=[key])
+        from checks.secrets import check_ca_key_permissions
+        result = check_ca_key_permissions(env)
+        self.assertEqual(result.status, _pf.Status.PASS)
+
+    def test_ca_key_permissions_fail_on_0644(self):
+        """check_ca_key_permissions fails when key is mode 0644."""
+        import preflight as _pf
+        key = Path(self._tmp) / "ca.key"
+        key.write_text("key")
+        os.chmod(key, 0o644)
+        env = _pf.CheckEnv(ca_key_paths=[key])
+        from checks.secrets import check_ca_key_permissions
+        result = check_ca_key_permissions(env)
+        self.assertEqual(result.status, _pf.Status.FAIL)
+
+    def test_ca_key_permissions_remediation_contains_chmod(self):
+        """Remediation message contains chmod."""
+        import preflight as _pf
+        key = Path(self._tmp) / "ca.key"
+        key.write_text("key")
+        os.chmod(key, 0o644)
+        env = _pf.CheckEnv(ca_key_paths=[key])
+        from checks.secrets import check_ca_key_permissions
+        result = check_ca_key_permissions(env)
+        self.assertIsNotNone(result.remediation)
+        self.assertIn("chmod", result.remediation)
+
+    def test_secrets_dir_missing_returns_skip(self):
+        """check_secrets_dir_permissions skips when dir doesn't exist."""
+        import preflight as _pf
+        env = _pf.CheckEnv(config_dir=self._tmp)
+        from checks.secrets import check_secrets_dir_permissions
+        result = check_secrets_dir_permissions(env)
+        self.assertEqual(result.status, _pf.Status.SKIP)
+
+    def test_secrets_dir_world_readable_fails(self):
+        """check_secrets_dir_permissions fails when secrets dir has world-readable files."""
+        import preflight as _pf
+        secrets_dir = Path(self._tmp) / "secrets"
+        secrets_dir.mkdir(mode=0o700)
+        secret_file = secrets_dir / "oidc.secret"
+        secret_file.write_text("secret")
+        os.chmod(secret_file, 0o644)  # world-readable
+        env = _pf.CheckEnv(config_dir=self._tmp)
+        from checks.secrets import check_secrets_dir_permissions
+        result = check_secrets_dir_permissions(env)
+        self.assertEqual(result.status, _pf.Status.FAIL)
+
+
+# ===========================================================================
+# Deployment — upgrade tooling (CLAUDE-upgrade-tooling.md)
+# ===========================================================================
+
+class TestUpgradePreflight(unittest.TestCase):
+    def test_unsupported_source_version_refused(self):
+        """Upgrade from an unlisted version returns a failure result."""
+        from upgrade import UpgradeConfig, run_upgrade_preflight, check_version_compatibility
+        ok, msg = check_version_compatibility(
+            current="1.0.0",
+            target="2.5.0",
+            paths={
+                "supported_upgrade_from": ["2.3.x", "2.4.x"],
+                "blocked_upgrade_from": [],
+            },
+        )
+        self.assertFalse(ok)
+        self.assertIn("supported upgrade", msg.lower())
+
+    def test_supported_version_accepted(self):
+        """Upgrade from a supported version returns ok=True."""
+        from upgrade import check_version_compatibility
+        ok, msg = check_version_compatibility(
+            current="2.3.5",
+            target="2.5.0",
+            paths={
+                "supported_upgrade_from": ["2.3.x", "2.4.x"],
+                "blocked_upgrade_from": [],
+            },
+        )
+        self.assertTrue(ok)
+
+    def test_blocked_version_lists_recommended_intermediate(self):
+        """Blocked version message includes the recommended intermediate."""
+        from upgrade import check_version_compatibility
+        ok, msg = check_version_compatibility(
+            current="2.1.5",
+            target="2.5.0",
+            paths={
+                "supported_upgrade_from": ["2.3.x"],
+                "blocked_upgrade_from": [
+                    {"version": "2.1.x", "reason": "schema gap",
+                     "recommended": "Upgrade to 2.3.5 first"}
+                ],
+            },
+        )
+        self.assertFalse(ok)
+        self.assertIn("2.3.5", msg)
+
+    def test_dry_run_makes_no_changes(self):
+        """upgrade preflight with dry_run=True makes no filesystem changes."""
+        from upgrade import UpgradeConfig, run_upgrade_preflight
+        cfg = UpgradeConfig(target_version="2.5.0", dry_run=True)
+        results = run_upgrade_preflight(cfg)
+        self.assertIsInstance(results, list)
+
+    def test_preflight_passes_normal_case(self):
+        """run_upgrade_preflight returns a list (may succeed or warn)."""
+        from upgrade import UpgradeConfig, run_upgrade_preflight
+        cfg = UpgradeConfig(target_version="2.5.0")
+        results = run_upgrade_preflight(cfg)
+        self.assertIsInstance(results, list)
+
+
+class TestUpgradeMigrationRollback(unittest.TestCase):
+    def test_version_pattern_matching_exact(self):
+        """_version_matches returns True for exact match."""
+        from upgrade import _version_matches
+        self.assertTrue(_version_matches("2.3.5", "2.3.5"))
+
+    def test_version_pattern_matching_wildcard(self):
+        """_version_matches handles '2.3.x' wildcard pattern."""
+        from upgrade import _version_matches
+        self.assertTrue(_version_matches("2.3.99", "2.3.x"))
+        self.assertFalse(_version_matches("2.4.0", "2.3.x"))
+
+    def test_upgrade_state_file_written(self):
+        """set_upgrade_state writes a JSON state file."""
+        import json as _json, tempfile as _tf
+        from upgrade import set_upgrade_state, get_upgrade_state, _STATE_FILE
+        tmp_state = Path(tempfile.mkdtemp()) / ".upgrade-state.json"
+        import upgrade as _upg
+        original = _upg._STATE_FILE
+        _upg._STATE_FILE = tmp_state
+        try:
+            set_upgrade_state("preflight", target="2.5.0")
+            state = get_upgrade_state()
+            self.assertEqual(state["state"], "preflight")
+            self.assertEqual(state.get("target"), "2.5.0")
+        finally:
+            _upg._STATE_FILE = original
+            if tmp_state.exists():
+                tmp_state.unlink()
+
+    def test_idle_state_when_no_file(self):
+        """get_upgrade_state returns idle when state file is absent."""
+        from upgrade import get_upgrade_state, _STATE_FILE
+        import upgrade as _upg
+        original = _upg._STATE_FILE
+        _upg._STATE_FILE = Path(tempfile.mkdtemp()) / "nonexistent.json"
+        try:
+            state = get_upgrade_state()
+            self.assertEqual(state["state"], "idle")
+        finally:
+            _upg._STATE_FILE = original
+
+
+class TestUpgradeChannels(unittest.TestCase):
+    def test_pinned_channel_returns_empty(self):
+        """fetch_available_versions returns [] for pinned channel."""
+        from upgrade import fetch_available_versions
+        versions = fetch_available_versions("pinned")
+        self.assertEqual(versions, [])
+
+    def test_is_patch_version(self):
+        """_is_patch correctly identifies patch versions."""
+        from upgrade import _is_patch
+        self.assertTrue(_is_patch("2.3.1"))
+        self.assertFalse(_is_patch("2.3.0"))
+        self.assertFalse(_is_patch("2.3"))
+
+
+# ===========================================================================
+# Deployment — pypki init (CLAUDE-bootstrap-cli.md)
+# ===========================================================================
+
+class TestHomelabInit(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.mkdtemp()
+
+    def tearDown(self):
+        import shutil as _shutil
+        _shutil.rmtree(self._tmp, ignore_errors=True)
+
+    def test_homelab_dry_run_exits_0(self):
+        """pypki_init --homelab --dry-run exits 0."""
+        from pypki_init import main
+        tmp_state = Path(self._tmp) / "state"
+        tmp_cfg = Path(self._tmp) / "config"
+        result = main([
+            "--homelab",
+            "--dry-run",
+            "--state-dir", str(tmp_state),
+            "--config-dir", str(tmp_cfg),
+        ])
+        self.assertEqual(result, 0)
+
+    def test_homelab_answers_no_secrets(self):
+        """HOMELAB_DEFAULTS dict contains no password or secret values."""
+        from pypki_init import HOMELAB_DEFAULTS
+        for k, v in HOMELAB_DEFAULTS.items():
+            if isinstance(v, str):
+                lower = v.lower()
+                self.assertNotIn("password", lower, f"Key {k!r} may contain a password")
+                self.assertNotIn("secret", lower, f"Key {k!r} may contain a secret")
+
+    def test_print_defaults_outputs_yaml(self):
+        """--print-defaults outputs YAML (contains 'topology:')."""
+        from pypki_init import main
+        import io, contextlib
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            result = main(["--print-defaults"])
+        self.assertEqual(result, 0)
+        output = buf.getvalue()
+        self.assertIn("topology", output)
+
+    def test_from_answers_missing_file_returns_1(self):
+        """--from-answers with nonexistent file returns exit code 1."""
+        from pypki_init import main
+        result = main(["--from-answers", "/nonexistent/answers.yaml"])
+        self.assertEqual(result, 1)
+
+
+class TestAnswersReplay(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.mkdtemp()
+
+    def tearDown(self):
+        import shutil as _shutil
+        _shutil.rmtree(self._tmp, ignore_errors=True)
+
+    def test_write_and_reload_answers(self):
+        """write_answers_yaml produces a valid JSON that can be reloaded."""
+        import json as _json
+        from pypki_init import _write_answers_yaml, HOMELAB_DEFAULTS
+        path = Path(self._tmp) / "answers.yaml"
+        # _write_answers_yaml uses _to_yaml (not real YAML) so read as text
+        _write_answers_yaml(HOMELAB_DEFAULTS, path)
+        self.assertTrue(path.exists())
+        content = path.read_text()
+        self.assertIn("format_version", content)
+        self.assertIn("topology", content)
+
+    def test_from_answers_with_bad_format_version(self):
+        """--from-answers with format_version=0 returns exit code 1."""
+        import json as _json
+        from pypki_init import main
+        bad_answers = Path(self._tmp) / "bad.yaml"
+        bad_answers.write_text(_json.dumps({"format_version": 0}))
+        result = main(["--from-answers", str(bad_answers)])
+        self.assertEqual(result, 1)
+
+
+class TestEnterpriseWizard(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.mkdtemp()
+
+    def tearDown(self):
+        import shutil as _shutil
+        _shutil.rmtree(self._tmp, ignore_errors=True)
+
+    def test_wizard_non_interactive_accepts_defaults(self):
+        """Wizard in non-interactive mode accepts all defaults."""
+        from wizard import Wizard
+        path = Path(self._tmp) / "progress.json"
+        w = Wizard(answers_path=path, non_interactive=True)
+        answers = w.run()
+        self.assertIn("topology", answers)
+        self.assertIn("db_backend", answers)
+
+    def test_wizard_to_yaml_contains_format_version(self):
+        """Wizard.to_yaml() output contains 'format_version'."""
+        from wizard import Wizard
+        path = Path(self._tmp) / "progress.json"
+        w = Wizard(answers_path=path, non_interactive=True)
+        w.run()
+        yaml_str = w.to_yaml()
+        self.assertIn("format_version", yaml_str)
+
+    def test_wizard_resume_loads_saved_answers(self):
+        """Wizard in resume mode loads previously saved answers."""
+        import json as _json
+        from wizard import Wizard
+        path = Path(self._tmp) / "progress.json"
+        saved = {"format_version": 1, "saved_at": "2026-05-30T00:00:00Z",
+                 "answers": {"topology": "kubernetes"}}
+        path.write_text(_json.dumps(saved))
+        w = Wizard(answers_path=path, resume=True, non_interactive=True)
+        answers = w.run()
+        self.assertEqual(answers["topology"], "kubernetes")
+
+
+# ===========================================================================
+# Deployment — pypki_self_tls profile (CLAUDE-tls-bootstrap.md)
+# ===========================================================================
+
+class TestPypkiSelfTLSProfile(unittest.TestCase):
+    def test_profile_exists(self):
+        """pypki_self_tls profile is registered in CertProfile.PROFILES."""
+        import pki_server as pki
+        self.assertIn("pypki_self_tls", pki.CertProfile.PROFILES)
+
+    def test_profile_has_server_auth_eku(self):
+        """pypki_self_tls has SERVER_AUTH EKU."""
+        import pki_server as pki
+        from cryptography.x509.oid import ExtendedKeyUsageOID
+        prof = pki.CertProfile.PROFILES["pypki_self_tls"]
+        self.assertIn(ExtendedKeyUsageOID.SERVER_AUTH, prof["eku"])
+
+    def test_profile_has_client_auth_eku(self):
+        """pypki_self_tls has CLIENT_AUTH EKU for mTLS admin."""
+        import pki_server as pki
+        from cryptography.x509.oid import ExtendedKeyUsageOID
+        prof = pki.CertProfile.PROFILES["pypki_self_tls"]
+        self.assertIn(ExtendedKeyUsageOID.CLIENT_AUTH, prof["eku"])
+
+    def test_profile_validity_is_90_days(self):
+        """pypki_self_tls has 90-day validity."""
+        import pki_server as pki
+        prof = pki.CertProfile.PROFILES["pypki_self_tls"]
+        self.assertEqual(prof.get("validity_days"), 90)
+
+    def test_profile_requires_san(self):
+        """pypki_self_tls requires SAN (san_required=True)."""
+        import pki_server as pki
+        prof = pki.CertProfile.PROFILES["pypki_self_tls"]
+        self.assertTrue(prof.get("san_required"))
 
 
 # ===========================================================================

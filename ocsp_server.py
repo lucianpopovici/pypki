@@ -684,7 +684,6 @@ def generate_static_responses(
 
     Returns the count of files written.
     """
-    import sqlite3 as _sqlite3
     from pathlib import Path as _Path
     import hashlib as _hashlib
 

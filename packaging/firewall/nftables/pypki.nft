@@ -1,0 +1,94 @@
+#!/usr/sbin/nft -f
+# PyPKI nftables firewall template.
+# Tune the sets below for your environment; the policy is default-deny.
+# Port matrix reference: CLAUDE-os-hardening-firewall.md
+
+table inet pypki {
+    set admin_networks {
+        type ipv4_addr; flags interval;
+        elements = { 10.0.0.0/8, 192.168.0.0/16, 172.16.0.0/12 }
+    }
+    set monitoring_networks {
+        type ipv4_addr; flags interval;
+        elements = { 10.10.0.0/16 }
+    }
+    set db_hosts {
+        type ipv4_addr; flags interval;
+        # Populate with your Postgres host(s)
+        # elements = { 10.20.0.5/32, 10.20.0.6/32 }
+    }
+
+    chain inbound {
+        type filter hook input priority 0; policy drop;
+
+        # Established/related
+        ct state established,related accept
+        ct state invalid drop
+
+        # Loopback
+        iifname "lo" accept
+
+        # ICMP (essential subset only)
+        ip protocol icmp icmp type { echo-request, destination-unreachable, time-exceeded } accept
+        ip6 nexthdr ipv6-icmp icmpv6 type {
+            echo-request, destination-unreachable, packet-too-big,
+            time-exceeded, parameter-problem, nd-neighbor-solicit,
+            nd-neighbor-advert, nd-router-advert
+        } accept
+
+        # SSH from admin networks only
+        tcp dport 22 ip saddr @admin_networks accept
+
+        # ACME http-01
+        tcp dport 80 accept
+
+        # HTTPS (admin + ACME + OCSP + CRL)
+        tcp dport 443 accept
+
+        # Prometheus from monitoring network only
+        tcp dport 9090 ip saddr @monitoring_networks accept
+
+        # EST (if enabled) — internal only; uncomment and set saddr restriction
+        # tcp dport 11112 ip saddr @admin_networks accept
+
+        # Drop with rate-limited logging
+        limit rate 5/minute log prefix "pypki-fw-drop: "
+    }
+
+    chain outbound {
+        type filter hook output priority 0; policy drop;
+
+        ct state established,related accept
+
+        # Loopback
+        oifname "lo" accept
+
+        # DNS
+        udp dport 53 accept
+        tcp dport 53 accept
+
+        # NTP (critical for cert validity)
+        udp dport 123 accept
+
+        # HTTPS to cloud KMS, OIDC IdP
+        tcp dport 443 accept
+
+        # HTTP for OCSP/CRL upstream fetches
+        tcp dport 80 accept
+
+        # Postgres (if remote) — restrict to db_hosts when populated
+        tcp dport 5432 accept
+
+        # PgBouncer (loopback only)
+        tcp dport 6432 accept
+
+        # Syslog (if remote) — uncomment and set target
+        # udp dport 514 ip daddr 10.30.0.5 accept
+
+        limit rate 5/minute log prefix "pypki-egress-drop: "
+    }
+
+    chain forward {
+        type filter hook forward priority 0; policy drop;
+    }
+}

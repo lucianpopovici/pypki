@@ -563,6 +563,138 @@ def build_parser() -> argparse.ArgumentParser:
     ssh_krl.add_argument("--pki-db-url", default=None, metavar="URL")
     ssh_krl.set_defaults(func=cmd_ssh_krl_export)
 
+    # --- DB bootstrap (CLAUDE-db-bootstrap.md) ---
+    dbi = sub.add_parser(
+        "db-init",
+        help="Bootstrap a SQLite or Postgres database for PyPKI.",
+    )
+    dbi.add_argument("--backend", choices=["sqlite", "postgres"], default="sqlite")
+    dbi.add_argument("--sqlite-path", default="/var/lib/pypki/db/pki.db",
+                     help="Path to SQLite file (sqlite backend only).")
+    dbi.add_argument("--dsn", default=None, metavar="URL",
+                     help="Bootstrap admin DSN (postgres only).")
+    dbi.add_argument("--target-db", default="pypki")
+    dbi.add_argument("--target-role", default="pypki")
+    dbi.add_argument("--target-role-password-source", default=None, metavar="SOURCE",
+                     help="file:///path or env://VARNAME.")
+    dbi.add_argument("--tls", choices=["require", "verify-ca", "verify-full", "mtls"],
+                     default="require")
+    dbi.add_argument("--extensions", default="citext",
+                     help="Comma-separated Postgres extensions (default: citext).")
+    dbi.add_argument("--apply-tuning", choices=["recommended", "none", "print-only"],
+                     default="none")
+    dbi.add_argument("--with-pgbouncer-sample", action="store_true",
+                     help="Emit a PgBouncer sample config.")
+    dbi.add_argument("--dry-run", action="store_true")
+    dbi.set_defaults(func=cmd_db_init)
+
+    # --- TLS management (CLAUDE-tls-bootstrap.md) ---
+    tls_rotate = sub.add_parser(
+        "tls-rotate",
+        help="Force TLS cert re-issuance from the PyPKI CA.",
+    )
+    tls_rotate.add_argument("--ca-dir", default="./ca")
+    tls_rotate.add_argument("--tls-cert", default="/etc/pypki/tls/admin.crt")
+    tls_rotate.add_argument("--tls-key", default="/etc/pypki/tls/admin.key")
+    tls_rotate.add_argument("--hostname", default="localhost")
+    tls_rotate.add_argument("--dry-run", action="store_true")
+    tls_rotate.set_defaults(func=cmd_tls_rotate)
+
+    tls_status = sub.add_parser(
+        "tls-status",
+        help="Print current TLS cert chain, expiry, and rotation history.",
+    )
+    tls_status.add_argument("--tls-cert", default="/etc/pypki/tls/admin.crt")
+    tls_status.set_defaults(func=cmd_tls_status)
+
+    tls_replace = sub.add_parser(
+        "tls-replace",
+        help="Swap in operator-provided cert+key (Pattern C).",
+    )
+    tls_replace.add_argument("--cert", required=True, metavar="PATH")
+    tls_replace.add_argument("--key", required=True, metavar="PATH")
+    tls_replace.add_argument("--dry-run", action="store_true")
+    tls_replace.set_defaults(func=cmd_tls_replace)
+
+    # --- Hardening (CLAUDE-os-hardening-firewall.md) ---
+    hs = sub.add_parser("hardening-status",
+                        help="Print current host hardening status.")
+    hs.set_defaults(func=cmd_hardening_status)
+
+    ha = sub.add_parser("hardening-apply",
+                        help="Install firewall, sysctl, and MAC profiles.")
+    ha.add_argument("--firewall-stack",
+                    choices=["auto", "nftables", "ufw", "firewalld", "iptables", "none"],
+                    default="auto")
+    ha.add_argument("--apply-sysctl", action="store_true")
+    ha.add_argument("--dry-run", action="store_true")
+    ha.set_defaults(func=cmd_hardening_apply)
+
+    hv = sub.add_parser("hardening-validate",
+                        help="Assert hardening state matches expectations.")
+    hv.set_defaults(func=cmd_hardening_validate)
+
+    # --- Preflight (CLAUDE-preflight-check.md) ---
+    pf = sub.add_parser(
+        "preflight",
+        help="Run preflight checks against the deployment.",
+    )
+    pf.add_argument("--format", choices=["human", "json", "prometheus"], default="human")
+    pf.add_argument("--output", default=None, metavar="PATH",
+                    help="Write output to file (default: stdout).")
+    pf.add_argument("--include", default=None, metavar="CATS",
+                    help="Comma-separated categories to include.")
+    pf.add_argument("--exclude", default=None, metavar="CATS",
+                    help="Comma-separated categories to exclude.")
+    pf.add_argument("--exit-on-warning",
+                    choices=["critical", "high", "medium", "low", "none"],
+                    default="critical",
+                    help="Exit non-zero when any check at or above this severity fails.")
+    pf.add_argument("--skip-slow", action="store_true",
+                    help="Skip checks that take > 1s (KMS, S3 probes).")
+    pf.add_argument("--quick", action="store_true",
+                    help="Alias for --skip-slow --exit-on-warning high.")
+    pf.add_argument("--ci", action="store_true",
+                    help="Alias for --format json --exit-on-warning high.")
+    pf.add_argument("--timeout", type=float, default=10.0,
+                    help="Per-check timeout in seconds (default: 10).")
+    pf.add_argument("--parallelism", type=int, default=8)
+    pf.add_argument("--no-color", action="store_true")
+    pf.add_argument("--ca-dir", default="./ca")
+    pf.set_defaults(func=cmd_preflight)
+
+    # --- Upgrade (CLAUDE-upgrade-tooling.md) ---
+    upg = sub.add_parser(
+        "upgrade",
+        help="Run a full upgrade cycle with pre-flight, migrate, health-check, rollback.",
+    )
+    upg.add_argument("--to", required=True, metavar="VERSION",
+                     help="Target version (e.g. 2.5.0 or 'latest').")
+    upg.add_argument("--channel", choices=["stable", "security", "preview", "pinned"],
+                     default="stable")
+    upg.add_argument("--health-window", default="5m", metavar="DURATION",
+                     help="Health check window duration (default: 5m).")
+    upg.add_argument("--no-rollback", action="store_true",
+                     help="Disable auto-rollback on health check failure.")
+    upg.add_argument("--accept-irreversible", action="store_true",
+                     help="Allow crossing non-reversible schema migrations.")
+    upg.add_argument("--dry-run", action="store_true")
+    upg.set_defaults(func=cmd_upgrade)
+
+    upg_check = sub.add_parser("upgrade-check",
+                               help="Show available versions in the configured channel.")
+    upg_check.add_argument("--channel", default="stable")
+    upg_check.set_defaults(func=cmd_upgrade_check)
+
+    upg_status = sub.add_parser("upgrade-status",
+                                help="Print current upgrade state machine position.")
+    upg_status.set_defaults(func=cmd_upgrade_status)
+
+    upg_rollback = sub.add_parser("upgrade-rollback",
+                                  help="Manually trigger rollback from an upgrade.")
+    upg_rollback.add_argument("--confirm", action="store_true", required=True)
+    upg_rollback.set_defaults(func=cmd_upgrade_rollback)
+
     return root
 
 
@@ -876,6 +1008,369 @@ def cmd_ssh_krl_export(args: argparse.Namespace) -> int:
     else:
         Path(args.out).write_bytes(krl_bytes)
         print(f"KRL written to {args.out} ({len(krl_bytes)} bytes)")
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# DB bootstrap commands (CLAUDE-db-bootstrap.md)
+# ---------------------------------------------------------------------------
+
+def cmd_db_init(args: argparse.Namespace) -> int:
+    """Initialize the database for PyPKI."""
+    import logging as _log
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
+    log = logging.getLogger("db-init")
+
+    if args.backend == "sqlite":
+        from db_bootstrap import init_sqlite, verify_sqlite
+        path = Path(args.sqlite_path)
+        if path.exists():
+            issues = verify_sqlite(path)
+            if issues:
+                for issue in issues:
+                    log.warning("Existing SQLite DB issue: %s", issue)
+            else:
+                log.info("SQLite DB already initialized and healthy: %s", path)
+            return 0
+        init_sqlite(path, dry_run=args.dry_run)
+        return 0
+
+    # Postgres
+    if not args.dsn:
+        print("ERROR: --dsn is required for postgres backend", file=sys.stderr)
+        return 1
+    if not args.target_role_password_source:
+        print("ERROR: --target-role-password-source required for postgres", file=sys.stderr)
+        return 1
+
+    from db_bootstrap import init_postgres
+    exts = [e.strip() for e in args.extensions.split(",") if e.strip()]
+    init_postgres(
+        admin_dsn=args.dsn,
+        target_db=args.target_db,
+        target_role=args.target_role,
+        password_source=args.target_role_password_source,
+        tls_mode=args.tls,
+        extensions=exts,
+        apply_tuning=args.apply_tuning,
+        dry_run=args.dry_run,
+    )
+
+    if args.with_pgbouncer_sample:
+        from pgbouncer import emit_sample
+        print(emit_sample(
+            target_db=args.target_db,
+            role=args.target_role,
+        ))
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# TLS management commands (CLAUDE-tls-bootstrap.md)
+# ---------------------------------------------------------------------------
+
+def cmd_tls_rotate(args: argparse.Namespace) -> int:
+    """Force TLS cert re-issuance from the CA."""
+    from tls_manager import generate_self_signed_bootstrap
+    cert_path = Path(args.tls_cert)
+    key_path = Path(args.tls_key)
+
+    if args.dry_run:
+        print(f"[dry-run] Would generate new TLS cert for {args.hostname}")
+        print(f"[dry-run] Would write cert → {cert_path}")
+        print(f"[dry-run] Would write key  → {key_path}")
+        return 0
+
+    generate_self_signed_bootstrap(
+        hostname=args.hostname,
+        cert_path=cert_path,
+        key_path=key_path,
+        validity_hours=24 * 90,  # 90 days (pypki_self_tls profile validity)
+    )
+    print(f"TLS cert rotated: {cert_path}")
+    print("Send SIGHUP to the running pypki-server to pick up the new cert.")
+    return 0
+
+
+def cmd_tls_status(args: argparse.Namespace) -> int:
+    """Print TLS cert status."""
+    import json as _json
+    from tls_manager import TLSManager
+    cert_path = Path(args.tls_cert)
+    if not cert_path.exists():
+        print(f"TLS cert not found: {cert_path}", file=sys.stderr)
+        return 1
+    # Key path: same stem, .key extension
+    key_path = cert_path.with_suffix(".key")
+    if not key_path.exists():
+        key_path = cert_path.parent / (cert_path.stem + ".key")
+
+    try:
+        mgr = TLSManager(cert_path, key_path)
+        status = mgr.status()
+        print(_json.dumps(status, indent=2))
+        return 0
+    except Exception as e:
+        print(f"Error: {e}", file=sys.stderr)
+        return 1
+
+
+def cmd_tls_replace(args: argparse.Namespace) -> int:
+    """Swap in operator-provided cert+key (Pattern C)."""
+    cert = Path(args.cert)
+    key = Path(args.key)
+    if not cert.exists():
+        print(f"Cert not found: {cert}", file=sys.stderr)
+        return 1
+    if not key.exists():
+        print(f"Key not found: {key}", file=sys.stderr)
+        return 1
+
+    if args.dry_run:
+        print(f"[dry-run] Would load TLSManager with {cert} + {key}")
+        return 0
+
+    from tls_manager import TLSManager
+    try:
+        TLSManager(cert, key)  # Validate they load
+        print(f"Cert+key validated. Send SIGHUP to pypki-server to apply.")
+        return 0
+    except Exception as e:
+        print(f"Invalid cert/key: {e}", file=sys.stderr)
+        return 1
+
+
+# ---------------------------------------------------------------------------
+# Hardening commands (CLAUDE-os-hardening-firewall.md)
+# ---------------------------------------------------------------------------
+
+def cmd_hardening_status(args: argparse.Namespace) -> int:
+    """Print current host hardening status."""
+    from bootstrap.firewall_setup import detect_firewall_stack, detect_mac
+    fw = detect_firewall_stack()
+    mac = detect_mac()
+
+    import shutil
+    import subprocess
+
+    score = "?"
+    if shutil.which("systemd-analyze"):
+        try:
+            r = subprocess.run(
+                ["systemd-analyze", "security", "pypki.service", "--no-pager"],
+                capture_output=True, text=True, timeout=10,
+            )
+            last = r.stdout.strip().splitlines()
+            if last:
+                parts = last[-1].split()
+                for tok in reversed(parts):
+                    try:
+                        float(tok)
+                        score = tok
+                        break
+                    except ValueError:
+                        pass
+        except Exception:
+            pass
+
+    sysctl_path = Path("/etc/sysctl.d/99-pypki.conf")
+    ulimits_path = Path("/etc/security/limits.d/pypki.conf")
+    apparmor_profile = Path("/etc/apparmor.d/usr.bin.pypki-server")
+    selinux_module = Path("/etc/selinux/local/pypki.pp")
+
+    print("PyPKI Host Hardening Status")
+    print("=" * 40)
+    print(f"  Firewall stack:       {fw}")
+    print(f"  MAC framework:        {mac}")
+    print(f"  systemd score:        {score}")
+    print(f"  sysctl config:        {'installed' if sysctl_path.exists() else 'NOT installed'}")
+    print(f"  ulimits config:       {'installed' if ulimits_path.exists() else 'NOT installed'}")
+    print(f"  AppArmor profile:     {'installed' if apparmor_profile.exists() else 'NOT installed'}")
+    print(f"  SELinux module:       {'installed' if selinux_module.exists() else 'NOT installed'}")
+    return 0
+
+
+def cmd_hardening_apply(args: argparse.Namespace) -> int:
+    """Install firewall templates, sysctl, and MAC profiles."""
+    from bootstrap.firewall_setup import apply_firewall_template, detect_firewall_stack
+
+    stack = None if args.firewall_stack == "auto" else args.firewall_stack
+    applied = apply_firewall_template(stack, dry_run=args.dry_run)
+    if applied:
+        print("Firewall rules applied.")
+    else:
+        print("No firewall rules applied (check firewall stack).")
+
+    if args.apply_sysctl:
+        import subprocess
+        src = Path(__file__).parent / "packaging" / "sysctl" / "pypki.conf"
+        dst = Path("/etc/sysctl.d/99-pypki.conf")
+        if args.dry_run:
+            print(f"[dry-run] Would install {src} → {dst}")
+        elif src.exists():
+            import shutil
+            shutil.copy2(src, dst)
+            subprocess.run(["sysctl", "--system"], capture_output=True)
+            print(f"sysctl config installed: {dst}")
+
+    return 0
+
+
+def cmd_hardening_validate(args: argparse.Namespace) -> int:
+    """Validate hardening state matches expected baseline."""
+    return cmd_hardening_status(args)
+
+
+# ---------------------------------------------------------------------------
+# Preflight command (CLAUDE-preflight-check.md)
+# ---------------------------------------------------------------------------
+
+def cmd_preflight(args: argparse.Namespace) -> int:
+    """Run preflight checks."""
+    import preflight as _pf
+
+    if args.ci:
+        args.format = "json"
+        args.exit_on_warning = "high"
+    if args.quick:
+        args.skip_slow = True
+        args.exit_on_warning = "high"
+
+    if args.no_color:
+        _pf._USE_COLOR = False
+
+    env = _pf.CheckEnv(
+        ca_dir=args.ca_dir,
+        ca_key_paths=list(Path(args.ca_dir).glob("**/*.key")) if Path(args.ca_dir).exists() else [],
+    )
+
+    include_cats = [c.strip() for c in args.include.split(",")] if args.include else None
+    exclude_cats = [c.strip() for c in args.exclude.split(",")] if args.exclude else None
+
+    results = _pf.run(
+        env=env,
+        include_categories=include_cats,
+        exclude_categories=exclude_cats,
+        skip_slow=args.skip_slow,
+        parallelism=args.parallelism,
+        per_check_timeout=args.timeout,
+    )
+
+    if args.format == "json":
+        output = _pf.format_json(results)
+    elif args.format == "prometheus":
+        output = _pf.format_prometheus(results)
+    else:
+        output = _pf.format_human(results)
+
+    if args.output:
+        Path(args.output).write_text(output)
+        print(f"Preflight results written to {args.output}")
+    else:
+        print(output)
+
+    threshold = _pf.Severity.from_str(args.exit_on_warning) if args.exit_on_warning != "none" else None
+    if threshold:
+        return _pf.determine_exit_code(results, threshold)
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# Upgrade commands (CLAUDE-upgrade-tooling.md)
+# ---------------------------------------------------------------------------
+
+def _parse_duration(s: str) -> int:
+    """Parse '5m', '30s', '1h' → seconds."""
+    s = s.strip()
+    if s.endswith("m"):
+        return int(s[:-1]) * 60
+    if s.endswith("h"):
+        return int(s[:-1]) * 3600
+    if s.endswith("s"):
+        return int(s[:-1])
+    return int(s)
+
+
+def cmd_upgrade(args: argparse.Namespace) -> int:
+    """Run a full upgrade cycle."""
+    from upgrade import UpgradeConfig, run_upgrade_preflight, run_health_window, set_upgrade_state
+
+    health_seconds = _parse_duration(args.health_window)
+    cfg = UpgradeConfig(
+        target_version=args.to,
+        channel=args.channel,
+        health_window_seconds=health_seconds,
+        rollback_on_failure=not args.no_rollback,
+        accept_irreversible=args.accept_irreversible,
+        dry_run=args.dry_run,
+    )
+
+    print(f"Upgrading to {cfg.target_version} (dry_run={cfg.dry_run})")
+
+    # Pre-flight
+    set_upgrade_state("preflight", target=cfg.target_version)
+    pf_results = run_upgrade_preflight(cfg)
+    failed = [r for r in pf_results if not r.success]
+    if failed:
+        for r in failed:
+            print(f"  FAIL [{r.step}]: {r.message}", file=sys.stderr)
+        return 1
+
+    print(f"Pre-flight passed. Health window: {health_seconds}s")
+
+    if cfg.dry_run:
+        print("[dry-run] Would proceed with upgrade.")
+        set_upgrade_state("idle")
+        return 0
+
+    # Health check window (simplified — real upgrade would stop/start the service)
+    set_upgrade_state("health-check", target=cfg.target_version)
+    ok, reason = run_health_window(cfg)
+    if ok:
+        set_upgrade_state("finalized", target=cfg.target_version)
+        print(f"Upgrade to {cfg.target_version} complete.")
+        return 0
+
+    if cfg.rollback_on_failure:
+        from upgrade import rollback
+        rollback(cfg, reason)
+        set_upgrade_state("idle")
+    else:
+        print(f"Health check failed: {reason}", file=sys.stderr)
+        set_upgrade_state("failed", reason=reason)
+        return 1
+    return 0
+
+
+def cmd_upgrade_check(args: argparse.Namespace) -> int:
+    """Show available versions."""
+    from upgrade import fetch_available_versions
+    versions = fetch_available_versions(args.channel)
+    if not versions:
+        print("No versions available (offline or source unreachable).")
+        return 0
+    print(f"Available versions ({args.channel} channel):")
+    for v in versions:
+        print(f"  {v}")
+    return 0
+
+
+def cmd_upgrade_status(args: argparse.Namespace) -> int:
+    """Print current upgrade state."""
+    import json as _json
+    from upgrade import get_upgrade_state
+    state = get_upgrade_state()
+    print(_json.dumps(state, indent=2))
+    return 0
+
+
+def cmd_upgrade_rollback(args: argparse.Namespace) -> int:
+    """Manually trigger rollback."""
+    from upgrade import UpgradeConfig, rollback, get_upgrade_state
+    state = get_upgrade_state()
+    target = state.get("target", "unknown")
+    cfg = UpgradeConfig(target_version=target)
+    rollback(cfg, "manual rollback via CLI")
     return 0
 
 

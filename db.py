@@ -7,11 +7,11 @@ schema lives in migration files (see ``migrations.py`` / ``db_migrations/``).
 
 Why this exists
 ---------------
-Today PyPKI calls ``sqlite3.connect(...)`` from 15+ sites scattered across
-``pki_server.py``. That makes it impossible to switch backends without
-auditing every site, and impossible to test the issuance code against a
-backend other than SQLite. This module collapses all DB access to a
-single interface so:
+DAL migration is complete. All application code goes through ``make_db()``
+and the ``Database`` interface. The only remaining ``sqlite3.connect()``
+calls are in ``db.py`` itself (the implementation) and ``db_bootstrap.py``
+(bootstrap-time PRAGMA setup that runs before the DAL is initialized).
+This module collapses all DB access to a single interface so:
 
   * SQLite remains the default (homelab, single-node).
   * PostgreSQL is selectable via ``--db-url postgresql://...`` when HA,

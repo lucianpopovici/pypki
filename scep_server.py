@@ -52,7 +52,6 @@ import http.server
 import json
 import logging
 import os
-import sqlite3
 from db import make_db, Database
 import struct
 import threading
