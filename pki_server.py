@@ -2286,6 +2286,20 @@ class CertificateAuthority:
                               - Non-ASCII local-part -> SmtpUTF8Mailbox otherName
                                 (OID 1.3.6.1.5.5.7.8.9, UTF8String value)
         """
+        # Check emergency halt — must run before any issuance work
+        try:
+            _halt_row = self._pki_db.fetchone(
+                "SELECT halted, halt_reason FROM emergency_state WHERE state = ?",
+                ("global",),
+            )
+            if _halt_row and _halt_row["halted"]:
+                _reason = _halt_row["halt_reason"] or "emergency stop active"
+                raise PermissionError(f"Issuance halted — {_reason}")
+        except PermissionError:
+            raise
+        except Exception:
+            pass  # table absent (pre-migration DB) — allow issuance
+
         prof = CertProfile.get(profile)
         is_ca = is_ca or prof.get("bc_ca", False)
 
@@ -5790,6 +5804,44 @@ def main():
             "(default). external-frontend: nginx/proxy terminates TLS (PyPKI serves "
             "plaintext on loopback). external-cert: operator-provided cert+key."
         ),
+    )
+
+    # Backup / DR flags
+    backup_group = parser.add_argument_group("Backup / DR (CLAUDE-backup-restore.md)")
+    backup_group.add_argument(
+        "--backup-enabled", action="store_true", default=False,
+        help="Enable scheduled backup creation (requires --backup-target).",
+    )
+    backup_group.add_argument(
+        "--backup-target", action="append", dest="backup_targets", metavar="URI",
+        help=(
+            "Backup target URI (file:// supported in this release). "
+            "May be specified multiple times for redundant targets."
+        ),
+    )
+    backup_group.add_argument(
+        "--backup-passphrase-file", metavar="PATH",
+        help="Path to a file containing the backup encryption passphrase.",
+    )
+    backup_group.add_argument(
+        "--backup-retention-count", type=int, default=30, metavar="N",
+        help="Keep at most N backups per target (0 = unlimited, default: 30).",
+    )
+    backup_group.add_argument(
+        "--backup-retention-days", type=int, default=90, metavar="N",
+        help="Delete backups older than N days (0 = unlimited, default: 90).",
+    )
+    backup_group.add_argument(
+        "--backup-compression", choices=["gzip", "none"], default="gzip",
+        help="Tarball compression algorithm (default: gzip).",
+    )
+    backup_group.add_argument(
+        "--shamir-shares", type=int, default=0, metavar="N",
+        help="Total Shamir shares for offline root passphrase (0 = disabled).",
+    )
+    backup_group.add_argument(
+        "--shamir-threshold", type=int, default=0, metavar="M",
+        help="Minimum Shamir shares required for reconstruction (0 = disabled).",
     )
 
     args = parser.parse_args()

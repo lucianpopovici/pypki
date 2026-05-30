@@ -11,6 +11,34 @@ This project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Backup and DR** (`backup.py`, `restore.py`, `shamir.py`, `mnemonic.py`,
+  `db_migrations/pki/006_dr.sql`): First-class backup and disaster recovery per
+  `CLAUDE-backup-restore.md`. Encrypted, integrity-verified backups (AES-256-GCM +
+  scrypt); Ed25519 signature over manifest; gzip tarball with `db/`, `keys/`, `config/`,
+  `audit-seal.json`. `BackupEngine` supports multiple `file://` targets, configurable
+  retention (count + days). `RestoreEngine` verifies then stages; `--dry-run` reports
+  without writing; `--db-only`, `--keys-only`, `--tables` for selective restore; safe
+  table allowlist prevents audit-chain corruption. Shamir's Secret Sharing in `shamir.py`
+  (GF(256), Lagrange interpolation) with BIP-39-style mnemonic encoding + CRC-16 checksum
+  in `mnemonic.py`. Emergency halt in `pki_server.py` (`emergency_state` table): issuance
+  blocked when `halted=1`, revocation unaffected. `pypki_admin.py` new subcommands:
+  `backup-now`, `restore`, `emergency-stop`, `emergency-resume`, `revoke-batch`,
+  `ca-init --shamir M-of-N`, `ca-recover --shamir`. CLI flags: `--backup-enabled`,
+  `--backup-target`, `--backup-passphrase-file`, `--backup-retention-count`,
+  `--backup-retention-days`, `--shamir-shares`, `--shamir-threshold`. 25 new tests
+  across 4 test classes (`TestShamir`, `TestBackup`, `TestRestore`, `TestDR`).
+  Runbooks: `docs/BACKUP.md`, `docs/DR.md`, `docs/CEREMONY.md`.
+
+### Security
+
+- **Shamir M-of-N split for offline root passphrase**: replaces single-passphrase model
+  with threshold secret sharing. Any M of N share-holders can reconstruct; fewer than M
+  reveals nothing (information-theoretic security). Shares never written to disk on the
+  issuing machine.
+- **Emergency issuance halt**: `pypki_admin.py emergency-stop` immediately blocks new
+  certificate issuance at the database layer. Running server instances pick up the halt
+  on the next request without restart.
+
 - **Policy engine** (`policy.py`, `db_migrations/pki/005_policy.sql`): Policy-as-code
   for issuance control per `CLAUDE-policy-engine.md`. JSON policy files with named rules
   evaluated in order (first match wins). 13 match predicates: `profile`, `profile_in`,

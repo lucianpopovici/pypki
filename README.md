@@ -2217,6 +2217,127 @@ reaches RFC status.
 
 ---
 
+## Backup and Disaster Recovery
+
+PyPKI includes a first-class backup and DR system (`CLAUDE-backup-restore.md`).
+
+### Scheduled backups
+
+```bash
+# Take an immediate backup (unencrypted)
+python pypki_admin.py backup-now --ca-dir ./ca --target file:///var/lib/pypki/backups/
+
+# Take an encrypted backup
+echo "my-passphrase" > /etc/pypki/backup.passphrase
+python pypki_admin.py backup-now --ca-dir ./ca \
+    --target file:///var/lib/pypki/backups/ \
+    --passphrase-file /etc/pypki/backup.passphrase
+
+# Add backup flags to the server for automatic post-backup recording
+python pki_server.py \
+    --backup-enabled \
+    --backup-target file:///var/lib/pypki/backups/ \
+    --backup-passphrase-file /etc/pypki/backup.passphrase \
+    --backup-retention-count 30 \
+    --backup-retention-days 90
+```
+
+Schedule via cron or systemd timer. Example cron entry:
+
+```
+0 3 * * * /usr/bin/python /opt/pypki/pypki_admin.py backup-now \
+    --ca-dir /var/lib/pypki/ca \
+    --target file:///var/lib/pypki/backups/ \
+    --passphrase-file /etc/pypki/backup.passphrase >> /var/log/pypki-backup.log 2>&1
+```
+
+### Restore
+
+```bash
+# Dry-run: verify backup integrity without writing anything
+python pypki_admin.py restore \
+    --from pypki-backup-20260525T030000Z.tar.gz \
+    --to /var/lib/pypki-staging \
+    --dry-run
+
+# Full restore to staging directory
+python pypki_admin.py restore \
+    --from pypki-backup-20260525T030000Z.tar.gz.enc \
+    --to /var/lib/pypki-staging \
+    --passphrase-file /etc/pypki/backup.passphrase
+
+# DB-only restore (preserve existing keys)
+python pypki_admin.py restore \
+    --from pypki-backup-20260525T030000Z.tar.gz \
+    --to /var/lib/pypki-staging \
+    --db-only
+
+# Selective table restore (leaf-compromise scenario)
+python pypki_admin.py restore \
+    --from pypki-backup-20260525T030000Z.tar.gz \
+    --to /var/lib/pypki-staging \
+    --tables certificates revocations
+```
+
+See [docs/DR.md](docs/DR.md) for the full runbook and three disaster scenarios.
+
+### Shamir's Secret Sharing for the offline root
+
+The offline root CA passphrase can be split into M-of-N shares:
+
+```bash
+# Export root with 3-of-5 Shamir splitting
+python pypki_admin.py ca-init \
+    --ca-dir ./ca \
+    --out root-bundle.tar.gz.enc \
+    --shamir 3-of-5
+
+# Prints 5 share strings. Distribute one to each share-holder.
+# Share 1: AAAA...
+# Share 2: BBBB...
+# ...
+
+# Recovery: collect 3 shares and issue a new sub-CA cert
+python pypki_admin.py ca-recover \
+    --bundle root-bundle.tar.gz.enc \
+    --csr-in intermediate.csr.pem \
+    --cert-out intermediate.crt.pem \
+    --shares 3
+# Prompts for 3 share strings interactively.
+```
+
+See [docs/CEREMONY.md](docs/CEREMONY.md) for the full ceremony script.
+
+### Emergency halt
+
+```bash
+# Halt all new certificate issuance (CA key compromise response)
+python pypki_admin.py emergency-stop \
+    --ca-dir ./ca \
+    --reason "ca_key_compromise: unauthorized HSM access detected"
+
+# Re-enable after incident is resolved
+python pypki_admin.py emergency-resume --ca-dir ./ca
+```
+
+### Batch revocation (leaf compromise)
+
+```bash
+# List affected serial numbers in a file (hex or decimal, one per line)
+python pypki_admin.py revoke-batch \
+    --ca-dir ./ca \
+    --serial-file /tmp/compromised-serials.txt \
+    --reason key_compromise
+
+# Dry-run first
+python pypki_admin.py revoke-batch \
+    --ca-dir ./ca \
+    --serial-file /tmp/compromised-serials.txt \
+    --dry-run
+```
+
+---
+
 ## License
 
 MIT — see [LICENSE](LICENSE).

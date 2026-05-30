@@ -739,6 +739,129 @@ def build_parser() -> argparse.ArgumentParser:
     upg_rollback.add_argument("--confirm", action="store_true", required=True)
     upg_rollback.set_defaults(func=cmd_upgrade_rollback)
 
+    # --- Backup / DR (CLAUDE-backup-restore.md) ---
+    bn = sub.add_parser(
+        "backup-now",
+        help="Create a backup of the CA state immediately.",
+    )
+    bn.add_argument("--ca-dir", default="./ca", metavar="DIR",
+                    help="CA directory (default: ./ca).")
+    bn.add_argument("--target", required=True, metavar="URI",
+                    help="Target URI for the backup (file:// supported).")
+    bn.add_argument("--passphrase-file", metavar="PATH",
+                    help="Path to a file containing the backup encryption passphrase.")
+    bn.add_argument("--log-level", default="WARNING")
+    bn.set_defaults(func=cmd_backup_now)
+
+    rst = sub.add_parser(
+        "restore",
+        help="Restore a backup to a staging directory.",
+    )
+    rst.add_argument("--from", dest="from_path", required=True, metavar="BACKUP",
+                     help="Path to the backup file (.tar.gz or .tar.gz.enc).")
+    rst.add_argument("--to", dest="to_dir", required=True, metavar="DIR",
+                     help="Destination directory to stage the restore into.")
+    rst.add_argument("--passphrase-file", metavar="PATH",
+                     help="Path to a file containing the decryption passphrase.")
+    rst.add_argument("--dry-run", action="store_true",
+                     help="Verify the backup without writing any files.")
+    rst.add_argument("--db-only", action="store_true",
+                     help="Only restore database files (skip keys/).")
+    rst.add_argument("--keys-only", action="store_true",
+                     help="Only restore key files (skip db/).")
+    rst.add_argument("--tables", nargs="+", metavar="TABLE",
+                     help="Selective table restore (safe tables only).")
+    rst.add_argument("--ca-dir", default="./ca", metavar="DIR",
+                     help="CA directory for recording restore event (default: ./ca).")
+    rst.add_argument("--log-level", default="WARNING")
+    rst.set_defaults(func=cmd_restore)
+
+    es = sub.add_parser(
+        "emergency-stop",
+        help="Halt all certificate issuance (CA key compromise response).",
+    )
+    es.add_argument("--ca-dir", default="./ca", metavar="DIR")
+    es.add_argument("--reason", required=True, metavar="REASON",
+                    help="Human-readable reason for the halt (required).")
+    es.add_argument("--by", default=None, metavar="USER",
+                    help="Operator identity (default: current OS user).")
+    es.add_argument("--log-level", default="WARNING")
+    es.set_defaults(func=cmd_emergency_stop)
+
+    er = sub.add_parser(
+        "emergency-resume",
+        help="Clear emergency halt and re-enable certificate issuance.",
+    )
+    er.add_argument("--ca-dir", default="./ca", metavar="DIR")
+    er.add_argument("--by", default=None, metavar="USER",
+                    help="Operator identity (default: current OS user).")
+    er.add_argument("--log-level", default="WARNING")
+    er.set_defaults(func=cmd_emergency_resume)
+
+    rb = sub.add_parser(
+        "revoke-batch",
+        help="Mass-revoke certificates from a serial number list.",
+    )
+    rb.add_argument("--ca-dir", default="./ca", metavar="DIR")
+    rb.add_argument("--serial-file", required=True, metavar="FILE",
+                    help="Path to a file with one hex or decimal serial per line.")
+    rb.add_argument("--reason", default="key_compromise", metavar="REASON",
+                    choices=[
+                        "unspecified", "key_compromise", "ca_compromise",
+                        "affiliation_changed", "superseded",
+                        "cessation_of_operation", "certificate_hold",
+                        "remove_from_crl", "privilege_withdrawn",
+                        "aa_compromise",
+                    ],
+                    help="RFC 5280 revocation reason (default: key_compromise).")
+    rb.add_argument("--dry-run", action="store_true",
+                    help="List certificates that would be revoked without revoking.")
+    rb.add_argument("--log-level", default="WARNING")
+    rb.set_defaults(func=cmd_revoke_batch)
+
+    # ca-init --shamir and ca-recover --shamir: user-friendly wrappers over
+    # the ceremony subcommands for the Shamir offline-root flow.
+    ci = sub.add_parser(
+        "ca-init",
+        help="Initialise (or re-export) the offline root CA bundle.",
+        description=(
+            "Wrapper around 'export-root' with Shamir splitting enabled. "
+            "Pass --shamir M-of-N to split the bundle passphrase into N shares, "
+            "any M of which reconstruct it."
+        ),
+    )
+    ci.add_argument("--ca-dir", default="./ca", metavar="DIR")
+    ci.add_argument("--out", required=True, metavar="BUNDLE.tar.gz.enc",
+                    help="Output path for the encrypted bundle.")
+    ci.add_argument("--shamir", metavar="M-of-N",
+                    help="Enable Shamir splitting, e.g. '3-of-5'.")
+    ci.add_argument("--passphrase-env", default=None, metavar="ENV_VAR",
+                    help="Read passphrase from environment variable (no Shamir).")
+    ci.add_argument("--log-level", default="INFO",
+                    choices=["DEBUG", "INFO", "WARNING", "ERROR"])
+    ci.set_defaults(func=cmd_ca_init)
+
+    cr = sub.add_parser(
+        "ca-recover",
+        help="Reconstruct offline root passphrase from Shamir shares.",
+        description=(
+            "Wrapper around 'sign-csr' that prompts for Shamir shares "
+            "and then issues a sub-CA certificate from the offline bundle."
+        ),
+    )
+    cr.add_argument("--bundle", required=True, metavar="BUNDLE.tar.gz.enc")
+    cr.add_argument("--csr-in", required=True, metavar="CSR.pem")
+    cr.add_argument("--cert-out", required=True, metavar="CERT.pem")
+    cr.add_argument("--shares", type=int, required=True, metavar="M",
+                    help="Number of Shamir shares to collect.")
+    cr.add_argument("--validity-days", type=int, default=1825, metavar="N")
+    cr.add_argument("--path-length", type=int, default=None, metavar="N")
+    cr.add_argument("--permitted-dns", nargs="+", default=[], metavar="DOMAIN")
+    cr.add_argument("--excluded-dns", nargs="+", default=[], metavar="DOMAIN")
+    cr.add_argument("--log-level", default="INFO",
+                    choices=["DEBUG", "INFO", "WARNING", "ERROR"])
+    cr.set_defaults(func=cmd_ca_recover)
+
     return root
 
 
@@ -1527,6 +1650,328 @@ def cmd_upgrade_rollback(args: argparse.Namespace) -> int:
     cfg = UpgradeConfig(target_version=target)
     rollback(cfg, "manual rollback via CLI")
     return 0
+
+
+# ---------------------------------------------------------------------------
+# Backup / DR subcommands
+# ---------------------------------------------------------------------------
+
+def _read_passphrase_file(path: Optional[str]) -> Optional[bytes]:
+    """Read passphrase from file, stripping trailing newline."""
+    if path is None:
+        return None
+    return Path(path).read_bytes().rstrip(b"\n")
+
+
+def _pki_db_for_ca_dir(ca_dir: str) -> "db.Database":
+    """Open the PKI DB for a given CA directory."""
+    from pathlib import Path as _P
+    url = f"sqlite:///{_P(ca_dir) / 'certificates.db'}"
+    return db.make_db(url)
+
+
+def _open_audit_for_ca_dir(ca_dir: str):
+    """Construct an AuditLog for a given CA directory."""
+    from pki_server import AuditLog
+    return AuditLog(Path(ca_dir))
+
+
+def cmd_backup_now(args: argparse.Namespace) -> int:
+    """Create a backup of the CA state immediately."""
+    _setup_logging(args.log_level)
+    log = logging.getLogger("pypki.backup-now")
+
+    try:
+        from backup import BackupConfig, BackupEngine
+    except ImportError:
+        print("ERROR: backup.py not found.")
+        return 1
+
+    ca_dir = Path(args.ca_dir)
+    if not ca_dir.is_dir():
+        print(f"ERROR: CA directory not found: {ca_dir}")
+        return 1
+
+    passphrase = _read_passphrase_file(getattr(args, "passphrase_file", None))
+    pki_db = _pki_db_for_ca_dir(args.ca_dir)
+
+    config = BackupConfig(
+        targets=(args.target,),
+        passphrase=passphrase,
+        retention_count=0,
+        retention_days=0,
+    )
+    engine = BackupEngine(ca_dir=ca_dir, db=pki_db, config=config)
+    try:
+        path = engine.create_backup()
+        print(f"Backup created: {path}")
+        return 0
+    except Exception as exc:
+        print(f"ERROR: Backup failed: {exc}")
+        log.exception("backup-now failed")
+        return 1
+
+
+def cmd_restore(args: argparse.Namespace) -> int:
+    """Restore a backup to a staging directory."""
+    _setup_logging(args.log_level)
+    log = logging.getLogger("pypki.restore")
+
+    try:
+        from restore import RestoreEngine
+    except ImportError:
+        print("ERROR: restore.py not found.")
+        return 1
+
+    backup_path = Path(args.from_path)
+    if not backup_path.is_file():
+        print(f"ERROR: Backup file not found: {backup_path}")
+        return 1
+
+    passphrase = _read_passphrase_file(getattr(args, "passphrase_file", None))
+
+    try:
+        pki_db = _pki_db_for_ca_dir(args.ca_dir)
+    except Exception:
+        pki_db = None
+
+    engine = RestoreEngine(db=pki_db)
+    result = engine.restore(
+        backup_path=backup_path,
+        dest_dir=Path(args.to_dir),
+        passphrase=passphrase,
+        dry_run=getattr(args, "dry_run", False),
+        db_only=getattr(args, "db_only", False),
+        keys_only=getattr(args, "keys_only", False),
+        tables=getattr(args, "tables", None),
+    )
+
+    if result.outcome == "ok":
+        if result.dry_run:
+            print("Dry run: backup verified successfully (no files written)")
+        else:
+            print(f"Restore successful: {len(result.files_restored)} file(s) staged to {args.to_dir}")
+            for f in result.files_restored:
+                print(f"  {f}")
+        return 0
+    else:
+        print(f"ERROR: Restore failed: {result.error}")
+        return 1
+
+
+def cmd_emergency_stop(args: argparse.Namespace) -> int:
+    """Halt all certificate issuance immediately."""
+    import getpass as _getpass
+    _setup_logging(args.log_level)
+
+    ca_dir = Path(args.ca_dir)
+    operator = getattr(args, "by", None) or _getpass.getuser()
+    reason = args.reason
+    now = __import__("datetime").datetime.now(__import__("datetime").timezone.utc).isoformat()
+
+    pki_db = _pki_db_for_ca_dir(args.ca_dir)
+    try:
+        pki_db.execute(
+            "UPDATE emergency_state SET halted=1, halt_reason=?, halted_at=?, halted_by=? "
+            "WHERE state='global'",
+            (reason, now, operator),
+        )
+    except Exception as exc:
+        print(f"ERROR: Could not update emergency_state: {exc}")
+        print("Hint: run 'pypki_admin.py db-init --ca-dir ...' to apply migration 006_dr.sql")
+        return 1
+
+    # Audit
+    try:
+        audit = _open_audit_for_ca_dir(args.ca_dir)
+        audit.record(
+            "emergency_stop",
+            f"halted by={operator!r} reason={reason!r}",
+        )
+        audit.close()
+    except Exception as exc:
+        logging.warning(f"Could not write audit log: {exc}")
+
+    print(f"Emergency stop activated. Reason: {reason}")
+    print("Issuance is now blocked. Running server will refuse new certs on next request.")
+    print("To re-enable: pypki_admin.py emergency-resume --ca-dir <dir>")
+    return 0
+
+
+def cmd_emergency_resume(args: argparse.Namespace) -> int:
+    """Clear emergency halt and re-enable issuance."""
+    import getpass as _getpass
+    _setup_logging(args.log_level)
+
+    operator = getattr(args, "by", None) or _getpass.getuser()
+    now = __import__("datetime").datetime.now(__import__("datetime").timezone.utc).isoformat()
+
+    pki_db = _pki_db_for_ca_dir(args.ca_dir)
+    try:
+        pki_db.execute(
+            "UPDATE emergency_state SET halted=0, halt_reason=NULL, halted_at=NULL, halted_by=NULL "
+            "WHERE state='global'",
+        )
+    except Exception as exc:
+        print(f"ERROR: Could not update emergency_state: {exc}")
+        return 1
+
+    try:
+        audit = _open_audit_for_ca_dir(args.ca_dir)
+        audit.record(
+            "emergency_resume",
+            f"resumed by={operator!r}",
+        )
+        audit.close()
+    except Exception as exc:
+        logging.warning(f"Could not write audit log: {exc}")
+
+    print("Emergency stop cleared. Issuance is now re-enabled.")
+    return 0
+
+
+def cmd_revoke_batch(args: argparse.Namespace) -> int:
+    """Mass-revoke certificates from a serial number list."""
+    _setup_logging(args.log_level)
+    log = logging.getLogger("pypki.revoke-batch")
+
+    try:
+        from pki_server import CertificateAuthority, ServerConfig, AuditLog
+    except ImportError:
+        print("ERROR: pki_server.py not found.")
+        return 1
+
+    ca_dir = Path(args.ca_dir)
+    serial_file = Path(args.serial_file)
+    if not serial_file.is_file():
+        print(f"ERROR: serial file not found: {serial_file}")
+        return 1
+
+    # Parse serials: one per line, hex (0x…) or decimal
+    serials: list[int] = []
+    for line in serial_file.read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        try:
+            serials.append(int(line, 16) if line.startswith("0x") or
+                           any(c in "abcdefABCDEF" for c in line) else int(line))
+        except ValueError:
+            print(f"WARNING: Could not parse serial {line!r} — skipping")
+
+    if not serials:
+        print("No valid serials found in file.")
+        return 1
+
+    if args.dry_run:
+        print(f"Dry run: would revoke {len(serials)} certificate(s):")
+        for s in serials:
+            print(f"  {s} (0x{s:X})")
+        return 0
+
+    # RFC 5280 §5.3.1 reason codes
+    _REASON_CODES: dict[str, int] = {
+        "unspecified": 0,
+        "key_compromise": 1,
+        "ca_compromise": 2,
+        "affiliation_changed": 3,
+        "superseded": 4,
+        "cessation_of_operation": 5,
+        "certificate_hold": 6,
+        "remove_from_crl": 8,
+        "privilege_withdrawn": 9,
+        "aa_compromise": 10,
+    }
+    reason_int = _REASON_CODES.get(args.reason, 0)
+
+    config = ServerConfig(ca_dir=ca_dir)
+    ca = CertificateAuthority(ca_dir=str(ca_dir), config=config)
+    audit = AuditLog(ca_dir)
+
+    revoked = 0
+    failed = 0
+    for serial in serials:
+        try:
+            ca.revoke_certificate(serial, reason=reason_int)
+            audit.record(
+                "revoke",
+                f"serial={serial} reason={args.reason}",
+            )
+            revoked += 1
+        except Exception as exc:
+            log.warning(f"Failed to revoke serial {serial}: {exc}")
+            failed += 1
+
+    audit.close()
+    print(f"Revoked {revoked} certificate(s); {failed} failure(s).")
+    return 0 if failed == 0 else 1
+
+
+def cmd_ca_init(args: argparse.Namespace) -> int:
+    """Initialise (or re-export) the offline root CA bundle, optionally with Shamir."""
+    _setup_logging(args.log_level)
+
+    # Parse --shamir M-of-N if given
+    shamir = getattr(args, "shamir", None)
+    threshold = 0
+    shares = 0
+    if shamir:
+        try:
+            m_str, n_str = shamir.split("-of-")
+            threshold = int(m_str)
+            shares = int(n_str)
+        except (ValueError, AttributeError):
+            print(f"ERROR: --shamir must be in 'M-of-N' format (e.g. '3-of-5'), got: {shamir!r}")
+            return 1
+        if threshold < 2:
+            print("ERROR: Shamir threshold must be ≥ 2")
+            return 1
+        if shares < threshold:
+            print("ERROR: Total shares must be ≥ threshold")
+            return 1
+
+    # Build a compatible namespace for the ceremony command
+    import argparse as _ap
+    ceremony_args = _ap.Namespace(
+        ca_dir=args.ca_dir,
+        out=args.out,
+        passphrase_env=getattr(args, "passphrase_env", None),
+        threshold=threshold,
+        shares=shares,
+        log_level=args.log_level,
+    )
+    return _ceremony_cmd("export_root")(ceremony_args)
+
+
+def cmd_ca_recover(args: argparse.Namespace) -> int:
+    """Collect M Shamir shares interactively and issue a sub-CA cert from the bundle."""
+    _setup_logging(args.log_level)
+
+    n_shares = args.shares
+    print(f"Collecting {n_shares} Shamir share(s). Paste each share and press Enter.")
+    collected: list[str] = []
+    for i in range(1, n_shares + 1):
+        while True:
+            share = input(f"  Share {i}/{n_shares}: ").strip()
+            if share:
+                collected.append(share)
+                break
+            print("  (empty — please paste the share)")
+
+    import argparse as _ap
+    ceremony_args = _ap.Namespace(
+        bundle=args.bundle,
+        csr_in=args.csr_in,
+        cert_out=args.cert_out,
+        passphrase_env=None,
+        share=collected,
+        validity_days=args.validity_days,
+        path_length=args.path_length,
+        permitted_dns=args.permitted_dns,
+        excluded_dns=args.excluded_dns,
+        log_level=args.log_level,
+    )
+    return _ceremony_cmd("sign_csr")(ceremony_args)
 
 
 def main(argv: Optional[List[str]] = None) -> int:

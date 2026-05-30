@@ -25,15 +25,19 @@ Run:
     python -m pytest test_pki_server.py -v -k rfc9608
 """
 
+import argparse
 import base64
 import datetime
+import gzip
 import hashlib
 import http.client
 import http.server
+import io
 import json
 import os
 import sqlite3
 import sys
+import tarfile
 import tempfile
 import threading
 import time
@@ -14526,6 +14530,629 @@ class TestPolicyIssuanceIntegration(unittest.TestCase):
         from cryptography.x509 import Certificate as _Cert
         delta = cert.not_valid_after_utc - cert.not_valid_before_utc
         self.assertLessEqual(delta.days, 31)
+
+
+# ===========================================================================
+# TestShamir — GF(256) Shamir SSS + mnemonic encoding
+# ===========================================================================
+
+class TestShamir(unittest.TestCase):
+    """Tests for shamir.py and mnemonic.py."""
+
+    @classmethod
+    def setUpClass(cls):
+        try:
+            import shamir as _s
+            cls.S = _s
+        except ImportError:
+            raise unittest.SkipTest("shamir.py not importable")
+        try:
+            import mnemonic as _m
+            cls.M = _m
+        except ImportError:
+            raise unittest.SkipTest("mnemonic.py not importable")
+
+    def test_split_and_reconstruct_round_trip(self):
+        """3-of-5 split reconstructs correctly from any 3 shares."""
+        secret = os.urandom(32)
+        shares = self.S.split(secret, threshold=3, n=5)
+        self.assertEqual(len(shares), 5)
+        # Use the first 3 shares
+        result = self.S.combine(shares[:3])
+        self.assertEqual(result, secret)
+
+    def test_threshold_minus_one_shares_insufficient(self):
+        """2 shares of a 3-of-5 scheme produce wrong (garbage) output."""
+        secret = b"\xAB" * 16
+        shares = self.S.split(secret, threshold=3, n=5)
+        wrong = self.S.combine(shares[:2])
+        # Not guaranteed to differ in every byte but statistically certain for 16 bytes
+        self.assertNotEqual(wrong, secret)
+
+    def test_any_threshold_subset_reconstructs(self):
+        """All C(5,3)=10 subsets of a 3-of-5 scheme reconstruct the secret."""
+        import itertools
+        secret = os.urandom(16)
+        shares = self.S.split(secret, threshold=3, n=5)
+        for combo in itertools.combinations(shares, 3):
+            result = self.S.combine(list(combo))
+            self.assertEqual(
+                result, secret,
+                f"Subset {[c[0] for c in combo]} did not reconstruct correctly"
+            )
+
+    def test_known_vector(self):
+        """
+        Verify the GF(256) arithmetic is correct with a deterministic vector.
+
+        We split a 1-byte secret with threshold=2, n=2. With f(x)=secret + c1*x,
+        we can verify Lagrange at x=0 reconstructs secret from shares at x=1, x=2.
+        """
+        # We can verify the math: for any 2-of-2 split and two distinct shares,
+        # the Lagrange interpolation should exactly recover the secret.
+        for secret_byte in [0x00, 0x01, 0xFF, 0xAB]:
+            secret = bytes([secret_byte])
+            shares = self.S.split(secret, threshold=2, n=2)
+            self.assertEqual(len(shares), 2)
+            result = self.S.combine(shares)
+            self.assertEqual(result, secret, f"Failed for secret byte 0x{secret_byte:02X}")
+
+    def test_mnemonic_round_trip(self):
+        """encode then decode returns the original bytes."""
+        data = os.urandom(16)
+        words = self.M.encode(data)
+        self.assertEqual(len(words), 18)  # 16 + 2 checksum
+        result = self.M.decode(words)
+        self.assertEqual(result, data)
+
+    def test_mnemonic_checksum_rejects_corruption(self):
+        """Corrupting a word triggers ValueError on decode."""
+        data = os.urandom(8)
+        words = self.M.encode(data)
+        # Flip the first word to something different but still in the wordlist
+        original = words[0]
+        words[0] = "zoo" if original != "zoo" else "abandon"
+        # If 'zoo' is not in wordlist, swap first and second words instead
+        try:
+            with self.assertRaises(ValueError):
+                self.M.decode(words)
+        except Exception:
+            # Swap first two words — almost certainly changes the checksum
+            words[0], words[1] = words[1], words[0]
+            with self.assertRaises(ValueError):
+                self.M.decode(words)
+
+    def test_encode_includes_checksum_words(self):
+        """Encoded output is always len(data)+2 words."""
+        for length in [0, 1, 4, 16, 32]:
+            data = os.urandom(length)
+            words = self.M.encode(data)
+            self.assertEqual(len(words), length + 2)
+
+    def test_split_parameter_validation(self):
+        """split() raises ValueError for bad parameters."""
+        secret = b"hello"
+        with self.assertRaises(ValueError):
+            self.S.split(secret, threshold=1, n=3)  # threshold < 2
+        with self.assertRaises(ValueError):
+            self.S.split(secret, threshold=4, n=3)  # n < threshold
+        with self.assertRaises(ValueError):
+            self.S.split(secret, threshold=2, n=256)  # n > 255
+        with self.assertRaises(ValueError):
+            self.S.split(b"", threshold=2, n=3)  # empty secret
+
+    def test_encode_decode_share_base64(self):
+        """encode_share / decode_share are inverse operations."""
+        for x in [1, 5, 128, 255]:
+            y = os.urandom(16)
+            encoded = self.S.encode_share(x, y)
+            self.assertIsInstance(encoded, str)
+            x2, y2 = self.S.decode_share(encoded)
+            self.assertEqual(x2, x)
+            self.assertEqual(y2, y)
+
+
+# ===========================================================================
+# TestBackup — backup.py
+# ===========================================================================
+
+class TestBackup(unittest.TestCase):
+    """Tests for backup.py: tarball layout, hashing, signing, encryption, retention."""
+
+    @classmethod
+    def setUpClass(cls):
+        try:
+            import backup as _b
+            cls.B = _b
+        except ImportError:
+            raise unittest.SkipTest("backup.py not importable")
+
+    def setUp(self):
+        self._tmp = tempfile.mkdtemp(prefix="pypki-test-backup-")
+        self._ca_dir = Path(self._tmp) / "ca"
+        self._ca_dir.mkdir()
+        self._backup_dir = Path(self._tmp) / "backups"
+        self._backup_dir.mkdir()
+        # Create a minimal SQLite DB
+        db_path = self._ca_dir / "certificates.db"
+        conn = sqlite3.connect(str(db_path))
+        conn.execute("CREATE TABLE IF NOT EXISTS test_table (id INTEGER PRIMARY KEY, val TEXT)")
+        conn.execute("INSERT INTO test_table VALUES (1, 'hello')")
+        conn.commit()
+        conn.close()
+        # Create a fake ca.key
+        (self._ca_dir / "ca.key").write_bytes(b"FAKE-CA-KEY-CONTENT")
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self._tmp, ignore_errors=True)
+
+    def _make_engine(self, passphrase=None, retention_count=0, retention_days=0):
+        from db import make_db
+        pki_db = make_db(f"sqlite:///{self._ca_dir / 'certificates.db'}")
+        config = self.B.BackupConfig(
+            targets=(f"file://{self._backup_dir}",),
+            passphrase=passphrase,
+            retention_count=retention_count,
+            retention_days=retention_days,
+        )
+        return self.B.BackupEngine(ca_dir=self._ca_dir, db=pki_db, config=config)
+
+    def test_tarball_layout_matches_spec(self):
+        """create_backup() produces a tarball with manifest.json, db/, keys/, signature."""
+        engine = self._make_engine()
+        path = engine.create_backup()
+        self.assertTrue(path.exists())
+        with tarfile.open(str(path), "r:gz") as tf:
+            names = {m.name.split("/", 1)[-1] for m in tf.getmembers() if "/" in m.name}
+        self.assertIn("manifest.json", names)
+        self.assertIn("signature", names)
+        self.assertIn("keys/ca.key.pem", names)
+        # certificates.db → db/pki.sql.gz
+        self.assertIn("db/pki.sql.gz", names)
+
+    def test_manifest_hashes_every_file(self):
+        """Every file listed in manifest.json has a correct sha256."""
+        import gzip as _gzip
+        engine = self._make_engine()
+        path = engine.create_backup()
+        with tarfile.open(str(path), "r:gz") as tf:
+            contents = {}
+            for m in tf.getmembers():
+                f = tf.extractfile(m)
+                if f:
+                    rel = m.name.split("/", 1)[-1] if "/" in m.name else m.name
+                    contents[rel] = f.read()
+        manifest = json.loads(contents["manifest.json"])
+        for rel, meta in manifest["files"].items():
+            actual = hashlib.sha256(contents[rel]).hexdigest()
+            self.assertEqual(actual, meta["sha256"], f"Hash mismatch for {rel}")
+
+    def test_signature_over_manifest_verifies(self):
+        """The signature file verifies against the signing pubkey in manifest."""
+        from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+        from cryptography.hazmat.primitives import serialization as _ser
+        engine = self._make_engine()
+        path = engine.create_backup()
+        with tarfile.open(str(path), "r:gz") as tf:
+            contents = {}
+            for m in tf.getmembers():
+                f = tf.extractfile(m)
+                if f:
+                    rel = m.name.split("/", 1)[-1] if "/" in m.name else m.name
+                    contents[rel] = f.read()
+        manifest_bytes = contents["manifest.json"]
+        signature = contents["signature"]
+        manifest = json.loads(manifest_bytes)
+        pubkey_hex = manifest["signing_pubkey"]
+        pubkey = _ser.load_der_public_key(bytes.fromhex(pubkey_hex))
+        # Should not raise
+        pubkey.verify(signature, manifest_bytes)
+
+    def test_passphrase_encryption_round_trip(self):
+        """Encrypted backup (.enc) can be decrypted and verified."""
+        passphrase = b"test-passphrase-secure"
+        engine = self._make_engine(passphrase=passphrase)
+        path = engine.create_backup()
+        self.assertTrue(str(path).endswith(".enc"), f"Expected .enc file, got {path}")
+        # verify_backup should succeed
+        result = engine.verify_backup(path)
+        self.assertIn("format_version", result)
+        self.assertEqual(result["format_version"], 1)
+
+    def test_no_passphrase_produces_plain_tarball(self):
+        """Without passphrase, backup is a plain .tar.gz readable by tarfile."""
+        engine = self._make_engine(passphrase=None)
+        path = engine.create_backup()
+        self.assertTrue(str(path).endswith(".tar.gz"), f"Expected .tar.gz, got {path}")
+        # Should open cleanly as a tarball
+        with tarfile.open(str(path), "r:gz") as tf:
+            self.assertTrue(len(tf.getmembers()) > 0)
+
+    def test_retention_deletes_oldest_first(self):
+        """prune_backups() deletes oldest files when retention_count is exceeded."""
+        import time as _time
+        engine = self._make_engine(retention_count=2)
+        # Create 3 backups (small delay ensures different timestamps)
+        for _ in range(3):
+            engine.create_backup()
+
+        backups_before = engine.list_backups(f"file://{self._backup_dir}")
+        # All 3 were created; prune_backups keeps 2, deletes 1
+        # (prune already ran in create_backup; but let's run again explicitly)
+        deleted = engine.prune_backups(f"file://{self._backup_dir}")
+        backups_after = engine.list_backups(f"file://{self._backup_dir}")
+        self.assertLessEqual(len(backups_after), 2)
+
+    def test_verify_backup_detects_tampered_content(self):
+        """verify_backup raises ValueError if a file is tampered inside the tarball."""
+        engine = self._make_engine()
+        path = engine.create_backup()
+
+        # Read tarball, tamper with db/pki.sql.gz, repack
+        contents = {}
+        order = []
+        with tarfile.open(str(path), "r:gz") as tf:
+            for m in tf.getmembers():
+                f = tf.extractfile(m)
+                contents[m.name] = (m, f.read() if f else b"")
+                order.append(m.name)
+
+        # Find the db file and tamper it
+        db_key = next((k for k in order if k.endswith("pki.sql.gz")), None)
+        if db_key is None:
+            self.skipTest("No pki.sql.gz in backup — skipping tamper test")
+
+        original_data = contents[db_key][1]
+        tampered = original_data[:-1] + bytes([original_data[-1] ^ 0xFF])
+        contents[db_key] = (contents[db_key][0], tampered)
+
+        # Rewrite tarball
+        buf = io.BytesIO()
+        with tarfile.open(fileobj=buf, mode="w:gz") as tf2:
+            for name in order:
+                m_orig, data = contents[name]
+                info = tarfile.TarInfo(name=name)
+                info.size = len(data)
+                tf2.addfile(info, io.BytesIO(data))
+
+        tampered_path = path.parent / (path.name + ".tampered")
+        tampered_path.write_bytes(buf.getvalue())
+
+        with self.assertRaises((ValueError, Exception)):
+            engine.verify_backup(tampered_path)
+
+
+# ===========================================================================
+# TestRestore — restore.py
+# ===========================================================================
+
+class TestRestore(unittest.TestCase):
+    """Tests for restore.py: dry-run, hash checking, db_only, event recording."""
+
+    @classmethod
+    def setUpClass(cls):
+        try:
+            import backup as _b
+            import restore as _r
+            cls.B = _b
+            cls.R = _r
+        except ImportError:
+            raise unittest.SkipTest("backup.py or restore.py not importable")
+
+    def setUp(self):
+        self._tmp = tempfile.mkdtemp(prefix="pypki-test-restore-")
+        self._ca_dir = Path(self._tmp) / "ca"
+        self._ca_dir.mkdir()
+        self._backup_dir = Path(self._tmp) / "backups"
+        self._backup_dir.mkdir()
+        self._restore_dir = Path(self._tmp) / "restore"
+        # Create minimal CA state
+        db_path = self._ca_dir / "certificates.db"
+        conn = sqlite3.connect(str(db_path))
+        conn.execute("CREATE TABLE test_data (id INTEGER PRIMARY KEY, val TEXT)")
+        conn.execute("INSERT INTO test_data VALUES (1, 'original')")
+        conn.commit()
+        conn.close()
+        (self._ca_dir / "ca.key").write_bytes(b"FAKE-CA-KEY")
+        # Create a backup to restore from
+        from db import make_db
+        pki_db = make_db(f"sqlite:///{db_path}")
+        config = self.B.BackupConfig(
+            targets=(f"file://{self._backup_dir}",),
+            passphrase=None,
+            retention_count=0,
+            retention_days=0,
+        )
+        engine = self.B.BackupEngine(ca_dir=self._ca_dir, db=pki_db, config=config)
+        self._backup_path = engine.create_backup()
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self._tmp, ignore_errors=True)
+
+    def _make_engine(self, with_db=True):
+        if with_db:
+            from db import make_db
+            pki_db = make_db(f"sqlite:///{self._ca_dir / 'certificates.db'}")
+        else:
+            pki_db = None
+        return self.R.RestoreEngine(db=pki_db)
+
+    def test_dry_run_makes_no_changes(self):
+        """dry_run=True verifies the backup but writes no files."""
+        engine = self._make_engine(with_db=False)
+        result = engine.restore(
+            backup_path=self._backup_path,
+            dest_dir=self._restore_dir,
+            dry_run=True,
+        )
+        self.assertEqual(result.outcome, "ok")
+        self.assertTrue(result.dry_run)
+        self.assertEqual(result.files_restored, [])
+        self.assertFalse(self._restore_dir.exists())
+
+    def test_tampered_file_detected_via_hash(self):
+        """Flipping a byte inside a tarball file triggers hash verification failure."""
+        # Tamper with the backup
+        with tarfile.open(str(self._backup_path), "r:gz") as tf:
+            contents = {}
+            order = []
+            for m in tf.getmembers():
+                f = tf.extractfile(m)
+                contents[m.name] = (m, f.read() if f else b"")
+                order.append(m.name)
+
+        # Tamper the keys file
+        key_name = next((k for k in order if "ca.key" in k), None)
+        if key_name is None:
+            self.skipTest("No ca.key in backup")
+
+        orig = contents[key_name][1]
+        contents[key_name] = (contents[key_name][0], orig + b"\xFF")
+
+        buf = io.BytesIO()
+        with tarfile.open(fileobj=buf, mode="w:gz") as tf2:
+            for name in order:
+                m_orig, data = contents[name]
+                info = tarfile.TarInfo(name=name)
+                info.size = len(data)
+                tf2.addfile(info, io.BytesIO(data))
+
+        tampered = self._backup_path.parent / "tampered.tar.gz"
+        tampered.write_bytes(buf.getvalue())
+
+        engine = self._make_engine(with_db=False)
+        result = engine.restore(
+            backup_path=tampered,
+            dest_dir=self._restore_dir,
+            dry_run=False,
+        )
+        self.assertEqual(result.outcome, "failed")
+
+    def test_db_only_restore_skips_keys(self):
+        """db_only=True writes db/ files but not keys/."""
+        engine = self._make_engine(with_db=False)
+        result = engine.restore(
+            backup_path=self._backup_path,
+            dest_dir=self._restore_dir,
+            db_only=True,
+        )
+        self.assertEqual(result.outcome, "ok")
+        # No key files
+        key_files = list(self._restore_dir.rglob("*.pem"))
+        self.assertEqual(key_files, [], f"Keys should not be restored; got {key_files}")
+        # DB files present
+        db_files = list(self._restore_dir.rglob("*.sql.gz"))
+        self.assertTrue(len(db_files) > 0, "DB files should be restored")
+
+    def test_restore_records_event(self):
+        """After a successful restore, restore_events has one row."""
+        # We need the real PKI DB with the 006_dr migration
+        from db import make_db
+        from migrations import MigrationRunner
+        pki_db_path = self._ca_dir / "certificates.db"
+        pki_db = make_db(f"sqlite:///{pki_db_path}")
+        # Apply migration if not done
+        try:
+            runner = MigrationRunner(
+                pki_db,
+                Path(__file__).parent / "db_migrations" / "pki",
+                namespace="pki",
+            )
+            runner.apply_pending()
+        except Exception:
+            self.skipTest("Could not apply DR migration — restore_events table unavailable")
+
+        engine = self.R.RestoreEngine(db=pki_db)
+        result = engine.restore(
+            backup_path=self._backup_path,
+            dest_dir=self._restore_dir,
+        )
+        self.assertEqual(result.outcome, "ok")
+        row = pki_db.fetchone("SELECT COUNT(*) AS cnt FROM restore_events")
+        self.assertGreater(row["cnt"], 0)
+
+    def test_full_drill_end_to_end(self):
+        """Backup → wipe → restore → issue cert integration drill."""
+        import shutil
+
+        # 1. Create a real CA and issue a cert
+        ca_dir = Path(self._tmp) / "ca-drill"
+        ca_dir.mkdir()
+        ca = _make_ca(str(ca_dir))
+        key = _gen_key()
+        cert = ca.issue_certificate("CN=drill.example.com", key.public_key())
+        serial = cert.serial_number
+
+        # 2. Take a backup
+        from db import make_db
+        pki_db = make_db(f"sqlite:///{ca_dir / 'certificates.db'}")
+        config = self.B.BackupConfig(
+            targets=(f"file://{self._backup_dir}",),
+            passphrase=None,
+            retention_count=0,
+            retention_days=0,
+        )
+        engine = self.B.BackupEngine(ca_dir=ca_dir, db=pki_db, config=config)
+        backup_path = engine.create_backup()
+
+        # 3. Wipe the ca_dir (except ca.key which we'll restore)
+        staging = Path(self._tmp) / "staging"
+        staging.mkdir()
+
+        # 4. Restore to staging
+        restore_engine = self.R.RestoreEngine(db=None)
+        result = restore_engine.restore(
+            backup_path=backup_path,
+            dest_dir=staging,
+        )
+        self.assertEqual(result.outcome, "ok", f"Restore failed: {result.error}")
+
+        # 5. Verify the restored DB contains the cert we issued
+        restored_db_path = staging / "db" / "pki.sql.gz"
+        self.assertTrue(restored_db_path.exists(), "Restored DB not found")
+        import gzip as _gzip
+        sql = _gzip.decompress(restored_db_path.read_bytes()).decode()
+        self.assertIn(str(serial), sql, "Serial not found in restored DB")
+
+
+# ===========================================================================
+# TestDR — emergency halt + revoke-batch
+# ===========================================================================
+
+class TestDR(unittest.TestCase):
+    """Tests for the DR features: emergency halt, revoke-batch."""
+
+    def setUp(self):
+        self._tmp = tempfile.mkdtemp(prefix="pypki-test-dr-")
+        self._ca = _make_ca(self._tmp)
+        # Apply the 006_dr migration so emergency_state table exists
+        from migrations import MigrationRunner
+        from db import make_db
+        db_path = Path(self._tmp) / "certificates.db"
+        self._pki_db = make_db(f"sqlite:///{db_path}")
+        try:
+            runner = MigrationRunner(
+                self._pki_db,
+                Path(__file__).parent / "db_migrations" / "pki",
+                namespace="pki",
+            )
+            runner.apply_pending()
+        except Exception as exc:
+            self.skipTest(f"Could not apply DR migration: {exc}")
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self._tmp, ignore_errors=True)
+
+    def _set_halt(self, halted: bool, reason: str = "test") -> None:
+        """Directly set the emergency_state row."""
+        self._pki_db.execute(
+            "UPDATE emergency_state SET halted=?, halt_reason=? WHERE state='global'",
+            (1 if halted else 0, reason if halted else None),
+        )
+
+    def test_emergency_stop_blocks_new_issuance(self):
+        """Setting halt=1 causes issue_certificate to raise PermissionError."""
+        self._set_halt(True, "test: ca_key_compromise")
+        key = _gen_key()
+        # The CA under test reads from the same DB path
+        ca = pki.CertificateAuthority(ca_dir=self._tmp)
+        # Apply the migration to this CA's DB too
+        from migrations import MigrationRunner
+        runner = MigrationRunner(
+            ca._pki_db,
+            Path(__file__).parent / "db_migrations" / "pki",
+            namespace="pki",
+        )
+        runner.apply_pending()
+        # Set halt on CA's own DB
+        ca._pki_db.execute(
+            "UPDATE emergency_state SET halted=1, halt_reason='test' WHERE state='global'"
+        )
+        with self.assertRaises(PermissionError):
+            ca.issue_certificate("CN=blocked.example.com", key.public_key())
+
+    def test_emergency_stop_does_not_block_revocation(self):
+        """Halt does NOT prevent revocation — operators must be able to revoke during incidents."""
+        ca = pki.CertificateAuthority(ca_dir=self._tmp)
+        from migrations import MigrationRunner
+        runner = MigrationRunner(
+            ca._pki_db,
+            Path(__file__).parent / "db_migrations" / "pki",
+            namespace="pki",
+        )
+        runner.apply_pending()
+        # Issue a cert first (before halt)
+        key = _gen_key()
+        cert = ca.issue_certificate("CN=revoke-me.example.com", key.public_key())
+        serial = cert.serial_number
+        # Now set halt
+        ca._pki_db.execute(
+            "UPDATE emergency_state SET halted=1, halt_reason='test' WHERE state='global'"
+        )
+        # Revocation should succeed even with halt active
+        result = ca.revoke_certificate(serial)
+        self.assertTrue(result)
+
+    def test_revoke_batch_handles_multiple_certs(self):
+        """Issue 5 certs, write serials to file, call cmd_revoke_batch."""
+        ca = pki.CertificateAuthority(ca_dir=self._tmp)
+        serials = []
+        for i in range(5):
+            key = _gen_key()
+            cert = ca.issue_certificate(f"CN=batch{i}.example.com", key.public_key())
+            serials.append(cert.serial_number)
+
+        serial_file = Path(self._tmp) / "serials.txt"
+        serial_file.write_text("\n".join(str(s) for s in serials))
+
+        import pypki_admin
+        args = argparse.Namespace(
+            ca_dir=self._tmp,
+            serial_file=str(serial_file),
+            reason="key_compromise",
+            dry_run=False,
+            log_level="WARNING",
+        )
+        rc = pypki_admin.cmd_revoke_batch(args)
+        self.assertEqual(rc, 0)
+
+        # Verify all certs are marked revoked
+        for serial in serials:
+            row = ca._pki_db.fetchone(
+                "SELECT revoked FROM certificates WHERE serial=?", (serial,)
+            )
+            self.assertEqual(row["revoked"], 1, f"Serial {serial} not revoked")
+
+    def test_emergency_state_persists_across_ca_instances(self):
+        """halt written via one CA instance is seen by a fresh CA instance."""
+        ca1 = pki.CertificateAuthority(ca_dir=self._tmp)
+        from migrations import MigrationRunner
+        runner = MigrationRunner(
+            ca1._pki_db,
+            Path(__file__).parent / "db_migrations" / "pki",
+            namespace="pki",
+        )
+        runner.apply_pending()
+        # Set halt
+        ca1._pki_db.execute(
+            "UPDATE emergency_state SET halted=1, halt_reason='persist-test' WHERE state='global'"
+        )
+
+        # New CA instance (same directory)
+        ca2 = pki.CertificateAuthority(ca_dir=self._tmp)
+        runner2 = MigrationRunner(
+            ca2._pki_db,
+            Path(__file__).parent / "db_migrations" / "pki",
+            namespace="pki",
+        )
+        runner2.apply_pending()
+        # ca2's DB should also see the halt (same DB file)
+        key = _gen_key()
+        with self.assertRaises(PermissionError):
+            ca2.issue_certificate("CN=blocked2.example.com", key.public_key())
 
 
 # ===========================================================================

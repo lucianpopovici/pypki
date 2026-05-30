@@ -399,6 +399,19 @@
       <span class="dot" style="background:#a855f7"></span> PAM Authentication
     </a>
   </div>
+
+  <div class="sidebar-group">
+    <div class="sidebar-group-label">Backup / DR</div>
+    <a class="sidebar-link" onclick="show('dr-backup')">
+      <span class="dot" style="background:#f59e0b"></span> Backup Creation
+    </a>
+    <a class="sidebar-link" onclick="show('dr-restore')">
+      <span class="dot" style="background:#f59e0b"></span> Restore &amp; Verify
+    </a>
+    <a class="sidebar-link" onclick="show('dr-shamir')">
+      <span class="dot" style="background:#ef4444"></span> Shamir Ceremony
+    </a>
+  </div>
 </nav>
 
 <!-- ═══════════════════════════ MAIN ═══════════════════════════ -->
@@ -2177,6 +2190,198 @@ sequenceDiagram
         </ul>
         <div class="note-box">
           Sessions are stored in memory only — they are cleared on process restart. Use <code>--web-pam-service pypki</code> with a custom <code>/etc/pam.d/pypki</code> to restrict access to a specific Unix group.
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ▸▸▸ DR — BACKUP CREATION ◂◂◂ -->
+<div id="sec-dr-backup" class="section-wrapper">
+  <div class="page-header">
+    <h2>Backup — Creation Flow</h2>
+    <p>Encrypted, integrity-verified snapshot of CA state. Each backup is a gzip tarball
+    containing DB dumps, CA key, config, and an audit seal, signed with an Ed25519 key
+    and optionally encrypted with AES-256-GCM + scrypt.</p>
+    <span class="rfc-tag">AES-256-GCM</span>
+    <span class="rfc-tag">scrypt N=2¹⁷</span>
+    <span class="rfc-tag">Ed25519 signature</span>
+  </div>
+  <div class="section-wrapper active">
+    <div class="flow-card">
+      <div class="flow-card-head">
+        <h3>backup-now: snapshot → sign → encrypt → upload</h3>
+        <span class="op-badge" style="background:#f59e0b;color:#0d1526">BACKUP</span>
+      </div>
+      <div class="flow-diagram">
+        <div class="mermaid">
+sequenceDiagram
+    autonumber
+    participant OP as Operator / Cron
+    participant BE as BackupEngine
+    participant DB as SQLite DB(s)
+    participant FS as File Target
+
+    OP->>BE: backup-now --ca-dir --target file://...
+    BE->>DB: iterdump() each logical DB
+    DB-->>BE: SQL text per DB
+    Note over BE: gzip-compress each dump
+
+    BE->>BE: collect ca.key, config.yaml, audit-seal
+    BE->>BE: build manifest.json with sha256 per file
+    BE->>BE: Ed25519.sign(manifest_bytes)
+
+    alt passphrase configured
+        BE->>BE: scrypt(passphrase, salt) → 32-byte key
+        BE->>BE: AESGCM(key).encrypt(tarball)
+        Note over BE: output: .tar.gz.enc
+    else no passphrase
+        Note over BE: output: .tar.gz
+    end
+
+    BE->>FS: write pypki-backup-&lt;ts&gt;.tar.gz[.enc]
+    FS-->>BE: path written
+    BE->>DB: INSERT INTO backups (status='success', …)
+    BE->>BE: prune_backups() per retention policy
+    BE-->>OP: Path to backup file
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ▸▸▸ DR — RESTORE ◂◂◂ -->
+<div id="sec-dr-restore" class="section-wrapper">
+  <div class="page-header">
+    <h2>Restore — Verify and Stage</h2>
+    <p>Restore never overwrites the live CA directory. The operator stages the restored
+    content to a separate directory and promotes it manually after verifying the
+    audit chain.</p>
+    <span class="rfc-tag">Ed25519 verify</span>
+    <span class="rfc-tag">SHA-256 per file</span>
+    <span class="rfc-tag">Selective table restore</span>
+  </div>
+  <div class="section-wrapper active">
+    <div class="flow-card">
+      <div class="flow-card-head">
+        <h3>restore: decrypt → verify → stage (or dry-run)</h3>
+        <span class="op-badge" style="background:#10b981;color:#0d1526">RESTORE</span>
+      </div>
+      <div class="flow-diagram">
+        <div class="mermaid">
+sequenceDiagram
+    autonumber
+    participant OP as Operator
+    participant RE as RestoreEngine
+    participant FS as Staging Dir
+
+    OP->>RE: restore --from backup.tar.gz[.enc] --to /staging [--dry-run]
+
+    alt encrypted (.enc)
+        RE->>RE: scrypt(passphrase, salt) → key
+        RE->>RE: AESGCM.decrypt(ciphertext) → tarball
+    end
+
+    RE->>RE: open tarball; extract all members
+    RE->>RE: parse manifest.json
+    RE->>RE: Ed25519.verify(signature, manifest_bytes)
+    Note over RE: raises if tampered
+
+    loop each file in manifest
+        RE->>RE: sha256(file_bytes) == manifest.files[name].sha256
+        Note over RE: raises on mismatch
+    end
+
+    alt dry-run
+        RE-->>OP: RestoreResult(verified=True, files_restored=[], dry_run=True)
+    else full restore
+        RE->>FS: mkdir -p; write each file
+        Note over FS: db_only / keys_only / tables filters applied
+        RE->>RE: INSERT INTO restore_events (outcome='ok')
+        RE-->>OP: RestoreResult(verified=True, files_restored=[…])
+    end
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ▸▸▸ DR — SHAMIR CEREMONY ◂◂◂ -->
+<div id="sec-dr-shamir" class="section-wrapper">
+  <div class="page-header">
+    <h2>Shamir Ceremony — M-of-N Root Split / Recovery</h2>
+    <p>The offline root CA passphrase is split into N shares via GF(256) Shamir Secret
+    Sharing. Any M shares reconstruct the passphrase; M−1 or fewer reveal nothing.
+    Shares are encoded as BIP-39-style English word lists with CRC-16 checksum for
+    paper distribution.</p>
+    <span class="rfc-tag">GF(256) Shamir SSS</span>
+    <span class="rfc-tag">BIP-39 mnemonic</span>
+    <span class="rfc-tag">CRC-16 checksum</span>
+  </div>
+  <div class="section-wrapper active">
+    <div class="flow-card">
+      <div class="flow-card-head">
+        <h3>ca-init: export root bundle with M-of-N share split</h3>
+        <span class="op-badge" style="background:#ef4444;color:#fff">CEREMONY</span>
+      </div>
+      <div class="flow-diagram">
+        <div class="mermaid">
+sequenceDiagram
+    autonumber
+    participant CO as Ceremony Officer
+    participant CI as ca-init (pypki_admin)
+    participant SH as Share-holders 1..N
+
+    CO->>CI: ca-init --out bundle.tar.gz.enc --shamir 3-of-5
+    CI->>CI: secrets.token_bytes(32) → passphrase
+    CI->>CI: shamir.split(passphrase, threshold=3, n=5)
+    Note over CI: 5 (x, y) pairs in GF(256)
+    CI->>CI: mnemonic.encode(y) for each share
+    CI-->>CO: print Share 1..5 to terminal (never to disk)
+
+    loop for each share-holder i
+        CO->>SH: read share i aloud / show on screen
+        SH->>SH: write word list on paper card
+        Note over SH: card: index, date, threshold, 34 words
+    end
+
+    CI->>CI: _build_bundle(ca_key, ca_crt, …)
+    CI->>CI: AESGCM(scrypt(passphrase)).encrypt(bundle)
+    CI->>CO: bundle written to output path
+    CO->>CO: clear terminal; history -c
+        </div>
+      </div>
+    </div>
+    <div class="flow-card">
+      <div class="flow-card-head">
+        <h3>ca-recover: collect M shares → reconstruct → sign CSR</h3>
+        <span class="op-badge" style="background:#ef4444;color:#fff">RECOVERY</span>
+      </div>
+      <div class="flow-diagram">
+        <div class="mermaid">
+sequenceDiagram
+    autonumber
+    participant CO as Ceremony Officer
+    participant CR as ca-recover (pypki_admin)
+    participant SH as Share-holders (any 3 of 5)
+
+    CO->>CR: ca-recover --bundle bundle.enc --csr-in new-intermediate.csr --shares 3
+
+    loop 3 times
+        CR->>CO: prompt "Share i/3:"
+        CO->>SH: ask share-holder i to read their card
+        SH->>CO: word list (34 words)
+        CO->>CR: type words or base64 share string
+        CR->>CR: mnemonic.decode(words) → y bytes
+    end
+
+    CR->>CR: shamir.combine([(x1,y1),(x2,y2),(x3,y3)])
+    Note over CR: Lagrange interpolation at x=0
+    CR->>CR: reconstructed passphrase (32 bytes, in memory only)
+    CR->>CR: _open_bundle(blob, passphrase) → root key + cert
+    CR->>CR: sign CSR → new sub-CA cert (DER)
+    CR-->>CO: cert written to --cert-out path
+    Note over CR: passphrase zeroized on function exit
         </div>
       </div>
     </div>
