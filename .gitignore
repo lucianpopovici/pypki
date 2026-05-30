@@ -23,3 +23,8 @@ ca/
 
 # IDE metadata
 .idea/
+
+# Design docs — local only, not for the repo
+CLAUDE.md
+CLAUDE-*.md
+specs/
