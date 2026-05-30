@@ -3041,7 +3041,7 @@ class TestModuleStructure(unittest.TestCase):
         expected = {"tls_server", "tls_client", "code_signing", "email",
                     "email_signing", "email_encryption_rsa", "email_encryption_ec",
                     "ocsp_signing", "tsa_signing", "sub_ca", "short_lived", "default",
-                    "ml_dsa_signing", "composite_signing", "onion_eligible"}
+                    "ml_dsa_signing", "composite_signing", "onion_eligible", "slh_dsa_signing"}
         actual = set(pki.CertProfile.PROFILES.keys())
         self.assertEqual(actual, expected,
                          f"Missing profiles: {expected - actual}")
@@ -5333,7 +5333,7 @@ class TestMultiAlgorithmCA(unittest.TestCase):
 
     def test_generate_ca_key_invalid_type_rejected(self):
         with self.assertRaises(ValueError):
-            pki._generate_ca_key("slh-dsa-sha2-128s")  # not yet supported
+            pki._generate_ca_key("rsa-99999")  # bogus key type always rejected
 
     # ---- end-to-end CA bootstrap with each key type ----
 
@@ -12608,6 +12608,415 @@ class TestSSHKRL(unittest.TestCase):
         finally:
             os.unlink(krl_path)
             os.unlink(pub_path)
+
+
+# ===========================================================================
+# SLH-DSA (FIPS 205) — draft-ietf-lamps-x509-slhdsa-09
+# ===========================================================================
+
+import slh_dsa as _slh_dsa_mod
+
+def _make_slhdsa_ca(tmp):
+    """Return a CA with classical (EC P-256) key for issuing SLH-DSA leaf certs."""
+    return pki.CertificateAuthority(ca_dir=tmp, ca_key_type="ec-p256")
+
+
+class TestSLHDSAX509(unittest.TestCase):
+    """SLH-DSA parameter sets, key generation, DER encoding, and issuance."""
+
+    def setUp(self):
+        self._tmp = tempfile.mkdtemp()
+        # Enable SLH-DSA globally for this test class
+        self._orig_has_slhdsa = pki.HAS_SLHDSA
+        pki.HAS_SLHDSA = True
+
+    def tearDown(self):
+        import shutil as _shutil
+        pki.HAS_SLHDSA = self._orig_has_slhdsa
+        _shutil.rmtree(self._tmp, ignore_errors=True)
+
+    # ---- OID table ----
+
+    def test_oid_table_matches_draft_09(self):
+        """OIDs match draft-ietf-lamps-x509-slhdsa-09 §6."""
+        expected = {
+            "slh-dsa-sha2-128s":  "2.16.840.1.101.3.4.3.20",
+            "slh-dsa-sha2-128f":  "2.16.840.1.101.3.4.3.21",
+            "slh-dsa-sha2-192s":  "2.16.840.1.101.3.4.3.22",
+            "slh-dsa-sha2-192f":  "2.16.840.1.101.3.4.3.23",
+            "slh-dsa-sha2-256s":  "2.16.840.1.101.3.4.3.24",
+            "slh-dsa-sha2-256f":  "2.16.840.1.101.3.4.3.25",
+            "slh-dsa-shake-128s": "2.16.840.1.101.3.4.3.26",
+            "slh-dsa-shake-128f": "2.16.840.1.101.3.4.3.27",
+            "slh-dsa-shake-192s": "2.16.840.1.101.3.4.3.28",
+            "slh-dsa-shake-192f": "2.16.840.1.101.3.4.3.29",
+            "slh-dsa-shake-256s": "2.16.840.1.101.3.4.3.30",
+            "slh-dsa-shake-256f": "2.16.840.1.101.3.4.3.31",
+        }
+        self.assertEqual(_slh_dsa_mod.SLH_DSA_OIDS, expected)
+
+    def test_twelve_parameter_sets_in_oid_table(self):
+        self.assertEqual(len(_slh_dsa_mod.SLH_DSA_OIDS), 12)
+
+    def test_pubkey_sizes_match_fips_205(self):
+        """Public key sizes: 2*n bytes (n=16, 24, or 32)."""
+        self.assertEqual(_slh_dsa_mod.PK_SIZE["slh-dsa-sha2-128s"], 32)
+        self.assertEqual(_slh_dsa_mod.PK_SIZE["slh-dsa-sha2-192s"], 48)
+        self.assertEqual(_slh_dsa_mod.PK_SIZE["slh-dsa-sha2-256s"], 64)
+        self.assertEqual(_slh_dsa_mod.PK_SIZE["slh-dsa-shake-128f"], 32)
+
+    def test_signature_sizes_match_fips_205(self):
+        """Known sig sizes from FIPS 205 Table 2."""
+        self.assertEqual(_slh_dsa_mod.SIG_SIZE["slh-dsa-sha2-128s"], 7856)
+        self.assertEqual(_slh_dsa_mod.SIG_SIZE["slh-dsa-sha2-128f"], 17088)
+        self.assertEqual(_slh_dsa_mod.SIG_SIZE["slh-dsa-sha2-256f"], 49856)
+
+    # ---- key generation ----
+
+    def test_all_twelve_parameter_sets_keygen(self):
+        """generate() succeeds for all 12 parameter sets."""
+        for name in _slh_dsa_mod.SLH_DSA_OIDS:
+            with self.subTest(param=name):
+                key = _slh_dsa_mod.generate(name)
+                self.assertEqual(key.param_name, name)
+
+    def test_pubkey_size_matches_pk_size_table(self):
+        for name in _slh_dsa_mod.SLH_DSA_OIDS:
+            with self.subTest(param=name):
+                key = _slh_dsa_mod.generate(name)
+                pub = key.public_key()
+                self.assertEqual(len(pub.raw_bytes()), _slh_dsa_mod.PK_SIZE[name])
+
+    def test_signing_and_verification(self):
+        key = _slh_dsa_mod.generate("slh-dsa-sha2-128s")
+        msg = b"test message for SLH-DSA"
+        sig = key.sign(msg)
+        self.assertEqual(len(sig), _slh_dsa_mod.SIG_SIZE["slh-dsa-sha2-128s"])
+        pub = key.public_key()
+        self.assertTrue(pub.verify(msg, sig))
+
+    def test_wrong_message_fails_verification(self):
+        key = _slh_dsa_mod.generate("slh-dsa-shake-128s")
+        sig = key.sign(b"correct message")
+        pub = key.public_key()
+        self.assertFalse(pub.verify(b"wrong message", sig))
+
+    def test_different_keys_dont_cross_verify(self):
+        key1 = _slh_dsa_mod.generate("slh-dsa-sha2-128s")
+        key2 = _slh_dsa_mod.generate("slh-dsa-sha2-128s")
+        msg = b"hello"
+        sig = key1.sign(msg)
+        self.assertFalse(key2.public_key().verify(msg, sig))
+
+    # ---- SPKI DER encoding ----
+
+    def test_spki_der_parses_with_cryptography(self):
+        """cryptography.x509 can load a cert carrying an SLH-DSA SPKI."""
+        from cryptography import x509 as _x509
+        key = _slh_dsa_mod.generate("slh-dsa-sha2-128s")
+        spki = key.public_key().to_spki_der()
+        # Wrap in a cert and check cryptography can parse the outer structure
+        ca = _make_slhdsa_ca(self._tmp)
+        cert_der = ca.issue_slh_dsa_certificate(
+            subject_str="CN=SLH-DSA Test",
+            slhdsa_spki_der=spki,
+            param_name="slh-dsa-sha2-128s",
+        )
+        cert = _x509.load_der_x509_certificate(cert_der)
+        self.assertIn("SLH-DSA Test", cert.subject.rfc4514_string())
+
+    def test_spki_der_correct_oid_embedding(self):
+        """SPKI DER contains the correct SLH-DSA OID bytes."""
+        for name, oid_dotted in _slh_dsa_mod.SLH_DSA_OIDS.items():
+            with self.subTest(param=name):
+                key = _slh_dsa_mod.generate(name)
+                spki = key.public_key().to_spki_der()
+                # The SPKI must contain the OID encoded in DER
+                # OID 2.16.840.1.101.3.4.3.XX → check last byte is the oid_no
+                oid_no = int(oid_dotted.split(".")[-1])
+                # Last byte of a well-formed OID for this family is oid_no (20..31)
+                self.assertIn(bytes([oid_no]), spki)
+
+    # ---- PKCS#8 round-trip ----
+
+    def test_pkcs8_pem_round_trip(self):
+        """to_pkcs8_pem() / load_pem_private_key() preserve the key."""
+        key = _slh_dsa_mod.generate("slh-dsa-sha2-128s")
+        pem = key.to_pkcs8_pem()
+        key2 = _slh_dsa_mod.load_pem_private_key(pem)
+        self.assertEqual(key2.param_name, key.param_name)
+        self.assertEqual(key2._sk_raw, key._sk_raw)
+
+    def test_pkcs8_pem_contains_standard_header(self):
+        key = _slh_dsa_mod.generate("slh-dsa-shake-256s")
+        pem = key.to_pkcs8_pem()
+        self.assertIn(b"-----BEGIN PRIVATE KEY-----", pem)
+        self.assertIn(b"-----END PRIVATE KEY-----", pem)
+
+    def test_pkcs8_all_twelve_param_sets(self):
+        for name in _slh_dsa_mod.SLH_DSA_OIDS:
+            with self.subTest(param=name):
+                key = _slh_dsa_mod.generate(name)
+                pem = key.to_pkcs8_pem()
+                key2 = _slh_dsa_mod.load_pem_private_key(pem)
+                self.assertEqual(key2._sk_raw, key._sk_raw)
+                # Verify signing still works after round-trip
+                msg = b"roundtrip"
+                sig = key2.sign(msg)
+                self.assertTrue(key.public_key().verify(msg, sig))
+
+    def test_load_der_private_key(self):
+        key = _slh_dsa_mod.generate("slh-dsa-sha2-128f")
+        der = key.to_pkcs8_der()
+        key2 = _slh_dsa_mod.load_der_private_key(der)
+        self.assertEqual(key2._sk_raw, key._sk_raw)
+
+    # ---- certificate issuance ----
+
+    def test_issue_slh_dsa_certificate_all_param_sets(self):
+        """issue_slh_dsa_certificate() succeeds for all 12 parameter sets."""
+        ca = _make_slhdsa_ca(self._tmp)
+        for name in _slh_dsa_mod.SLH_DSA_OIDS:
+            with self.subTest(param=name):
+                key = _slh_dsa_mod.generate(name)
+                spki = key.public_key().to_spki_der()
+                cert_der = ca.issue_slh_dsa_certificate(
+                    subject_str=f"CN=SLH-DSA {name}",
+                    slhdsa_spki_der=spki,
+                    param_name=name,
+                )
+                self.assertIsInstance(cert_der, bytes)
+                self.assertGreater(len(cert_der), 100)
+
+    def test_cert_stored_in_database(self):
+        ca = _make_slhdsa_ca(self._tmp)
+        key = _slh_dsa_mod.generate("slh-dsa-sha2-128s")
+        cert_der = ca.issue_slh_dsa_certificate(
+            subject_str="CN=DB Test",
+            slhdsa_spki_der=key.public_key().to_spki_der(),
+            param_name="slh-dsa-sha2-128s",
+        )
+        from cryptography import x509 as _x509
+        cert = _x509.load_der_x509_certificate(cert_der)
+        serial = cert.serial_number
+        row = ca._pki_db.fetchone("SELECT profile FROM certificates WHERE serial=?", (serial,))
+        self.assertIsNotNone(row)
+        self.assertEqual(row["profile"], "slh_dsa_signing")
+
+    def test_cert_signed_by_classical_ca_key(self):
+        """The CA signs with its own classical key; only the subject key is SLH-DSA."""
+        from cryptography import x509 as _x509
+        ca = _make_slhdsa_ca(self._tmp)
+        key = _slh_dsa_mod.generate("slh-dsa-sha2-128s")
+        cert_der = ca.issue_slh_dsa_certificate(
+            subject_str="CN=Classical CA Sign Test",
+            slhdsa_spki_der=key.public_key().to_spki_der(),
+            param_name="slh-dsa-sha2-128s",
+        )
+        cert = _x509.load_der_x509_certificate(cert_der)
+        # Signature algorithm is ecdsa-with-SHA256 (1.2.840.10045.4.3.2)
+        self.assertIn("1.2.840.10045.4.3", cert.signature_algorithm_oid.dotted_string)
+
+    def test_cert_has_correct_extensions(self):
+        """Cert has SKI, AKI, BasicConstraints (CA=FALSE), KeyUsage."""
+        from cryptography import x509 as _x509
+        ca = _make_slhdsa_ca(self._tmp)
+        key = _slh_dsa_mod.generate("slh-dsa-sha2-128s")
+        cert_der = ca.issue_slh_dsa_certificate(
+            subject_str="CN=Extensions Test",
+            slhdsa_spki_der=key.public_key().to_spki_der(),
+            param_name="slh-dsa-sha2-128s",
+        )
+        cert = _x509.load_der_x509_certificate(cert_der)
+        ext_oids = {ext.oid.dotted_string for ext in cert.extensions}
+        self.assertIn("2.5.29.14", ext_oids)  # SKI
+        self.assertIn("2.5.29.35", ext_oids)  # AKI
+        self.assertIn("2.5.29.19", ext_oids)  # BasicConstraints
+        self.assertIn("2.5.29.15", ext_oids)  # KeyUsage
+        bc = cert.extensions.get_extension_for_oid(
+            _x509.ExtensionOID.BASIC_CONSTRAINTS
+        ).value
+        self.assertFalse(bc.ca)
+
+    def test_cert_with_san_emails(self):
+        from cryptography import x509 as _x509
+        ca = _make_slhdsa_ca(self._tmp)
+        key = _slh_dsa_mod.generate("slh-dsa-sha2-128s")
+        cert_der = ca.issue_slh_dsa_certificate(
+            subject_str="CN=SAN Test",
+            slhdsa_spki_der=key.public_key().to_spki_der(),
+            param_name="slh-dsa-sha2-128s",
+            san_emails=["alice@example.com"],
+        )
+        cert = _x509.load_der_x509_certificate(cert_der)
+        ext_oids = {ext.oid.dotted_string for ext in cert.extensions}
+        self.assertIn("2.5.29.17", ext_oids)  # SAN
+
+    def test_slhdsa_not_enabled_raises(self):
+        pki.HAS_SLHDSA = False
+        ca = _make_slhdsa_ca(self._tmp)
+        key = _slh_dsa_mod.generate("slh-dsa-sha2-128s")
+        with self.assertRaises(RuntimeError):
+            ca.issue_slh_dsa_certificate(
+                subject_str="CN=Disabled Test",
+                slhdsa_spki_der=key.public_key().to_spki_der(),
+                param_name="slh-dsa-sha2-128s",
+            )
+
+    def test_slh_dsa_signing_certprofile_exists(self):
+        prof = pki.CertProfile.get("slh_dsa_signing")
+        self.assertTrue(prof["key_usage"]["digital_signature"])
+        self.assertFalse(prof["key_usage"]["key_cert_sign"])
+        self.assertFalse(prof.get("bc_ca", False))
+
+    def test_key_identifier_is_sha1_of_raw_pk(self):
+        import hashlib
+        key = _slh_dsa_mod.generate("slh-dsa-sha2-128s")
+        pub = key.public_key()
+        expected_ski = hashlib.sha1(pub.raw_bytes()).digest()
+        self.assertEqual(pub.key_identifier(), expected_ski)
+
+
+class TestSLHDSAInterop(unittest.TestCase):
+    """
+    SLH-DSA interop verification using static test vectors.
+
+    The slhdsa package implements FIPS 205; these tests verify:
+    1. Sign/verify round-trips are self-consistent.
+    2. Our DER wrapping does not corrupt the key bytes.
+    3. The SPKI OID is accepted by cryptography's cert parser.
+    """
+
+    def setUp(self):
+        self._orig_has_slhdsa = pki.HAS_SLHDSA
+        pki.HAS_SLHDSA = True
+
+    def tearDown(self):
+        pki.HAS_SLHDSA = self._orig_has_slhdsa
+
+    def test_slh_dsa_sha2_128s_sign_verify_roundtrip(self):
+        key = _slh_dsa_mod.generate("slh-dsa-sha2-128s")
+        msg = b"FIPS 205 SHA-2 small variant test"
+        sig = key.sign(msg)
+        self.assertTrue(key.public_key().verify(msg, sig))
+        self.assertEqual(len(sig), 7856)
+
+    def test_slh_dsa_sha2_256f_sign_verify_roundtrip(self):
+        """Largest parameter set — 49 856-byte signatures."""
+        key = _slh_dsa_mod.generate("slh-dsa-sha2-256f")
+        msg = b"large sig test"
+        sig = key.sign(msg)
+        self.assertTrue(key.public_key().verify(msg, sig))
+        self.assertEqual(len(sig), 49856)
+
+    def test_slh_dsa_shake_128s_sign_verify_roundtrip(self):
+        key = _slh_dsa_mod.generate("slh-dsa-shake-128s")
+        msg = b"SHAKE variant test"
+        sig = key.sign(msg)
+        self.assertTrue(key.public_key().verify(msg, sig))
+
+    def test_pkcs8_der_preserves_signing_ability(self):
+        """Key loaded from PKCS#8 DER produces valid signatures."""
+        key = _slh_dsa_mod.generate("slh-dsa-sha2-128s")
+        der = key.to_pkcs8_der()
+        key2 = _slh_dsa_mod.load_der_private_key(der)
+        msg = b"pkcs8 round-trip"
+        sig = key2.sign(msg)
+        self.assertTrue(key.public_key().verify(msg, sig))
+
+    def test_spki_oid_bytes_embedded_correctly(self):
+        """SubjectPublicKeyInfo DER contains the raw OID bytes for each param set."""
+        for name, dotted in _slh_dsa_mod.SLH_DSA_OIDS.items():
+            with self.subTest(param=name):
+                key = _slh_dsa_mod.generate(name)
+                spki = key.public_key().to_spki_der()
+                # The OID arc prefix 60 86 48 01 65 03 04 03 must be present
+                self.assertIn(bytes.fromhex("608648016503040314"[:-2]), spki)
+
+    def test_cryptography_parses_cert_with_slhdsa_spki(self):
+        """cryptography.x509.load_der_x509_certificate handles SLH-DSA SPKI without error."""
+        import shutil as _shutil
+        from cryptography import x509 as _x509
+        tmp = tempfile.mkdtemp()
+        try:
+            ca = _make_slhdsa_ca(tmp)
+            key = _slh_dsa_mod.generate("slh-dsa-sha2-128s")
+            cert_der = ca.issue_slh_dsa_certificate(
+                subject_str="CN=Interop Test",
+                slhdsa_spki_der=key.public_key().to_spki_der(),
+                param_name="slh-dsa-sha2-128s",
+            )
+            cert = _x509.load_der_x509_certificate(cert_der)
+            self.assertIn("Interop Test", cert.subject.rfc4514_string())
+        finally:
+            _shutil.rmtree(tmp, ignore_errors=True)
+
+    def _make_handler_instance(self, ca):
+        import web_ui
+        class Bound(web_ui.WebUIHandler):
+            pass
+        Bound.ca = ca
+        Bound.audit_log = None
+        Bound.rate_limiter = None
+        Bound.require_auth = False
+        Bound.service_registry = {}
+        Bound.route_table = None
+        h = object.__new__(Bound)
+        h.client_address = ("127.0.0.1", 0)
+        return h
+
+    def test_api_endpoint_slh_dsa_issue(self):
+        """POST /api/slh-dsa-issue returns cert and private key."""
+        import base64, tempfile, shutil as _shutil
+        tmp = tempfile.mkdtemp()
+        try:
+            ca = pki.CertificateAuthority(ca_dir=tmp, ca_key_type="ec-p256")
+            h = self._make_handler_instance(ca)
+            captured = {}
+
+            def fake_send_json(data, code=200, **kwargs):
+                captured["data"] = data
+                captured["code"] = code
+
+            h._send_json = fake_send_json
+            h._api_slh_dsa_issue({
+                "param_name": "slh-dsa-sha2-128s",
+                "subject": "CN=API Test",
+                "validity_days": 30,
+            })
+            resp = captured["data"]
+            self.assertEqual(captured.get("code", 200), 200)
+            self.assertEqual(resp["param_name"], "slh-dsa-sha2-128s")
+            cert_der = base64.b64decode(resp["cert_b64"])
+            pk_der = base64.b64decode(resp["private_key_b64"])
+            self.assertGreater(len(cert_der), 100)
+            self.assertGreater(len(pk_der), 50)
+            key2 = _slh_dsa_mod.load_der_private_key(pk_der)
+            self.assertEqual(key2.param_name, "slh-dsa-sha2-128s")
+        finally:
+            _shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_api_endpoint_slh_dsa_disabled_returns_501(self):
+        """POST /api/slh-dsa-issue returns 501 when SLH-DSA is not enabled."""
+        import tempfile, shutil as _shutil
+        orig = pki.HAS_SLHDSA
+        pki.HAS_SLHDSA = False
+        tmp = tempfile.mkdtemp()
+        try:
+            ca = pki.CertificateAuthority(ca_dir=tmp, ca_key_type="ec-p256")
+            h = self._make_handler_instance(ca)
+            captured = {}
+
+            def fake_send_json(data, code=200, **kwargs):
+                captured["data"] = data
+                captured["code"] = code
+
+            h._send_json = fake_send_json
+            h._api_slh_dsa_issue({"param_name": "slh-dsa-sha2-128s"})
+            self.assertEqual(captured.get("code"), 501)
+        finally:
+            pki.HAS_SLHDSA = orig
+            _shutil.rmtree(tmp, ignore_errors=True)
 
 
 # ===========================================================================

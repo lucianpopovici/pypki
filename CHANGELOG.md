@@ -11,6 +11,18 @@ This project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **SLH-DSA (FIPS 205) leaf certificates** (`slh_dsa.py`, `pki_server.py`,
+  `web_ui.py`). All 12 parameter sets from draft-ietf-lamps-x509-slhdsa-09
+  supported: SHA-2 and SHAKE families at 128/192/256-bit security, small (`s`)
+  and fast (`f`) variants. OIDs `2.16.840.1.101.3.4.3.{20..31}`. The CA signs
+  leaf certs with its own classical key; only the subject holds the SLH-DSA
+  public key (`slh_dsa_signing` CertProfile, digitalSignature + nonRepudiation
+  KeyUsage). Key generation and SPKI/PKCS#8 DER encoding in `slh_dsa.py`,
+  backed by the `slhdsa` pip package. REST endpoint `POST /api/slh-dsa-issue`.
+  Gated behind `--enable-slh-dsa`. Large-signature warning logged for
+  `f`-variant parameter sets (17–50 KB). Requires `pip install slh-dsa`.
+  31 tests in `TestSLHDSAX509` and `TestSLHDSAInterop`.
+
 - **RFC 9799 — ACME for Tor .onion hidden services** (`onion.py`, `acme_server.py`,
   `pki_server.py`). Tor v3 address decode validates the 56-char base32 address
   (Ed25519 public key + SHA3-256 checksum + version byte). The `onion-csr-01`

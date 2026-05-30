@@ -312,6 +312,7 @@ landmarks here are a bug.
 | `ssh_ca.py`             | SSH certificate builder, KRL generation, key classification    |
 | `ssh_wire.py`           | SSH binary wire-format primitives (RFC 4251 §5)                |
 | `onion.py`              | Tor v3 address decode + ACME onion-csr-01 CSR validation       |
+| `slh_dsa.py`            | SLH-DSA (FIPS 205) key gen, SPKI/PKCS#8 DER, sign/verify      |
 
 Additional modules are added per sidecar spec (`policy.py`,
 `audit_chain.py`, `tls_manager.py`, etc.). Each spec lists the module
@@ -445,8 +446,8 @@ release.
 | FIPS 204                                 | ML-DSA                      | shipped |
 | RFC 9763                                 | Paired hybrid certificates  | shipped |
 | draft-ietf-lamps-pq-composite-sigs (-18) | Composite signatures        | spec'd, gated |
-| FIPS 205                                 | SLH-DSA                     | spec'd, gated |
-| draft-ietf-lamps-x509-slhdsa             | SLH-DSA in X.509            | spec'd, gated |
+| FIPS 205                                 | SLH-DSA                     | shipped, gated (--enable-slh-dsa) |
+| draft-ietf-lamps-x509-slhdsa-09          | SLH-DSA in X.509            | shipped, gated (--enable-slh-dsa) |
 | RFC 9773                                 | ACME Renewal Information    | spec'd  |
 | RFC 9799                                 | ACME for .onion             | shipped, gated (--acme-onion-enabled) |
 | OpenSSH PROTOCOL.certkeys                | SSH certificates + KRL      | shipped, gated (--ssh-ca-enabled) |
@@ -570,8 +571,9 @@ connection leak fixes shipped. Serial number race condition
 identified; mitigation is `advisory_lock("serial-allocation")` which
 is in place for `AuditLog` and pending for `CertificateAuthority`.
 
-**PQC posture**: ML-DSA shipped, RFC 9763 shipped, SLH-DSA and
-composite ML-DSA spec'd but not implemented. Crypto-agility dashboard
+**PQC posture**: ML-DSA shipped, RFC 9763 shipped, SLH-DSA shipped
+(leaf certs gated behind `--enable-slh-dsa`; requires `pip install slh-dsa`).
+Composite ML-DSA spec'd but not implemented. Crypto-agility dashboard
 spec'd but not implemented.
 
 **Infrastructure**: Docker Compose with PyPKI + nginx; PAM auth with
@@ -587,7 +589,7 @@ at `/ssh`. Admin CLI: `ssh-revoke`, `ssh-list`, `ssh-krl-export`.
 address decode and `onion-csr-01` challenge validation per RFC 9799.
 Enabled via `--acme-onion-enabled`. `onion_eligible` CertProfile added.
 
-**Test suite**: `test_pki_server.py`, 835+ tests passing, 2 Postgres
+**Test suite**: `test_pki_server.py`, 866+ tests passing, 2 Postgres
 tests correctly skipping without env var.
 
 **Observability**: Prometheus metrics + Grafana dashboard JSON
@@ -646,12 +648,30 @@ Past entries (reconstructed from memory; future sessions append):
   CLI flags `--acme-onion-*` and `--ssh-ca-*`; Web UI `/ssh` routes;
   admin CLI `ssh-revoke` / `ssh-list` / `ssh-krl-export`; 47 new tests
   (6 test classes) covering wire format, interop, and profile enforcement
-- Pending: portal, SSO, SLH-DSA, composite ML-DSA implementation
+- Pending: portal, SSO, composite ML-DSA implementation
 - Deferred: KRL signing (format is unclear across OpenSSH versions)
 - Landmarks changed: `onion.py` (new), `ssh_wire.py` (new), `ssh_ca.py`
   (new), `acme_server.py` (onion-csr-01 support), `pki_server.py` (SSH CA
   methods + onion_eligible profile), `web_ui.py` (/ssh routes),
   `pypki_admin.py` (ssh-* subcommands)
+
+### 2026-05-30 — SLH-DSA (FIPS 205) X.509 leaf certificate issuance
+- Decided: use `slhdsa` pip package (not a hand-rolled FIPS 205 impl); leaf
+  certs only — the CA retains a classical key because `cryptography` lib has
+  no SLH-DSA support; slhdsa package schema API is broken for DER export so
+  SPKI/PKCS#8 encoding is hand-rolled in `slh_dsa.py`
+- Done: `slh_dsa.py` (new — SLH_DSA_OIDS, SLHDSAPrivateKey/PublicKey, generate,
+  load_pem/der_private_key, hand-rolled SPKI + PKCS#8 DER); `pki_server.py`
+  (HAS_SLHDSA gate, _sig_alg_der_for_key + _sign_data + _hash_for_key extended,
+  12 SLH-DSA entries in _CA_KEY_FACTORIES, `slh_dsa_signing` CertProfile,
+  `issue_slh_dsa_certificate()`, `--enable-slh-dsa` flag); `web_ui.py`
+  (`POST /api/slh-dsa-issue`); 31 tests in TestSLHDSAX509 + TestSLHDSAInterop
+- Pending: portal, SSO, composite ML-DSA
+- Deferred: SLH-DSA CA keys (requires cryptography library support to load
+  SLH-DSA CA certs; deferred until upstream ships)
+- Landmarks changed: `slh_dsa.py` (new), `pki_server.py` (HAS_SLHDSA +
+  `issue_slh_dsa_certificate` + slh_dsa_signing profile), `web_ui.py`
+  (`_api_slh_dsa_issue`)
 
 ---
 

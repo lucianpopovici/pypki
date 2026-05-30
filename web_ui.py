@@ -997,6 +997,8 @@ class WebUIHandler(http.server.BaseHTTPRequestHandler):
                 self._api_paired_issue(data)
             elif path == "/api/composite-issue":
                 self._api_composite_issue(data)
+            elif path == "/api/slh-dsa-issue":
+                self._api_slh_dsa_issue(data)
             elif path == "/api/ssh/sign":
                 self._api_ssh_sign(data)
             elif path == "/api/ssh/host-cert":
@@ -2074,6 +2076,47 @@ class WebUIHandler(http.server.BaseHTTPRequestHandler):
             "cert_b64": _b64.b64encode(cert_der).decode(),
             "private_key_b64": _b64.b64encode(private_key_der).decode(),
             "composite_name": composite_name,
+        })
+
+    def _api_slh_dsa_issue(self, data: dict) -> None:
+        """POST /api/slh-dsa-issue — SLH-DSA (FIPS 205) leaf certificate issuance."""
+        import pki_server as _pki_mod
+        if not _pki_mod.HAS_SLHDSA:
+            self._send_json({"error": "SLH-DSA not enabled (requires --enable-slh-dsa)"}, 501)
+            return
+        import slh_dsa as _slhdsa
+        import base64 as _b64
+
+        param_name = data.get("param_name", "slh-dsa-sha2-128s")
+        if param_name not in _slhdsa.SLH_DSA_OIDS:
+            self._send_json(
+                {"error": f"param_name must be one of {sorted(_slhdsa.SLH_DSA_OIDS)}"}, 400
+            )
+            return
+
+        subject = data.get("subject", "CN=SLH-DSA Entity")
+        validity_days = int(data.get("validity_days", 365))
+        san_emails = data.get("san_emails") or None
+
+        slhdsa_key = _slhdsa.generate(param_name)
+        pub = slhdsa_key.public_key()
+        spki_der = pub.to_spki_der()
+
+        cert_der = self.ca.issue_slh_dsa_certificate(
+            subject_str=subject,
+            slhdsa_spki_der=spki_der,
+            param_name=param_name,
+            validity_days=validity_days,
+            san_emails=san_emails,
+            audit=self.audit_log,
+            requester_ip=self.client_address[0] if self.client_address else "",
+        )
+        self._send_json({
+            "cert_b64": _b64.b64encode(cert_der).decode(),
+            "private_key_b64": _b64.b64encode(slhdsa_key.to_pkcs8_der()).decode(),
+            "param_name": param_name,
+            "sig_size_bytes": _slhdsa.SIG_SIZE.get(param_name, 0),
+            "pk_size_bytes": _slhdsa.PK_SIZE.get(param_name, 0),
         })
 
     # ------------------------------------------------------------------

@@ -146,6 +146,16 @@ except ImportError:
     _composite_mod = None  # type: ignore[assignment]
     _COMPOSITE_AVAILABLE = False
 
+# SLH-DSA (FIPS 205) — gated behind --enable-slh-dsa (default off)
+# draft-ietf-lamps-x509-slhdsa-09; OIDs 2.16.840.1.101.3.4.3.{20..31}.
+HAS_SLHDSA: bool = False  # toggled by --enable-slh-dsa at startup
+try:
+    import slh_dsa as _slhdsa_mod
+    _SLHDSA_AVAILABLE = True
+except ImportError:
+    _slhdsa_mod = None  # type: ignore[assignment]
+    _SLHDSA_AVAILABLE = False
+
 # SSH CA — gated behind --ssh-ca-enabled (default off)
 try:
     import ssh_ca as _ssh_ca_mod
@@ -1066,6 +1076,8 @@ def _hash_for_key(key):
         return None
     if HAS_MLDSA and isinstance(key, tuple(_MLDSA_CLASS_TO_OID)):
         return None  # ML-DSA signs internally, no external hash
+    if HAS_SLHDSA and isinstance(key, _slhdsa_mod.SLHDSAPrivateKey):
+        return None  # SLH-DSA signs internally, no external hash
     raise TypeError(f"Unsupported private-key type for signing: {type(key).__name__}")
 
 
@@ -1126,6 +1138,8 @@ def _sign_data(key, data: bytes, *, rsa_pss: bool = False) -> bytes:
         return key.sign(data)
     if HAS_MLDSA and isinstance(key, tuple(_MLDSA_CLASS_TO_OID)):
         return key.sign(data)
+    if HAS_SLHDSA and isinstance(key, _slhdsa_mod.SLHDSAPrivateKey):
+        return key.sign(data)
     raise TypeError(f"Unsupported private-key type for signing: {type(key).__name__}")
 
 
@@ -1159,6 +1173,8 @@ def _sig_alg_der_for_key(key) -> bytes:
         oid = _MLDSA_CLASS_TO_OID.get(type(key))
         if oid:
             return _pder_seq(_pder_oid(oid))
+    if HAS_SLHDSA and isinstance(key, _slhdsa_mod.SLHDSAPrivateKey):
+        return _pder_seq(_pder_oid(_slhdsa_mod.SLH_DSA_OIDS[key.param_name]))
     raise TypeError(f"Cannot determine sig alg for key type: {type(key).__name__}")
 
 
@@ -1250,6 +1266,19 @@ _CA_KEY_FACTORIES = {
     "composite-mldsa44-ecdsa-p256":   lambda: _composite_mod.generate_composite_key("composite-mldsa44-ecdsa-p256") if HAS_COMPOSITE_MLDSA else (_ for _ in ()).throw(RuntimeError("--enable-composite-mldsa not set")),
     "composite-mldsa65-ecdsa-p384":   lambda: _composite_mod.generate_composite_key("composite-mldsa65-ecdsa-p384") if HAS_COMPOSITE_MLDSA else (_ for _ in ()).throw(RuntimeError("--enable-composite-mldsa not set")),
     "composite-mldsa87-ecdsa-p521":   lambda: _composite_mod.generate_composite_key("composite-mldsa87-ecdsa-p521") if HAS_COMPOSITE_MLDSA else (_ for _ in ()).throw(RuntimeError("--enable-composite-mldsa not set")),
+    # SLH-DSA key types — gated behind --enable-slh-dsa (all 12 parameter sets)
+    "slh-dsa-sha2-128s":  lambda: _slhdsa_mod.generate("slh-dsa-sha2-128s")  if HAS_SLHDSA else (_ for _ in ()).throw(RuntimeError("--enable-slh-dsa not set")),
+    "slh-dsa-sha2-128f":  lambda: _slhdsa_mod.generate("slh-dsa-sha2-128f")  if HAS_SLHDSA else (_ for _ in ()).throw(RuntimeError("--enable-slh-dsa not set")),
+    "slh-dsa-sha2-192s":  lambda: _slhdsa_mod.generate("slh-dsa-sha2-192s")  if HAS_SLHDSA else (_ for _ in ()).throw(RuntimeError("--enable-slh-dsa not set")),
+    "slh-dsa-sha2-192f":  lambda: _slhdsa_mod.generate("slh-dsa-sha2-192f")  if HAS_SLHDSA else (_ for _ in ()).throw(RuntimeError("--enable-slh-dsa not set")),
+    "slh-dsa-sha2-256s":  lambda: _slhdsa_mod.generate("slh-dsa-sha2-256s")  if HAS_SLHDSA else (_ for _ in ()).throw(RuntimeError("--enable-slh-dsa not set")),
+    "slh-dsa-sha2-256f":  lambda: _slhdsa_mod.generate("slh-dsa-sha2-256f")  if HAS_SLHDSA else (_ for _ in ()).throw(RuntimeError("--enable-slh-dsa not set")),
+    "slh-dsa-shake-128s": lambda: _slhdsa_mod.generate("slh-dsa-shake-128s") if HAS_SLHDSA else (_ for _ in ()).throw(RuntimeError("--enable-slh-dsa not set")),
+    "slh-dsa-shake-128f": lambda: _slhdsa_mod.generate("slh-dsa-shake-128f") if HAS_SLHDSA else (_ for _ in ()).throw(RuntimeError("--enable-slh-dsa not set")),
+    "slh-dsa-shake-192s": lambda: _slhdsa_mod.generate("slh-dsa-shake-192s") if HAS_SLHDSA else (_ for _ in ()).throw(RuntimeError("--enable-slh-dsa not set")),
+    "slh-dsa-shake-192f": lambda: _slhdsa_mod.generate("slh-dsa-shake-192f") if HAS_SLHDSA else (_ for _ in ()).throw(RuntimeError("--enable-slh-dsa not set")),
+    "slh-dsa-shake-256s": lambda: _slhdsa_mod.generate("slh-dsa-shake-256s") if HAS_SLHDSA else (_ for _ in ()).throw(RuntimeError("--enable-slh-dsa not set")),
+    "slh-dsa-shake-256f": lambda: _slhdsa_mod.generate("slh-dsa-shake-256f") if HAS_SLHDSA else (_ for _ in ()).throw(RuntimeError("--enable-slh-dsa not set")),
 }
 
 
@@ -1660,6 +1689,18 @@ class CertProfile:
                               key_agreement=False, key_cert_sign=False,
                               crl_sign=False, encipher_only=False, decipher_only=False),
             "eku": [ExtendedKeyUsageOID.EMAIL_PROTECTION],
+            "san_required": False,
+            "bc_ca": False,
+        },
+        # SLH-DSA signing — draft-ietf-lamps-x509-slhdsa-09 (FIPS 205).
+        # Subject holds an SLH-DSA public key; CA signs with its own (classical) key.
+        # Gate behind --enable-slh-dsa; default off until draft publishes as RFC.
+        "slh_dsa_signing": {
+            "key_usage": dict(digital_signature=True, content_commitment=True,
+                              key_encipherment=False, data_encipherment=False,
+                              key_agreement=False, key_cert_sign=False,
+                              crl_sign=False, encipher_only=False, decipher_only=False),
+            "eku": [],
             "san_required": False,
             "bc_ca": False,
         },
@@ -3206,6 +3247,135 @@ class CertificateAuthority:
                          requester_ip=requester_ip)
         logger.info("Issued composite cert serial=%d subject='%s' algo=%s",
                     serial, subject_str_out, composite_name)
+        return cert_der
+
+    def issue_slh_dsa_certificate(
+        self,
+        subject_str: str,
+        slhdsa_spki_der: bytes,
+        param_name: str,
+        validity_days: int = 365,
+        profile: str = "slh_dsa_signing",
+        san_emails: Optional[list] = None,
+        audit: Optional["AuditLog"] = None,
+        requester_ip: str = "",
+    ) -> bytes:
+        """
+        Issue an X.509 certificate with an SLH-DSA subject public key.
+
+        The CA signs with its own (classical) key.  The subject holds an SLH-DSA
+        public key encoded as a SubjectPublicKeyInfo DER blob.
+
+        Signature sizes are large (7–50 KB depending on parameter set); warn when
+        issuing with the `f`-variant parameter sets (fast signing, large certs).
+
+        Args:
+            slhdsa_spki_der:  DER-encoded SubjectPublicKeyInfo for the SLH-DSA public key.
+            param_name:       SLH-DSA parameter set name, e.g. "slh-dsa-sha2-128s".
+        Returns:
+            DER bytes of the issued certificate.
+        """
+        if not HAS_SLHDSA:
+            raise RuntimeError("SLH-DSA requires --enable-slh-dsa and the slhdsa package")
+
+        if param_name not in _slhdsa_mod.SLH_DSA_OIDS:
+            raise ValueError(f"Unknown SLH-DSA parameter set: {param_name!r}")
+
+        sig_size = _slhdsa_mod.SIG_SIZE.get(param_name, 0)
+        if sig_size > 20000:
+            logger.warning(
+                "SLH-DSA parameter set %s produces %d-byte signatures; "
+                "consider 's'-variant for smaller certs", param_name, sig_size
+            )
+
+        prof = CertProfile.get(profile)
+
+        attrs = []
+        for part in subject_str.split(","):
+            part = part.strip()
+            if "=" not in part:
+                continue
+            key_s, _, val_s = part.partition("=")
+            oid_map = {
+                "CN": NameOID.COMMON_NAME, "O": NameOID.ORGANIZATION_NAME,
+                "OU": NameOID.ORGANIZATIONAL_UNIT_NAME, "C": NameOID.COUNTRY_NAME,
+                "L": NameOID.LOCALITY_NAME, "ST": NameOID.STATE_OR_PROVINCE_NAME,
+                "EMAIL": NameOID.EMAIL_ADDRESS,
+            }
+            k = key_s.strip().upper()
+            if k in oid_map:
+                attrs.append(x509.NameAttribute(oid_map[k], val_s.strip()))
+        if not attrs:
+            attrs = [x509.NameAttribute(NameOID.COMMON_NAME, subject_str or "SLH-DSA Entity")]
+        subject = x509.Name(attrs)
+
+        serial = self._next_serial()
+        now = datetime.datetime.now(datetime.timezone.utc)
+        not_before = now
+        not_after = now + datetime.timedelta(days=validity_days)
+
+        issuer_name_der = self.ca_cert.issuer.public_bytes()
+        subject_name_der = subject.public_bytes()
+        ca_ski_ext = self.ca_cert.extensions.get_extension_for_class(x509.SubjectKeyIdentifier)
+        ca_ski_bytes = ca_ski_ext.value.key_identifier
+        subject_ski = _ski_from_spki(slhdsa_spki_der)
+
+        ku = prof["key_usage"]
+        ku_bits = 0
+        for bit_pos, flag_name in enumerate([
+            "digital_signature", "content_commitment", "key_encipherment",
+            "data_encipherment", "key_agreement", "key_cert_sign",
+            "crl_sign", "encipher_only", "decipher_only",
+        ]):
+            if ku.get(flag_name):
+                ku_bits |= (0x80 >> bit_pos)
+        ku_byte = bytes([ku_bits & 0xFF])
+        unused = 0
+        tmp = ku_bits
+        while tmp and not (tmp & 1):
+            unused += 1; tmp >>= 1
+        ku_der = _pder_tlv(0x03, bytes([unused]) + ku_byte)
+
+        extensions: list = [
+            ("2.5.29.19", _pder_seq(b""), True),
+            ("2.5.29.14", _pder_os(subject_ski), False),
+            ("2.5.29.35", _pder_seq(_pder_ctx(0, ca_ski_bytes, False)), False),
+            ("2.5.29.15", ku_der, True),
+        ]
+        if prof.get("eku"):
+            eku_body = b"".join(_pder_oid(oid.dotted_string) for oid in prof["eku"])
+            extensions.append(("2.5.29.37", _pder_seq(eku_body), False))
+        if san_emails:
+            san_body = b"".join(_pder_tlv(0x81, e.encode("ascii")) for e in san_emails)
+            extensions.append(("2.5.29.17", _pder_seq(san_body), False))
+
+        tbs = _build_mldsa_tbs(
+            serial=serial,
+            ca_key=self.ca_key,
+            issuer_name_der=issuer_name_der,
+            not_before=not_before,
+            not_after=not_after,
+            subject_name_der=subject_name_der,
+            spki_der=slhdsa_spki_der,
+            extensions=extensions,
+        )
+        cert_der = _build_cert_der_from_tbs(tbs, self.ca_key, rsa_pss=self._rsa_pss)
+
+        subject_str_out = subject.rfc4514_string()
+        self._pki_db.execute(
+            "INSERT OR REPLACE INTO certificates"
+            "(serial,subject,not_before,not_after,der,revoked,revoked_at,reason,profile) "
+            "VALUES(?,?,?,?,?,0,NULL,NULL,?)",
+            (serial, subject_str_out,
+             not_before.isoformat(), not_after.isoformat(),
+             cert_der, profile),
+        )
+        if audit:
+            audit.record("issue_slh_dsa",
+                         f"serial={serial} subject='{subject_str_out}' param={param_name}",
+                         requester_ip=requester_ip)
+        logger.info("Issued SLH-DSA cert serial=%d subject='%s' param=%s",
+                    serial, subject_str_out, param_name)
         return cert_der
 
     def get_certificate_by_serial(self, serial: int) -> Optional[str]:
@@ -5514,6 +5684,13 @@ def main():
         help="Enable composite ML-DSA + classical certificates "
              "(draft-ietf-lamps-pq-composite-sigs; default off until RFC publishes)"
     )
+    parser.add_argument(
+        "--enable-slh-dsa", action="store_true", default=False,
+        help="Enable SLH-DSA (FIPS 205) leaf certificate issuance "
+             "(draft-ietf-lamps-x509-slhdsa; default off until RFC publishes). "
+             "Requires the slhdsa package (pip install slh-dsa). "
+             "Warning: signatures are 8–50 KB depending on parameter set."
+    )
 
     args = parser.parse_args()
 
@@ -5524,6 +5701,16 @@ def main():
             raise SystemExit("--enable-composite-mldsa: composite.py module not found")
         HAS_COMPOSITE_MLDSA = True
         logger.info("Composite ML-DSA enabled (draft-ietf-lamps-pq-composite-sigs)")
+
+    # Enable SLH-DSA if requested
+    if getattr(args, "enable_slh_dsa", False):
+        global HAS_SLHDSA
+        if not _SLHDSA_AVAILABLE:
+            raise SystemExit(
+                "--enable-slh-dsa: slhdsa package not found; run: pip install slh-dsa"
+            )
+        HAS_SLHDSA = True
+        logger.info("SLH-DSA enabled (draft-ietf-lamps-x509-slhdsa-09 / FIPS 205)")
 
     configure_logging(args.log_level, getattr(args, "log_format", "text"))
 
