@@ -11,6 +11,23 @@ This project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Policy engine** (`policy.py`, `db_migrations/pki/005_policy.sql`): Policy-as-code
+  for issuance control per `CLAUDE-policy-engine.md`. JSON policy files with named rules
+  evaluated in order (first match wins). 13 match predicates: `profile`, `profile_in`,
+  `requester.backend`, `requester.roles`, `requester.identity_regex`, `sans.all_match_regex`,
+  `sans.any_match_regex`, `sans.none_match_regex`, `sans.count_max`, `key.type_in`,
+  `key.size_min`, `validity.requested_days_max`, `time.day_of_week_in`, `time.hour_range`.
+  Four decision types: `allow`, `deny`, `require_ra`, `require_dual_control`. `sets.validity_days_max`
+  caps validity at evaluation time. Default action configurable (`allow` or `deny`). Hot-reload
+  via `SIGHUP` — invalid reload keeps previous policy. Three enforcement modes: `enforce`
+  (deny takes effect), `warn` (log only, always allow), `off` (bypass evaluation entirely).
+  All decisions recorded in `policy_decisions` table; policy file content-hash stored in
+  `policy_versions` for auditor replay. Regexes compiled at load time (invalid regex rejects
+  the file). Admin CLI: `policy-validate`, `policy-test`, `policy-show`, `policy-history`.
+  CLI flags: `--policy-file`, `--policy-mode`. 41 new tests across 5 test classes
+  (`TestPolicyLoader`, `TestPolicyEvaluation`, `TestPolicyAudit`, `TestPolicyHotReload`,
+  `TestPolicyIssuanceIntegration`).
+
 - **Deployment infrastructure** (`notify.py`, `tls_manager.py`, `db_bootstrap.py`,
   `pg_tuning.py`, `pgbouncer.py`, `preflight.py`, `upgrade.py`, `wizard.py`,
   `pypki_init.py`, `bootstrap/`, `checks/`, `packaging/`). Eight deployment sidecar

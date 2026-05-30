@@ -1861,6 +1861,8 @@ class CertificateAuthority:
         self._ssh_host_max_validity: int = 2592000
         self._ssh_krl_ttl: int = 300
         self._ssh_krl_cache: Optional["KRLCache"] = None
+        # Policy engine — set by configure_policy() after CLI arg parsing; None = legacy behavior
+        self.policy_engine: Optional["policy_module.PolicyEngine"] = None
         self._init_db()
         self._load_or_create_ca()
         self._load_parent_chain(parent_chain_path)
@@ -1868,6 +1870,17 @@ class CertificateAuthority:
     def configure_ra(self, policy: RAPolicy) -> None:
         """Attach an RAWorkflow to this CA with the given approval policy."""
         self.ra = RAWorkflow(self._pki_db, self, policy)
+
+    def configure_policy(self, policy_file: str, mode: str = "enforce",
+                         audit: Optional["AuditLog"] = None) -> None:
+        """Load a policy file and attach a PolicyEngine to this CA."""
+        import policy as policy_module
+        self.policy_engine = policy_module.PolicyEngine(
+            policy_file=policy_file,
+            mode=mode,
+            db=self._pki_db,
+            audit=audit,
+        )
 
     def _init_db(self):
         # Bootstrap the core schema directly via the DAL (idempotent).
@@ -2240,6 +2253,7 @@ class CertificateAuthority:
         requester_ip: str = "",
         path_length: Optional[int] = None,
         protocol: str = "",
+        policy_req: Optional[Any] = None,
     ) -> x509.Certificate:
         """
         Issue a certificate signed by this CA.
@@ -2274,6 +2288,27 @@ class CertificateAuthority:
         """
         prof = CertProfile.get(profile)
         is_ca = is_ca or prof.get("bc_ca", False)
+
+        # Policy engine evaluation (after profile validation, before issuance)
+        if self.policy_engine is not None and policy_req is not None:
+            import policy as _policy_mod
+            decision = self.policy_engine.evaluate(policy_req)
+            if not decision.allowed:
+                action = decision.action
+                rule = decision.rule_name or "default"
+                reason = decision.reason or action
+                if audit:
+                    audit.record(
+                        "policy_deny",
+                        f"profile={profile} rule={rule} action={action} reason={reason}",
+                        ip=requester_ip,
+                    )
+                raise PermissionError(
+                    f"Issuance denied by policy (rule={rule!r}, action={action!r}): {reason}"
+                )
+            # Apply validity_days_max from sets clause
+            if "validity_days_max" in decision.sets and validity_days is not None:
+                validity_days = min(validity_days, int(decision.sets["validity_days_max"]))
 
         # RFC 9608 — resolve noRevAvail: explicit parameter wins, else profile default
         # MUST NOT appear in CA certificates (RFC 9608 §4 para 2)
@@ -5243,6 +5278,22 @@ def main():
         help="Path to a JSON RA policy file. Overrides --ra-auto-approve-profiles for "
              "the profiles it mentions."
     )
+    policy_group = parser.add_argument_group(
+        "Issuance policy options",
+        "Policy-as-code for issuance decisions (CLAUDE-policy-engine.md)."
+    )
+    policy_group.add_argument(
+        "--policy-file", default="", metavar="PATH",
+        help="Path to a JSON issuance policy file. When absent, legacy CertProfile-only "
+             "behavior applies (implicit allow). Reloaded on SIGHUP."
+    )
+    policy_group.add_argument(
+        "--policy-mode", default="enforce", choices=["enforce", "warn", "off"],
+        help="enforce: deny/require_ra decisions block issuance; "
+             "warn: log what would be blocked but allow anyway (migration path); "
+             "off: disable policy evaluation (default: enforce)"
+    )
+
     tls_group = parser.add_argument_group(
         "TLS options",
         "Use --tls for one-way TLS (server cert only) or --mtls for mutual TLS. "
@@ -5904,6 +5955,31 @@ def main():
         # Default / --ra-auto-approve: backwards-compatible auto-approve-all
         _ra_policy = RAPolicy(auto_approve_all=True)
     ca.configure_ra(_ra_policy)
+
+    # Issuance policy engine
+    _policy_file = getattr(args, "policy_file", "") or ""
+    _policy_mode = getattr(args, "policy_mode", "enforce") or "enforce"
+    if _policy_file:
+        try:
+            ca.configure_policy(_policy_file, mode=_policy_mode, audit=audit_log)
+            logger.info("Issuance policy: %s (mode=%s)", _policy_file, _policy_mode)
+        except Exception as _pe:
+            logger.error("Policy file load failed: %s — aborting startup", _pe)
+            raise SystemExit(1) from _pe
+
+        import signal as _signal
+        import policy as _policy_mod
+        _engine_ref = ca.policy_engine
+
+        def _sighup_handler(signum, frame):
+            if _engine_ref is not None:
+                ok = _engine_ref.reload()
+                logger.info("SIGHUP: policy reload %s", "OK" if ok else "FAILED")
+
+        try:
+            _signal.signal(_signal.SIGHUP, _sighup_handler)
+        except (OSError, AttributeError):
+            pass  # Windows / unsupported platform
 
     # Feature 5: ACME dns-01 hook configuration
     _dns01_hook = None

@@ -13916,6 +13916,619 @@ class TestPypkiSelfTLSProfile(unittest.TestCase):
 
 
 # ===========================================================================
+# Policy engine tests
+# ===========================================================================
+
+class TestPolicyLoader(unittest.TestCase):
+    """policy.load_policy() — schema validation, error cases."""
+
+    @classmethod
+    def setUpClass(cls):
+        try:
+            import policy as _p
+            cls.policy = _p
+        except ImportError:
+            raise unittest.SkipTest("policy.py not importable")
+
+    def _load_str(self, json_str: str):
+        import tempfile, json
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
+            f.write(json_str)
+            name = f.name
+        try:
+            return self.policy.load_policy(name)
+        finally:
+            import os; os.unlink(name)
+
+    def _valid_policy(self, **overrides):
+        import json
+        doc = {"version": 1, "default": "deny", "rules": []}
+        doc.update(overrides)
+        return json.dumps(doc)
+
+    def test_load_minimal_valid_policy(self):
+        p = self._load_str(self._valid_policy())
+        self.assertEqual(p.default, "deny")
+        self.assertEqual(len(p.rules), 0)
+
+    def test_content_hash_stable_across_loads(self):
+        raw = self._valid_policy()
+        p1 = self._load_str(raw)
+        p2 = self._load_str(raw)
+        self.assertEqual(p1.content_hash, p2.content_hash)
+
+    def test_unknown_top_level_key_rejected(self):
+        import json
+        bad = json.dumps({"version": 1, "default": "deny", "rules": [], "extra": True})
+        with self.assertRaises(ValueError):
+            self._load_str(bad)
+
+    def test_unknown_decision_rejected(self):
+        import json
+        bad = json.dumps({"version": 1, "default": "maybe", "rules": []})
+        with self.assertRaises(ValueError):
+            self._load_str(bad)
+
+    def test_invalid_regex_rejected_at_load(self):
+        import json
+        bad = json.dumps({"version": 1, "default": "deny", "rules": [
+            {"name": "r1", "match": {"sans": {"all_match_regex": "[bad"}}, "decide": "allow"}
+        ]})
+        with self.assertRaises(ValueError):
+            self._load_str(bad)
+
+    def test_duplicate_rule_names_rejected(self):
+        import json
+        bad = json.dumps({"version": 1, "default": "deny", "rules": [
+            {"name": "same", "match": {}, "decide": "allow"},
+            {"name": "same", "match": {}, "decide": "deny"},
+        ]})
+        with self.assertRaises(ValueError):
+            self._load_str(bad)
+
+    def test_unknown_match_predicate_rejected(self):
+        import json
+        bad = json.dumps({"version": 1, "default": "deny", "rules": [
+            {"name": "r1", "match": {"invented_key": "foo"}, "decide": "allow"}
+        ]})
+        with self.assertRaises(ValueError):
+            self._load_str(bad)
+
+    def test_unknown_sets_key_rejected(self):
+        import json
+        bad = json.dumps({"version": 1, "default": "deny", "rules": [
+            {"name": "r1", "match": {}, "decide": "allow", "sets": {"magic": 99}}
+        ]})
+        with self.assertRaises(ValueError):
+            self._load_str(bad)
+
+    def test_rule_with_all_predicates_loads(self):
+        import json
+        doc = {"version": 1, "default": "deny", "rules": [
+            {"name": "full", "match": {
+                "profile": "tls_server",
+                "requester": {"backend": "oidc", "roles": ["pki:admin"]},
+                "sans": {"all_match_regex": "\\.example\\.com$", "count_max": 5},
+                "key": {"type_in": ["ecdsa-p256"], "size_min": 256},
+                "validity": {"requested_days_max": 365},
+                "time": {"day_of_week_in": ["monday", "friday"], "hour_range": [8, 18]},
+            }, "decide": "allow", "sets": {"validity_days_max": 90}},
+        ]}
+        p = self._load_str(json.dumps(doc))
+        self.assertEqual(len(p.rules), 1)
+        self.assertEqual(p.rules[0].name, "full")
+
+    def test_invalid_json_rejected(self):
+        import tempfile, os
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
+            f.write("not json {")
+            name = f.name
+        try:
+            with self.assertRaises(ValueError):
+                self.policy.load_policy(name)
+        finally:
+            os.unlink(name)
+
+
+class TestPolicyEvaluation(unittest.TestCase):
+    """policy.evaluate() — predicate matching and decision logic."""
+
+    @classmethod
+    def setUpClass(cls):
+        try:
+            import policy as _p
+            cls.P = _p
+        except ImportError:
+            raise unittest.SkipTest("policy.py not importable")
+
+    def _make_policy(self, rules, default="deny"):
+        import json, tempfile, os
+        doc = {"version": 1, "default": default, "rules": rules}
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
+            json.dump(doc, f)
+            name = f.name
+        pol = self.P.load_policy(name)
+        os.unlink(name)
+        return pol
+
+    def _req(self, **kwargs):
+        defaults = dict(
+            profile="tls_server",
+            requester_backend="oidc",
+            requester_roles=("pki:operator",),
+            requester_identity="alice",
+            sans=("foo.example.com",),
+            key_type="ecdsa-p256",
+            key_bits=256,
+            validity_days_requested=90,
+        )
+        defaults.update(kwargs)
+        return self.P.IssuanceRequest(**defaults)
+
+    def test_no_match_returns_default_deny(self):
+        pol = self._make_policy([], default="deny")
+        d = self.P.evaluate(self._req(), pol)
+        self.assertEqual(d.action, "deny")
+        self.assertIsNone(d.rule_name)
+
+    def test_no_match_returns_default_allow(self):
+        pol = self._make_policy([], default="allow")
+        d = self.P.evaluate(self._req(), pol)
+        self.assertTrue(d.allowed)
+
+    def test_first_matching_rule_wins(self):
+        pol = self._make_policy([
+            {"name": "first", "match": {"profile": "tls_server"}, "decide": "allow"},
+            {"name": "second", "match": {"profile": "tls_server"}, "decide": "deny"},
+        ])
+        d = self.P.evaluate(self._req(profile="tls_server"), pol)
+        self.assertEqual(d.rule_name, "first")
+        self.assertTrue(d.allowed)
+
+    def test_profile_predicate_match(self):
+        pol = self._make_policy([
+            {"name": "r", "match": {"profile": "code_signing"}, "decide": "allow"},
+        ])
+        self.assertTrue(self.P.evaluate(self._req(profile="code_signing"), pol).allowed)
+        self.assertFalse(self.P.evaluate(self._req(profile="tls_server"), pol).allowed)
+
+    def test_profile_in_predicate(self):
+        pol = self._make_policy([
+            {"name": "r", "match": {"profile_in": ["tls_server", "tls_client"]}, "decide": "allow"},
+        ])
+        self.assertTrue(self.P.evaluate(self._req(profile="tls_client"), pol).allowed)
+        self.assertFalse(self.P.evaluate(self._req(profile="code_signing"), pol).allowed)
+
+    def test_requester_backend_match(self):
+        pol = self._make_policy([
+            {"name": "r", "match": {"requester": {"backend": "acme"}}, "decide": "allow"},
+        ])
+        self.assertTrue(self.P.evaluate(self._req(requester_backend="acme"), pol).allowed)
+        self.assertFalse(self.P.evaluate(self._req(requester_backend="oidc"), pol).allowed)
+
+    def test_requester_roles_any_match(self):
+        pol = self._make_policy([
+            {"name": "r", "match": {"requester": {"roles": ["pki:admin", "pki:operator"]}},
+             "decide": "allow"},
+        ])
+        self.assertTrue(self.P.evaluate(
+            self._req(requester_roles=("pki:operator",)), pol).allowed)
+        self.assertFalse(self.P.evaluate(
+            self._req(requester_roles=("pki:readonly",)), pol).allowed)
+
+    def test_all_match_regex(self):
+        pol = self._make_policy([
+            {"name": "r", "match": {"sans": {"all_match_regex": "\\.internal\\.example\\.com$"}},
+             "decide": "allow"},
+        ])
+        self.assertTrue(self.P.evaluate(
+            self._req(sans=("a.internal.example.com", "b.internal.example.com")), pol).allowed)
+        self.assertFalse(self.P.evaluate(
+            self._req(sans=("a.internal.example.com", "public.example.com")), pol).allowed)
+
+    def test_any_match_regex(self):
+        pol = self._make_policy([
+            {"name": "wildcard-deny",
+             "match": {"sans": {"any_match_regex": r"^\*\."}}, "decide": "deny"},
+            {"name": "allow-rest", "match": {}, "decide": "allow"},
+        ])
+        self.assertTrue(self.P.evaluate(
+            self._req(sans=("*.example.com",)), pol).denied)
+        self.assertTrue(self.P.evaluate(
+            self._req(sans=("foo.example.com",)), pol).allowed)
+
+    def test_none_match_regex(self):
+        pol = self._make_policy([
+            {"name": "r", "match": {
+                "sans": {"none_match_regex": "\\.internal\\.example\\.com$"}
+            }, "decide": "allow"},
+        ])
+        self.assertTrue(self.P.evaluate(
+            self._req(sans=("public.example.com",)), pol).allowed)
+        self.assertFalse(self.P.evaluate(
+            self._req(sans=("a.internal.example.com",)), pol).allowed)
+
+    def test_sans_count_max(self):
+        pol = self._make_policy([
+            {"name": "r", "match": {"sans": {"count_max": 2}}, "decide": "allow"},
+        ])
+        self.assertTrue(self.P.evaluate(
+            self._req(sans=("a.example.com", "b.example.com")), pol).allowed)
+        self.assertFalse(self.P.evaluate(
+            self._req(sans=("a.example.com", "b.example.com", "c.example.com")), pol).allowed)
+
+    def test_validity_days_max_cap_applied_in_sets(self):
+        """sets.validity_days_max is returned in decision.sets for callers to apply."""
+        pol = self._make_policy([
+            {"name": "r", "match": {}, "decide": "allow",
+             "sets": {"validity_days_max": 90}},
+        ])
+        d = self.P.evaluate(self._req(validity_days_requested=365), pol)
+        self.assertTrue(d.allowed)
+        self.assertEqual(d.sets.get("validity_days_max"), 90)
+
+    def test_validity_requested_days_max_predicate(self):
+        pol = self._make_policy([
+            {"name": "r", "match": {"validity": {"requested_days_max": 90}}, "decide": "allow"},
+        ])
+        self.assertTrue(self.P.evaluate(
+            self._req(validity_days_requested=90), pol).allowed)
+        self.assertFalse(self.P.evaluate(
+            self._req(validity_days_requested=91), pol).allowed)
+
+    def test_require_ra_decision(self):
+        pol = self._make_policy([
+            {"name": "r", "match": {"profile": "code_signing"}, "decide": "require_ra"},
+        ])
+        d = self.P.evaluate(self._req(profile="code_signing"), pol)
+        self.assertEqual(d.action, "require_ra")
+        self.assertFalse(d.allowed)
+        self.assertFalse(d.denied)
+
+    def test_time_day_of_week_predicate(self):
+        import datetime as _dt
+        monday = _dt.datetime(2026, 6, 1, 10, 0, tzinfo=_dt.timezone.utc)  # a Monday
+        saturday = _dt.datetime(2026, 6, 6, 10, 0, tzinfo=_dt.timezone.utc)
+        pol = self._make_policy([
+            {"name": "weekday-only",
+             "match": {"time": {"day_of_week_in": ["monday", "tuesday", "wednesday",
+                                                   "thursday", "friday"]}},
+             "decide": "allow"},
+        ])
+        self.assertTrue(self.P.evaluate(self._req(now=monday), pol).allowed)
+        self.assertFalse(self.P.evaluate(self._req(now=saturday), pol).allowed)
+
+    def test_time_hour_range_predicate(self):
+        import datetime as _dt
+        in_hours = _dt.datetime(2026, 6, 1, 14, 0, tzinfo=_dt.timezone.utc)
+        out_hours = _dt.datetime(2026, 6, 1, 3, 0, tzinfo=_dt.timezone.utc)
+        pol = self._make_policy([
+            {"name": "business-hours",
+             "match": {"time": {"hour_range": [8, 18]}},
+             "decide": "allow"},
+        ])
+        self.assertTrue(self.P.evaluate(self._req(now=in_hours), pol).allowed)
+        self.assertFalse(self.P.evaluate(self._req(now=out_hours), pol).allowed)
+
+    def test_identity_regex_predicate(self):
+        pol = self._make_policy([
+            {"name": "r", "match": {
+                "requester": {"identity_regex": "^svc-"}
+            }, "decide": "allow"},
+        ])
+        self.assertTrue(self.P.evaluate(
+            self._req(requester_identity="svc-deploy"), pol).allowed)
+        self.assertFalse(self.P.evaluate(
+            self._req(requester_identity="alice"), pol).allowed)
+
+    def test_key_type_in_predicate(self):
+        pol = self._make_policy([
+            {"name": "r", "match": {"key": {"type_in": ["ecdsa-p256", "ecdsa-p384"]}},
+             "decide": "allow"},
+        ])
+        self.assertTrue(self.P.evaluate(self._req(key_type="ecdsa-p256"), pol).allowed)
+        self.assertFalse(self.P.evaluate(self._req(key_type="rsa-2048"), pol).allowed)
+
+    def test_multiple_predicates_and_logic(self):
+        """All predicates in a rule must match (AND semantics)."""
+        pol = self._make_policy([
+            {"name": "r", "match": {
+                "profile": "tls_server",
+                "requester": {"backend": "oidc"},
+            }, "decide": "allow"},
+        ])
+        # Both match → allow
+        self.assertTrue(self.P.evaluate(
+            self._req(profile="tls_server", requester_backend="oidc"), pol).allowed)
+        # Only profile matches → deny (default)
+        self.assertFalse(self.P.evaluate(
+            self._req(profile="tls_server", requester_backend="acme"), pol).allowed)
+
+
+class TestPolicyAudit(unittest.TestCase):
+    """PolicyEngine.evaluate() — DB recording and warn-mode behavior."""
+
+    @classmethod
+    def setUpClass(cls):
+        try:
+            import policy as _p
+            cls.P = _p
+        except ImportError:
+            raise unittest.SkipTest("policy.py not importable")
+
+    def setUp(self):
+        import tempfile, os
+        from pathlib import Path as _Path
+        self._tmp = tempfile.mkdtemp(prefix="policy-audit-")
+        # Bootstrap a minimal DB with the policy_decisions / policy_versions tables
+        from db import make_db
+        self._db = make_db(f"sqlite:///{self._tmp}/pki.db")
+        self._db.execute(
+            "CREATE TABLE policy_decisions ("
+            "id INTEGER PRIMARY KEY AUTOINCREMENT,"
+            "request_id TEXT, policy_hash TEXT, rule_name TEXT, decision TEXT,"
+            "decided_at INTEGER, requester TEXT, profile TEXT, sans_summary TEXT)"
+        )
+        self._db.execute(
+            "CREATE TABLE policy_versions ("
+            "content_hash TEXT PRIMARY KEY, content TEXT,"
+            "loaded_at INTEGER, loaded_by TEXT)"
+        )
+
+    def tearDown(self):
+        self._db.close()
+        import shutil
+        shutil.rmtree(self._tmp, ignore_errors=True)
+
+    def _make_engine(self, rules, default="deny", mode="enforce"):
+        import json, os
+        doc = {"version": 1, "default": default, "rules": rules}
+        path = os.path.join(self._tmp, "policy.json")
+        with open(path, "w") as f:
+            json.dump(doc, f)
+        return self.P.PolicyEngine(policy_file=path, mode=mode, db=self._db)
+
+    def _req(self, **kwargs):
+        defaults = dict(
+            profile="tls_server",
+            requester_backend="oidc",
+            requester_roles=("pki:admin",),
+            requester_identity="alice",
+            sans=("foo.example.com",),
+            request_id="req-123",
+        )
+        defaults.update(kwargs)
+        return self.P.IssuanceRequest(**defaults)
+
+    def test_decision_recorded_in_db(self):
+        engine = self._make_engine([
+            {"name": "r", "match": {}, "decide": "allow"},
+        ])
+        engine.evaluate(self._req())
+        row = self._db.fetchone("SELECT * FROM policy_decisions WHERE request_id='req-123'")
+        self.assertIsNotNone(row)
+        self.assertEqual(row["decision"], "allow")
+        self.assertEqual(row["rule_name"], "r")
+
+    def test_default_path_recorded_distinctly(self):
+        engine = self._make_engine([], default="deny")
+        engine.evaluate(self._req(request_id="req-default"))
+        row = self._db.fetchone(
+            "SELECT * FROM policy_decisions WHERE request_id='req-default'"
+        )
+        self.assertIsNotNone(row)
+        self.assertIsNone(row["rule_name"])
+        self.assertEqual(row["decision"], "deny")
+
+    def test_policy_version_persisted_on_load(self):
+        engine = self._make_engine([])
+        row = self._db.fetchone("SELECT * FROM policy_versions")
+        self.assertIsNotNone(row)
+        self.assertEqual(len(row["content_hash"]), 64)
+
+    def test_warn_mode_allows_but_does_not_record_block(self):
+        """In warn mode, a deny decision is logged but the returned action is allow."""
+        engine = self._make_engine(
+            [{"name": "always-deny", "match": {}, "decide": "deny"}],
+            mode="warn",
+        )
+        d = engine.evaluate(self._req(request_id="req-warn"))
+        self.assertTrue(d.allowed)
+        # The DB still records the original (deny) decision
+        row = self._db.fetchone(
+            "SELECT decision FROM policy_decisions WHERE request_id='req-warn'"
+        )
+        self.assertIsNotNone(row)
+        self.assertEqual(row["decision"], "deny")
+
+    def test_off_mode_skips_evaluation(self):
+        engine = self._make_engine(
+            [{"name": "always-deny", "match": {}, "decide": "deny"}],
+            mode="off",
+        )
+        d = engine.evaluate(self._req())
+        self.assertTrue(d.allowed)
+        self.assertEqual(d.policy_hash, "")
+
+
+class TestPolicyHotReload(unittest.TestCase):
+    """PolicyEngine.reload() — SIGHUP-style hot swap."""
+
+    @classmethod
+    def setUpClass(cls):
+        try:
+            import policy as _p
+            cls.P = _p
+        except ImportError:
+            raise unittest.SkipTest("policy.py not importable")
+
+    def setUp(self):
+        import tempfile
+        self._tmp = tempfile.mkdtemp(prefix="policy-reload-")
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self._tmp, ignore_errors=True)
+
+    def _write_policy(self, rules, default="deny", name="policy.json"):
+        import json, os
+        path = os.path.join(self._tmp, name)
+        with open(path, "w") as f:
+            json.dump({"version": 1, "default": default, "rules": rules}, f)
+        return path
+
+    def _req(self, **kwargs):
+        defaults = dict(
+            profile="tls_server", requester_backend="oidc",
+            requester_identity="alice", sans=("foo.example.com",),
+        )
+        defaults.update(kwargs)
+        return self.P.IssuanceRequest(**defaults)
+
+    def test_initial_load_applies(self):
+        path = self._write_policy([], default="allow")
+        engine = self.P.PolicyEngine(policy_file=path)
+        d = engine.evaluate(self._req())
+        self.assertTrue(d.allowed)
+
+    def test_reload_swaps_policy(self):
+        path = self._write_policy([], default="allow")
+        engine = self.P.PolicyEngine(policy_file=path)
+        self.assertTrue(engine.evaluate(self._req()).allowed)
+        # Overwrite with deny-all
+        self._write_policy([], default="deny", name="policy.json")
+        ok = engine.reload()
+        self.assertTrue(ok)
+        self.assertFalse(engine.evaluate(self._req()).allowed)
+
+    def test_reload_invalid_keeps_previous(self):
+        path = self._write_policy([], default="allow")
+        engine = self.P.PolicyEngine(policy_file=path)
+        # Write invalid JSON
+        with open(path, "w") as f:
+            f.write("{ not valid json")
+        ok = engine.reload()
+        self.assertFalse(ok)
+        # Previous allow-all policy still active
+        self.assertTrue(engine.evaluate(self._req()).allowed)
+
+    def test_status_reports_correct_rule_count(self):
+        path = self._write_policy([
+            {"name": "r1", "match": {}, "decide": "allow"},
+            {"name": "r2", "match": {"profile": "code_signing"}, "decide": "require_ra"},
+        ], default="deny")
+        engine = self.P.PolicyEngine(policy_file=path)
+        status = engine.status()
+        self.assertEqual(status["rule_count"], 2)
+        self.assertEqual(status["default"], "deny")
+        self.assertEqual(status["mode"], "enforce")
+
+
+class TestPolicyIssuanceIntegration(unittest.TestCase):
+    """issue_certificate() respects policy_req when policy_engine is configured."""
+
+    @classmethod
+    def setUpClass(cls):
+        try:
+            import policy as _p
+            cls.P = _p
+        except ImportError:
+            raise unittest.SkipTest("policy.py not importable")
+
+    def setUp(self):
+        import tempfile
+        self._tmp = tempfile.mkdtemp(prefix="policy-integ-")
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self._tmp, ignore_errors=True)
+
+    def _make_engine(self, rules, default="deny"):
+        import json, os
+        path = os.path.join(self._tmp, "pol.json")
+        with open(path, "w") as f:
+            json.dump({"version": 1, "default": default, "rules": rules}, f)
+        return self.P.PolicyEngine(policy_file=path, mode="enforce")
+
+    def test_policy_allow_permits_issuance(self):
+        ca = _make_ca(self._tmp)
+        ca.policy_engine = self._make_engine(
+            [{"name": "r", "match": {}, "decide": "allow"}]
+        )
+        req = self.P.IssuanceRequest(
+            profile="tls_server",
+            requester_backend="oidc",
+            requester_identity="alice",
+            sans=("foo.example.com",),
+        )
+        key = _gen_key()
+        cert = ca.issue_certificate(
+            "CN=foo.example.com", key.public_key(),
+            san_dns=["foo.example.com"],
+            profile="tls_server",
+            policy_req=req,
+        )
+        self.assertIsNotNone(cert)
+
+    def test_policy_deny_raises_permission_error(self):
+        ca = _make_ca(self._tmp)
+        ca.policy_engine = self._make_engine([], default="deny")
+        req = self.P.IssuanceRequest(
+            profile="tls_server",
+            requester_backend="acme",
+            requester_identity="account-1",
+            sans=("foo.example.com",),
+        )
+        key = _gen_key()
+        with self.assertRaises(PermissionError):
+            ca.issue_certificate(
+                "CN=foo.example.com", key.public_key(),
+                san_dns=["foo.example.com"],
+                profile="tls_server",
+                policy_req=req,
+            )
+
+    def test_no_policy_req_skips_evaluation(self):
+        """If policy_req is not passed, policy engine is not consulted (legacy path)."""
+        ca = _make_ca(self._tmp)
+        ca.policy_engine = self._make_engine([], default="deny")
+        key = _gen_key()
+        # No policy_req → no policy check → should succeed
+        cert = ca.issue_certificate(
+            "CN=foo.example.com", key.public_key(),
+            san_dns=["foo.example.com"],
+            profile="tls_server",
+        )
+        self.assertIsNotNone(cert)
+
+    def test_sets_validity_days_max_cap(self):
+        """sets.validity_days_max caps the issued validity to the smaller value."""
+        ca = _make_ca(self._tmp)
+        ca.policy_engine = self._make_engine(
+            [{"name": "r", "match": {}, "decide": "allow",
+              "sets": {"validity_days_max": 30}}]
+        )
+        req = self.P.IssuanceRequest(
+            profile="tls_server",
+            requester_backend="oidc",
+            requester_identity="alice",
+            sans=("foo.example.com",),
+            validity_days_requested=365,
+        )
+        key = _gen_key()
+        cert = ca.issue_certificate(
+            "CN=foo.example.com", key.public_key(),
+            san_dns=["foo.example.com"],
+            profile="tls_server",
+            validity_days=365,
+            policy_req=req,
+        )
+        from cryptography.x509 import Certificate as _Cert
+        delta = cert.not_valid_after_utc - cert.not_valid_before_utc
+        self.assertLessEqual(delta.days, 31)
+
+
+# ===========================================================================
 # Entry point
 # ===========================================================================
 

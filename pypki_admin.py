@@ -471,6 +471,50 @@ def build_parser() -> argparse.ArgumentParser:
                     choices=["DEBUG", "INFO", "WARNING", "ERROR"])
     ae.set_defaults(func=cmd_audit_export)
 
+    # ---- policy subcommands ----
+    pv = sub.add_parser(
+        "policy-validate",
+        help="Validate a policy JSON file (schema + regex compile); no side effects.",
+    )
+    pv.add_argument("policy_file", metavar="FILE",
+                    help="Path to the JSON policy file to validate.")
+    pv.add_argument("--log-level", default="WARNING",
+                    choices=["DEBUG", "INFO", "WARNING", "ERROR"])
+    pv.set_defaults(func=cmd_policy_validate)
+
+    pt = sub.add_parser(
+        "policy-test",
+        help="Dry-run a JSON request against a policy file and print the decision.",
+    )
+    pt.add_argument("policy_file", metavar="FILE",
+                    help="Path to the JSON policy file.")
+    pt.add_argument("--request", required=True, metavar="JSON",
+                    help='Issuance request as JSON, e.g. \'{"profile":"tls_server",'
+                         '"requester_backend":"oidc","sans":["foo.example.com"]}\'')
+    pt.add_argument("--log-level", default="WARNING",
+                    choices=["DEBUG", "INFO", "WARNING", "ERROR"])
+    pt.set_defaults(func=cmd_policy_test)
+
+    ps = sub.add_parser(
+        "policy-show",
+        help="Show the currently loaded policy (hash, rule count, default).",
+    )
+    ps.add_argument("policy_file", metavar="FILE",
+                    help="Path to the policy file to inspect.")
+    ps.add_argument("--log-level", default="WARNING",
+                    choices=["DEBUG", "INFO", "WARNING", "ERROR"])
+    ps.set_defaults(func=cmd_policy_show)
+
+    ph = sub.add_parser(
+        "policy-history",
+        help="List all policy versions stored in the PKI DB.",
+    )
+    ph.add_argument("--ca-dir", default="./ca", metavar="DIR")
+    ph.add_argument("--pki-db-url", default=None, metavar="URL")
+    ph.add_argument("--log-level", default="WARNING",
+                    choices=["DEBUG", "INFO", "WARNING", "ERROR"])
+    ph.set_defaults(func=cmd_policy_history)
+
     asw = sub.add_parser(
         "ari-set-window",
         help="Set or override the ARI renewal window for a specific certificate.",
@@ -838,6 +882,117 @@ def _acme_db(args: argparse.Namespace):
         print("ERROR: acme_server.py not found — place it in the same directory.")
         raise SystemExit(1)
     return acme_server.ACMEDatabase(url)
+
+
+def cmd_policy_validate(args: argparse.Namespace) -> int:
+    """Validate a policy JSON file — schema + regex compile, no side effects."""
+    _setup_logging(args.log_level)
+    try:
+        import policy as _policy
+    except ImportError:
+        print("ERROR: policy.py not found.")
+        return 1
+    try:
+        p = _policy.load_policy(args.policy_file)
+        print(f"OK  {args.policy_file}")
+        print(f"    version=1  rules={len(p.rules)}  default={p.default}")
+        print(f"    hash={p.content_hash[:16]}...")
+        return 0
+    except Exception as exc:
+        print(f"INVALID  {args.policy_file}")
+        print(f"  {exc}")
+        return 1
+
+
+def cmd_policy_test(args: argparse.Namespace) -> int:
+    """Dry-run a request against a policy file and print the decision."""
+    import json as _json
+    _setup_logging(args.log_level)
+    try:
+        import policy as _policy
+    except ImportError:
+        print("ERROR: policy.py not found.")
+        return 1
+    try:
+        pol = _policy.load_policy(args.policy_file)
+    except Exception as exc:
+        print(f"Policy load error: {exc}")
+        return 1
+    try:
+        req_dict = _json.loads(args.request)
+    except _json.JSONDecodeError as exc:
+        print(f"Invalid --request JSON: {exc}")
+        return 1
+    req = _policy.IssuanceRequest(
+        profile=req_dict.get("profile", ""),
+        requester_backend=req_dict.get("requester_backend", ""),
+        requester_roles=tuple(req_dict.get("requester_roles", [])),
+        requester_identity=req_dict.get("requester_identity", ""),
+        sans=tuple(req_dict.get("sans", [])),
+        key_type=req_dict.get("key_type", ""),
+        key_bits=int(req_dict.get("key_bits", 0)),
+        validity_days_requested=int(req_dict.get("validity_days_requested", 0)),
+        request_id=req_dict.get("request_id", ""),
+    )
+    decision = _policy.evaluate(req, pol)
+    print(f"Decision : {decision.action}")
+    print(f"Rule     : {decision.rule_name or '(default)'}")
+    print(f"Reason   : {decision.reason or '-'}")
+    if decision.sets:
+        print(f"Sets     : {decision.sets}")
+    print(f"Hash     : {decision.policy_hash[:16]}...")
+    return 0 if decision.allowed else 2
+
+
+def cmd_policy_show(args: argparse.Namespace) -> int:
+    """Show metadata for a policy file."""
+    _setup_logging(args.log_level)
+    try:
+        import policy as _policy
+    except ImportError:
+        print("ERROR: policy.py not found.")
+        return 1
+    try:
+        pol = _policy.load_policy(args.policy_file)
+    except Exception as exc:
+        print(f"Error: {exc}")
+        return 1
+    print(f"File    : {args.policy_file}")
+    print(f"Hash    : {pol.content_hash}")
+    print(f"Default : {pol.default}")
+    print(f"Rules   : {len(pol.rules)}")
+    for i, rule in enumerate(pol.rules, 1):
+        print(f"  [{i:2d}] {rule.name!r}  decide={rule.decide}")
+    return 0
+
+
+def cmd_policy_history(args: argparse.Namespace) -> int:
+    """List policy versions stored in the PKI DB."""
+    import json as _json
+    import datetime as _dt
+    _setup_logging(args.log_level)
+    from db import make_db
+    ca_dir = args.ca_dir
+    url = getattr(args, "pki_db_url", None) or f"sqlite:///{ca_dir}/certificates.db"
+    db = make_db(url)
+    try:
+        rows = db.fetchall(
+            "SELECT content_hash, loaded_at, loaded_by FROM policy_versions ORDER BY loaded_at DESC"
+        )
+    except Exception as exc:
+        print(f"Error reading policy_versions: {exc}")
+        db.close()
+        return 1
+    db.close()
+    if not rows:
+        print("No policy versions recorded.")
+        return 0
+    print(f"{'Hash (first 16)':18}  {'Loaded at':20}  {'By':12}")
+    print("-" * 58)
+    for row in rows:
+        ts = _dt.datetime.fromtimestamp(row["loaded_at"], tz=_dt.timezone.utc).isoformat()
+        print(f"{row['content_hash'][:16]}  {ts}  {row['loaded_by']}")
+    return 0
 
 
 def cmd_ari_set_window(args: argparse.Namespace) -> int:

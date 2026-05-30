@@ -328,9 +328,11 @@ landmarks here are a bug.
 |                         | firewall_setup                                                  |
 | `packaging/`            | systemd units, nftables/ufw/firewalld, AppArmor, sysctl,       |
 |                         | ulimits, cron, topology reference docs                          |
+| `policy.py`             | Policy-as-code engine: load, evaluate, hot-reload JSON policies |
+| `audit_chain.py`        | Tamper-evident hash-chained audit log (append serialized)       |
+| `composite.py`          | Composite ML-DSA X.509 (draft-ietf-lamps-pq-composite-sigs)    |
 
-Additional modules are added per sidecar spec (`policy.py`,
-`audit_chain.py`, etc.). Each spec lists the module it introduces.
+Additional modules are added per sidecar spec. Each spec lists the module it introduces.
 
 ### 5.2 Key code locations
 
@@ -488,7 +490,7 @@ Current sidecars:
 - `CLAUDE-ssh-ca.md` — SSH certificate authority
 - `CLAUDE-sso.md` — OIDC and SAML SSO for admin
 - `CLAUDE-portal.md` — Self-service end-user portal
-- `CLAUDE-policy-engine.md` — Policy-as-code for issuance
+- `CLAUDE-policy-engine.md` — Policy-as-code for issuance (**shipped**)
 - `CLAUDE-audit-chain.md` — Tamper-evident hash-chained audit log (**shipped**)
 - `CLAUDE-terraform-provider.md` — Terraform provider
 
@@ -579,8 +581,15 @@ is in place for `AuditLog` and pending for `CertificateAuthority`.
 
 **PQC posture**: ML-DSA shipped, RFC 9763 shipped, SLH-DSA shipped
 (leaf certs gated behind `--enable-slh-dsa`; requires `pip install slh-dsa`).
-Composite ML-DSA spec'd but not implemented. Crypto-agility dashboard
-spec'd but not implemented.
+Composite ML-DSA shipped (`composite.py`, `--enable-composite-mldsa`). Crypto-agility
+dashboard spec'd but not implemented.
+
+**Policy engine**: shipped. `policy.py` implements JSON policy-as-code for issuance
+control. 13 match predicates, 4 decision types (`allow`/`deny`/`require_ra`/
+`require_dual_control`), hot-reload via SIGHUP, three modes (`enforce`/`warn`/`off`).
+Decisions recorded in `policy_decisions`; policy content stored in `policy_versions`.
+Admin CLI: `policy-validate`, `policy-test`, `policy-show`, `policy-history`.
+CLI flags: `--policy-file`, `--policy-mode`.
 
 **Infrastructure**: Docker Compose with PyPKI + nginx; PAM auth with
 brute-force lockout; configurable `base_path` for Web UI. Helm chart
@@ -605,7 +614,7 @@ nftables/ufw/firewalld, AppArmor, sysctl, cron, topology reference docs).
 `pypki_admin.py` extended with: `db-init`, `tls-rotate/status/replace`,
 `hardening-status/apply/validate`, `preflight`, `upgrade/upgrade-check/status/rollback`.
 
-**Test suite**: `test_pki_server.py`, 930+ tests, 2 Postgres
+**Test suite**: `test_pki_server.py`, 978+ tests, 2 Postgres
 tests correctly skipping without env var.
 
 **Observability**: Prometheus metrics + Grafana dashboard JSON
@@ -713,6 +722,28 @@ Past entries (reconstructed from memory; future sessions append):
   `pgbouncer.py`, `preflight.py`, `checks/`, `upgrade.py`, `wizard.py`, `pypki_init.py`,
   `bootstrap/`, `packaging/` (all new); `pki_server.py` (pypki_self_tls profile +
   sd_notify + CLI flags); `pypki_admin.py` (12 new subcommands)
+
+### 2026-05-30 — Policy engine + DAL migration completion
+- Decided: policy files are JSON (no pyyaml dep); `IssuanceRequest` frozen dataclass
+  passed as `policy_req=` to `issue_certificate()` for backwards-compat; advisory lock
+  not needed for policy (read-only at runtime); warn mode records with original action
+  but returns allow; `PRAGMA foreign_keys` removed from `verify_sqlite()` (per-connection,
+  does not persist)
+- Done: `policy.py` (~450 lines: `IssuanceRequest`, `Decision`, `_Rule`, `Policy`,
+  `PolicyEngine`; 13 predicates, 4 decision types, hot-reload, enforce/warn/off modes);
+  `db_migrations/pki/005_policy.sql` (`policy_decisions` + `policy_versions`);
+  `pki_server.py` (`configure_policy()` on CA, `policy_req` param, evaluation in
+  `issue_certificate()`, `--policy-file`/`--policy-mode` CLI flags, SIGHUP handler);
+  `pypki_admin.py` (4 new subcommands: `policy-validate`, `policy-test`, `policy-show`,
+  `policy-history`); DAL migration finalized (removed stale `import sqlite3` from
+  `scep_server.py`, `acme_server.py`, `cmp_server.py`; `ocsp_server.py` import in
+  function body; `ceremony.py` converted to `make_db()`); 41 new tests (5 classes)
+- Pending: portal, SSO, cloud KMS, backup-restore, multitenancy, crypto-agility
+  dashboard, embedded enrollment, Terraform provider
+- Deferred: none
+- Landmarks changed: `policy.py` (new), `db_migrations/pki/005_policy.sql` (new),
+  `pki_server.py` (`configure_policy`, `policy_req`, SIGHUP), `pypki_admin.py` (4 new
+  subcommands), `ceremony.py` (DAL), `db.py` (docstring)
 
 ---
 
