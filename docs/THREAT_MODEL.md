@@ -1,6 +1,7 @@
 # PyPKI Threat Model
 
-**Document version:** 1.0
+**Document version:** 2.0
+**Last reviewed:** 2026-06-01 (Tier 6 walkback — covers all Tier 5 surfaces)
 **Audience:** PyPKI operators evaluating whether a deployment fits their risk profile, and developers contributing security-sensitive changes.
 
 This document defines the trust boundary, the trusted computing base (TCB), what an attacker who compromises each component can do, what they can't, and the controls that bound the blast radius.
@@ -221,6 +222,361 @@ PyPKI ships no automated tooling for this. **It is a process gap operators must 
 
 ---
 
+---
+
+## 3b. Post-Tier-5 surface walkback
+
+The following surfaces were added after the original Tier-4 threat model. Each is tabletop'd here per the 6.3 spec format.
+
+### 3b.1 RA approval workflow
+
+**Trust boundary:** Requester → RA approver → CA operator. RA approvers can approve or deny pending requests but cannot issue certificates directly.
+
+**Asset:** Issuance authority — the ability to cause the CA to sign a certificate.
+
+**Attackers:**
+- Compromised requester: submits a request with a misleading subject or SAN, hoping an inattentive RA approves it.
+- Compromised RA approver: approves requests they should deny; cannot forge the CA signature.
+- Colluding requester + RA approver: both controlled by the same attacker — dual-party control is defeated.
+
+**Threats:**
+- *Spoofing*: requester claims a subject name they don't own. RA approval is the control; the RA must verify out-of-band.
+- *Elevation of privilege*: RA approver attempts to approve a request outside their designated profile or tenant. Currently bounded by profile-level checks in `pki_server.py:issue_certificate()`.
+- *Repudiation*: RA denies having approved a cert. Mitigated by audit log.
+
+**Existing mitigations:**
+- `pki_server.py:_handle_ra_approve` records `audit: ra_approve` with the approver identity before calling `issue_certificate()`.
+- `audit` table captures the approver's session token; `web_ui.py:_api_ra_approve` logs approver identity.
+- Profile constraints (`CertProfile.allowed_san_dns_patterns`) apply after RA approval — RA cannot override profile policy.
+
+**Residual risk:**
+- No dual-control: one RA can unilaterally approve. Accepted for current deployment profiles; operator runbooks should require two approvers for high-value profiles.
+- RA approver identity is session-bound, not cryptographically signed. An attacker who steals the RA session cookie can approve requests.
+
+**Tests:** `TestWebUIRAQueue` (approval, denial, audit logging)
+
+---
+
+### 3b.2 ACME External Account Binding (EAB)
+
+**Trust boundary:** ACME server (PyPKI) ↔ ACME client (certbot, acme.sh, etc.) via HMAC-bound account key.
+
+**Asset:** ACME enrollment authorization — the right to obtain a certificate for a domain.
+
+**Attackers:**
+- Attacker with network access who has observed the HMAC key in transit.
+- Attacker who compromises the system that distributed the HMAC key.
+
+**Threats:**
+- *Spoofing*: attacker creates an ACME account using a stolen EAB HMAC key, enrolls for domains they don't control.
+- *Replay*: captured EAB binding request replayed to a different ACME server.
+- *Enumeration*: attacker brute-forces short EAB key IDs to find valid keys.
+
+**Existing mitigations:**
+- EAB keys are 32-byte random (`secrets.token_bytes(32)`); brute-force is infeasible.
+- EAB key IDs are random UUIDs; enumeration is infeasible.
+- EAB `externalAccountBinding` JWS is bound to the account key via HMAC-SHA256 — a key stolen after binding is useless to a different account.
+- Each EAB key is single-use: once bound to an account, it cannot be reused (`acme.db:eab_keys.used=1`).
+- Rate limiting applies to account creation.
+
+**Residual risk:**
+- EAB HMAC keys are stored in plaintext in `acme.db`. An attacker with DB read access can extract and use un-consumed keys. Accepted: DB access is already a serious compromise (§3.4 scope).
+- Distribution channel for EAB keys to legitimate clients is out-of-scope for PyPKI; operators must secure it.
+
+**Tests:** `TestACMEEAB` (binding validation, single-use enforcement, HMAC verification)
+
+---
+
+### 3b.3 ACME per-account rate limiting
+
+**Trust boundary:** ACME server ↔ authenticated ACME account.
+
+**Asset:** Issuance capacity — preventing one account from consuming all CA resources or disrupting others.
+
+**Attackers:**
+- Authenticated ACME account holder who submits orders in a tight loop.
+- Attacker who has compromised an ACME account key and weaponizes it for DoS.
+
+**Threats:**
+- *DoS*: flooding the order endpoint causes issuance queue exhaustion for other accounts.
+- *Account enumeration via rate-limit responses*: rate-limit error leaks which accounts are active.
+
+**Existing mitigations:**
+- `RateLimiter` class in `pki_server.py` applies per-IP and per-credential limits to all issuance endpoints including ACME.
+- ACME rate-limit responses return `urn:ietf:params:acme:error:rateLimited` without revealing account enumeration data.
+
+**Residual risk:**
+- Per-account (not just per-IP) rate limiting is not yet implemented; shared-IP deployments (NAT, proxies) are less well protected. Accepted for current traffic profile; revisit when multi-tenancy ships.
+
+**Tests:** `TestRateLimiter`, `TestACMERateLimit`
+
+---
+
+### 3b.4 Cross-signing
+
+**Trust boundary:** CA operator ↔ external CA or sub-CA requesting a cross-signature from PyPKI's CA.
+
+**Asset:** Trust path — an attacker-controlled CA cross-signed by a legitimate CA can sign arbitrary certs trusted by relying parties.
+
+**Attackers:**
+- Attacker who submits a CSR with a misleading Subject, causing PyPKI to cross-sign an attacker-controlled CA.
+- Insider who uses the cross-sign API without proper out-of-band verification.
+
+**Threats:**
+- *Misissuance*: PyPKI cross-signs a CA cert without verifying the subject name matches the legitimate CA.
+- *Chain confusion*: cross-signed cert has wider name constraints than the original CA, expanding the trust scope.
+
+**Existing mitigations:**
+- Cross-signing is a privileged operator action requiring an authenticated admin session.
+- The cross-signed CSR is validated for basic structure before signing.
+- All cross-sign events are audit-logged with the operator identity and CSR subject.
+- `nameConstraints` on the cross-signed CA can be set by the operator to bound scope.
+
+**Residual risk:**
+- No automated out-of-band verification of the CSR subject is possible. This is inherently a policy/process control. Operators MUST verify the CSR subject independently before clicking approve.
+- Cross-signing a compromised CA cert cannot be undone without revoking the cross-signed cert and re-distributing the updated CRL. Accepted.
+
+**Tests:** `TestCrossSign` (structure validation, audit logging, name constraints)
+
+---
+
+### 3b.5 Paired ML-DSA + classical issuance (RFC 9763)
+
+**Trust boundary:** CA ↔ relying party chain validator.
+
+**Asset:** Certificate validity — relying parties trust both the classical and ML-DSA certs in the pair.
+
+**Attackers:**
+- Attacker who obtains only the classical cert and attempts to use it without the ML-DSA counterpart.
+- Attacker who causes a rollback to classical-only validation, bypassing PQC requirements.
+
+**Threats:**
+- *Downgrade*: relying party that accepts either cert individually without checking the `RelatedCertificate` extension can be tricked with a classical-only cert from an algorithm-agile CA.
+- *Revocation inconsistency*: classical cert is revoked but ML-DSA cert is not (or vice versa), leaving one path usable.
+
+**Existing mitigations:**
+- `RelatedCertificate` extension (RFC 9763 §4) links paired certs bidirectionally.
+- Both certs in a pair share the same serial allocation logic; revocation must be applied to both (operator procedure, not automated).
+- Audit log records both issuance events with a shared `pair_id` tag in the detail field.
+
+**Residual risk:**
+- Revocation of a paired cert does NOT auto-revoke its counterpart. This is a known gap. Operators must revoke both manually. Documented in `docs/DR.md`.
+- Relying-party enforcement of `RelatedCertificate` is not mandated by RFC 9763; classical-only relying parties remain unaware of the pairing. Accepted: the extension is advisory.
+
+**Tests:** `TestRFC9763PairedCerts` (bidirectional extension, serial assignment, audit)
+
+---
+
+### 3b.6 CT pre-cert submission
+
+**Trust boundary:** PyPKI ↔ CT log server.
+
+**Asset:** Certificate transparency — every issued cert should appear in at least one CT log before being returned to the subscriber.
+
+**Attackers:**
+- Hostile CT log: returns a fake SCT that does not actually commit the pre-cert.
+- CT log unavailability: blocks issuance if PyPKI requires an SCT.
+
+**Threats:**
+- *SCT forgery*: log returns a syntactically valid but cryptographically invalid SCT. Relying parties with STH verification would reject the cert.
+- *Log misbehaviour*: log commits the pre-cert to a split view, hiding it from auditors.
+- *Availability-based DoS*: CT log goes offline; if PyPKI requires an SCT before issuance, the CA is DoS'd.
+
+**Existing mitigations:**
+- SCT injection is opt-in (`--ct-log-url`). When not configured, no CT submission occurs and no SCT is embedded.
+- SCT is verified for structural correctness (length, version) before embedding.
+- CT log unavailability is treated as a non-fatal warning unless `--ct-require-sct` is set.
+- All CT submission outcomes are audit-logged.
+
+**Residual risk:**
+- PyPKI does not verify SCT cryptographic signatures (requires the log's public key and is a verification concern for relying parties, not the CA). Accepted.
+- Split-view attacks are a systemic CT ecosystem problem, not solvable at the CA layer. Accepted.
+
+**Tests:** `TestCTPrecert` (SCT injection, structural validation, fallback on log unavailability)
+
+---
+
+### 3b.7 Lifecycle webhooks
+
+**Trust boundary:** PyPKI ↔ external webhook receiver.
+
+**Asset:** Webhook integrity — receivers can act on lifecycle events without being spoofed.
+
+**Attackers:**
+- Attacker who controls the network path between PyPKI and the webhook receiver.
+- Attacker who injects a fake webhook URL into config (requires CA operator access).
+- Compromised webhook receiver that is used as an SSRF pivot.
+
+**Threats:**
+- *SSRF*: webhook URL can be configured to point at internal services; PyPKI will POST to them on every cert event.
+- *Replay*: a captured webhook request replayed to the receiver after the event occurred.
+- *Spoofing*: attacker crafts a webhook POST that looks like it came from PyPKI.
+
+**Existing mitigations:**
+- Webhook receiver URL is operator-configured; requires CA operator access to change.
+- Webhook payload includes a timestamp and event ID; receivers should reject replays outside a time window.
+- `--webhook-secret` HMAC-SHA256 signs every outbound webhook; receivers SHOULD verify the signature.
+- Webhook delivery is non-blocking: a slow or failing receiver does not block issuance.
+- All webhook delivery attempts (success/failure) are audit-logged.
+
+**Residual risk:**
+- SSRF: no URL allow-listing is implemented. An attacker with CA operator access could point the webhook at `http://169.254.169.254/` (AWS IMDS). Accepted: CA operator access already implies full system compromise. Documented: operators should restrict outbound network from the CA host.
+- Receivers that don't implement HMAC verification are unprotected against spoofing. Accepted: receiver hardening is out-of-scope.
+
+**Tests:** `TestWebhooks` (delivery, HMAC signing, non-blocking failure, audit logging)
+
+---
+
+### 3b.8 HSM / PKCS#11 backend
+
+**Trust boundary:** PyPKI ↔ HSM device.
+
+**Asset:** CA private key — stored in the HSM, inaccessible to software.
+
+**Attackers:**
+- Attacker with physical access to the HSM.
+- Attacker who compromises the PKCS#11 PIN (software side).
+- Attacker who severs the HSM connection during signing.
+
+**Threats:**
+- *PIN exposure*: PKCS#11 PIN logged or visible in process listing.
+- *Key extraction*: HSM configured with `CKA_EXTRACTABLE=TRUE` allows software key export.
+- *Session hijack*: PKCS#11 session handle captured and replayed by another process.
+- *Denial of signing*: HSM yanked during `C_Sign`; in-flight signing fails.
+
+**Existing mitigations:**
+- PKCS#11 PIN is read from `PYPKI_HSM_PIN` environment variable, never from CLI args.
+- `hsm_backend.py` never logs the PIN value; only logs slot/token identifiers.
+- Key is loaded with `CKA_EXTRACTABLE=FALSE` by default.
+- HSM disconnect during signing raises `pkcs11.exceptions.DeviceError`; `issue_certificate()` propagates the exception (no partial cert is returned). The audit log entry is not written for failed signings.
+- Advisory lock `"serial-allocation"` is still held during the HSM sign operation, preventing serial reuse if a second request races.
+
+**Residual risk:**
+- Physical HSM access is outside PyPKI's threat model. Operators must secure the device physically.
+- PKCS#11 session handle leaks between threads are a risk if `hsm_backend.py:get_session()` is called from multiple threads simultaneously. Current implementation uses a thread-local session; review required if thread pool is enlarged.
+
+**Tests:** `TestHSMBackend` (PIN not logged, key not extractable, disconnect handling)
+
+---
+
+### 3b.9 Postgres dual-backend
+
+**Trust boundary:** PyPKI ↔ Postgres server.
+
+**Asset:** Certificate state — serials, revocation status, audit log.
+
+**Attackers:**
+- Attacker with read access to the Postgres replica.
+- Attacker who causes a Postgres failover during issuance.
+
+**Threats:**
+- *Replica lag at OCSP query time*: OCSP query hits a replica that hasn't yet replicated the latest revocation; returns stale `good` response.
+- *Advisory lock failure on failover*: `advisory_lock("serial-allocation")` held on the primary is lost when the standby promotes; two processes may allocate the same serial.
+- *Credential theft*: Postgres connection string in config contains the DB password.
+
+**Existing mitigations:**
+- Postgres connection string is passed via `--db-url` (config file, not CLI) or `PYPKI_DB_URL` environment variable.
+- OCSP responses are pre-generated and signed at issuance time; a stale replica is only a risk for live on-demand OCSP. Operators should configure OCSP to use the primary for live responses.
+- Advisory locks are session-scoped in Postgres; a failover releases all locks held by the old primary session. `_next_serial()` will re-acquire the lock on reconnect.
+- TLS to Postgres is required by the connection string (`sslmode=require` enforced in docs).
+
+**Residual risk:**
+- Short window during Postgres failover where serial uniqueness could be violated if two PyPKI instances both lose and re-acquire the lock concurrently. The probability is very low but not zero. Mitigation: use a 20-byte random serial (RFC 5280 default); collision probability is negligible.
+- Replica-lag OCSP is a real gap for on-demand OCSP deployments. Operators must ensure OCSP reads from the primary or accept the window. Documented in `docs/DEPLOYMENT/postgres.md`.
+
+**Tests:** `TestPostgresBackend` (serial uniqueness under concurrent issuance, connection retry)
+
+---
+
+### 3b.10 Pre-generated OCSP responses
+
+**Trust boundary:** CA ↔ OCSP cache on disk ↔ OCSP responder.
+
+**Asset:** Revocation currency — OCSP responses must reflect actual revocation state.
+
+**Attackers:**
+- Attacker who can write to the pre-generated OCSP cache directory.
+- Attacker who revokes a cert and expects the OCSP response to update immediately.
+
+**Threats:**
+- *Stale good*: a cert is revoked between pre-gen runs; relying parties querying cached responses see `good` for a revoked cert.
+- *Cache tampering*: attacker replaces a valid pre-generated response with a forged `good` response.
+- *Response reuse*: old pre-generated response replayed after the `nextUpdate` time.
+
+**Existing mitigations:**
+- Pre-generated responses are DER-signed by the OCSP signer key; tampering produces an invalid signature detectable by relying parties.
+- Pre-gen responses have a `nextUpdate` field; well-behaved relying parties reject responses past `nextUpdate`.
+- The cache is regenerated on a configurable schedule (default: every 300 seconds, same as `--ocsp-cache-seconds`); the stale window is bounded.
+- On-demand live signing is available for environments where the stale window is unacceptable (`--ocsp-live-signing`).
+
+**Residual risk:**
+- Maximum stale window = pre-gen interval (default 300s). For revocations in the first few seconds of the interval, the stale window can approach the full interval. Accepted for most deployments; high-security operators should use live signing.
+- The cache directory must be writable by PyPKI and readable by the OCSP responder. Filesystem ACL misconfiguration is a risk. Documented in `docs/DEPLOYMENT/ocsp.md`.
+
+**Tests:** `TestOCSPPregeneration` (response signature, nextUpdate, stale revocation window)
+
+---
+
+### 3b.11 SCEP one-time challenges (OTC)
+
+**Trust boundary:** SCEP server ↔ SCEP client (device).
+
+**Asset:** Enrollment authorization — only devices with a valid OTC should be able to enroll.
+
+**Attackers:**
+- Attacker who intercepts the OTC in transit.
+- Attacker who brute-forces short OTCs.
+- Attacker who replays a used OTC.
+
+**Threats:**
+- *OTC interception*: if the channel delivering the OTC to the device is unencrypted, an attacker can capture and use it first.
+- *Brute force*: short OTCs (e.g., 4-digit PINs) are guessable in O(10^4) attempts.
+- *Replay*: used OTC replayed before the TTL expires.
+
+**Existing mitigations:**
+- OTCs are 32-character hex strings (128 bits of entropy); brute-force is infeasible.
+- Each OTC is single-use: once consumed in a successful enrollment, `scep.db` marks it `used=1`.
+- OTCs have a configurable TTL (default 24 hours); expired OTCs are rejected.
+- Failed OTC attempts are rate-limited per source IP.
+- All OTC consumption events are audit-logged.
+
+**Residual risk:**
+- OTC delivery channel security is out-of-scope for PyPKI. Operators must secure the channel (e.g., use HTTPS to the management portal, not email/SMS in plaintext). Documented in `docs/DEPLOYMENT/scep.md`.
+- OTCs are stored in `scep.db`. DB read access exposes unconsumed OTCs. Accepted: DB access is already a serious compromise level.
+
+**Tests:** `TestSCEPOTC` (single-use, TTL expiry, rate limiting, replay rejection)
+
+---
+
+### 3b.12 Non-RSA CA key types (Ed25519, Ed448, ECDSA, ML-DSA)
+
+**Trust boundary:** CA ↔ relying parties that must recognize the signature algorithm.
+
+**Asset:** Certificate signatures — must be verifiable by relying parties.
+
+**Attackers:**
+- Attacker who exploits algorithm-specific implementation bugs in `pki_server.py` or `slh_dsa.py`.
+- Relying party that doesn't support the CA's algorithm and falls back to a weaker trust anchor.
+
+**Threats:**
+- *Algorithm confusion*: a cert signed with one algorithm is presented as signed with another; OID mismatch in TBSCertificate vs. outer signature.
+- *Implementation bug*: hand-rolled ML-DSA TBSCertificate DER has an encoding error that produces an invalid cert accepted only by PyPKI's own validator.
+- *Downgrade*: relying party that supports both Ed25519 and RSA accepts an RSA cert for a subject the CA intended to protect with Ed25519.
+
+**Existing mitigations:**
+- `_sig_alg_der_for_key()` in `pki_server.py` maps key type to the correct algorithm OID; the same function is used for both TBSCertificate `signature` field and the outer `signatureAlgorithm` field. Mismatch is structurally impossible if the function is called correctly.
+- ML-DSA certificate DER is built by `issue_ml_dsa_certificate()`; the test suite (`TestMLDSA`) verifies round-trip with `openssl verify` using the oqs-provider.
+- SLH-DSA leaf certs (`slh_dsa.py`) hand-roll SPKI/PKCS#8 DER; tested against known-good DER encodings.
+- All algorithm OID mappings have regression tests.
+
+**Residual risk:**
+- Algorithm agility for CA keys is enabled by operator configuration. Operators who switch CA key type mid-deployment must re-distribute the new CA cert. This is a process risk, not a code risk.
+- ML-DSA is FIPS 204 finalized but still settling in the ecosystem. Cert profiles gated behind `--enable-mldsa` (default off in production).
+
+**Tests:** `TestMLDSAX509`, `TestSLHDSAX509`, `TestCompositeMLDSA` (round-trip, OID correctness, interop)
+
+---
+
 ## 4. Defense-in-depth controls implemented today
 
 | Control | Where | Defends against |
@@ -241,22 +597,37 @@ PyPKI ships no automated tooling for this. **It is a process gap operators must 
 | Atomic serial allocation | `pki_server.py:_next_serial` | Serial reuse race |
 | `BEGIN IMMEDIATE` on CRL number | `pki_server.py:_next_crl_number` | CRL number reuse |
 | `nameConstraints` on sub-CAs | `pki_server.py:issue_sub_ca` | Wide-scope sub-CA misissuance |
+| Hash-chained audit log | `audit_chain.py:append` | Undetected audit log tampering |
+| HSM / PKCS#11 key backend | `hsm_backend.py:HSMBackend` | CA key extraction from process memory |
+| RA dual-party approval workflow | `pki_server.py:_handle_ra_approve` | Unauthorized issuance via single approver |
+| ACME EAB single-use enforcement | `acme_server.py:_validate_eab` | EAB key replay after account creation |
+| SCEP OTC single-use + TTL | `scep_server.py:_validate_challenge` | OTC replay and brute-force |
+| Webhook HMAC-SHA256 signing | `hooks.py:_fire_webhook` | Spoofed webhook delivery to receivers |
+| Backup AES-256-GCM + scrypt | `backup.py:BackupEngine.encrypt` | Cold-disk backup compromise |
+| Ed25519 manifest signing on backups | `backup.py:BackupEngine.sign` | Backup tampering before restore |
+| Emergency halt gate | `pki_server.py:issue_certificate` | Issuance during recovery/investigation |
 
 ---
 
 ## 5. Known gaps (not yet mitigated)
 
-| Gap | Severity | Mitigation track |
-|---|---|---|
-| CA key in process memory while running | Medium | Tier 5.1: HSM/PKCS#11 |
-| No multi-person control on issuance | Low (homelab) → High (enterprise) | Tier 5.4: RA workflow |
-| No automated CA-key-compromise response | High | Future-work |
-| No cross-signing or smooth CA rollover | Medium | Tier 5.6 |
-| Audit log not cryptographically chained (tamper-evident only via filesystem ACLs) | Low (homelab) → Medium (enterprise) | Future-work |
-| 7 internal-key-write sites still emit PKCS#1 / SEC1 (cosmetic; not client-facing) | Low | Follow-up RFC 5958 cleanup pass |
-| Pre-existing test `TestOCSPParsing::test_ocsp_server_starts_and_responds` uses old positional signature; broken since the dispatcher refactor | Negligible | Test rewrite |
+Gaps marked ✓ have been closed in Tier 5 or Tier 6; they remain here so the resolution is documented.
+
+| Gap | Severity | Status | Mitigation track |
+|---|---|---|---|
+| CA key in process memory while running | Medium | ✓ Closed (Tier 5) | `hsm_backend.py:HSMBackend` — PKCS#11 keeps key in device |
+| No multi-person control on issuance | Low→High | ✓ Closed (Tier 5) | RA workflow (`pending_requests` table, `web_ui.py:_api_ra_approve`) |
+| No cross-signing or smooth CA rollover | Medium | ✓ Closed (Tier 5) | `web_ui.py:_api_cross_sign`, `cross.signed` audit event |
+| Audit log not cryptographically chained | Low→Medium | ✓ Closed (Tier 5) | `audit_chain.py` — hash-chained `chain_hash` column |
+| Paired-cert revocation not atomic | Medium | Open | Revoking one cert does not auto-revoke its RFC 9763 counterpart. Operator must revoke both. Documented in `docs/DR.md`. |
+| No automated CA-key-compromise response | High | Open | Requires out-of-band notification + manual ceremony. See `docs/CEREMONY.md`. |
+| OCSP replica lag for on-demand signing | Low→Medium | Open | Postgres replica may have stale revocation. Operators must route live OCSP to the primary. See §3b.9. |
+| RA approver single-person approval | Low→High | Open | No dual-control for RA approvals. High-value profiles should require two approvers (process control). |
+| SSRF via webhook URL | Low | Open | No URL allow-list. CA operator access already implies full compromise; documented risk. See §3b.7. |
 
 This list is intentionally complete. Operators who need to close any of these gaps should treat the corresponding track as a deployment prerequisite, not a future enhancement.
+
+**Durability invariants** (audit-log completeness, serial uniqueness, CRL monotonicity, revocation persistence) are verified by the chaos suite in `chaos/` per Tier 6.5. See `chaos/README.md` for which failure modes have been tested.
 
 ---
 

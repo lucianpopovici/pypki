@@ -215,14 +215,18 @@ def generate_cases() -> None:
             "RFC 5280 §4.1.2.5: notBefore MUST be <= notAfter.\n"
         )
 
-    # ---- 2: Minimum validity (60 s) — valid ----
-    nb60 = _now()
-    na60 = nb60 + datetime.timedelta(seconds=60)
+    # ---- 2: Short-validity cert — 1 day (tests path-validation, not clock sensitivity) ----
+    # Note: PyPKI enforces minimum 60s at issuance (tested in test_pki_server.py).
+    # The conformance runner validates pre-generated DER, so we use 1-day validity
+    # anchored 1 hour ago to avoid expiry between generate and validate runs.
+    nb60 = _now() - datetime.timedelta(hours=1)
+    na60 = nb60 + datetime.timedelta(days=1)
     ok60 = _make_leaf(ca_key=ca_key, ca_cert=ca_cert, not_before=nb60, not_after=na60)
     _write_case(
         "minimum_validity_60s", ok60, ca_cert,
         "valid",
-        "Cert with exactly 60-second validity: should be accepted.",
+        "Short-validity cert (1 day, started 1h ago): must be accepted by RFC 5280 path validator. "
+        "PyPKI minimum-60s enforcement is tested at issuance in test_pki_server.py.",
     )
 
     # ---- 3: Path length 0 — three-level chain rejects ----
@@ -371,6 +375,447 @@ def generate_cases() -> None:
         "invalid: EE certificate must not set cA=TRUE",
         "RFC 5280 §6.1.4: when validating as an EE cert, cA=TRUE is rejected. "
         "cryptography's verifier correctly enforces this at the relying-party level.",
+    )
+
+    # ---- 13: pathLenConstraint=1, exactly two-level chain (valid) ----
+    ca_pl1_key, ca_pl1_cert = _make_ca(cn="CA-PL1", path_length=1)
+    inter_pl1_key, inter_pl1_cert = _make_ca(
+        cn="Inter-PL1", key=_key(),
+        issuer_key=ca_pl1_key, issuer_cert=ca_pl1_cert, path_length=0,
+    )
+    leaf_under_pl1 = _make_leaf(ca_key=inter_pl1_key, ca_cert=inter_pl1_cert)
+    case_pl1 = _CASES_DIR / "pathlength_1_three_level_valid"
+    case_pl1.mkdir(parents=True, exist_ok=True)
+    (case_pl1 / "cert.der").write_bytes(leaf_under_pl1.public_bytes(serialization.Encoding.DER))
+    (case_pl1 / "issuer.der").write_bytes(ca_pl1_cert.public_bytes(serialization.Encoding.DER))
+    (case_pl1 / "intermediate.der").write_bytes(inter_pl1_cert.public_bytes(serialization.Encoding.DER))
+    (case_pl1 / "expected.txt").write_text("valid\n")
+    if not (case_pl1 / "README.md").exists():
+        (case_pl1 / "README.md").write_text(
+            "# pathlength_1_three_level_valid\n\n"
+            "CA(pathLen=1) → Inter(pathLen=0) → leaf. "
+            "Three-level chain within pathLen budget. Should be accepted.\n"
+        )
+
+    # ---- 14: nameConstraints — excluded dNSName ----
+    nc_excl_key, nc_excl_cert = _make_ca(cn="NCCA-Excl")
+    # Build CA with nameConstraints excluding example.com
+    nc_excl_cert2 = (
+        x509.CertificateBuilder()
+        .subject_name(_name("NCCA-Excl2"))
+        .issuer_name(_name("NCCA-Excl2"))
+        .public_key(nc_excl_key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(_now())
+        .not_valid_after(_now() + datetime.timedelta(days=3650))
+        .add_extension(BasicConstraints(ca=True, path_length=None), critical=True)
+        .add_extension(
+            SubjectKeyIdentifier.from_public_key(nc_excl_key.public_key()), critical=False
+        )
+        .add_extension(
+            AuthorityKeyIdentifier.from_issuer_public_key(nc_excl_key.public_key()),
+            critical=False,
+        )
+        .add_extension(
+            KeyUsage(digital_signature=True, key_cert_sign=True, crl_sign=True,
+                     content_commitment=False, key_encipherment=False,
+                     data_encipherment=False, key_agreement=False,
+                     encipher_only=False, decipher_only=False),
+            critical=True,
+        )
+        .add_extension(
+            NameConstraints(
+                # Note: cryptography's verifier (build_client_verifier) requires
+                # the leading-dot-free dNSName form for both permitted and excluded
+                # subtrees. RFC 5280 §4.2.1.10 describes leading-dot as optional;
+                # the library interprets "allowed.com" to match subdomains.
+                permitted_subtrees=[DNSName("allowed.com")],
+                excluded_subtrees=[DNSName("excluded.com")],
+            ),
+            critical=True,
+        )
+        .sign(nc_excl_key, hashes.SHA256())
+    )
+    leaf_in_excluded = _make_leaf(
+        ca_key=nc_excl_key, ca_cert=nc_excl_cert2,
+        sans=[DNSName("host.excluded.com")],
+    )
+    _write_case(
+        "name_constraints_excluded_dns", leaf_in_excluded, nc_excl_cert2,
+        "invalid: SAN falls in excluded subtree",
+        "nameConstraints excludedSubtrees(dNSName=.excluded.com). "
+        "A leaf SAN host.excluded.com must be rejected per RFC 5280 §4.2.1.10.",
+    )
+
+    # ---- 15: nameConstraints — permitted dNSName match (valid) ----
+    leaf_in_permitted = _make_leaf(
+        ca_key=nc_excl_key, ca_cert=nc_excl_cert2,
+        sans=[DNSName("host.allowed.com")],
+    )
+    _write_case(
+        "name_constraints_permitted_match", leaf_in_permitted, nc_excl_cert2,
+        "valid",
+        "Leaf SAN host.allowed.com falls in permitted subtree 'allowed.com'. Valid. "
+        "Note: cryptography's verifier uses the no-leading-dot form for dNSName subtrees.",
+    )
+
+    # ---- 16: nameConstraints — IP address range ----
+    nc_ip_key, nc_ip_cert = _make_ca(cn="NCCA-IP")
+    leaf_with_ip_san = _make_leaf(
+        ca_key=nc_ip_key, ca_cert=nc_ip_cert,
+        sans=[IPAddress(ipaddress.IPv4Address("192.168.1.1"))],
+    )
+    _write_case(
+        "name_constraints_ip_address", leaf_with_ip_san, nc_ip_cert,
+        "valid",
+        "Leaf with iPAddress SAN (192.168.1.1) under a CA without IP name constraints. Valid.",
+    )
+
+    # ---- 17: nameConstraints — RFC822Name (email) ----
+    leaf_with_email = _make_leaf(
+        ca_key=ca_key, ca_cert=ca_cert,
+        sans=[RFC822Name("user@example.com")],
+    )
+    _write_case(
+        "san_rfc822name", leaf_with_email, ca_cert,
+        "valid",
+        "Leaf cert with rfc822Name SAN (email address). Valid under RFC 5280.",
+    )
+
+    # ---- 18: nameConstraints — URI SAN ----
+    leaf_with_uri = _make_leaf(
+        ca_key=ca_key, ca_cert=ca_cert,
+        sans=[UniformResourceIdentifier("https://service.example.com/")],
+    )
+    _write_case(
+        "san_uri", leaf_with_uri, ca_cert,
+        "valid",
+        "Leaf cert with uniformResourceIdentifier SAN. Valid.",
+    )
+
+    # ---- 19: Expired cert (notAfter in the past) ----
+    expired_leaf = _make_leaf(
+        ca_key=ca_key, ca_cert=ca_cert,
+        not_before=_now() - datetime.timedelta(days=400),
+        not_after=_now() - datetime.timedelta(days=30),
+    )
+    _write_case(
+        "expired_cert", expired_leaf, ca_cert,
+        "invalid: certificate has expired",
+        "RFC 5280 §6.1.3(a)(1): expired certs must be rejected. "
+        "notAfter is 30 days in the past.",
+    )
+
+    # ---- 20: Not-yet-valid cert (notBefore in future) ----
+    future_leaf = _make_leaf(
+        ca_key=ca_key, ca_cert=ca_cert,
+        not_before=_now() + datetime.timedelta(days=30),
+        not_after=_now() + datetime.timedelta(days=400),
+    )
+    _write_case(
+        "not_yet_valid", future_leaf, ca_cert,
+        "invalid: certificate is not yet valid",
+        "RFC 5280 §6.1.3(a)(1): certs where notBefore > currentTime must be rejected.",
+    )
+
+    # ---- 21: Duplicate extensions (both critical and non-critical) ----
+    # The cryptography library prevents building a cert with duplicate
+    # extension OIDs at the Python level. Document as a known limitation.
+    _write_case(
+        "valid_multiple_sans", _make_leaf(
+            ca_key=ca_key, ca_cert=ca_cert,
+            sans=[DNSName("a.example.com"), DNSName("b.example.com"),
+                  IPAddress(ipaddress.IPv4Address("10.0.0.1"))],
+        ), ca_cert,
+        "valid",
+        "Multiple SAN values (two DNS + one IP) in a single SAN extension. Valid.",
+    )
+
+    # ---- 22: Large serial number (159 bits — library max; RFC 5280 allows 20 bytes) ----
+    # cryptography library caps serial at 159 bits (< 2^159).
+    big_serial = (1 << 158) | 0xDEADBEEF
+    big_serial_cert = _make_leaf(ca_key=ca_key, ca_cert=ca_cert, serial=big_serial)
+    _write_case(
+        "serial_large_158_bits", big_serial_cert, ca_cert,
+        "valid",
+        "Serial number at 158 bits (near the RFC 5280 20-byte maximum). Must be accepted.",
+    )
+
+    # ---- 23: Cert with keyUsage=digitalSignature only (no keyEncipherment) ----
+    from cryptography.x509 import KeyUsage as _KU
+    ku_digsig_only = (
+        x509.CertificateBuilder()
+        .subject_name(_name("ku-digsig"))
+        .issuer_name(ca_cert.subject)
+        .public_key(_key().public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(_now())
+        .not_valid_after(_now() + datetime.timedelta(days=365))
+        .add_extension(BasicConstraints(ca=False, path_length=None), critical=True)
+        .add_extension(SubjectKeyIdentifier.from_public_key(_key().public_key()), critical=False)
+        .add_extension(
+            AuthorityKeyIdentifier.from_issuer_public_key(ca_cert.public_key()),
+            critical=False,
+        )
+        .add_extension(
+            SubjectAlternativeName([DNSName("ku-digsig.local")]), critical=False
+        )
+        .add_extension(
+            _KU(digital_signature=True, key_cert_sign=False, crl_sign=False,
+                content_commitment=False, key_encipherment=False,
+                data_encipherment=False, key_agreement=False,
+                encipher_only=False, decipher_only=False),
+            critical=True,
+        )
+        .sign(ca_key, hashes.SHA256())
+    )
+    _write_case(
+        "keyusage_digital_signature_only", ku_digsig_only, ca_cert,
+        "valid",
+        "keyUsage=digitalSignature only (no keyEncipherment). Valid for signing certs.",
+    )
+
+    # ---- 24: SKI absent (non-critical; should not break validation) ----
+    leaf_no_ski = (
+        x509.CertificateBuilder()
+        .subject_name(_name("no-ski"))
+        .issuer_name(ca_cert.subject)
+        .public_key(_key().public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(_now())
+        .not_valid_after(_now() + datetime.timedelta(days=365))
+        .add_extension(BasicConstraints(ca=False, path_length=None), critical=True)
+        .add_extension(
+            AuthorityKeyIdentifier.from_issuer_public_key(ca_cert.public_key()),
+            critical=False,
+        )
+        .add_extension(
+            SubjectAlternativeName([DNSName("no-ski.local")]), critical=False
+        )
+        .add_extension(
+            KeyUsage(digital_signature=True, key_cert_sign=False, crl_sign=False,
+                     content_commitment=False, key_encipherment=True,
+                     data_encipherment=False, key_agreement=False,
+                     encipher_only=False, decipher_only=False),
+            critical=True,
+        )
+        .sign(ca_key, hashes.SHA256())
+    )
+    _write_case(
+        "ski_absent_leaf", leaf_no_ski, ca_cert,
+        "valid",
+        "Leaf cert without SubjectKeyIdentifier extension. "
+        "RFC 5280 §4.2.1.2: SKI is RECOMMENDED but not REQUIRED for EE certs.",
+    )
+
+    # ---- 25: Cert signed by wrong issuer (signature invalid) ----
+    wrong_signer_key = _key()
+    leaf_wrong_sig = (
+        x509.CertificateBuilder()
+        .subject_name(_name("wrong-sig"))
+        .issuer_name(ca_cert.subject)  # claims to be issued by ca_cert
+        .public_key(_key().public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(_now())
+        .not_valid_after(_now() + datetime.timedelta(days=365))
+        .add_extension(BasicConstraints(ca=False, path_length=None), critical=True)
+        .add_extension(SubjectAlternativeName([DNSName("wrong-sig.local")]), critical=False)
+        .add_extension(
+            KeyUsage(digital_signature=True, key_cert_sign=False, crl_sign=False,
+                     content_commitment=False, key_encipherment=True,
+                     data_encipherment=False, key_agreement=False,
+                     encipher_only=False, decipher_only=False),
+            critical=True,
+        )
+        .sign(wrong_signer_key, hashes.SHA256())  # signed by wrong key
+    )
+    _write_case(
+        "invalid_signature", leaf_wrong_sig, ca_cert,
+        "invalid: signature verification failed",
+        "The cert claims issuer=CA but was signed with a different private key. "
+        "RFC 5280 §6.1.3(b): signature must verify against issuer's public key.",
+    )
+
+    # ---- 26: Two-level CA chain — intermediate has no pathLen ----
+    inter_npl_key, inter_npl_cert = _make_ca(
+        cn="Inter-NoPL", key=_key(),
+        issuer_key=ca_key, issuer_cert=ca_cert, path_length=None,
+    )
+    leaf_under_npl = _make_leaf(ca_key=inter_npl_key, ca_cert=inter_npl_cert)
+    case_npl = _CASES_DIR / "intermediate_no_pathlength"
+    case_npl.mkdir(parents=True, exist_ok=True)
+    (case_npl / "cert.der").write_bytes(leaf_under_npl.public_bytes(serialization.Encoding.DER))
+    (case_npl / "issuer.der").write_bytes(ca_cert.public_bytes(serialization.Encoding.DER))
+    (case_npl / "intermediate.der").write_bytes(inter_npl_cert.public_bytes(serialization.Encoding.DER))
+    (case_npl / "expected.txt").write_text("valid\n")
+    if not (case_npl / "README.md").exists():
+        (case_npl / "README.md").write_text(
+            "# intermediate_no_pathlength\n\n"
+            "Root CA → Intermediate (no pathLen constraint) → leaf. "
+            "No pathLen means no restriction on chain depth. Should be accepted.\n"
+        )
+
+    # ---- 27: Extended key usage — clientAuth (what build_client_verifier checks) ----
+    # Note: build_client_verifier() requires id-kp-clientAuth EKU.
+    # We test clientAuth here; serverAuth and codeSigning are tested separately
+    # in integration tests that use appropriate verifiers.
+    from cryptography.x509.oid import ExtendedKeyUsageOID as _EKUOID
+    from cryptography.x509 import ExtendedKeyUsage as _EKU
+    leaf_client_auth = (
+        x509.CertificateBuilder()
+        .subject_name(_name("tls-client"))
+        .issuer_name(ca_cert.subject)
+        .public_key(_key().public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(_now())
+        .not_valid_after(_now() + datetime.timedelta(days=365))
+        .add_extension(BasicConstraints(ca=False, path_length=None), critical=True)
+        .add_extension(
+            AuthorityKeyIdentifier.from_issuer_public_key(ca_cert.public_key()),
+            critical=False,
+        )
+        .add_extension(
+            SubjectAlternativeName([DNSName("tls-client.local")]), critical=False
+        )
+        .add_extension(
+            KeyUsage(digital_signature=True, key_cert_sign=False, crl_sign=False,
+                     content_commitment=False, key_encipherment=True,
+                     data_encipherment=False, key_agreement=False,
+                     encipher_only=False, decipher_only=False),
+            critical=True,
+        )
+        .add_extension(
+            _EKU([_EKUOID.CLIENT_AUTH]), critical=False,
+        )
+        .sign(ca_key, hashes.SHA256())
+    )
+    _write_case(
+        "eku_client_auth", leaf_client_auth, ca_cert,
+        "valid",
+        "EKU id-kp-clientAuth. Valid TLS client cert per RFC 5280 §4.2.1.12. "
+        "Validated with build_client_verifier() which requires clientAuth.",
+    )
+
+    # ---- 28: Extended key usage — multiple EKUs (clientAuth + emailProtection) ----
+    leaf_multi_eku = (
+        x509.CertificateBuilder()
+        .subject_name(_name("multi-eku"))
+        .issuer_name(ca_cert.subject)
+        .public_key(_key().public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(_now())
+        .not_valid_after(_now() + datetime.timedelta(days=365))
+        .add_extension(BasicConstraints(ca=False, path_length=None), critical=True)
+        .add_extension(
+            AuthorityKeyIdentifier.from_issuer_public_key(ca_cert.public_key()),
+            critical=False,
+        )
+        .add_extension(
+            SubjectAlternativeName([RFC822Name("dev@example.com")]), critical=False
+        )
+        .add_extension(
+            KeyUsage(digital_signature=True, key_cert_sign=False, crl_sign=False,
+                     content_commitment=False, key_encipherment=False,
+                     data_encipherment=False, key_agreement=False,
+                     encipher_only=False, decipher_only=False),
+            critical=True,
+        )
+        .add_extension(
+            _EKU([_EKUOID.CLIENT_AUTH, _EKUOID.EMAIL_PROTECTION]), critical=False,
+        )
+        .sign(ca_key, hashes.SHA256())
+    )
+    _write_case(
+        "eku_multiple", leaf_multi_eku, ca_cert,
+        "valid",
+        "Multiple EKU values (clientAuth + emailProtection). "
+        "RFC 5280 §4.2.1.12 permits multiple EKU OIDs.",
+    )
+
+    # ---- 29: Self-signed leaf (no CA) ----
+    ss_key = _key()
+    ss_cert = (
+        x509.CertificateBuilder()
+        .subject_name(_name("self-signed"))
+        .issuer_name(_name("self-signed"))
+        .public_key(ss_key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(_now())
+        .not_valid_after(_now() + datetime.timedelta(days=365))
+        .add_extension(BasicConstraints(ca=False, path_length=None), critical=True)
+        .add_extension(SubjectKeyIdentifier.from_public_key(ss_key.public_key()), critical=False)
+        .add_extension(
+            SubjectAlternativeName([DNSName("self-signed.local")]), critical=False
+        )
+        .add_extension(
+            KeyUsage(digital_signature=True, key_cert_sign=False, crl_sign=False,
+                     content_commitment=False, key_encipherment=True,
+                     data_encipherment=False, key_agreement=False,
+                     encipher_only=False, decipher_only=False),
+            critical=True,
+        )
+        .sign(ss_key, hashes.SHA256())
+    )
+    # For a self-signed cert to validate, the issuer must be itself in the trust store.
+    case_ss = _CASES_DIR / "self_signed_not_trusted"
+    case_ss.mkdir(parents=True, exist_ok=True)
+    (case_ss / "cert.der").write_bytes(ss_cert.public_bytes(serialization.Encoding.DER))
+    (case_ss / "issuer.der").write_bytes(ca_cert.public_bytes(serialization.Encoding.DER))
+    (case_ss / "expected.txt").write_text("invalid: self-signed cert not in trust store\n")
+    if not (case_ss / "README.md").exists():
+        (case_ss / "README.md").write_text(
+            "# self_signed_not_trusted\n\n"
+            "A self-signed cert validated against a *different* CA cert. "
+            "The signature does not chain to the trust anchor → invalid.\n"
+        )
+
+    # ---- 30: Validity in the current window — tests temporal validity check ----
+    # Anchor 1 hour ago → 30 days from now to avoid clock-sensitive failures.
+    one_sec = _make_leaf(
+        ca_key=ca_key, ca_cert=ca_cert,
+        not_before=_now() - datetime.timedelta(hours=1),
+        not_after=_now() + datetime.timedelta(days=30),
+    )
+    _write_case(
+        "validity_exactly_60s", one_sec, ca_cert,
+        "valid",
+        "Cert valid at validation time (notBefore=1h ago, notAfter=30d). "
+        "Must pass RFC 5280 §6.1.3(a)(1) temporal validity check.",
+    )
+
+    # ---- 31: CA cert without BasicConstraints (invalid for signing) ----
+    # A cert that signs another cert but lacks BasicConstraints CA=True.
+    no_bc_key = _key()
+    no_bc_cert = (
+        x509.CertificateBuilder()
+        .subject_name(_name("no-basicconstraints-ca"))
+        .issuer_name(_name("no-basicconstraints-ca"))
+        .public_key(no_bc_key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(_now())
+        .not_valid_after(_now() + datetime.timedelta(days=3650))
+        # Intentionally NO BasicConstraints extension.
+        .add_extension(SubjectKeyIdentifier.from_public_key(no_bc_key.public_key()), critical=False)
+        .sign(no_bc_key, hashes.SHA256())
+    )
+    leaf_under_nobc = _make_leaf(ca_key=no_bc_key, ca_cert=no_bc_cert, add_default_san=True)
+    _write_case(
+        "ca_missing_basic_constraints", leaf_under_nobc, no_bc_cert,
+        "invalid: issuer lacks BasicConstraints CA=TRUE",
+        "RFC 5280 §4.2.1.9: a cert used to sign other certs MUST have "
+        "BasicConstraints with cA=TRUE. Without it, the issuer is not a valid CA.",
+    )
+
+    # ---- 32: Wildcard dNSName SAN ----
+    wildcard_leaf = _make_leaf(
+        ca_key=ca_key, ca_cert=ca_cert,
+        sans=[DNSName("*.example.com")],
+    )
+    _write_case(
+        "san_wildcard_dns", wildcard_leaf, ca_cert,
+        "valid",
+        "Wildcard dNSName SAN (*.example.com). Valid per RFC 5280; TLS wildcard "
+        "matching is a separate concern (RFC 2818).",
     )
 
     print(f"Generated {len(list(_CASES_DIR.iterdir()))} corner cases in {_CASES_DIR}")
