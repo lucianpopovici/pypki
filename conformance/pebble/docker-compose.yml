@@ -1,0 +1,45 @@
+version: "3.9"
+# Pebble ACME compliance test
+# Pebble is Let's Encrypt's reference ACME server in test/validation mode.
+# We point it at PyPKI's ACME endpoint and exercise ACME compliance.
+#
+# Usage: docker compose up --exit-code-from pebble-test
+
+services:
+  pypki:
+    image: python:3.12-slim
+    working_dir: /pypki
+    volumes:
+      - ../../:/pypki:ro
+    command: >
+      bash -c "
+        pip install cryptography psycopg pyasn1 pyasn1-modules --quiet &&
+        python3 pki_server.py --no-auth --acme-enabled --port 8090 --ca-key-type ec-p256
+      "
+    ports:
+      - "8090:8090"
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8090/')"]
+      interval: 5s
+      retries: 10
+
+  pebble:
+    image: letsencrypt/pebble:latest
+    command: pebble -config /pebble/config.json
+    volumes:
+      - ./pebble-config.json:/pebble/config.json:ro
+    environment:
+      PEBBLE_VA_NOSLEEP: "1"
+      PEBBLE_WFE_NONCEREJECT: "0"
+    depends_on:
+      pypki:
+        condition: service_healthy
+    ports:
+      - "14000:14000"
+
+  pebble-test:
+    image: letsencrypt/pebble:latest
+    command: pebble-challtestsrv
+    network_mode: host
+    depends_on:
+      - pebble

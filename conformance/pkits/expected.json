@@ -1,0 +1,20 @@
+{
+  "_comment": "Expected outcomes per PKITS test case ID.",
+  "_format": "{ 'valid': true/false } for expected-to-pass/fail, { 'expected': 'skipped', 'rationale': '...' } for intentional deviations.",
+
+  "_deviations": {
+    "_note": "PyPKI intentional deviations from PKITS. Each entry requires a rationale.",
+    "4.4.19": {
+      "expected": "skipped",
+      "rationale": "PKITS 4.4.19 tests policy mapping (RFC 5280 §6.1.4 step (d)). PyPKI issues certs but does not implement a policy-mapping verifier for relying-party validation. Out of scope for an issuing CA."
+    },
+    "4.4.20": {
+      "expected": "skipped",
+      "rationale": "Same policy-mapping deviation as 4.4.19."
+    },
+    "4.9.7": {
+      "expected": "skipped",
+      "rationale": "PKITS 4.9.7 requires rejection of requireExplicitPolicy=0 with no policy. PyPKI's CA issues certs with anyPolicy; the relying-party strictness is a verifier concern, not an issuer concern."
+    }
+  }
+}

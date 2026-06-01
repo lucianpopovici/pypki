@@ -1,0 +1,35 @@
+# requirements-dev.txt — development, test, fuzz, build, and audit tools.
+# Runtime dependencies are in requirements.txt.
+#
+# Regenerate with hashes:
+#   pip-compile requirements-dev.in --generate-hashes -o requirements-dev.txt
+#
+# For a CA codebase we do NOT auto-merge dependency bumps. Review each one.
+
+# Test runner
+pytest>=7.4
+
+# Browser-based UI tests
+playwright>=1.40
+
+# HTTP client (interop tests, get_cert.py helper)
+requests>=2.31
+urllib3>=2.0
+
+# Fuzz testing (optional — install separately; not imported by server code)
+# atheris>=2.3.0
+
+# Vulnerability scanning
+pip-audit>=2.7
+
+# SBOM generation
+cyclonedx-bom>=4.0
+
+# Reproducible-build diff tool (requires diffoscope system package)
+# diffoscope>=250
+
+# Coverage measurement (for fuzz corpus line-coverage check)
+coverage>=7.4
+
+# Type checking
+mypy>=1.8

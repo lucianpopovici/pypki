@@ -1,0 +1,33 @@
+version: "3.9"
+# SCEP interop: PyPKI server + sscep client
+# sscep: https://github.com/certnanny/sscep
+
+services:
+  pypki:
+    image: python:3.12-slim
+    working_dir: /pypki
+    volumes:
+      - ../../:/pypki:ro
+      - pypki-data:/var/lib/pypki
+    command: >
+      bash -c "
+        pip install cryptography pyasn1 pyasn1-modules --quiet 2>&1 | tail -3 &&
+        mkdir -p /var/lib/pypki &&
+        python3 pki_server.py
+          --no-auth
+          --data-dir /var/lib/pypki
+          --port 8090
+          --ca-key-type rsa-2048
+          --scep-enabled
+          --scep-challenge-password test1234
+      "
+    ports:
+      - "8090:8090"
+    healthcheck:
+      test: ["CMD", "python3", "-c",
+             "import urllib.request; urllib.request.urlopen('http://localhost:8090/scep?operation=GetCACert', timeout=3)"]
+      interval: 5s
+      retries: 12
+
+volumes:
+  pypki-data:
