@@ -1,5 +1,7 @@
 # PyPKI Performance Baseline
 
+> Last reviewed: 2026-06-01 (commit 453e7ba)
+
 This document defines the performance envelope for PyPKI deployments. Numbers
 here are measured on the reference hardware profile below. They are reproducible
 from the source tree using the bench harness in `bench/`.

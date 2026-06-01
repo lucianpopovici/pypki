@@ -1,5 +1,7 @@
 # PyPKI — Private PKI Server
 
+> Last reviewed: 2026-06-01 (commit 453e7ba)
+
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Python 3.9+](https://img.shields.io/badge/python-3.9%2B-blue.svg)](https://www.python.org/)
 [![RFC 4210](https://img.shields.io/badge/RFC-4210%20CMPv2-informational)](https://www.rfc-editor.org/rfc/rfc4210)
@@ -16,6 +18,22 @@
 [![RFC 4809](https://img.shields.io/badge/RFC-4809%20IPsec%20CertMgmt-informational)](https://www.rfc-editor.org/rfc/rfc4809)
 
 A self-contained, production-grade private Certificate Authority with support for five industry-standard certificate management protocols — **CMPv2/v3** (RFC 4210 / RFC 9480) for embedded/IoT devices, **ACME** (RFC 8555) for servers and workstations, **SCEP** (RFC 8894) for network devices and MDM-enrolled endpoints, and **EST** (RFC 7030) for TLS-capable devices — plus an **IPsec PKI server** (RFC 4945 / RFC 4806 / RFC 4809) for IKEv2 gateway and user certificates, and an Ansible role for distributing the CA certificate to client machines.
+
+---
+
+## Documentation
+
+| Doc | Description |
+|-----|-------------|
+| [`docs/HOWTO/`](docs/HOWTO/README.md) | **Service guides** — how to deploy each protocol server (ACME, SCEP, EST, OCSP, CMP, CRL, Web UI, TSA, S/MIME) |
+| [`docs/DEPLOYMENT/`](docs/DEPLOYMENT/homelab-single-node.md) | Topology-first install guides (homelab, Kubernetes, offline root, VPN, IoT) |
+| [`docs/THREAT_MODEL.md`](docs/THREAT_MODEL.md) | Security analysis: trust boundaries, adversary model, per-component compromise scenarios |
+| [`docs/PERFORMANCE.md`](docs/PERFORMANCE.md) | Issuance throughput, OCSP latency, storage growth (reference hardware numbers) |
+| [`docs/CPS.md`](docs/CPS.md) | Certification Practice Statement template (RFC 3647) |
+| [`docs/MIGRATION.md`](docs/MIGRATION.md) | SQLite → Postgres migration runbook |
+| [`docs/BACKUP.md`](docs/BACKUP.md) | Backup and restore procedures |
+| [`docs/DR.md`](docs/DR.md) | Disaster recovery runbooks |
+| [`docs/CEREMONY.md`](docs/CEREMONY.md) | Offline root key ceremony procedure |
 
 ---
 

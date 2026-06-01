@@ -1,0 +1,34 @@
+[Unit]
+Description=PyPKI Timestamp Authority (RFC 3161)
+Documentation=file:///opt/pypki/docs/HOWTO/tsa.md
+After=network.target
+Wants=network.target
+
+[Service]
+Type=notify
+User=pypki
+Group=pypki
+WorkingDirectory=/opt/pypki
+ExecStart=/opt/pypki/venv/bin/python3 pki_server.py \
+    --ca-dir /var/lib/pypki/ca \
+    --port 8080 \
+    --tsa-prefix /tsa \
+    --tsa-policy-oid 1.3.6.1.4.1.YOUR_PEN.1 \
+    --tsa-accuracy-seconds 1 \
+    --log-level INFO
+
+Restart=on-failure
+RestartSec=5
+TimeoutStartSec=30
+TimeoutStopSec=30
+
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/var/lib/pypki
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+
+[Install]
+WantedBy=multi-user.target

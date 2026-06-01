@@ -1,5 +1,7 @@
 # PyPKI Certification Practice Statement (CPS)
 
+> Last reviewed: 2026-06-01 (commit 453e7ba)
+
 **Document version:** 1.0
 **Effective date:** _to be set per deployment_
 **Policy OID:** `1.3.6.1.4.1.<PEN>.1.1` _(operator: replace `<PEN>` with your IANA-assigned Private Enterprise Number; see §1.2)_

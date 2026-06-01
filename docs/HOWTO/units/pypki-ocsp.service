@@ -1,0 +1,34 @@
+[Unit]
+Description=PyPKI OCSP Responder (RFC 6960)
+Documentation=file:///opt/pypki/docs/HOWTO/ocsp.md
+After=network.target
+Wants=network.target
+
+[Service]
+Type=notify
+User=pypki
+Group=pypki
+WorkingDirectory=/opt/pypki
+ExecStart=/opt/pypki/venv/bin/python3 pki_server.py \
+    --ca-dir /var/lib/pypki/ca \
+    --port 8080 \
+    --ocsp-prefix /ocsp \
+    --ocsp-url http://pki.internal:8080/ocsp \
+    --ocsp-cache-seconds 300 \
+    --log-level INFO
+
+Restart=on-failure
+RestartSec=5
+TimeoutStartSec=30
+TimeoutStopSec=30
+
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/var/lib/pypki
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+
+[Install]
+WantedBy=multi-user.target

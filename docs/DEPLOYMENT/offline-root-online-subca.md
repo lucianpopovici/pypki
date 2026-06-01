@@ -1,5 +1,7 @@
 # Deployment: Offline Root + Online Sub-CA
 
+> Last reviewed: 2026-06-01 (commit 453e7ba)
+
 This is the standard pattern for security-conscious internal CAs. The root CA lives on a dedicated, normally-powered-down machine that only comes online for ceremonial events (issuing or rotating sub-CAs, rotating CRLs). All day-to-day issuance happens on a separate, online sub-CA. A compromise of the online sub-CA is **recoverable** because the root is not on the network.
 
 It's the most-asked-about deployment shape for a reason: it cuts most of the practical attack surface to the bare minimum without sacrificing operational throughput.

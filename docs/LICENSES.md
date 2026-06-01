@@ -1,5 +1,7 @@
 # PyPKI — Dependency License Inventory
 
+> Last reviewed: 2026-06-01 (commit 453e7ba)
+
 Every dependency used by PyPKI (runtime and dev) is listed here. When adding
 a new dependency, update this file in the same PR. CI blocks merges that add
 a package without a license entry.

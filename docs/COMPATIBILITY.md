@@ -1,5 +1,7 @@
 # PyPKI Compatibility Matrix
 
+> Last reviewed: 2026-06-01 (commit 453e7ba)
+
 This document records which client tools and library versions PyPKI has been tested against, and the known interoperability quirks.
 
 **This is a working document.** Versions listed as "tested" have an actual test run behind them; versions listed as "expected to work" are extrapolation from the protocol RFC compliance and have not been verified end-to-end. **Do not assume a version works in production without your own validation.**

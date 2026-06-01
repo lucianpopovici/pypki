@@ -1,5 +1,7 @@
 # Deployment: PyPKI as Istio Mesh CA
 
+> Last reviewed: 2026-06-01 (commit 453e7ba)
+
 This guide chains PyPKI into an [Istio](https://istio.io) service mesh as the trust root for mTLS between meshed workloads. It builds on `docs/DEPLOYMENT/kubernetes-cert-manager.md` — read that first if you haven't, because the same sub-CA pattern underlies both. The difference is that Istio's `istiod` control plane is the issuer of leaf workload certs, and we wire it to a PyPKI-rooted intermediate.
 
 > **The big picture.** Istio's default behavior is to generate its own self-signed root and use it as the mesh CA. That's fine for a demo, terrible for any environment where workloads outside the mesh need to verify mesh-issued certs (and vice versa). Wiring Istio to a PyPKI-rooted intermediate means **everything in your environment chains to one trust root**: meshed workloads, non-meshed workloads, ingress endpoints, internal HTTPS, IoT, the lot.

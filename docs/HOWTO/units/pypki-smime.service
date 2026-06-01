@@ -1,0 +1,33 @@
+[Unit]
+Description=PyPKI S/MIME Server (RFC 8551)
+Documentation=file:///opt/pypki/docs/HOWTO/smime.md
+After=network.target
+Wants=network.target
+
+[Service]
+Type=notify
+User=pypki
+Group=pypki
+WorkingDirectory=/opt/pypki
+ExecStart=/opt/pypki/venv/bin/python3 pki_server.py \
+    --ca-dir /var/lib/pypki/ca \
+    --port 8080 \
+    --smime-prefix /smime \
+    --web-prefix / \
+    --log-level INFO
+
+Restart=on-failure
+RestartSec=5
+TimeoutStartSec=30
+TimeoutStopSec=30
+
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/var/lib/pypki
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+
+[Install]
+WantedBy=multi-user.target

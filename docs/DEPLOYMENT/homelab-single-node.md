@@ -1,5 +1,7 @@
 # Deployment: homelab single-node
 
+> Last reviewed: 2026-06-01 (commit 453e7ba)
+
 This is the simplest PyPKI deployment: one host, one CA key, SQLite for storage, optional reverse proxy. It's what most people should start with — easy to set up, easy to back up, easy to understand. Migrate to a more elaborate topology only when you actually need to.
 
 ## What this gives you

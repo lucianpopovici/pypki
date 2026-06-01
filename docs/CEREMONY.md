@@ -1,5 +1,7 @@
 # PyPKI Offline Root CA Ceremony Script
 
+> Last reviewed: 2026-06-01 (commit 453e7ba)
+
 This document is the operator script for:
 
 1. **Initial root export**: packaging the offline root CA key + cert into an encrypted

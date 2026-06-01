@@ -1,5 +1,7 @@
 # Deployment: Kubernetes with cert-manager + PyPKI sub-CA
 
+> Last reviewed: 2026-06-01 (commit 453e7ba)
+
 This guide deploys PyPKI as a Certificate Authority for a Kubernetes cluster, with **cert-manager** as the in-cluster issuer. PyPKI runs outside the cluster (typically on a dedicated host or VM); cert-manager runs inside the cluster as a `CA` ClusterIssuer using a sub-CA bootstrapped from PyPKI.
 
 This is the topology PyPKI is designed for in cloud-native environments.

@@ -1,5 +1,7 @@
 # Deployment: IoT Devices via EST (RFC 7030)
 
+> Last reviewed: 2026-06-01 (commit 453e7ba)
+
 This guide deploys PyPKI as the certificate enrollment endpoint for fleets of IoT devices that speak EST. EST (Enrollment over Secure Transport) is the right protocol for embedded devices that have a TLS stack but no DNS / HTTP infrastructure flexibility — it's a tight, well-defined protocol designed for exactly this case.
 
 PyPKI's EST implementation supports `simpleenroll` (initial enrollment), `simplereenroll` (renewal), `cacerts` (chain distribution), and `csrattrs` (server-driven CSR attribute hints). Critically, **CSR Subject Alternative Names are passed through to the issued certificate** — a fix that shipped in PyPKI's Tier 1 work after a latent bug was found that silently dropped them.

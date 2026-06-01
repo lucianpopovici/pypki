@@ -1,0 +1,33 @@
+[Unit]
+Description=PyPKI CMP Server (RFC 4210/9480)
+Documentation=file:///opt/pypki/docs/HOWTO/cmp.md
+After=network.target
+Wants=network.target
+
+[Service]
+Type=notify
+User=pypki
+Group=pypki
+WorkingDirectory=/opt/pypki
+ExecStart=/opt/pypki/venv/bin/python3 pki_server.py \
+    --ca-dir /var/lib/pypki/ca \
+    --port 8080 \
+    --cmp-prefix /cmp \
+    --default-profile tls_server \
+    --log-level INFO
+
+Restart=on-failure
+RestartSec=5
+TimeoutStartSec=30
+TimeoutStopSec=30
+
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/var/lib/pypki
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+
+[Install]
+WantedBy=multi-user.target

@@ -1,5 +1,7 @@
 # PyPKI Storage Backends
 
+> Last reviewed: 2026-06-01 (commit 453e7ba)
+
 This document covers PyPKI's storage layer: the supported backends, when
 to pick which, how to deploy each, and how to switch between them when
 your needs change. The design contract is **optionality**: stay on

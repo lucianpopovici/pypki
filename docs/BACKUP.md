@@ -1,5 +1,7 @@
 # PyPKI Backup and Restore
 
+> Last reviewed: 2026-06-01 (commit 453e7ba)
+
 Operational guide for the backup system introduced in `CLAUDE-backup-restore.md`.
 
 ---

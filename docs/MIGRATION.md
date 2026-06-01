@@ -1,5 +1,7 @@
 # PyPKI Migration Guide
 
+> Last reviewed: 2026-06-01 (commit 453e7ba)
+
 This document covers data and configuration migrations for PyPKI deployments. It will grow as features ship; today it covers:
 
 1. [SQLite → PostgreSQL backend migration](#1-sqlite--postgresql-backend-migration)

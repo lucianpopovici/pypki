@@ -1,5 +1,7 @@
 # Deployment: strongSwan IPsec VPN with CMP Enrollment
 
+> Last reviewed: 2026-06-01 (commit 453e7ba)
+
 This guide enrolls [strongSwan](https://www.strongswan.org/) IPsec gateways and roadwarrior clients against PyPKI using **CMPv2 over HTTP** (RFC 4210). The result: certs that auto-renew, fully audited issuance, and standard X.509 revocation when a peer's key is compromised.
 
 > **Why CMP instead of pasting in a CSR?** CMPv2 is the protocol IPsec gear actually understands. strongSwan ships [`pki --est`](https://wiki.strongswan.org/projects/strongswan/wiki/pki) and [`pki --cmp`](https://docs.strongswan.org/docs/5.9/pki/pkiCmp.html), Cisco IOS gateways speak it, IBM Hardware Crypto Cards speak it. PSK-based IPsec is fine for a homelab where you have three peers; once you have a dozen, certificate-based auth with proper enrollment is the only configuration that scales.

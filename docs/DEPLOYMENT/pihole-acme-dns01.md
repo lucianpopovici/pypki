@@ -1,5 +1,7 @@
 # Deployment: ACME dns-01 against Pi-hole
 
+> Last reviewed: 2026-06-01 (commit 453e7ba)
+
 This guide documents an unusual but functional setup: using a **Pi-hole** (dnsmasq-based) DNS server as the authoritative resolver for ACME `dns-01` challenges against PyPKI. It's the configuration that emerged from running this in a homelab, and it has properties that make it useful elsewhere too.
 
 ## Why this combination is interesting

@@ -1,5 +1,7 @@
 # PyPKI Disaster Recovery Runbooks
 
+> Last reviewed: 2026-06-01 (commit 453e7ba)
+
 Three scenarios in order of severity. Read all three before an incident so you
 know which one applies. Mean times are for a rehearsed operator; add 2–4× for
 first-time responders.

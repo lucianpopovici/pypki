@@ -1,0 +1,34 @@
+[Unit]
+Description=PyPKI EST Server (RFC 7030)
+Documentation=file:///opt/pypki/docs/HOWTO/est.md
+After=network.target
+Wants=network.target
+
+[Service]
+Type=notify
+User=pypki
+Group=pypki
+WorkingDirectory=/opt/pypki
+EnvironmentFile=-/etc/pypki/est.env
+ExecStart=/opt/pypki/venv/bin/python3 pki_server.py \
+    --ca-dir /var/lib/pypki/ca \
+    --port 8443 \
+    --est-prefix /est \
+    --est-require-auth \
+    --log-level INFO
+
+Restart=on-failure
+RestartSec=5
+TimeoutStartSec=30
+TimeoutStopSec=30
+
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/var/lib/pypki
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+
+[Install]
+WantedBy=multi-user.target

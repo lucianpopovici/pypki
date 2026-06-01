@@ -1,5 +1,7 @@
 # PyPKI Threat Model
 
+> Last reviewed: 2026-06-01 (commit 453e7ba)
+
 **Document version:** 2.0
 **Last reviewed:** 2026-06-01 (Tier 6 walkback — covers all Tier 5 surfaces)
 **Audience:** PyPKI operators evaluating whether a deployment fits their risk profile, and developers contributing security-sensitive changes.
