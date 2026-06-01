@@ -45,7 +45,7 @@ def run() -> bool:
         from cryptography.hazmat.primitives.asymmetric import ec
         key = ec.generate_private_key(ec.SECP256R1())
         pre_cert = ca.issue_certificate("CN=pg-pre-failover", key.public_key(), audit=audit)
-        ca.revoke_certificate(pre_cert.serial_number, reason=0, audit=audit)
+        ca.revoke_certificate(pre_cert.serial_number, reason=0)
 
         # Take a revocation snapshot.
         import sqlite3

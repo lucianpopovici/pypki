@@ -42,11 +42,11 @@ def run() -> bool:
 
         # Issue + revoke a cert to populate a CRL.
         cert1 = ca.issue_certificate("CN=f13-c1", key.public_key(), audit=audit)
-        ca.revoke_certificate(cert1.serial_number, reason=0, audit=audit)
+        ca.revoke_certificate(cert1.serial_number, reason=0)
 
         # Generate the first CRL.
         try:
-            ca.generate_crl(audit=audit)
+            ca.generate_crl()
             result.check("first_crl_generated", True)
         except Exception as e:
             result.check("first_crl_generated", False, str(e))
@@ -60,10 +60,12 @@ def run() -> bool:
             )
         else:
             # In-process: generate a second CRL immediately and verify monotonicity.
+            # cRLNumber is a DB counter independent of wall time, so it must
+            # increase regardless of any clock change.
             cert2 = ca.issue_certificate("CN=f13-c2", key.public_key(), audit=audit)
-            ca.revoke_certificate(cert2.serial_number, reason=0, audit=audit)
+            ca.revoke_certificate(cert2.serial_number, reason=0)
             try:
-                ca.generate_crl(audit=audit)
+                ca.generate_crl()
                 result.check("second_crl_generated", True)
             except Exception as e:
                 result.check("second_crl_generated", False, str(e))

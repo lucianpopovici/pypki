@@ -44,11 +44,11 @@ def run() -> bool:
         # Issue and revoke a cert so the CRL is non-empty.
         key_obj = _gen_key()
         cert = ca.issue_certificate("CN=crl-victim", key_obj.public_key(), audit=audit)
-        ca.revoke_certificate(cert.serial_number, reason=0, audit=audit)
+        ca.revoke_certificate(cert.serial_number, reason=0)
 
         # Generate a first CRL (should succeed).
         try:
-            ca.generate_crl(audit=audit)
+            ca.generate_crl()
         except Exception as e:
             result.check("first_crl_ok", False, str(e))
             return result.summary()
@@ -60,7 +60,7 @@ def run() -> bool:
         # Attempt CRL generation under disk-full condition.
         crl_fail_ok = False
         try:
-            ca.generate_crl(audit=audit)
+            ca.generate_crl()
         except (OSError, IOError, Exception):
             crl_fail_ok = True
 
@@ -75,7 +75,7 @@ def run() -> bool:
 
         # CRL generation should succeed again.
         try:
-            ca.generate_crl(audit=audit)
+            ca.generate_crl()
             result.check("crl_recovers_after_disk_freed", True)
         except Exception as e:
             result.check("crl_recovers_after_disk_freed", False, str(e))

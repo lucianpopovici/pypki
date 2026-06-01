@@ -51,22 +51,25 @@ def run() -> bool:
                 "FAKETIME='+1y' and verify cert validity dates are correct."
             )
         else:
-            # In-process simulation: override the CA's notion of "now" if possible.
-            # This tests that the CA code doesn't hard-code datetime.utcnow() calls.
-            # We verify that issuing certs with explicit not_before/not_after works.
+            # In-process simulation via forced_time parameter.
+            # issue_certificate() accepts forced_time= to override datetime.now()
+            # for the cert's notBefore/notAfter and DB timestamps.
+            # This verifies the CA correctly uses forced_time rather than hard-coding
+            # datetime.utcnow() calls, and that a future timestamp doesn't corrupt
+            # the audit log or serial counter.
             future = datetime.now(timezone.utc) + timedelta(days=365)
             cert = ca.issue_certificate(
                 "CN=f12-future",
                 _gen_key().public_key(),
                 audit=audit,
-                not_before=future,
-                not_after=future + timedelta(days=90),
+                forced_time=future,
             )
             result.check(
                 "future_dated_cert_issued",
                 cert is not None,
                 "CA rejected a future-dated cert",
             )
+            # notBefore should be the forced_time (within a few seconds of rounding).
             result.check(
                 "future_dated_cert_notbefore_correct",
                 cert.not_valid_before_utc >= future - timedelta(seconds=2),
