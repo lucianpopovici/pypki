@@ -168,14 +168,24 @@ def make_dispatcher_handler(route_table: RouteTable) -> type:
                 if not rest or (rest[0] not in ("?", "#", "/")):
                     rest = "/" + rest
                 self.path = rest
+            # Temporarily rebind self's class to the service handler so that
+            # its instance methods (_send_html, _check_auth, etc.) are found
+            # during attribute lookup.  Both DispatchingHandler and the service
+            # handler inherit from BaseHTTPRequestHandler, so __class__
+            # assignment is layout-compatible.  Instance attributes (wfile,
+            # rfile, headers, …) live in self.__dict__ and are unaffected.
+            orig_cls = type(self)
             try:
+                self.__class__ = cls
                 method_name = f"do_{self.command}"
-                handler_method = getattr(cls, method_name, None)
+                handler_method = getattr(self, method_name, None)
                 if handler_method is None:
+                    self.__class__ = orig_cls
                     self.send_error(405, f"Method {self.command} not allowed")
                     return
-                handler_method(self)
+                handler_method()
             finally:
+                self.__class__ = orig_cls
                 self.path = orig_path
                 request_id_var.reset(token)
 
