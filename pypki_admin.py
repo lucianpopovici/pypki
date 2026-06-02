@@ -1181,6 +1181,30 @@ def build_parser() -> argparse.ArgumentParser:
     _add_tenant_db_args(td)
     td.set_defaults(func=cmd_tenant_delete)
 
+    # ------------------------------------------------------------------
+    # Code-signing log subcommands
+    # ------------------------------------------------------------------
+
+    cs_verify = sub.add_parser(
+        "codesign-log-verify",
+        help="Re-hash the full Merkle tree from leaves and verify against checkpoints.",
+    )
+    cs_verify.add_argument("--ca-dir", default="./ca", metavar="DIR")
+    cs_verify.add_argument("--pki-db-url", default=None, metavar="URL")
+    cs_verify.add_argument("--log-level", default="INFO",
+                           choices=["DEBUG", "INFO", "WARNING", "ERROR"])
+    cs_verify.set_defaults(func=cmd_codesign_log_verify)
+
+    cs_anchor = sub.add_parser(
+        "codesign-anchor-now",
+        help="Write a signed Merkle checkpoint immediately.",
+    )
+    cs_anchor.add_argument("--ca-dir", default="./ca", metavar="DIR")
+    cs_anchor.add_argument("--pki-db-url", default=None, metavar="URL")
+    cs_anchor.add_argument("--log-level", default="INFO",
+                           choices=["DEBUG", "INFO", "WARNING", "ERROR"])
+    cs_anchor.set_defaults(func=cmd_codesign_anchor_now)
+
     return root
 
 
@@ -2840,6 +2864,28 @@ def cmd_tenant_delete(args: argparse.Namespace) -> int:
     except (ValueError, PermissionError) as exc:
         print(f"ERROR: {exc}")
         return 1
+
+
+def cmd_codesign_log_verify(args: argparse.Namespace) -> int:
+    """Verify the Merkle log from leaves up."""
+    _setup_logging(args.log_level)
+    db = _open_pki_db(args)
+    import merkle_log as _ml
+    ok, msg = _ml.verify_log(db)
+    print(msg)
+    return 0 if ok else 1
+
+
+def cmd_codesign_anchor_now(args: argparse.Namespace) -> int:
+    """Write a signed Merkle checkpoint immediately."""
+    _setup_logging(args.log_level)
+    db = _open_pki_db(args)
+    import merkle_log as _ml
+    from pki_server import CertificateAuthority
+    ca = CertificateAuthority(ca_dir=getattr(args, "ca_dir", "./ca"))
+    chk = _ml.write_checkpoint(db, ca.ca_key)
+    print(f"Checkpoint written: tree_size={chk['tree_size']} root={chk['root_hash'][:16]}…")
+    return 0
 
 
 def main(argv: Optional[List[str]] = None) -> int:

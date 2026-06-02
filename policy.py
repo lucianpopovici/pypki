@@ -48,7 +48,7 @@ from typing import Any, Optional
 logger = logging.getLogger("pypki.policy")
 
 _VALID_DECISIONS = frozenset({"allow", "deny", "require_ra", "require_dual_control"})
-_VALID_MATCH_KEYS = frozenset({"profile", "profile_in", "requester", "sans", "key", "validity", "time"})
+_VALID_MATCH_KEYS = frozenset({"profile", "profile_in", "requester", "sans", "key", "validity", "time", "codesign"})
 _VALID_REQUESTER_KEYS = frozenset({"backend", "roles", "identity_regex"})
 _VALID_SANS_KEYS = frozenset({"all_match_regex", "any_match_regex", "none_match_regex", "count_max"})
 _VALID_KEY_KEYS = frozenset({"type_in", "size_min"})
@@ -79,6 +79,7 @@ class IssuanceRequest:
     validity_days_requested: int = 0
     request_id: str = ""
     now: Optional[datetime.datetime] = None  # fixed clock for time predicates; None → real UTC
+    codesign_meta: dict = dataclasses.field(default_factory=dict)  # codesign.* predicates
 
 
 @dataclasses.dataclass(frozen=True)
@@ -321,6 +322,23 @@ def _matches(match: dict, compiled: dict[str, re.Pattern], req: IssuanceRequest)
             now = req.now or datetime.datetime.now(datetime.timezone.utc)
             if not _match_time(val, now):
                 return False
+        elif key == "codesign":
+            if not _match_codesign(val, req):
+                return False
+    return True
+
+
+def _match_codesign(pred: dict, req: IssuanceRequest) -> bool:
+    """Match codesign.* predicates against req.codesign_meta."""
+    meta = req.codesign_meta or {}
+    for field, expected in pred.items():
+        actual = meta.get(field, "")
+        if isinstance(expected, str):
+            # Treat as regex pattern
+            if not re.search(expected, str(actual)):
+                return False
+        elif actual != expected:
+            return False
     return True
 
 

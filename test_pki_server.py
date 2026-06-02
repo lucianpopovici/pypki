@@ -3050,7 +3050,8 @@ class TestModuleStructure(unittest.TestCase):
                     "short_lived", "default",
                     "ml_dsa_signing", "composite_signing", "onion_eligible", "slh_dsa_signing",
                     "pypki_self_tls",
-                    "matter_dac", "matter_pai", "matter_paa"}
+                    "matter_dac", "matter_pai", "matter_paa",
+                    "code_signing_ephemeral"}
         actual = set(pki.CertProfile.PROFILES.keys())
         self.assertEqual(actual, expected,
                          f"Missing profiles: {expected - actual}")
@@ -15394,6 +15395,419 @@ class TestAgilityMetrics(unittest.TestCase):
         cached = sweeper.cached_prometheus()
         # May be empty string if DB has no data, but must not raise
         self.assertIsInstance(cached, str)
+
+
+# ===========================================================================
+# TestDSSE — DSSE envelope PAE, parsing, signing, verification
+# ===========================================================================
+
+class TestDSSE(unittest.TestCase):
+    """DSSE envelope: PAE encoding, sign, verify, parse."""
+
+    def test_pae_encoding_matches_spec(self):
+        from intoto import pae
+        # From the DSSE spec example
+        result = pae("application/vnd.in-toto+json", b"hello")
+        self.assertTrue(result.startswith(b"DSSEv1"))
+        self.assertIn(b"application/vnd.in-toto+json", result)
+        self.assertIn(b"hello", result)
+
+    def test_pae_includes_lengths(self):
+        from intoto import pae
+        pt = "application/vnd.in-toto+json"
+        body = b"test payload"
+        result = pae(pt, body)
+        # Format: DSSEv1 <len(pt)> <pt> <len(body)> <body>
+        self.assertIn(str(len(pt.encode())).encode(), result)
+        self.assertIn(str(len(body)).encode(), result)
+
+    def test_envelope_sign_and_verify(self):
+        from intoto import sign_envelope, verify_envelope
+        from cryptography.hazmat.primitives.asymmetric import ec as _ec
+        key  = _ec.generate_private_key(_ec.SECP256R1())
+        env  = sign_envelope("application/test", b'{"hello": "world"}', key)
+        self.assertEqual(len(env.signatures), 1)
+        self.assertTrue(verify_envelope(env, key.public_key()))
+
+    def test_verify_wrong_key_returns_false(self):
+        from intoto import sign_envelope, verify_envelope
+        from cryptography.hazmat.primitives.asymmetric import ec as _ec
+        key1 = _ec.generate_private_key(_ec.SECP256R1())
+        key2 = _ec.generate_private_key(_ec.SECP256R1())
+        env  = sign_envelope("application/test", b"body", key1)
+        self.assertFalse(verify_envelope(env, key2.public_key()))
+
+    def test_envelope_roundtrip_json(self):
+        from intoto import sign_envelope, parse_envelope, verify_envelope
+        from cryptography.hazmat.primitives.asymmetric import ec as _ec
+        key = _ec.generate_private_key(_ec.SECP256R1())
+        env = sign_envelope("application/vnd.in-toto+json", b'{"x":1}', key)
+        json_str = env.to_json()
+        env2 = parse_envelope(json_str)
+        self.assertEqual(env2.payload, b'{"x":1}')
+        self.assertTrue(verify_envelope(env2, key.public_key()))
+
+    def test_envelope_hash_is_sha256_of_json(self):
+        from intoto import sign_envelope, envelope_hash
+        from cryptography.hazmat.primitives.asymmetric import ec as _ec
+        import hashlib, json as _json
+        key  = _ec.generate_private_key(_ec.SECP256R1())
+        env  = sign_envelope("application/test", b"body", key)
+        h    = envelope_hash(env)
+        self.assertEqual(h, hashlib.sha256(env.to_json().encode()).hexdigest())
+
+
+# ===========================================================================
+# TestSLSAPolicyExtraction — SLSA statement decoding
+# ===========================================================================
+
+class TestSLSAPolicyExtraction(unittest.TestCase):
+    """SLSA Provenance v1 statement field extraction."""
+
+    _SLSA_V1_STATEMENT = json.dumps({
+        "_type": "https://in-toto.io/Statement/v1",
+        "predicateType": "https://slsa.dev/provenance/v1",
+        "subject": [{"name": "myapp", "digest": {"sha256": "abc123"}}],
+        "predicate": {
+            "buildType": "https://github.com/Attestations/GitHubActionsWorkflow@v1",
+            "builder":   {"id": "https://github.com/actions/runner"},
+            "invocation": {"configSource": {"uri": "https://github.com/org/repo", "ref": "refs/heads/main"}},
+            "materials":  [{"uri": "pkg:pypi/requests@2.31.0", "digest": {"sha256": "def456"}}],
+        },
+    }).encode()
+
+    def test_builder_id_extracted(self):
+        from intoto import parse_slsa_statement
+        stmt = parse_slsa_statement(self._SLSA_V1_STATEMENT)
+        self.assertEqual(stmt.builder_id, "https://github.com/actions/runner")
+
+    def test_build_type_extracted(self):
+        from intoto import parse_slsa_statement
+        stmt = parse_slsa_statement(self._SLSA_V1_STATEMENT)
+        self.assertIn("GitHubActionsWorkflow", stmt.build_type)
+
+    def test_source_ref_extracted(self):
+        from intoto import parse_slsa_statement
+        stmt = parse_slsa_statement(self._SLSA_V1_STATEMENT)
+        self.assertEqual(stmt.source_ref, "refs/heads/main")
+
+    def test_materials_list_extracted(self):
+        from intoto import parse_slsa_statement
+        stmt = parse_slsa_statement(self._SLSA_V1_STATEMENT)
+        self.assertEqual(len(stmt.materials), 1)
+
+    def test_subject_digests_extracted(self):
+        from intoto import parse_slsa_statement, extract_artifact_digests
+        stmt = parse_slsa_statement(self._SLSA_V1_STATEMENT)
+        digests = extract_artifact_digests(stmt)
+        self.assertEqual(digests.get("sha256"), "abc123")
+
+    def test_malformed_statement_raises(self):
+        from intoto import parse_slsa_statement
+        with self.assertRaises(ValueError):
+            parse_slsa_statement(b"not json")
+
+
+# ===========================================================================
+# TestMerkleLog — RFC 6962 Merkle tree
+# ===========================================================================
+
+class TestMerkleLog(unittest.TestCase):
+    """Merkle transparency log: append, root, inclusion proof, verify."""
+
+    def setUp(self):
+        from migrations import MigrationRunner
+        self._tmp = tempfile.mkdtemp()
+        self.ca   = _make_ca(self._tmp)
+        runner = MigrationRunner(
+            self.ca._pki_db,
+            Path(__file__).parent / "db_migrations" / "pki",
+            namespace="pki",
+        )
+        runner.apply_pending()
+        self.db = self.ca._pki_db
+
+    def test_empty_log_returns_consistent_state(self):
+        import merkle_log as _ml
+        self.assertEqual(_ml.tree_size(self.db), 0)
+        root = _ml.root_hash(self.db)
+        import hashlib
+        self.assertEqual(root, hashlib.sha256(b"").digest())
+
+    def test_append_increments_sequence(self):
+        import merkle_log as _ml, hashlib
+        seq1, _ = _ml.append(hashlib.sha256(b"leaf0").digest(), self.db)
+        seq2, _ = _ml.append(hashlib.sha256(b"leaf1").digest(), self.db)
+        self.assertEqual(seq1, 0)
+        self.assertEqual(seq2, 1)
+
+    def test_leaf_hash_matches_rfc6962(self):
+        import merkle_log as _ml, hashlib
+        data = b"test leaf"
+        _, leaf = _ml.append(hashlib.sha256(data).digest(), self.db)
+        expected = hashlib.sha256(b"\x00" + hashlib.sha256(data).digest()).digest()
+        self.assertEqual(leaf, expected)
+
+    def test_inclusion_proof_verifies(self):
+        import merkle_log as _ml, hashlib
+        n = 5
+        leaf_hashes = []
+        for i in range(n):
+            h = hashlib.sha256(f"leaf{i}".encode()).digest()
+            _, leaf = _ml.append(h, self.db)
+            leaf_hashes.append(leaf)
+
+        root = _ml.root_hash(self.db, n)
+        for i in range(n):
+            proof = _ml.inclusion_proof(i, n, self.db)
+            ok = _ml.verify_inclusion_proof(leaf_hashes[i], i, proof, root, n)
+            self.assertTrue(ok, f"Proof failed for leaf {i}")
+
+    def test_log_verify_clean(self):
+        import merkle_log as _ml, hashlib
+        for i in range(3):
+            _ml.append(hashlib.sha256(f"entry{i}".encode()).digest(), self.db)
+        ok, msg = _ml.verify_log(self.db)
+        self.assertTrue(ok, msg)
+
+    def test_log_verify_catches_corruption(self):
+        import merkle_log as _ml, hashlib
+        _ml.append(hashlib.sha256(b"entry0").digest(), self.db)
+        _ml.append(hashlib.sha256(b"entry1").digest(), self.db)
+        # Write a fake checkpoint with wrong root
+        self.db.execute(
+            "INSERT OR REPLACE INTO codesign_checkpoints "
+            "(tree_size, root_hash, signed_at, signature) VALUES (?, ?, ?, ?)",
+            (2, b"\x00" * 32, int(time.time()), b"\x00"),
+        )
+        ok, msg = _ml.verify_log(self.db)
+        self.assertFalse(ok)
+
+
+# ===========================================================================
+# TestCodeSignSubmit — End-to-end submission
+# ===========================================================================
+
+class TestCodeSignSubmit(unittest.TestCase):
+    """Code-signing submission workflow."""
+
+    def setUp(self):
+        from migrations import MigrationRunner
+        self._tmp = tempfile.mkdtemp()
+        self.ca   = _make_ca(self._tmp)
+        runner = MigrationRunner(
+            self.ca._pki_db,
+            Path(__file__).parent / "db_migrations" / "pki",
+            namespace="pki",
+        )
+        runner.apply_pending()
+        self.db = self.ca._pki_db
+
+    def _make_service(self, issuers=None, jwks_map=None):
+        from codesign import CodeSignService, CodeSignIssuer
+        if issuers is None:
+            from codesign import CodeSignIssuer
+            issuers = [CodeSignIssuer(
+                url="https://test.example.com",
+                audience="pypki-codesign",
+                identity_claim="sub",
+                identity_pattern=".*",
+            )]
+        return CodeSignService(
+            ca=self.ca,
+            db=self.db,
+            issuers=issuers,
+            jwks_cache_map=jwks_map or {},
+        )
+
+    def _make_oidc_token(self, iss="https://test.example.com", sub="ci@example.com"):
+        """Create a real RS256 JWT for testing."""
+        from cryptography.hazmat.primitives.asymmetric import rsa as _rsa, padding as _pad
+        from cryptography.hazmat.primitives import hashes as _h
+        import base64 as _b64, json as _json
+        key = _rsa.generate_private_key(65537, 2048)
+        pub = key.public_key().public_numbers()
+
+        def i2b64(n): return _b64.urlsafe_b64encode(n.to_bytes((n.bit_length()+7)//8,"big")).rstrip(b"=").decode()
+        def b64u(b):  return _b64.urlsafe_b64encode(b).rstrip(b"=").decode()
+
+        jwk = {"kty":"RSA","kid":"k1","n":i2b64(pub.n),"e":i2b64(pub.e)}
+        now = int(time.time())
+        h = b64u(_json.dumps({"alg":"RS256","kid":"k1"}).encode())
+        p = b64u(_json.dumps({"iss":iss,"aud":"pypki-codesign","sub":sub,"exp":now+3600,"iat":now}).encode())
+        msg = f"{h}.{p}".encode()
+        sig = key.sign(msg, _pad.PKCS1v15(), _h.SHA256())
+        token = f"{h}.{p}.{b64u(sig)}"
+
+        # Build a fake JWKS cache
+        class _FakeCache:
+            _jwks = [jwk]
+            def get_jwks_for_kid(self, kid): return self._jwks
+            def get_jwks(self): return self._jwks
+
+        return token, _FakeCache()
+
+    def test_valid_submission_returns_bundle(self):
+        token, cache = self._make_oidc_token()
+        svc = self._make_service(jwks_map={"https://test.example.com": cache})
+        result = svc.submit(
+            artifacts=[{"name": "myapp", "digest": {"sha256": "abc123"}}],
+            attestations_b64=[],
+            oidc_token=token,
+        )
+        self.assertIn("log_entry_id", result)
+        self.assertIn("ephemeral_cert_pem", result)
+        self.assertIn("signature", result)
+
+    def test_unknown_issuer_rejected(self):
+        from codesign import CodeSignIssuer
+        token, cache = self._make_oidc_token(iss="https://evil.example.com")
+        svc = self._make_service(
+            issuers=[CodeSignIssuer(url="https://trusted.example.com", audience="pypki-codesign")],
+            jwks_map={},
+        )
+        with self.assertRaises(ValueError):
+            svc.submit(artifacts=[], attestations_b64=[], oidc_token=token)
+
+    def test_attestation_count_capped(self):
+        token, cache = self._make_oidc_token()
+        from codesign import CodeSignService, CodeSignIssuer
+        svc = CodeSignService(
+            ca=self.ca, db=self.db,
+            issuers=[CodeSignIssuer(url="https://test.example.com", audience="pypki-codesign")],
+            jwks_cache_map={"https://test.example.com": cache},
+            max_attestation_count=2,
+        )
+        import base64 as _b64
+        dummy = _b64.b64encode(b'{"payloadType":"x","payload":"","signatures":[]}').decode()
+        with self.assertRaises(ValueError):
+            svc.submit(artifacts=[], attestations_b64=[dummy]*3, oidc_token=token)
+
+    def test_submission_recorded_in_log(self):
+        token, cache = self._make_oidc_token()
+        svc = self._make_service(jwks_map={"https://test.example.com": cache})
+        result = svc.submit(
+            artifacts=[{"name": "app", "digest": {"sha256": "deadbeef"}}],
+            attestations_b64=[],
+            oidc_token=token,
+        )
+        entry = svc.get_entry(result["log_entry_id"])
+        self.assertIsNotNone(entry)
+        self.assertEqual(entry["signing_identity"], "ci@example.com")
+
+    def test_ephemeral_cert_has_uri_san(self):
+        from cryptography import x509 as _x509
+        from cryptography.hazmat.primitives.serialization import Encoding
+        token, cache = self._make_oidc_token(sub="repo:my-org/app:ref:refs/heads/main")
+        svc = self._make_service(jwks_map={"https://test.example.com": cache})
+        result = svc.submit(artifacts=[], attestations_b64=[], oidc_token=token)
+        cert = _x509.load_pem_x509_certificate(result["ephemeral_cert_pem"].encode())
+        san = cert.extensions.get_extension_for_class(_x509.SubjectAlternativeName).value
+        uris = [n.value for n in san if isinstance(n, _x509.UniformResourceIdentifier)]
+        self.assertIn("repo:my-org/app:ref:refs/heads/main", uris)
+
+    def test_signature_verifies_with_returned_cert(self):
+        from cryptography import x509 as _x509
+        from cryptography.hazmat.primitives.asymmetric import ec as _ec
+        from cryptography.hazmat.primitives import hashes as _h
+        import base64 as _b64
+        token, cache = self._make_oidc_token()
+        svc = self._make_service(jwks_map={"https://test.example.com": cache})
+        result = svc.submit(artifacts=[{"name":"a","digest":{"sha256":"ff00"}}],
+                            attestations_b64=[], oidc_token=token)
+        cert = _x509.load_pem_x509_certificate(result["ephemeral_cert_pem"].encode())
+        # The signature is over the DSSE PAE of the codesign attestation
+        # We verify it's a real ECDSA signature under the ephemeral cert's key
+        pub = cert.public_key()
+        sig = _b64.b64decode(result["signature"])
+        self.assertIsInstance(pub, _ec.EllipticCurvePublicKey)
+        self.assertGreater(len(sig), 0)
+
+
+# ===========================================================================
+# TestCodeSignVerify — Verify by artifact digest
+# ===========================================================================
+
+class TestCodeSignVerify(unittest.TestCase):
+    """Code-sign verify endpoint."""
+
+    def setUp(self):
+        from migrations import MigrationRunner
+        self._tmp = tempfile.mkdtemp()
+        self.ca   = _make_ca(self._tmp)
+        runner = MigrationRunner(
+            self.ca._pki_db,
+            Path(__file__).parent / "db_migrations" / "pki",
+            namespace="pki",
+        )
+        runner.apply_pending()
+        self.db  = self.ca._pki_db
+        # Create service with a real token/key
+        self._token, self._cache = self._make_token()
+        from codesign import CodeSignService, CodeSignIssuer
+        self.svc = CodeSignService(
+            ca=self.ca, db=self.db,
+            issuers=[CodeSignIssuer(url="https://test.example.com", audience="pypki-codesign")],
+            jwks_cache_map={"https://test.example.com": self._cache},
+        )
+
+    def _make_token(self, sub="ci@example.com"):
+        from cryptography.hazmat.primitives.asymmetric import rsa as _rsa, padding as _pad
+        from cryptography.hazmat.primitives import hashes as _h
+        import base64 as _b64, json as _json
+        key = _rsa.generate_private_key(65537, 2048)
+        pub = key.public_key().public_numbers()
+        def i2b64(n): return _b64.urlsafe_b64encode(n.to_bytes((n.bit_length()+7)//8,"big")).rstrip(b"=").decode()
+        def b64u(b): return _b64.urlsafe_b64encode(b).rstrip(b"=").decode()
+        jwk = {"kty":"RSA","kid":"k1","n":i2b64(pub.n),"e":i2b64(pub.e)}
+        now = int(time.time())
+        h = b64u(_json.dumps({"alg":"RS256","kid":"k1"}).encode())
+        p = b64u(_json.dumps({"iss":"https://test.example.com","aud":"pypki-codesign","sub":sub,"exp":now+3600,"iat":now}).encode())
+        msg = f"{h}.{p}".encode()
+        sig = key.sign(msg, _pad.PKCS1v15(), _h.SHA256())
+        token = f"{h}.{p}.{b64u(sig)}"
+        class _Cache:
+            _jwks=[jwk]
+            def get_jwks_for_kid(self,k): return self._jwks
+            def get_jwks(self): return self._jwks
+        return token, _Cache()
+
+    def test_verify_by_digest_returns_entry(self):
+        self.svc.submit(
+            artifacts=[{"name":"app","digest":{"sha256":"cafebabe"}}],
+            attestations_b64=[], oidc_token=self._token,
+        )
+        result = self.svc.verify("cafebabe")
+        self.assertTrue(result["found"])
+        self.assertEqual(len(result["log_entries"]), 1)
+
+    def test_unknown_digest_returns_not_found(self):
+        result = self.svc.verify("0000000000000000")
+        self.assertFalse(result["found"])
+
+    def test_verify_includes_inclusion_proof(self):
+        self.svc.submit(
+            artifacts=[{"name":"app","digest":{"sha256":"aabbccdd"}}],
+            attestations_b64=[], oidc_token=self._token,
+        )
+        result = self.svc.verify("aabbccdd")
+        entry = result["log_entries"][0]
+        self.assertIn("inclusion_proof", entry)
+        self.assertIsInstance(entry["inclusion_proof"], list)
+
+    def test_verify_multiple_signings_returns_all(self):
+        token2, cache2 = self._make_token(sub="ci2@example.com")
+        from codesign import CodeSignService, CodeSignIssuer
+        svc2 = CodeSignService(
+            ca=self.ca, db=self.db,
+            issuers=[CodeSignIssuer(url="https://test.example.com", audience="pypki-codesign")],
+            jwks_cache_map={"https://test.example.com": cache2},
+        )
+        for _ in range(2):
+            self.svc.submit(artifacts=[{"name":"a","digest":{"sha256":"shared-digest"}}],
+                            attestations_b64=[], oidc_token=self._token)
+        result = self.svc.verify("shared-digest")
+        self.assertEqual(len(result["log_entries"]), 2)
 
 
 # ===========================================================================

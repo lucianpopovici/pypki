@@ -24,6 +24,29 @@ This project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `TestOIDCTokenVerification`, `TestOIDCFlow`, `TestSessionStore`, `TestOIDCDiscovery`.
   Setup guides for Keycloak, Okta, Entra ID, and Google Workspace in `docs/SSO.md`.
 
+- **Code-signing portal** (`codesign.py`, `intoto.py`, `merkle_log.py`,
+  `db_migrations/pki/014_codesign.sql`, `docs/CODESIGN.md`):
+  "Sigstore for your private code." CI submits artifact digests + in-toto/DSSE
+  attestations + OIDC identity token; PyPKI validates the token against configured
+  trusted issuers, issues a 10-minute ephemeral ECDSA P-256 cert (URI SAN = OIDC sub),
+  signs a PyPKI codesign attestation, appends to an RFC 6962 Merkle transparency log,
+  and returns a verification bundle.
+  - `intoto.py`: DSSE PAE encoding (DSSEv1 SP len SP type SP len SP body), envelope
+    parse/sign/verify (EC P-256/Ed25519), SLSA Provenance v1 decoder, extract_artifact_digests
+  - `merkle_log.py`: RFC 6962 Merkle tree (leaf=H(0x00||x), node=H(0x01||l||r));
+    append under advisory lock, inclusion proof with correct RFC 6962 last_node tracking
+    (handles non-power-of-2 trees), verify_log re-hash from leaves
+  - `codesign.py`: CodeSignService.submit/verify/get_entry/checkpoint/search;
+    OIDC token validation against issuer list (reuses oidc.py); ephemeral key never persisted
+  - `code_signing_ephemeral` CertProfile (digitalSignature, codeSigning EKU, noRevAvail)
+  - `policy.py`: `codesign.*` predicate namespace; `codesign_meta` field on IssuanceRequest
+  - REST: POST /api/codesign/submit, GET /api/codesign/verify/<digest>,
+    GET /api/codesign/log/entries/<id>, GET /api/codesign/log/checkpoint,
+    GET /api/codesign/log/search; --codesign-enabled / --codesign-issuers-file flags
+  - Admin CLI: codesign-log-verify, codesign-anchor-now
+  - 28 new tests: TestDSSE x6, TestSLSAPolicyExtraction x6, TestMerkleLog x6,
+    TestCodeSignSubmit x6, TestCodeSignVerify x4; full suite 1222 passing
+
 - **Multi-tenancy** (`tenant.py`, `db_migrations/pki/013_tenant.sql`,
   `scripts/lint_tenant_scoping.py`, `docs/MULTITENANCY.md`):
   Hard isolation between organizational units. `TenantScopedConnection` wraps

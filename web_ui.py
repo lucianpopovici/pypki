@@ -692,6 +692,8 @@ class WebUIHandler(http.server.BaseHTTPRequestHandler):
     rate_limiter  = None   # RateLimiter | None
     require_auth: bool = True   # PAM auth gate; set False with --web-no-auth
     pam_service:  str  = "login"  # PAM service name (e.g. "login", "sshd")
+    # Code-signing portal service (None = disabled)
+    codesign_service = None   # Optional[codesign.CodeSignService]
     # OIDC configuration (None = PAM mode)
     oidc_config  = None   # Optional[auth.OIDCConfig]
     jwks_cache   = None   # Optional[auth.JWKSCache]
@@ -1152,6 +1154,17 @@ class WebUIHandler(http.server.BaseHTTPRequestHandler):
                 self._api_matter_list_authorities()
             elif path == "/api/matter/dacs":
                 self._api_matter_list_dacs()
+            # Code-signing portal GET routes
+            elif path.startswith("/api/codesign/verify/"):
+                digest = path.split("/api/codesign/verify/", 1)[1].strip("/")
+                self._api_codesign_verify(digest)
+            elif path.startswith("/api/codesign/log/entries/"):
+                entry_id = path.split("/api/codesign/log/entries/", 1)[1].strip("/")
+                self._api_codesign_entry(entry_id)
+            elif path == "/api/codesign/log/checkpoint":
+                self._api_codesign_checkpoint()
+            elif path == "/api/codesign/log/search":
+                self._api_codesign_search()
             elif path in ("/ca/cert.pem", "/ca/cert"):
                 # Serve full chain PEM (leaf + intermediates) for intermediate CA mode.
                 self._send_raw(200, "application/x-pem-file", self.ca.ca_chain_pem)
@@ -1242,6 +1255,9 @@ class WebUIHandler(http.server.BaseHTTPRequestHandler):
                 self._api_matter_bulk_dac(data)
             elif path == "/api/matter/pai":
                 self._api_matter_issue_pai(data)
+            # Code-signing portal
+            elif path == "/api/codesign/submit":
+                self._api_codesign_submit(data)
             else:
                 self._send_json({"error": "not found"}, 404)
         except Exception as e:
@@ -3363,6 +3379,63 @@ async function getKnownHosts() {
         self.wfile.write(body)
 
     # ------------------------------------------------------------------
+    # Code-signing portal API handlers
+    # ------------------------------------------------------------------
+
+    def _api_codesign_submit(self, data: dict):
+        if self.codesign_service is None:
+            self._send_json({"error": "Code-signing portal is not enabled"}, 503)
+            return
+        try:
+            result = self.codesign_service.submit(
+                artifacts=data.get("artifacts", []),
+                attestations_b64=data.get("attestations", []),
+                oidc_token=data.get("oidc_token", ""),
+                requester_ip=self.client_address[0],
+            )
+            self._send_json(result, 201)
+        except PermissionError as exc:
+            self._send_json({"error": str(exc)}, 403)
+        except ValueError as exc:
+            self._send_json({"error": str(exc)}, 400)
+
+    def _api_codesign_verify(self, digest: str):
+        if self.codesign_service is None:
+            self._send_json({"error": "Code-signing portal is not enabled"}, 503)
+            return
+        result = self.codesign_service.verify(digest)
+        code = 200 if result["found"] else 404
+        self._send_json(result, code)
+
+    def _api_codesign_entry(self, entry_id: str):
+        if self.codesign_service is None:
+            self._send_json({"error": "Code-signing portal is not enabled"}, 503)
+            return
+        entry = self.codesign_service.get_entry(entry_id)
+        if entry is None:
+            self._send_json({"error": "entry not found"}, 404)
+        else:
+            self._send_json(entry)
+
+    def _api_codesign_checkpoint(self):
+        if self.codesign_service is None:
+            self._send_json({"error": "Code-signing portal is not enabled"}, 503)
+            return
+        self._send_json(self.codesign_service.get_checkpoint())
+
+    def _api_codesign_search(self):
+        if self.codesign_service is None:
+            self._send_json({"error": "Code-signing portal is not enabled"}, 503)
+            return
+        import urllib.parse as _up
+        qs = dict(_up.parse_qsl(self.path.split("?", 1)[1] if "?" in self.path else ""))
+        results = self.codesign_service.search(
+            artifact_digest=qs.get("artifact-digest"),
+            identity=qs.get("issuer"),  # 'issuer' param matches identity field
+        )
+        self._send_json({"entries": results})
+
+    # ------------------------------------------------------------------
     # Infrastructure API handlers (no auth required)
     # ------------------------------------------------------------------
 
@@ -3642,6 +3715,7 @@ def start_web_ui(
             logger.error("OIDC setup failed: %s", exc)
 
     BoundWebUIHandler.ca                  = ca
+    BoundWebUIHandler.codesign_service    = None  # set separately via start_codesign
     BoundWebUIHandler.audit_log           = audit_log
     BoundWebUIHandler.rate_limiter        = rate_limiter
     BoundWebUIHandler.require_auth        = require_auth

@@ -1706,6 +1706,21 @@ class CertProfile:
             "suppress_cdp": True,
             "suppress_ocsp_aia": True,
         },
+        # Code-signing portal: ephemeral cert, 10-minute lifetime, ECDSA P-256 only.
+        # URI SAN carries the CI runner's OIDC identity (Sigstore convention).
+        # portal_self_revoke/renew both False: lifecycle is managed by the portal.
+        "code_signing_ephemeral": {
+            "key_usage": dict(digital_signature=True, content_commitment=False,
+                              key_encipherment=False, data_encipherment=False,
+                              key_agreement=False, key_cert_sign=False,
+                              crl_sign=False, encipher_only=False, decipher_only=False),
+            "eku": [ExtendedKeyUsageOID.CODE_SIGNING],
+            "san_required": False,
+            "bc_ca": False,
+            "no_rev_avail": True,  # RFC 9608: ephemeral certs don't need CRL/OCSP
+            "portal_self_revoke": False,
+            "portal_self_renew":  False,
+        },
         # RFC 9336 — document-signing certificate.
         # id-kp-documentSigning (1.3.6.1.5.5.7.3.36); KU digitalSignature +
         # contentCommitment (nonRepudiation) for non-repudiable document signatures.
@@ -5411,6 +5426,35 @@ def main():
     mt_group.add_argument(
         "--tenant-dns-routing-enabled", action="store_true", default=False,
         help="Resolve tenant from the HTTP Host header (requires DNS aliases in DB).",
+    )
+
+    cs_group = parser.add_argument_group(
+        "Code-signing portal",
+        "Software-supply-chain signing with in-toto attestations and Merkle transparency log.",
+    )
+    cs_group.add_argument(
+        "--codesign-enabled", action="store_true", default=False,
+        help="Enable the code-signing portal API.",
+    )
+    cs_group.add_argument(
+        "--codesign-issuers-file", default="", metavar="FILE",
+        help="JSON file listing trusted OIDC issuers for build runner identity tokens.",
+    )
+    cs_group.add_argument(
+        "--codesign-ephemeral-validity-seconds", type=int, default=600, metavar="SEC",
+        help="Ephemeral signing cert lifetime in seconds (default: 600 = 10 min).",
+    )
+    cs_group.add_argument(
+        "--codesign-max-artifact-bytes", type=int, default=500*1024*1024, metavar="BYTES",
+        help="Max artifact size for codesign submissions (default: 500 MB).",
+    )
+    cs_group.add_argument(
+        "--codesign-max-attestation-count", type=int, default=16, metavar="N",
+        help="Max DSSE attestations per submission (default: 16).",
+    )
+    cs_group.add_argument(
+        "--codesign-log-checkpoint-interval", type=int, default=60, metavar="SEC",
+        help="Seconds between signed Merkle tree checkpoints (default: 60).",
     )
 
     kms_group = parser.add_argument_group(
