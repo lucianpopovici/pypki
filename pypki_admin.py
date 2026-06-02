@@ -1105,6 +1105,82 @@ def build_parser() -> argparse.ArgumentParser:
                          choices=["DEBUG", "INFO", "WARNING", "ERROR"])
     kms_rot.set_defaults(func=cmd_kms_rotate_version)
 
+    # ------------------------------------------------------------------
+    # Tenant management subcommands
+    # ------------------------------------------------------------------
+
+    def _add_tenant_db_args(p):
+        p.add_argument("--ca-dir", default="./ca", metavar="DIR")
+        p.add_argument("--pki-db-url", default=None, metavar="URL")
+        p.add_argument("--log-level", default="WARNING",
+                       choices=["DEBUG", "INFO", "WARNING", "ERROR"])
+
+    tc = sub.add_parser("tenant-create", help="Create a new tenant.")
+    tc.add_argument("--slug", required=True, metavar="SLUG")
+    tc.add_argument("--display-name", required=True, metavar="NAME")
+    tc.add_argument("--owner-identity", default="system", metavar="IDENTITY")
+    tc.add_argument("--max-active-certs", type=int, default=None, metavar="N")
+    _add_tenant_db_args(tc)
+    tc.set_defaults(func=cmd_tenant_create)
+
+    tl = sub.add_parser("tenant-list", help="List tenants.")
+    tl.add_argument("--include-suspended", action="store_true")
+    _add_tenant_db_args(tl)
+    tl.set_defaults(func=cmd_tenant_list)
+
+    ts = sub.add_parser("tenant-show", help="Show tenant details.")
+    ts.add_argument("--slug", required=True, metavar="SLUG")
+    _add_tenant_db_args(ts)
+    ts.set_defaults(func=cmd_tenant_show)
+
+    tq = sub.add_parser("tenant-set-quota", help="Set quota for a tenant.")
+    tq.add_argument("--slug", required=True, metavar="SLUG")
+    tq.add_argument("--max-active-certs", type=int, default=None, metavar="N")
+    tq.add_argument("--max-issuances-per-day", type=int, default=None, metavar="N")
+    tq.add_argument("--max-sub-cas", type=int, default=None, metavar="N")
+    _add_tenant_db_args(tq)
+    tq.set_defaults(func=cmd_tenant_set_quota)
+
+    ta = sub.add_parser("tenant-add-admin", help="Grant a user admin access to a tenant.")
+    ta.add_argument("--slug", required=True, metavar="SLUG")
+    ta.add_argument("--identity", required=True, metavar="IDENTITY")
+    ta.add_argument("--role", default="operator",
+                    choices=["admin", "operator", "viewer"])
+    _add_tenant_db_args(ta)
+    ta.set_defaults(func=cmd_tenant_add_admin)
+
+    tra = sub.add_parser("tenant-remove-admin",
+                         help="Remove a user's admin access from a tenant.")
+    tra.add_argument("--slug", required=True, metavar="SLUG")
+    tra.add_argument("--identity", required=True, metavar="IDENTITY")
+    _add_tenant_db_args(tra)
+    tra.set_defaults(func=cmd_tenant_remove_admin)
+
+    tda = sub.add_parser("tenant-add-dns-alias",
+                         help="Add a DNS hostname alias for a tenant.")
+    tda.add_argument("--slug", required=True, metavar="SLUG")
+    tda.add_argument("--hostname", required=True, metavar="HOST")
+    _add_tenant_db_args(tda)
+    tda.set_defaults(func=cmd_tenant_add_dns_alias)
+
+    tsu = sub.add_parser("tenant-suspend", help="Suspend a tenant (read-only).")
+    tsu.add_argument("--slug", required=True, metavar="SLUG")
+    tsu.add_argument("--reason", default="", metavar="REASON")
+    _add_tenant_db_args(tsu)
+    tsu.set_defaults(func=cmd_tenant_suspend)
+
+    tre = sub.add_parser("tenant-resume", help="Resume a suspended tenant.")
+    tre.add_argument("--slug", required=True, metavar="SLUG")
+    _add_tenant_db_args(tre)
+    tre.set_defaults(func=cmd_tenant_resume)
+
+    td = sub.add_parser("tenant-delete", help="Delete an empty tenant.")
+    td.add_argument("--slug", required=True, metavar="SLUG")
+    td.add_argument("--confirm", action="store_true",
+                    help="Required to actually delete.")
+    _add_tenant_db_args(td)
+    td.set_defaults(func=cmd_tenant_delete)
+
     return root
 
 
@@ -2630,6 +2706,140 @@ def cmd_kms_rotate_version(args: argparse.Namespace) -> int:
     print(f"  new ref: {args.new_ref}")
     print("Restart the PyPKI server to load the new key version.")
     return 0
+
+
+def _get_tenant_manager(args):
+    db = _open_pki_db(args)
+    from tenant import TenantManager
+    return TenantManager(db)
+
+
+def cmd_tenant_create(args: argparse.Namespace) -> int:
+    _setup_logging(args.log_level)
+    tm = _get_tenant_manager(args)
+    try:
+        t = tm.create(
+            slug=args.slug,
+            display_name=args.display_name,
+            created_by=getattr(args, "owner_identity", "system"),
+            max_active_certs=getattr(args, "max_active_certs", None),
+        )
+        print(f"Tenant created: {t.slug!r} ({t.display_name})")
+        return 0
+    except ValueError as exc:
+        print(f"ERROR: {exc}")
+        return 1
+
+
+def cmd_tenant_list(args: argparse.Namespace) -> int:
+    _setup_logging(args.log_level)
+    tm = _get_tenant_manager(args)
+    tenants = tm.list(include_suspended=getattr(args, "include_suspended", False))
+    if not tenants:
+        print("No tenants.")
+        return 0
+    print(f"{'SLUG':<20} {'DISPLAY NAME':<30} {'STATUS'}")
+    print("-" * 60)
+    for t in tenants:
+        status = "[SUSPENDED]" if t.suspended else "active"
+        print(f"{t.slug:<20} {t.display_name:<30} {status}")
+    return 0
+
+
+def cmd_tenant_show(args: argparse.Namespace) -> int:
+    _setup_logging(args.log_level)
+    tm = _get_tenant_manager(args)
+    t = tm.get(args.slug)
+    if t is None:
+        print(f"ERROR: Tenant not found: {args.slug!r}")
+        return 1
+    quota = tm.get_quota(args.slug)
+    print(f"Slug:          {t.slug}")
+    print(f"Name:          {t.display_name}")
+    print(f"Created by:    {t.created_by}")
+    print(f"Isolation:     {t.isolation_level}")
+    print(f"Suspended:     {t.suspended}" + (f" ({t.suspended_reason})" if t.suspended_reason else ""))
+    if quota:
+        print(f"Quota (active certs): {quota.max_active_certs or 'unlimited'}")
+        print(f"Quota (per-day):      {quota.max_issuances_per_day or 'unlimited'}")
+    admins = tm.list_admins(args.slug)
+    if admins:
+        print(f"Admins:        {', '.join(a['identity'] + '(' + a['role'] + ')' for a in admins)}")
+    return 0
+
+
+def cmd_tenant_set_quota(args: argparse.Namespace) -> int:
+    _setup_logging(args.log_level)
+    tm = _get_tenant_manager(args)
+    kwargs = {}
+    if getattr(args, "max_active_certs", None) is not None:
+        kwargs["max_active_certs"] = args.max_active_certs
+    if getattr(args, "max_issuances_per_day", None) is not None:
+        kwargs["max_issuances_per_day"] = args.max_issuances_per_day
+    if getattr(args, "max_sub_cas", None) is not None:
+        kwargs["max_sub_cas"] = args.max_sub_cas
+    tm.set_quota(args.slug, **kwargs)
+    print(f"Quota updated for tenant {args.slug!r}")
+    return 0
+
+
+def cmd_tenant_add_admin(args: argparse.Namespace) -> int:
+    _setup_logging(args.log_level)
+    tm = _get_tenant_manager(args)
+    tm.add_admin(args.slug, args.identity, getattr(args, "role", "operator"))
+    print(f"Admin added: {args.identity!r} → {args.slug!r} (role={args.role})")
+    return 0
+
+
+def cmd_tenant_remove_admin(args: argparse.Namespace) -> int:
+    _setup_logging(args.log_level)
+    tm = _get_tenant_manager(args)
+    tm.remove_admin(args.slug, args.identity)
+    print(f"Admin removed: {args.identity!r} from {args.slug!r}")
+    return 0
+
+
+def cmd_tenant_add_dns_alias(args: argparse.Namespace) -> int:
+    _setup_logging(args.log_level)
+    tm = _get_tenant_manager(args)
+    try:
+        tm.add_dns_alias(args.slug, args.hostname)
+        print(f"DNS alias added: {args.hostname!r} → {args.slug!r}")
+        return 0
+    except ValueError as exc:
+        print(f"ERROR: {exc}")
+        return 1
+
+
+def cmd_tenant_suspend(args: argparse.Namespace) -> int:
+    _setup_logging(args.log_level)
+    tm = _get_tenant_manager(args)
+    tm.suspend(args.slug, getattr(args, "reason", ""))
+    print(f"Tenant suspended: {args.slug!r}")
+    return 0
+
+
+def cmd_tenant_resume(args: argparse.Namespace) -> int:
+    _setup_logging(args.log_level)
+    tm = _get_tenant_manager(args)
+    tm.resume(args.slug)
+    print(f"Tenant resumed: {args.slug!r}")
+    return 0
+
+
+def cmd_tenant_delete(args: argparse.Namespace) -> int:
+    _setup_logging(args.log_level)
+    if not getattr(args, "confirm", False):
+        print("ERROR: Add --confirm to actually delete the tenant.")
+        return 1
+    tm = _get_tenant_manager(args)
+    try:
+        tm.delete(args.slug)
+        print(f"Tenant deleted: {args.slug!r}")
+        return 0
+    except (ValueError, PermissionError) as exc:
+        print(f"ERROR: {exc}")
+        return 1
 
 
 def main(argv: Optional[List[str]] = None) -> int:

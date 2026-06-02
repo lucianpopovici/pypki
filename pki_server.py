@@ -5391,6 +5391,28 @@ def main():
         help="Generate a 4096-bit RSA key on the token if the label is absent. "
              "The generated key has CKA_EXTRACTABLE=False — it can never be exported."
     )
+    mt_group = parser.add_argument_group(
+        "Multi-tenancy",
+        "Enable software-defined tenant isolation. Off by default; turning it on "
+        "is a one-way operation (existing data stays in __system tenant).",
+    )
+    mt_group.add_argument(
+        "--multi-tenant-enabled", action="store_true", default=False,
+        help="Enable multi-tenancy. Tenant isolation is enforced at the DAL layer.",
+    )
+    mt_group.add_argument(
+        "--tenant-default-max-active-certs", type=int, default=None, metavar="N",
+        help="Default active-cert quota for new tenants (None = unlimited).",
+    )
+    mt_group.add_argument(
+        "--tenant-default-max-issuances-per-day", type=int, default=None, metavar="N",
+        help="Default daily issuance quota for new tenants (None = unlimited).",
+    )
+    mt_group.add_argument(
+        "--tenant-dns-routing-enabled", action="store_true", default=False,
+        help="Resolve tenant from the HTTP Host header (requires DNS aliases in DB).",
+    )
+
     kms_group = parser.add_argument_group(
         "Cloud KMS key backends",
         "AWS KMS, GCP Cloud KMS, or Azure Key Vault as CA signing key backends. "

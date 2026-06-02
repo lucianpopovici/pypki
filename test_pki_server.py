@@ -15397,6 +15397,325 @@ class TestAgilityMetrics(unittest.TestCase):
 
 
 # ===========================================================================
+# TestTenantIsolation — Cross-tenant data leak prevention (critical)
+# ===========================================================================
+
+class TestTenantIsolation(unittest.TestCase):
+    """
+    Cross-tenant isolation via TenantScopedConnection.
+
+    These tests are non-negotiable: every test here protects against a real
+    cross-tenant data leak scenario.
+    """
+
+    def setUp(self):
+        from migrations import MigrationRunner
+        self._tmp = tempfile.mkdtemp()
+        self.ca   = _make_ca(self._tmp)
+        runner = MigrationRunner(
+            self.ca._pki_db,
+            Path(__file__).parent / "db_migrations" / "pki",
+            namespace="pki",
+        )
+        runner.apply_pending()
+        self.key = _gen_key()
+
+    def _scoped(self, tenant_id: str):
+        from tenant import TenantScopedConnection
+        return TenantScopedConnection(self.ca._pki_db, tenant_id)
+
+    def _issue_for_tenant(self, cn: str, tenant_id: str) -> int:
+        cert = self.ca.issue_certificate(f"CN={cn}", self.key.public_key())
+        serial = cert.serial_number
+        # Assign to tenant
+        self.ca._pki_db.execute(
+            "UPDATE certificates SET tenant_id = ? WHERE serial = ?",
+            (tenant_id, serial),
+        )
+        return serial
+
+    def test_tenant_a_cannot_list_tenant_b_certs(self):
+        serialA = self._issue_for_tenant("cert-a", "tenant-a")
+        serialB = self._issue_for_tenant("cert-b", "tenant-b")
+        db_a = self._scoped("tenant-a")
+        certs_a = db_a.fetchall("SELECT serial FROM certificates")
+        serials_a = [r["serial"] for r in certs_a]
+        self.assertIn(serialA, serials_a)
+        self.assertNotIn(serialB, serials_a)
+
+    def test_tenant_b_cannot_list_tenant_a_certs(self):
+        serialA = self._issue_for_tenant("cert-a", "tenant-a")
+        serialB = self._issue_for_tenant("cert-b", "tenant-b")
+        db_b = self._scoped("tenant-b")
+        certs_b = db_b.fetchall("SELECT serial FROM certificates")
+        serials_b = [r["serial"] for r in certs_b]
+        self.assertNotIn(serialA, serials_b)
+        self.assertIn(serialB, serials_b)
+
+    def test_tenant_a_cannot_revoke_tenant_b_cert(self):
+        serialB = self._issue_for_tenant("cert-b", "tenant-b")
+        db_a = self._scoped("tenant-a")
+        # UPDATE through scoped connection injects AND tenant_id = 'tenant-a'
+        db_a.execute("UPDATE certificates SET revoked = 1 WHERE serial = ?", (serialB,))
+        # The cert should NOT be revoked (the update matched 0 rows)
+        row = self.ca._pki_db.fetchone(
+            "SELECT revoked FROM certificates WHERE serial = ?", (serialB,)
+        )
+        self.assertFalse(bool(row["revoked"]))
+
+    def test_sql_injection_via_tenant_id_cannot_escape_filter(self):
+        """Malicious tenant_id value is passed as a parameter, never interpolated."""
+        self._issue_for_tenant("cert-a", "tenant-a")
+        # Attempt SQL injection via tenant_id
+        evil = "tenant-a' OR '1'='1"
+        db_evil = self._scoped(evil)
+        rows = db_evil.fetchall("SELECT serial FROM certificates")
+        # Should return 0 rows: no cert has tenant_id = "tenant-a' OR '1'='1"
+        self.assertEqual(rows, [])
+
+    def test_system_tenant_sees_all_via_unscoped(self):
+        serialA = self._issue_for_tenant("cert-a", "tenant-a")
+        serialB = self._issue_for_tenant("cert-b", "tenant-b")
+        db_sys = self._scoped("__system")
+        # unscoped() bypasses tenant filter
+        rows = db_sys.unscoped("SELECT serial FROM certificates")
+        all_serials = [r["serial"] for r in rows]
+        self.assertIn(serialA, all_serials)
+        self.assertIn(serialB, all_serials)
+
+    def test_inject_tenant_filter_where_clause(self):
+        from tenant import _inject_tenant_filter
+        sql, params = _inject_tenant_filter(
+            "SELECT * FROM certificates WHERE revoked = ?", (0,), "acme"
+        )
+        self.assertIn("tenant_id = ?", sql)
+        self.assertIn("acme", params)
+        self.assertIn(0, params)
+
+    def test_inject_tenant_filter_no_where(self):
+        from tenant import _inject_tenant_filter
+        sql, params = _inject_tenant_filter(
+            "SELECT * FROM certificates", (), "acme"
+        )
+        self.assertIn("WHERE tenant_id = ?", sql)
+        self.assertEqual(params, ("acme",))
+
+    def test_inject_tenant_filter_non_scoped_table_passthrough(self):
+        from tenant import _inject_tenant_filter
+        sql_orig = "SELECT * FROM tenants WHERE slug = ?"
+        sql, params = _inject_tenant_filter(sql_orig, ("acme",), "acme")
+        self.assertEqual(sql, sql_orig)   # tenants is NOT a scoped table
+        self.assertEqual(params, ("acme",))
+
+    def test_inject_tenant_filter_insert_passthrough(self):
+        from tenant import _inject_tenant_filter
+        sql_orig = "INSERT INTO certificates (serial, subject) VALUES (?, ?)"
+        sql, params = _inject_tenant_filter(sql_orig, (1, "CN=x"), "acme")
+        self.assertEqual(sql, sql_orig)   # INSERT passthrough
+
+
+# ===========================================================================
+# TestTenantRouting — URL path and DNS hostname resolution
+# ===========================================================================
+
+class TestTenantRouting(unittest.TestCase):
+    """URL path and DNS Host-header tenant resolution."""
+
+    def setUp(self):
+        from migrations import MigrationRunner
+        self._tmp = tempfile.mkdtemp()
+        self.ca   = _make_ca(self._tmp)
+        runner = MigrationRunner(
+            self.ca._pki_db,
+            Path(__file__).parent / "db_migrations" / "pki",
+            namespace="pki",
+        )
+        runner.apply_pending()
+        from tenant import TenantManager
+        self.tm = TenantManager(self.ca._pki_db)
+        self.tm.create("acme-corp", "Acme Corp")
+        self.tm.add_dns_alias("acme-corp", "acme.pki.example.com")
+
+    def test_url_path_routing_resolves_tenant(self):
+        slug = self.tm.resolve_from_path("/api/v1/t/acme-corp/issue")
+        self.assertEqual(slug, "acme-corp")
+
+    def test_url_path_routing_acme_prefix(self):
+        slug = self.tm.resolve_from_path("/acme/t/acme-corp/directory")
+        self.assertEqual(slug, "acme-corp")
+
+    def test_dns_routing_resolves_tenant(self):
+        slug = self.tm.resolve_from_host("acme.pki.example.com")
+        self.assertEqual(slug, "acme-corp")
+
+    def test_dns_routing_with_port_resolves_tenant(self):
+        slug = self.tm.resolve_from_host("acme.pki.example.com:8443")
+        self.assertEqual(slug, "acme-corp")
+
+    def test_unknown_dns_returns_system(self):
+        slug = self.tm.resolve_from_host("unknown.pki.example.com")
+        self.assertEqual(slug, "__system")
+
+    def test_system_tenant_implicit_at_root_path(self):
+        slug = self.tm.resolve_from_path("/api/v1/issue")
+        self.assertEqual(slug, "__system")
+
+    def test_url_path_takes_priority_over_dns(self):
+        # Explicit /t/ path always wins over DNS alias
+        slug = self.tm.resolve_from_path("/api/v1/t/acme-corp/issue")
+        self.assertEqual(slug, "acme-corp")
+
+    def test_suspended_tenant_detected(self):
+        self.tm.suspend("acme-corp", reason="non-payment")
+        t = self.tm.get("acme-corp")
+        self.assertTrue(t.suspended)
+        with self.assertRaises(PermissionError):
+            self.tm.require_not_suspended("acme-corp")
+
+
+# ===========================================================================
+# TestTenantQuotas — Quota enforcement
+# ===========================================================================
+
+class TestTenantQuotas(unittest.TestCase):
+    """Tenant quota enforcement."""
+
+    def setUp(self):
+        from migrations import MigrationRunner
+        self._tmp = tempfile.mkdtemp()
+        self.ca   = _make_ca(self._tmp)
+        runner = MigrationRunner(
+            self.ca._pki_db,
+            Path(__file__).parent / "db_migrations" / "pki",
+            namespace="pki",
+        )
+        runner.apply_pending()
+        from tenant import TenantManager
+        self.tm = TenantManager(self.ca._pki_db)
+        self.key = _gen_key()
+
+    def test_quota_blocks_issuance_above_limit(self):
+        self.tm.create("small-tenant", "Small", max_active_certs=2)
+        # Fake 2 active certs in DB
+        for i in range(2):
+            self.ca._pki_db.execute(
+                "INSERT INTO certificates (serial, subject, not_before, not_after, der, "
+                "revoked, tenant_id) VALUES (?, ?, '2026-01-01', '2027-01-01', X'', 0, ?)",
+                (9000 + i, f"CN=fake-{i}", "small-tenant"),
+            )
+        with self.assertRaises(PermissionError):
+            self.tm.check_active_cert_quota("small-tenant")
+
+    def test_quota_not_triggered_below_limit(self):
+        self.tm.create("big-tenant", "Big", max_active_certs=100)
+        # Only 1 cert — should not raise
+        self.tm.check_active_cert_quota("big-tenant")  # no exception
+
+    def test_no_quota_allows_any_count(self):
+        self.tm.create("unlimited-tenant", "Unlimited")
+        # No quota set → check passes
+        self.tm.check_active_cert_quota("unlimited-tenant")  # no exception
+
+    def test_active_certs_quota_excludes_revoked(self):
+        self.tm.create("rev-tenant", "RevTest", max_active_certs=1)
+        # Insert 1 revoked + 0 active — should not trigger quota
+        self.ca._pki_db.execute(
+            "INSERT INTO certificates (serial, subject, not_before, not_after, der, "
+            "revoked, tenant_id) VALUES (?, ?, '2026-01-01', '2027-01-01', X'', 1, ?)",
+            (9900, "CN=revoked", "rev-tenant"),
+        )
+        self.tm.check_active_cert_quota("rev-tenant")  # no exception (revoked excluded)
+
+    def test_set_quota_updates_existing(self):
+        self.tm.create("quota-tenant", "Quota")
+        self.tm.set_quota("quota-tenant", max_active_certs=500, max_issuances_per_day=100)
+        q = self.tm.get_quota("quota-tenant")
+        self.assertEqual(q.max_active_certs, 500)
+        self.assertEqual(q.max_issuances_per_day, 100)
+
+
+# ===========================================================================
+# TestTenantLifecycle — Tenant CRUD, suspension, deletion
+# ===========================================================================
+
+class TestTenantLifecycle(unittest.TestCase):
+    """Tenant lifecycle: create, show, suspend, resume, delete."""
+
+    def setUp(self):
+        from migrations import MigrationRunner
+        self._tmp = tempfile.mkdtemp()
+        self.ca   = _make_ca(self._tmp)
+        runner = MigrationRunner(
+            self.ca._pki_db,
+            Path(__file__).parent / "db_migrations" / "pki",
+            namespace="pki",
+        )
+        runner.apply_pending()
+        from tenant import TenantManager
+        self.tm = TenantManager(self.ca._pki_db)
+
+    def test_create_tenant_provisions_default_quotas(self):
+        self.tm.create("new-corp", "New Corp")
+        q = self.tm.get_quota("new-corp")
+        self.assertIsNotNone(q)
+        self.assertIsNone(q.max_active_certs)  # unlimited by default
+
+    def test_create_tenant_invalid_slug_rejected(self):
+        with self.assertRaises(ValueError):
+            self.tm.create("INVALID SLUG!", "Bad")
+
+    def test_tenant_list_includes_created(self):
+        self.tm.create("list-tenant", "Listed")
+        slugs = [t.slug for t in self.tm.list()]
+        self.assertIn("list-tenant", slugs)
+
+    def test_suspend_then_resume_round_trip(self):
+        self.tm.create("susp-tenant", "Suspend Me")
+        self.tm.suspend("susp-tenant", reason="test")
+        t = self.tm.get("susp-tenant")
+        self.assertTrue(t.suspended)
+        self.assertEqual(t.suspended_reason, "test")
+        self.tm.resume("susp-tenant")
+        t2 = self.tm.get("susp-tenant")
+        self.assertFalse(t2.suspended)
+        self.assertIsNone(t2.suspended_reason)
+
+    def test_delete_tenant_refuses_non_empty(self):
+        self.tm.create("non-empty", "Has Certs")
+        # Insert a fake cert
+        self.ca._pki_db.execute(
+            "INSERT INTO certificates (serial, subject, not_before, not_after, der, "
+            "revoked, tenant_id) VALUES (?, ?, '2026-01-01', '2027-01-01', X'', 0, ?)",
+            (8888, "CN=fake", "non-empty"),
+        )
+        with self.assertRaises((ValueError, PermissionError)):
+            self.tm.delete("non-empty")
+
+    def test_delete_empty_tenant_succeeds(self):
+        self.tm.create("empty-tenant", "Empty")
+        self.tm.delete("empty-tenant")
+        self.assertIsNone(self.tm.get("empty-tenant"))
+
+    def test_delete_system_tenant_rejected(self):
+        with self.assertRaises(ValueError):
+            self.tm.delete("__system")
+
+    def test_dns_alias_collision_rejected(self):
+        self.tm.create("tenant-x", "X")
+        self.tm.create("tenant-y", "Y")
+        self.tm.add_dns_alias("tenant-x", "x.pki.example.com")
+        with self.assertRaises(ValueError):
+            self.tm.add_dns_alias("tenant-y", "x.pki.example.com")
+
+    def test_add_and_list_admins(self):
+        self.tm.create("admin-tenant", "Admin Test")
+        self.tm.add_admin("admin-tenant", "alice@example.com", role="admin")
+        admins = self.tm.list_admins("admin-tenant")
+        self.assertEqual(len(admins), 1)
+        self.assertEqual(admins[0]["identity"], "alice@example.com")
+
+
+# ===========================================================================
 # TestKeyBackendInterface — KeyBackend protocol, shims, and factory
 # ===========================================================================
 

@@ -24,6 +24,29 @@ This project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `TestOIDCTokenVerification`, `TestOIDCFlow`, `TestSessionStore`, `TestOIDCDiscovery`.
   Setup guides for Keycloak, Okta, Entra ID, and Google Workspace in `docs/SSO.md`.
 
+- **Multi-tenancy** (`tenant.py`, `db_migrations/pki/013_tenant.sql`,
+  `scripts/lint_tenant_scoping.py`, `docs/MULTITENANCY.md`):
+  Hard isolation between organizational units. `TenantScopedConnection` wraps
+  `Database` and injects `AND tenant_id = ?` (parameterized, never interpolated)
+  into every SELECT/UPDATE/DELETE against tenant-scoped tables. `TENANT_SCOPED_TABLES`
+  allowlist gates which tables get filtered. INSERT statements are passed through
+  (caller passes `tenant_id`). JOIN queries are logged and passed through for explicit
+  handling. Schema: `tenants`, `tenant_dns_aliases`, `tenant_admins`, `tenant_quotas`
+  tables + `tenant_id` columns on `certificates`, `ca_keys`, `cert_owners`,
+  `sso_sessions`, `matter_dacs` with `DEFAULT '__system'` for backward compat.
+  URL path routing (`/api/v1/t/<slug>/`) and DNS alias routing.
+  Active-cert quota enforcement. `--multi-tenant-enabled`, `--tenant-dns-routing-enabled`
+  CLI flags. Admin CLI: `tenant-create/list/show/set-quota/add-admin/remove-admin/
+  add-dns-alias/suspend/resume/delete`. CI lint: `scripts/lint_tenant_scoping.py`.
+  31 new tests across `TestTenantIsolation`, `TestTenantRouting`,
+  `TestTenantQuotas`, `TestTenantLifecycle`.
+
+### Security
+
+- Multi-tenancy isolation: `tenant_id` is always a parameterized bind
+  variable in `TenantScopedConnection`; SQL injection via tenant_id
+  values cannot escape the filter.
+
 - **Cloud KMS backends** (`key_backend.py`, `kms_aws.py`, `kms_gcp.py`, `kms_azure.py`,
   `auth_aws.py`, `auth_gcp.py`, `auth_azure.py`, `db_migrations/pki/012_kms_backend.sql`,
   `docs/KMS.md`):
