@@ -533,6 +533,7 @@ def _page(title: str, body: str, active: str = "") -> str:
         ("Sub-CA",       "/sub-ca",     "sub-ca"),
         ("RA Queue",     "/ra-queue",   "ra-queue"),
         ("ACME EAB",     "/acme-eab",   "acme-eab"),
+        ("Agility",      "/agility",    "agility"),
         ("Metrics",      "/metrics-ui", "metrics-ui"),
         ("Config",       "/config-ui",  "config-ui"),
         ("Audit Log",    "/audit",      "audit"),
@@ -928,6 +929,16 @@ class WebUIHandler(http.server.BaseHTTPRequestHandler):
                 self._api_services_status()
             elif path.startswith("/api/certs/"):
                 self._route_api_cert(path)
+            elif path == "/agility":
+                self._agility_page()
+            elif path == "/api/agility/summary":
+                self._api_agility_summary()
+            elif path.startswith("/api/agility/breakdown"):
+                self._api_agility_breakdown()
+            elif path == "/api/agility/migration-forecast":
+                self._api_agility_forecast()
+            elif path == "/api/agility/csr-demand":
+                self._api_agility_csr_demand()
             elif path == "/ssh":
                 self._ssh_page()
             elif path.startswith("/api/ssh/krl/"):
@@ -2289,6 +2300,239 @@ class WebUIHandler(http.server.BaseHTTPRequestHandler):
         self._send_json({"otp": token, "ttl_seconds": ttl})
 
     # ------------------------------------------------------------------
+    # ------------------------------------------------------------------
+    # Crypto Agility Dashboard
+    # ------------------------------------------------------------------
+
+    def _agility_page(self):
+        try:
+            import agility as _ag
+            summ = _ag.summary(self.ca._pki_db)
+        except Exception as exc:
+            body = '<div class="card"><div class="card-body"><p>Agility module error: {}</p></div></div>'.format(exc)
+            self._send_html(200, _page("Crypto Agility", body, "agility"))
+            return
+
+        total  = summ["total_active_certs"]
+        pq_pct = summ["pq_capable_pct"]
+        by_cls = summ["by_class"]
+
+        # ── Class palette ───────────────────────────────────────────────
+        _colours = {
+            "classical-rsa":   "#94a3b8",
+            "classical-ec":    "#64748b",
+            "classical-eddsa": "#475569",
+            "hybrid-9763":     "#60a5fa",
+            "composite-mldsa": "#34d399",
+            "mldsa-only":      "#10b981",
+            "slhdsa-only":     "#059669",
+            "unknown":         "#e5e7eb",
+        }
+
+        # ── Distribution table ──────────────────────────────────────────
+        dist_rows = ""
+        for cls, info in sorted(by_cls.items(), key=lambda kv: -kv[1]["count"]):
+            colour = _colours.get(cls, "#e5e7eb")
+            pq_badge = (
+                '<span class="badge-ok" style="margin-left:6px">PQ</span>'
+                if cls in ("hybrid-9763", "composite-mldsa", "mldsa-only", "slhdsa-only")
+                else ""
+            )
+            bar_w = max(info["pct"], 1)
+            dist_rows += (
+                "<tr>"
+                "<td><span style='display:inline-block;width:12px;height:12px;"
+                "border-radius:2px;background:{colour};margin-right:6px;vertical-align:middle'></span>"
+                "<code>{cls}</code>{badge}</td>"
+                "<td style='text-align:right'>{count:,}</td>"
+                "<td style='text-align:right'>{pct}%</td>"
+                "<td style='width:220px;padding-right:16px'>"
+                "<div style='background:#f3f4f6;border-radius:4px;height:10px;overflow:hidden'>"
+                "<div style='background:{colour};width:{bar_w}%;height:10px'></div>"
+                "</div></td>"
+                "</tr>"
+            ).format(cls=cls, badge=pq_badge, colour=colour,
+                     count=info["count"], pct=info["pct"], bar_w=bar_w)
+
+        dist_card = """
+<div class="card">
+  <div class="card-head">
+    <h2>Active Certificate Distribution</h2>
+    <span style="color:#6b7280;font-size:.85rem">{total:,} active certs &mdash; {pq_pct}% PQ-capable</span>
+  </div>
+  <div class="card-body">
+    <table><thead><tr>
+      <th>Crypto class</th><th style="text-align:right">Count</th>
+      <th style="text-align:right">%</th><th>Bar</th>
+    </tr></thead><tbody>{rows}</tbody></table>
+  </div>
+</div>""".format(total=total, pq_pct=pq_pct, rows=dist_rows)
+
+        # ── Profile hotspots table ──────────────────────────────────────
+        try:
+            bkdn = _ag.breakdown(self.ca._pki_db, by="profile")
+            groups = bkdn.get("groups", [])
+        except Exception:
+            groups = []
+
+        hotspot_rows = ""
+        for g in groups:
+            prof  = g["key"]
+            tot   = g["total"]
+            bc    = g["by_class"]
+            pq    = sum(bc.get(c, 0) for c in _ag.PQ_CLASSES)
+            pq_f  = round(pq / tot * 100, 1) if tot > 0 else 0.0
+            colour = "#ef4444" if pq_f < 10 else ("#f59e0b" if pq_f < 50 else "#10b981")
+            hotspot_rows += (
+                "<tr>"
+                "<td><code>{prof}</code></td>"
+                "<td style='text-align:right'>{tot:,}</td>"
+                "<td style='text-align:right'>"
+                "<span style='color:{colour};font-weight:600'>{pq_f}%</span></td>"
+                "</tr>"
+            ).format(prof=prof, tot=tot, pq_f=pq_f, colour=colour)
+
+        hotspot_card = """
+<div class="card">
+  <div class="card-head">
+    <h2>Profile Hotspots <span style="font-size:.8rem;font-weight:400;color:#6b7280">(sorted by % PQ ascending — worst first)</span></h2>
+    <a href="/api/agility/breakdown?by=profile" class="btn btn-secondary" target="_blank">JSON</a>
+  </div>
+  <div class="card-body">
+    {content}
+  </div>
+</div>""".format(content=(
+            "<table><thead><tr><th>Profile</th><th style='text-align:right'>Active</th>"
+            "<th style='text-align:right'>PQ %</th></tr></thead>"
+            "<tbody>" + hotspot_rows + "</tbody></table>"
+        ) if hotspot_rows else "<p style='color:#6b7280'>No active certs.</p>")
+
+        # ── Forecast card ───────────────────────────────────────────────
+        try:
+            fc = _ag.forecast(self.ca._pki_db)
+            ms = fc.get("milestones", [])
+            milestone_html = ""
+            for m in ms:
+                tgt = m["target_pq_pct"]
+                eta = m["estimated_at"]
+                colour = "#10b981" if eta in ("already met",) else "#3b82f6"
+                milestone_html += (
+                    "<div style='display:flex;justify-content:space-between;"
+                    "border-bottom:1px solid #f0f0f0;padding:6px 0'>"
+                    "<span>{tgt}% PQ-capable</span>"
+                    "<strong style='color:{colour}'>{eta}</strong></div>"
+                ).format(tgt=tgt, eta=eta, colour=colour)
+            caveats_html = "".join(
+                "<li style='color:#6b7280;font-size:.83rem'>{}</li>".format(c)
+                for c in fc.get("caveats", [])
+            )
+            inp = fc.get("model_inputs", {})
+            inputs_html = (
+                "<p style='font-size:.82rem;color:#6b7280;margin-bottom:10px'>"
+                "Window: {wd}d &bull; Current PQ: {cpq}% &bull; "
+                "Renewal rate: {rr}/day &bull; PQ adoption: {pa}/day"
+                "</p>"
+            ).format(
+                wd=inp.get("window_days", "?"),
+                cpq=inp.get("current_pq_pct", "?"),
+                rr=inp.get("renewal_rate_per_day", "?"),
+                pa=inp.get("pq_adoption_rate_per_day", "?"),
+            )
+            forecast_body = inputs_html + (milestone_html or "<p style='color:#6b7280'>Insufficient data.</p>")
+            if caveats_html:
+                forecast_body += "<ul style='margin-top:10px;padding-left:18px'>" + caveats_html + "</ul>"
+        except Exception as exc:
+            forecast_body = "<p style='color:#6b7280'>Forecast unavailable: {}</p>".format(exc)
+
+        forecast_card = """
+<div class="card">
+  <div class="card-head">
+    <h2>Migration Forecast (linear extrapolation)</h2>
+    <a href="/api/agility/migration-forecast" class="btn btn-secondary" target="_blank">JSON</a>
+  </div>
+  <div class="card-body">{body}</div>
+</div>""".format(body=forecast_body)
+
+        # ── CSR demand card ─────────────────────────────────────────────
+        try:
+            demand = _ag.csr_demand(self.ca._pki_db, window_days=30)
+            demand_rows = ""
+            dem_total = demand.get("csrs_total", 0)
+            for cls, n in sorted(demand.get("by_issued_class", {}).items(),
+                                  key=lambda kv: -kv[1]):
+                pct = round(n / dem_total * 100, 1) if dem_total > 0 else 0.0
+                colour = _colours.get(cls, "#e5e7eb")
+                demand_rows += (
+                    "<tr><td><code>{cls}</code></td>"
+                    "<td style='text-align:right'>{n:,}</td>"
+                    "<td style='text-align:right'>{pct}%</td></tr>"
+                ).format(cls=cls, n=n, pct=pct, colour=colour)
+            demand_note = demand.get("note", "")
+            demand_body = (
+                "<table><thead><tr>"
+                "<th>Crypto class</th><th style='text-align:right'>Issued</th>"
+                "<th style='text-align:right'>%</th>"
+                "</tr></thead><tbody>" + demand_rows + "</tbody></table>"
+                + ("<p style='font-size:.8rem;color:#6b7280;margin-top:8px'>{}</p>".format(demand_note) if demand_note else "")
+            ) if demand_rows else "<p style='color:#6b7280'>No issuances in last 30 days.</p>"
+        except Exception as exc:
+            demand_body = "<p style='color:#6b7280'>CSR demand unavailable: {}</p>".format(exc)
+
+        demand_card = """
+<div class="card">
+  <div class="card-head">
+    <h2>CSR Demand — last 30 days</h2>
+    <a href="/api/agility/csr-demand" class="btn btn-secondary" target="_blank">JSON</a>
+  </div>
+  <div class="card-body">{body}</div>
+</div>""".format(body=demand_body)
+
+        body = dist_card + hotspot_card + forecast_card + demand_card
+        self._send_html(200, _page("Crypto Agility", body, "agility"))
+
+    def _api_agility_summary(self):
+        try:
+            import agility as _ag
+            self._send_json(_ag.summary(self.ca._pki_db))
+        except Exception as exc:
+            self._send_json({"error": str(exc)}, 500)
+
+    def _api_agility_breakdown(self):
+        try:
+            import agility as _ag
+            qs = urllib.parse.parse_qs(
+                urllib.parse.urlparse(self.path).query
+            )
+            by = (qs.get("by") or ["profile"])[0]
+            if by not in ("profile", "month", "ca"):
+                self._send_json({"error": "by must be profile|month|ca"}, 400)
+                return
+            self._send_json(_ag.breakdown(self.ca._pki_db, by=by))
+        except Exception as exc:
+            self._send_json({"error": str(exc)}, 500)
+
+    def _api_agility_forecast(self):
+        try:
+            import agility as _ag
+            qs = urllib.parse.parse_qs(
+                urllib.parse.urlparse(self.path).query
+            )
+            window = int((qs.get("window_days") or [180])[0])
+            self._send_json(_ag.forecast(self.ca._pki_db, window_days=window))
+        except Exception as exc:
+            self._send_json({"error": str(exc)}, 500)
+
+    def _api_agility_csr_demand(self):
+        try:
+            import agility as _ag
+            qs = urllib.parse.parse_qs(
+                urllib.parse.urlparse(self.path).query
+            )
+            since_days = int((qs.get("since_days") or [30])[0])
+            self._send_json(_ag.csr_demand(self.ca._pki_db, window_days=since_days))
+        except Exception as exc:
+            self._send_json({"error": str(exc)}, 500)
+
     # SSH CA — issuance, KRL, known-hosts
     # ------------------------------------------------------------------
 

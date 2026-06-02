@@ -1,0 +1,147 @@
+{
+  "__inputs": [
+    {
+      "name": "DS_PROMETHEUS",
+      "label": "Prometheus",
+      "type": "datasource",
+      "pluginId": "prometheus"
+    }
+  ],
+  "description": "PyPKI Cryptographic Agility and PQ Migration Tracker",
+  "editable": true,
+  "panels": [
+    {
+      "id": 1,
+      "type": "gauge",
+      "title": "PQ Migration Progress",
+      "gridPos": {
+        "h": 8,
+        "w": 6,
+        "x": 0,
+        "y": 0
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "min": 0,
+          "max": 1,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "red",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 0.25
+              },
+              {
+                "color": "green",
+                "value": 0.75
+              }
+            ]
+          }
+        }
+      },
+      "targets": [
+        {
+          "expr": "pypki_pq_migration_progress",
+          "legendFormat": "PQ fraction",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "type": "piechart",
+      "title": "Active Certs by Crypto Class",
+      "gridPos": {
+        "h": 8,
+        "w": 10,
+        "x": 6,
+        "y": 0
+      },
+      "options": {
+        "pieType": "donut"
+      },
+      "targets": [
+        {
+          "expr": "sum by (crypto_class) (pypki_certs_active_total)",
+          "legendFormat": "{{crypto_class}}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "type": "stat",
+      "title": "Total Active Certs",
+      "gridPos": {
+        "h": 4,
+        "w": 8,
+        "x": 16,
+        "y": 0
+      },
+      "targets": [
+        {
+          "expr": "sum(pypki_certs_active_total)",
+          "legendFormat": "total",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "type": "timeseries",
+      "title": "Certs Issued (30d) by Crypto Class",
+      "gridPos": {
+        "h": 8,
+        "w": 24,
+        "x": 0,
+        "y": 8
+      },
+      "targets": [
+        {
+          "expr": "pypki_certs_issued_30d",
+          "legendFormat": "{{crypto_class}}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 5,
+      "type": "table",
+      "title": "Active Certs by Profile and Crypto Class",
+      "gridPos": {
+        "h": 8,
+        "w": 24,
+        "x": 0,
+        "y": 16
+      },
+      "targets": [
+        {
+          "expr": "sum by (profile,crypto_class) (pypki_certs_active_total)",
+          "legendFormat": "{{profile}}/{{crypto_class}}",
+          "format": "table",
+          "instant": true,
+          "refId": "A"
+        }
+      ]
+    }
+  ],
+  "refresh": "1m",
+  "schemaVersion": 38,
+  "tags": [
+    "pypki",
+    "pq",
+    "crypto"
+  ],
+  "time": {
+    "from": "now-7d",
+    "to": "now"
+  },
+  "title": "PyPKI Crypto Agility",
+  "uid": "pypki-agility",
+  "version": 1
+}

@@ -11,6 +11,22 @@ This project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Crypto Agility Dashboard** (`agility.py`, `db_migrations/pki/007_crypto_classification.sql`,
+  `dashboards/pypki-agility.json`, `docs/AGILITY.md`): Classifies every issued certificate
+  into one of eight canonical crypto classes (`classical-rsa`, `classical-ec`,
+  `classical-eddsa`, `hybrid-9763`, `composite-mldsa`, `mldsa-only`, `slhdsa-only`,
+  `unknown`). Classification happens at issuance time via a DER-parsing classifier that
+  works for hand-rolled PQ certs as well as standard library-built certs. Web UI page at
+  `/agility` with distribution table, profile hotspot ranking, linear-extrapolation forecast,
+  and CSR demand panel. REST API at `/api/agility/{summary,breakdown,migration-forecast,csr-demand}`.
+  Prometheus gauges `pypki_certs_active_total{crypto_class,profile}`,
+  `pypki_pq_migration_progress`, and `pypki_certs_issued_30d{crypto_class}` with
+  optional background sweeper (`--agility-enabled`, `--agility-sweep-interval-seconds`).
+  Admin CLI: `agility-summary`, `agility-reclassify` (backfill pre-migration certs),
+  `agility-export --format csv|json`. Grafana dashboard at `dashboards/pypki-agility.json`.
+  24 new tests across `TestCryptoClassifier`, `TestAgilityAggregator`,
+  `TestMigrationForecaster`, `TestAgilityMetrics`.
+
 - **Backup and DR** (`backup.py`, `restore.py`, `shamir.py`, `mnemonic.py`,
   `db_migrations/pki/006_dr.sql`): First-class backup and disaster recovery per
   `CLAUDE-backup-restore.md`. Encrypted, integrity-verified backups (AES-256-GCM +

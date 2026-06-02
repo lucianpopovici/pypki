@@ -83,12 +83,13 @@ OID_IKE_INTERMEDIATE = "1.3.6.1.5.5.7.3.14"
 
 # RFC 7030 label routing to certificate profiles
 EST_LABEL_PROFILE = {
-    "tls-server":   "tls_server",
-    "tls-client":   "tls_client",
-    "code-signing": "code_signing",
-    "email":        "email",
-    "ipsec":        "ipsec_end",  # requires ipsec_end profile in pki_server.py
-    "spiffe":       "spiffe",     # placeholder for future SPIFFE work
+    "tls-server":       "tls_server",
+    "tls-client":       "tls_client",
+    "code-signing":     "code_signing",
+    "email":            "email",
+    "document-signing": "document_signing",
+    "ipsec":            "ipsec_end",  # requires ipsec_end profile in pki_server.py
+    "spiffe":           "spiffe",     # placeholder for future SPIFFE work
 }
 
 # Profile-specific CSR attribute constraints and validation rules

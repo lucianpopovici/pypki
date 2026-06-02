@@ -69,11 +69,13 @@ from cryptography.x509.oid import NameOID, ExtendedKeyUsageOID, ExtensionOID
 # Shared helpers
 # ---------------------------------------------------------------------------
 
-def _make_ca(tmpdir: str, ocsp_url: str = "", crl_url: str = "") -> pki.CertificateAuthority:
+def _make_ca(tmpdir: str, ocsp_url: str = "", crl_url: str = "",
+             ca_issuers_url: str = "") -> pki.CertificateAuthority:
     return pki.CertificateAuthority(
         ca_dir=tmpdir,
         ocsp_url=ocsp_url,
         crl_url=crl_url,
+        ca_issuers_url=ca_issuers_url,
     )
 
 
@@ -3044,7 +3046,8 @@ class TestModuleStructure(unittest.TestCase):
     def test_cert_profile_has_all_profiles(self):
         expected = {"tls_server", "tls_client", "code_signing", "email",
                     "email_signing", "email_encryption_rsa", "email_encryption_ec",
-                    "ocsp_signing", "tsa_signing", "sub_ca", "short_lived", "default",
+                    "ocsp_signing", "tsa_signing", "document_signing", "sub_ca",
+                    "short_lived", "default",
                     "ml_dsa_signing", "composite_signing", "onion_eligible", "slh_dsa_signing",
                     "pypki_self_tls"}
         actual = set(pki.CertProfile.PROFILES.keys())
@@ -8481,8 +8484,7 @@ class TestStructuredLogging(unittest.TestCase):
         captured = []
 
         class _DummyHandler:
-            @staticmethod
-            def do_GET(self_handler):
+            def do_GET(self):
                 captured.append(request_id_var.get())
 
         rt = RouteTable()
@@ -8516,8 +8518,7 @@ class TestStructuredLogging(unittest.TestCase):
             self.skipTest("dispatcher_server not available")
 
         class _DummyHandler:
-            @staticmethod
-            def do_GET(self_handler):
+            def do_GET(self):
                 pass
 
         rt = RouteTable()
@@ -15153,6 +15154,441 @@ class TestDR(unittest.TestCase):
         key = _gen_key()
         with self.assertRaises(PermissionError):
             ca2.issue_certificate("CN=blocked2.example.com", key.public_key())
+
+
+# ===========================================================================
+# Crypto Agility Dashboard
+# ===========================================================================
+
+class TestCryptoClassifier(unittest.TestCase):
+    """agility.classify_der() — correct class for every supported algorithm."""
+
+    def setUp(self):
+        self._tmp = tempfile.mkdtemp()
+        self.ca   = _make_ca(self._tmp)
+        self.key  = _gen_key()
+
+    def _cert_der(self, key=None, profile="default", **kw) -> bytes:
+        if key is None:
+            key = self.key
+        cert = self.ca.issue_certificate("CN=test", key.public_key(), profile=profile, **kw)
+        return cert.public_bytes(Encoding.DER)
+
+    def test_rsa_2048_classified(self):
+        import agility as ag
+        der = self._cert_der()
+        self.assertEqual(ag.classify_der(der), "classical-rsa")
+
+    def test_ecdsa_p256_classified(self):
+        import agility as ag
+        from cryptography.hazmat.primitives.asymmetric import ec
+        k = ec.generate_private_key(ec.SECP256R1())
+        der = self._cert_der(key=k)
+        self.assertEqual(ag.classify_der(der), "classical-ec")
+
+    def test_ecdsa_p384_classified(self):
+        import agility as ag
+        from cryptography.hazmat.primitives.asymmetric import ec
+        k = ec.generate_private_key(ec.SECP384R1())
+        der = self._cert_der(key=k)
+        self.assertEqual(ag.classify_der(der), "classical-ec")
+
+    def test_ed25519_classified(self):
+        import agility as ag
+        from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+        k = Ed25519PrivateKey.generate()
+        der = self._cert_der(key=k)
+        self.assertEqual(ag.classify_der(der), "classical-eddsa")
+
+    def test_ed448_classified(self):
+        import agility as ag
+        from cryptography.hazmat.primitives.asymmetric.ed448 import Ed448PrivateKey
+        k = Ed448PrivateKey.generate()
+        der = self._cert_der(key=k)
+        self.assertEqual(ag.classify_der(der), "classical-eddsa")
+
+    def test_empty_bytes_returns_unknown(self):
+        import agility as ag
+        self.assertEqual(ag.classify_der(b""), "unknown")
+
+    def test_corrupt_bytes_returns_unknown(self):
+        import agility as ag
+        self.assertEqual(ag.classify_der(b"\x30\x00\xff"), "unknown")
+
+    def test_spki_oid_extractor_rsa(self):
+        import agility as ag
+        der = self._cert_der()
+        oid = ag._spki_oid_from_der(der)
+        self.assertEqual(oid, "1.2.840.113549.1.1.1")
+
+    def test_spki_oid_extractor_ec(self):
+        import agility as ag
+        from cryptography.hazmat.primitives.asymmetric import ec
+        k = ec.generate_private_key(ec.SECP256R1())
+        der = self._cert_der(key=k)
+        oid = ag._spki_oid_from_der(der)
+        self.assertEqual(oid, "1.2.840.10045.2.1")
+
+    @unittest.skipUnless(pki.HAS_MLDSA, "ML-DSA not available")
+    def test_ml_dsa_classified(self):
+        import agility as ag
+        from cryptography.hazmat.primitives.serialization import PublicFormat
+        mldsa_key = pki._mldsa_mod.MLDSA65PrivateKey.generate()
+        spki_der  = mldsa_key.public_key().public_bytes(Encoding.DER, PublicFormat.SubjectPublicKeyInfo)
+        cert_der  = self.ca.issue_ml_dsa_certificate(
+            "CN=mldsa", spki_der, validity_days=60, profile="ml_dsa_signing"
+        )
+        self.assertEqual(ag.classify_der(cert_der), "mldsa-only")
+
+
+class TestAgilityAggregator(unittest.TestCase):
+    """agility.summary(), breakdown(), csr_demand() — DB queries."""
+
+    def setUp(self):
+        from migrations import MigrationRunner
+        self._tmp = tempfile.mkdtemp()
+        self.ca   = _make_ca(self._tmp)
+        # Apply the crypto_class migration so the column exists
+        runner = MigrationRunner(
+            self.ca._pki_db,
+            Path(__file__).parent / "db_migrations" / "pki",
+            namespace="pki",
+        )
+        runner.apply_pending()
+        self.key = _gen_key()
+
+    def _issue(self, profile="default"):
+        return self.ca.issue_certificate("CN=test", self.key.public_key(), profile=profile)
+
+    def test_summary_counts_active_certs(self):
+        import agility as ag
+        self._issue(); self._issue()
+        summ = ag.summary(self.ca._pki_db)
+        self.assertGreaterEqual(summ["total_active_certs"], 2)
+
+    def test_summary_excludes_revoked(self):
+        import agility as ag
+        cert = self._issue()
+        self.ca.revoke_certificate(cert.serial_number)
+        summ = ag.summary(self.ca._pki_db)
+        revoked_n = self.ca._pki_db.fetchone(
+            "SELECT COUNT(*) FROM certificates WHERE revoked=1"
+        )[0]
+        # Revoked certs must not appear in total_active_certs
+        total_db = self.ca._pki_db.fetchone(
+            "SELECT COUNT(*) FROM certificates WHERE revoked=0"
+        )[0]
+        self.assertEqual(summ["total_active_certs"], total_db)
+
+    def test_summary_pq_capable_pct_zero_on_classical_only(self):
+        import agility as ag
+        self._issue()
+        summ = ag.summary(self.ca._pki_db)
+        # All certs are classical-rsa (the test CA uses RSA)
+        self.assertEqual(summ["pq_capable_pct"], 0.0)
+
+    def test_summary_has_by_class_keys(self):
+        import agility as ag
+        self._issue()
+        summ = ag.summary(self.ca._pki_db)
+        self.assertIn("by_class", summ)
+
+    def test_breakdown_by_profile_returns_groups(self):
+        import agility as ag
+        self._issue(profile="tls_server")
+        self._issue(profile="tls_client")
+        result = ag.breakdown(self.ca._pki_db, by="profile")
+        keys = {g["key"] for g in result["groups"]}
+        self.assertTrue(keys.issuperset({"tls_server", "tls_client"}))
+
+    def test_breakdown_by_month_returns_sorted(self):
+        import agility as ag
+        self._issue()
+        result = ag.breakdown(self.ca._pki_db, by="month")
+        months = [g["key"] for g in result["groups"]]
+        self.assertEqual(months, sorted(months))
+
+    def test_csr_demand_window_respected(self):
+        import agility as ag
+        self._issue()
+        result = ag.csr_demand(self.ca._pki_db, window_days=30)
+        self.assertIn("csrs_total", result)
+        self.assertGreaterEqual(result["csrs_total"], 1)
+
+
+class TestMigrationForecaster(unittest.TestCase):
+    """agility.forecast() — linear extrapolation logic."""
+
+    def setUp(self):
+        from migrations import MigrationRunner
+        self._tmp = tempfile.mkdtemp()
+        self.ca   = _make_ca(self._tmp)
+        runner = MigrationRunner(
+            self.ca._pki_db,
+            Path(__file__).parent / "db_migrations" / "pki",
+            namespace="pki",
+        )
+        runner.apply_pending()
+        self.key = _gen_key()
+
+    def test_insufficient_data_returns_caveat(self):
+        import agility as ag
+        # Empty DB → < 2 months
+        result = ag.forecast(self.ca._pki_db)
+        self.assertEqual(result["milestones"], [])
+        self.assertTrue(any("Insufficient" in c for c in result["caveats"]))
+
+    def test_linear_extrapolation_no_pq_trend(self):
+        import agility as ag
+        self.ca.issue_certificate("CN=t", self.key.public_key())
+        result = ag.forecast(self.ca._pki_db)
+        # With only classical certs, no upward PQ trend
+        self.assertIn("milestones", result)
+
+    def test_already_met_milestone(self):
+        import agility as ag
+        self.assertEqual(ag._least_squares([0, 1, 2], [0, 1, 2]), (1.0, 0.0))
+
+    def test_least_squares_flat_line(self):
+        import agility as ag
+        slope, intercept = ag._least_squares([0, 1, 2], [5, 5, 5])
+        self.assertAlmostEqual(slope, 0.0, places=6)
+        self.assertAlmostEqual(intercept, 5.0, places=6)
+
+
+class TestAgilityMetrics(unittest.TestCase):
+    """agility.agility_prometheus() and AgilitySweeper."""
+
+    def setUp(self):
+        from migrations import MigrationRunner
+        self._tmp = tempfile.mkdtemp()
+        self.ca   = _make_ca(self._tmp)
+        runner = MigrationRunner(
+            self.ca._pki_db,
+            Path(__file__).parent / "db_migrations" / "pki",
+            namespace="pki",
+        )
+        runner.apply_pending()
+        self.key = _gen_key()
+
+    def test_prometheus_format_contains_metric_name(self):
+        import agility as ag
+        self.ca.issue_certificate("CN=t", self.key.public_key())
+        output = ag.agility_prometheus(self.ca._pki_db)
+        self.assertIn("pypki_certs_active_total", output)
+        self.assertIn("pypki_pq_migration_progress", output)
+
+    def test_prometheus_no_crash_on_empty_db(self):
+        import agility as ag
+        output = ag.agility_prometheus(self.ca._pki_db)
+        self.assertIsInstance(output, str)
+
+    def test_sweeper_caches_output(self):
+        import agility as ag
+        import time as _time
+        sweeper = ag.AgilitySweeper(self.ca._pki_db, interval_seconds=1)
+        sweeper.start()
+        _time.sleep(1.2)
+        sweeper.stop()
+        cached = sweeper.cached_prometheus()
+        # May be empty string if DB has no data, but must not raise
+        self.assertIsInstance(cached, str)
+
+
+# ===========================================================================
+# TestRFC9336DocumentSigning — document_signing profile (RFC 9336)
+# ===========================================================================
+
+class TestRFC9336DocumentSigning(unittest.TestCase):
+    """RFC 9336 document-signing certificate profile tests."""
+
+    def setUp(self):
+        self._tmp = tempfile.mkdtemp()
+        self.ca   = _make_ca(self._tmp)
+        self.key  = _gen_key()
+
+    def test_profile_shape(self):
+        from cryptography.x509 import ObjectIdentifier
+        prof = pki.CertProfile.get("document_signing")
+        ku = prof["key_usage"]
+        self.assertTrue(ku["digital_signature"])
+        self.assertTrue(ku["content_commitment"])
+        # All other KeyUsage bits must be off
+        for bit in ("key_encipherment", "data_encipherment", "key_agreement",
+                    "key_cert_sign", "crl_sign", "encipher_only", "decipher_only"):
+            self.assertFalse(ku[bit], f"{bit} should be False")
+        self.assertEqual(prof["eku"], [ObjectIdentifier("1.3.6.1.5.5.7.3.36")])
+        self.assertFalse(prof["san_required"])
+        self.assertFalse(prof["bc_ca"])
+
+    def test_issued_cert_key_usage(self):
+        cert = self.ca.issue_certificate(
+            "CN=Jane Doe, Document Signer/O=Example Org",
+            self.key.public_key(),
+            profile="document_signing",
+        )
+        ku = cert.extensions.get_extension_for_class(x509.KeyUsage).value
+        self.assertTrue(ku.digital_signature)
+        self.assertTrue(ku.content_commitment)
+        self.assertFalse(ku.key_encipherment)
+        self.assertFalse(ku.key_cert_sign)
+
+    def test_issued_cert_eku(self):
+        cert = self.ca.issue_certificate(
+            "CN=Jane Doe",
+            self.key.public_key(),
+            profile="document_signing",
+        )
+        eku = cert.extensions.get_extension_for_class(x509.ExtendedKeyUsage).value
+        oids = list(eku)
+        self.assertEqual(len(oids), 1)
+        self.assertEqual(oids[0].dotted_string, "1.3.6.1.5.5.7.3.36")
+
+    def test_eku_not_critical(self):
+        cert = self.ca.issue_certificate(
+            "CN=Jane Doe",
+            self.key.public_key(),
+            profile="document_signing",
+        )
+        ext = cert.extensions.get_extension_for_class(x509.ExtendedKeyUsage)
+        self.assertFalse(ext.critical)
+
+    def test_basic_constraints_not_ca(self):
+        cert = self.ca.issue_certificate(
+            "CN=Jane Doe",
+            self.key.public_key(),
+            profile="document_signing",
+        )
+        bc = cert.extensions.get_extension_for_class(x509.BasicConstraints).value
+        self.assertFalse(bc.ca)
+
+    def test_est_label_routing(self):
+        from est_server import EST_LABEL_PROFILE
+        self.assertEqual(EST_LABEL_PROFILE["document-signing"], "document_signing")
+
+    def test_revocation_works(self):
+        cert = self.ca.issue_certificate(
+            "CN=Jane Doe",
+            self.key.public_key(),
+            profile="document_signing",
+        )
+        serial = cert.serial_number
+        result = self.ca.revoke_certificate(serial, "key_compromise")
+        self.assertTrue(result)
+        record = next(c for c in self.ca.list_certificates() if c["serial"] == serial)
+        self.assertTrue(record["revoked"])
+
+
+# ===========================================================================
+# TestRFC4158CAIssuers — AIA caIssuers path-building (RFC 4158)
+# ===========================================================================
+
+class TestRFC4158CAIssuers(unittest.TestCase):
+    """AIA id-ad-caIssuers path-building enablement tests (RFC 4158)."""
+
+    _CA_ISSUERS_URL = "http://pki.internal:8080/ca/ca.crt"
+    _OCSP_URL       = "http://pki.internal:8082/ocsp"
+
+    def setUp(self):
+        self._tmp = tempfile.mkdtemp()
+        self.key  = _gen_key()
+
+    def _make_ca_with_urls(self, ocsp_url="", ca_issuers_url=""):
+        # Use a fresh subdirectory per call to avoid CA re-use conflicts
+        import uuid as _uuid
+        subdir = os.path.join(self._tmp, _uuid.uuid4().hex)
+        return _make_ca(subdir, ocsp_url=ocsp_url, ca_issuers_url=ca_issuers_url)
+
+    def _get_aia(self, cert):
+        return cert.extensions.get_extension_for_class(
+            x509.AuthorityInformationAccess
+        ).value
+
+    def test_ca_issuers_present(self):
+        ca = self._make_ca_with_urls(ca_issuers_url=self._CA_ISSUERS_URL)
+        cert = ca.issue_certificate("CN=EE", self.key.public_key())
+        aia = self._get_aia(cert)
+        methods = {ad.access_method for ad in aia}
+        self.assertIn(x509.AuthorityInformationAccessOID.CA_ISSUERS, methods)
+        uris = [ad.access_location.value for ad in aia
+                if ad.access_method == x509.AuthorityInformationAccessOID.CA_ISSUERS]
+        self.assertEqual(uris, [self._CA_ISSUERS_URL])
+
+    def test_combined_aia_single_extension(self):
+        ca = self._make_ca_with_urls(
+            ocsp_url=self._OCSP_URL,
+            ca_issuers_url=self._CA_ISSUERS_URL,
+        )
+        cert = ca.issue_certificate("CN=EE", self.key.public_key())
+        # Must be exactly one AIA extension (no DuplicateExtension)
+        aia_exts = [e for e in cert.extensions
+                    if e.oid == x509.AuthorityInformationAccess.oid]
+        self.assertEqual(len(aia_exts), 1)
+        aia = aia_exts[0].value
+        methods = {ad.access_method for ad in aia}
+        self.assertIn(x509.AuthorityInformationAccessOID.CA_ISSUERS, methods)
+        self.assertIn(x509.AuthorityInformationAccessOID.OCSP, methods)
+
+    def test_sub_ca_carries_ca_issuers(self):
+        ca = self._make_ca_with_urls(ca_issuers_url=self._CA_ISSUERS_URL)
+        sub_key = _gen_key()
+        sub_cert = ca.issue_certificate(
+            "CN=Sub CA", sub_key.public_key(), profile="sub_ca"
+        )
+        aia = self._get_aia(sub_cert)
+        methods = {ad.access_method for ad in aia}
+        self.assertIn(x509.AuthorityInformationAccessOID.CA_ISSUERS, methods)
+
+    def test_no_rev_avail_keeps_ca_issuers_drops_ocsp(self):
+        ca = self._make_ca_with_urls(
+            ocsp_url=self._OCSP_URL,
+            ca_issuers_url=self._CA_ISSUERS_URL,
+        )
+        cert = ca.issue_certificate(
+            "CN=ShortLived", self.key.public_key(), profile="short_lived"
+        )
+        # short_lived suppresses OCSP/CDP per RFC 9608
+        aia = self._get_aia(cert)
+        methods = {ad.access_method for ad in aia}
+        self.assertIn(x509.AuthorityInformationAccessOID.CA_ISSUERS, methods)
+        self.assertNotIn(x509.AuthorityInformationAccessOID.OCSP, methods)
+
+    def test_back_compat_ocsp_only(self):
+        """With ca_issuers_url unset and ocsp_url set, AIA contains only OCSP."""
+        ca = self._make_ca_with_urls(ocsp_url=self._OCSP_URL)
+        cert = ca.issue_certificate("CN=EE", self.key.public_key())
+        aia = self._get_aia(cert)
+        methods = {ad.access_method for ad in aia}
+        self.assertIn(x509.AuthorityInformationAccessOID.OCSP, methods)
+        self.assertNotIn(x509.AuthorityInformationAccessOID.CA_ISSUERS, methods)
+
+    def test_back_compat_no_aia_when_both_unset(self):
+        """With both URLs unset, no AIA extension is emitted."""
+        ca = self._make_ca_with_urls()
+        cert = ca.issue_certificate("CN=EE", self.key.public_key())
+        with self.assertRaises(Exception):
+            cert.extensions.get_extension_for_class(x509.AuthorityInformationAccess)
+
+    def test_cross_sign_carries_ca_issuers(self):
+        ca = self._make_ca_with_urls(ca_issuers_url=self._CA_ISSUERS_URL)
+        target_key = _gen_key()
+        leaf = ca.issue_certificate("CN=Leaf", target_key.public_key())
+        cross = ca.cross_sign(leaf, validity_days=90)
+        aia = self._get_aia(cross)
+        methods = {ad.access_method for ad in aia}
+        self.assertIn(x509.AuthorityInformationAccessOID.CA_ISSUERS, methods)
+
+    def test_per_call_override(self):
+        """ca_issuers_url per-call override overrides the CA-level setting."""
+        ca = self._make_ca_with_urls(ca_issuers_url="http://default.example/ca.crt")
+        override_url = "http://override.example/ca.crt"
+        cert = ca.issue_certificate(
+            "CN=EE", self.key.public_key(), ca_issuers_url=override_url
+        )
+        aia = self._get_aia(cert)
+        uris = [ad.access_location.value for ad in aia
+                if ad.access_method == x509.AuthorityInformationAccessOID.CA_ISSUERS]
+        self.assertEqual(uris, [override_url])
 
 
 # ===========================================================================

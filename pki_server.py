@@ -1661,6 +1661,18 @@ class CertProfile:
             "san_required": False,
             "bc_ca": False,
         },
+        # RFC 9336 — document-signing certificate.
+        # id-kp-documentSigning (1.3.6.1.5.5.7.3.36); KU digitalSignature +
+        # contentCommitment (nonRepudiation) for non-repudiable document signatures.
+        "document_signing": {
+            "key_usage": dict(digital_signature=True, content_commitment=True,
+                              key_encipherment=False, data_encipherment=False,
+                              key_agreement=False, key_cert_sign=False,
+                              crl_sign=False, encipher_only=False, decipher_only=False),
+            "eku": [x509.ObjectIdentifier("1.3.6.1.5.5.7.3.36")],  # id-kp-documentSigning
+            "san_required": False,
+            "bc_ca": False,
+        },
         "sub_ca": {
             "key_usage": dict(digital_signature=True, content_commitment=False,
                               key_encipherment=False, data_encipherment=False,
@@ -1788,7 +1800,7 @@ class CertificateAuthority:
     """
 
     def __init__(self, ca_dir: str = "./ca", config: Optional["ServerConfig"] = None,
-                 ocsp_url: str = "", crl_url: str = "",
+                 ocsp_url: str = "", crl_url: str = "", ca_issuers_url: str = "",
                  parent_chain_path: Optional[str] = None,
                  ca_key_type: str = "rsa-4096",
                  sig_algorithm: str = "rsa-pkcs1v15",
@@ -1801,6 +1813,7 @@ class CertificateAuthority:
         config            : Optional ServerConfig for live-editable validity periods.
         ocsp_url          : AIA OCSP URL embedded in every issued cert.
         crl_url           : CDP URL embedded in every issued cert.
+        ca_issuers_url    : AIA caIssuers URL embedded in every issued cert (RFC 4158 path building).
         parent_chain_path : PEM file with the certificate(s) that signed ca.crt
                             (parent → … → root, *not* including ca.crt itself).
                             If omitted, <ca_dir>/ca-chain.pem is loaded automatically
@@ -1828,8 +1841,9 @@ class CertificateAuthority:
         _pki_url = pki_db_url or f"sqlite:///{self.db_path}"
         self._pki_db: Database = make_db(_pki_url)
         self.config  = config  # may be None (uses hardcoded defaults as fallback)
-        self._ocsp_url = ocsp_url   # embedded in every issued cert AIA extension
-        self._crl_url  = crl_url    # embedded in every issued cert CDP extension
+        self._ocsp_url        = ocsp_url        # embedded in every issued cert AIA extension
+        self._crl_url         = crl_url         # embedded in every issued cert CDP extension
+        self._ca_issuers_url  = ca_issuers_url  # embedded as AIA id-ad-caIssuers on issued certs
         self._ca_key_type = ca_key_type
         # Normalize the signature-algorithm choice once at init so every
         # _sign_builder call can read self._rsa_pss as a plain bool.
@@ -1863,6 +1877,8 @@ class CertificateAuthority:
         self._ssh_krl_cache: Optional["KRLCache"] = None
         # Policy engine — set by configure_policy() after CLI arg parsing; None = legacy behavior
         self.policy_engine: Optional["policy_module.PolicyEngine"] = None
+        # Agility sweeper — set by start_agility_sweeper() from main(); None = compute inline
+        self._agility_sweeper = None
         self._init_db()
         self._load_or_create_ca()
         self._load_parent_chain(parent_chain_path)
@@ -2247,6 +2263,7 @@ class CertificateAuthority:
         forced_time: Optional[datetime.datetime] = None,
         ocsp_url: Optional[str] = None,
         crl_url: Optional[str] = None,
+        ca_issuers_url: Optional[str] = None,
         no_rev_avail: Optional[bool] = None,
         certificate_policies: Optional[List[dict]] = None,
         audit: Optional["AuditLog"] = None,
@@ -2260,8 +2277,9 @@ class CertificateAuthority:
 
         profile             : one of the CertProfile names (tls_server, tls_client,
                               code_signing, email, ocsp_signing, sub_ca, short_lived, default)
-        ocsp_url            : if set, adds an AIA extension with OCSP access description
+        ocsp_url            : if set, adds an AIA OCSP access description
         crl_url             : if set, adds a CRL Distribution Points extension
+        ca_issuers_url      : if set, adds an AIA caIssuers access description (RFC 4158)
         no_rev_avail        : if True, adds the RFC 9608 id-ce-noRevAvail (OID 2.5.29.56)
                               extension and suppresses CDP and AIA-OCSP extensions.
                               If None (default), determined automatically from the profile.
@@ -2499,23 +2517,36 @@ class CertificateAuthority:
                 x509.SubjectAlternativeName(san_names), critical=san_critical
             )
 
-        # AIA — OCSP URL
-        # RFC 9608 §4: MUST NOT include AIA OCSP if noRevAvail is set
-        if not suppress_ocsp_aia and (ocsp_url or self._ocsp_url):
-            url = ocsp_url or self._ocsp_url
-            builder = builder.add_extension(
-                x509.AuthorityInformationAccess([
-                    x509.AccessDescription(
-                        x509.AuthorityInformationAccessOID.OCSP,
-                        x509.UniformResourceIdentifier(url),
-                    )
-                ]),
-                critical=False,
+        # AIA — caIssuers (RFC 4158 path building) + OCSP (revocation)
+        # x509 forbids duplicate extensions; build the list first, add once.
+        aia_descriptions = []
+        # id-ad-caIssuers: path-building pointer; not revocation data, so it is
+        # kept even when noRevAvail/short-lived suppresses OCSP.
+        _ca_issuers = ca_issuers_url or self._ca_issuers_url
+        if _ca_issuers:
+            aia_descriptions.append(
+                x509.AccessDescription(
+                    x509.AuthorityInformationAccessOID.CA_ISSUERS,
+                    x509.UniformResourceIdentifier(_ca_issuers),
+                )
             )
-        elif no_rev_avail and (ocsp_url or self._ocsp_url):
+        # id-ad-ocsp: revocation pointer, suppressed under RFC 9608 noRevAvail.
+        _ocsp = ocsp_url or self._ocsp_url
+        if not suppress_ocsp_aia and _ocsp:
+            aia_descriptions.append(
+                x509.AccessDescription(
+                    x509.AuthorityInformationAccessOID.OCSP,
+                    x509.UniformResourceIdentifier(_ocsp),
+                )
+            )
+        elif no_rev_avail and _ocsp:
             logger.debug(
-                f"Suppressed AIA-OCSP on serial={self._next_serial.__self__ if False else '?'}: "
-                "RFC 9608 §4 prohibits AIA OCSP when noRevAvail is set"
+                "Suppressed AIA-OCSP: RFC 9608 §4 prohibits AIA OCSP when noRevAvail is set"
+            )
+        if aia_descriptions:
+            builder = builder.add_extension(
+                x509.AuthorityInformationAccess(aia_descriptions),
+                critical=False,
             )
 
         # CDP — CRL distribution point
@@ -2576,18 +2607,25 @@ class CertificateAuthority:
             cert = _sign_builder(builder, self.ca_key, rsa_pss=self._rsa_pss)
         _hist_issuance.observe(time.perf_counter() - _t0, (profile, protocol))
 
-        # Store in DB (including profile)
+        # Store in DB (including profile and crypto classification)
+        _cert_der = cert.public_bytes(Encoding.DER)
+        try:
+            import agility as _agility_mod
+            _crypto_class = _agility_mod.classify_der(_cert_der)
+        except Exception:
+            _crypto_class = "unknown"
         self._pki_db.execute(
             "INSERT OR REPLACE INTO certificates"
-            "(serial,subject,not_before,not_after,der,revoked,revoked_at,reason,profile) "
-            "VALUES(?,?,?,?,?,0,NULL,NULL,?)",
+            "(serial,subject,not_before,not_after,der,revoked,revoked_at,reason,profile,crypto_class) "
+            "VALUES(?,?,?,?,?,0,NULL,NULL,?,?)",
             (
                 serial,
                 subject_str,
                 now.isoformat(),
                 (now + datetime.timedelta(days=validity_days)).isoformat(),
-                cert.public_bytes(Encoding.DER),
+                _cert_der,
                 profile,
+                _crypto_class,
             ),
         )
 
@@ -2815,12 +2853,20 @@ class CertificateAuthority:
         cert = _sign_builder(client_builder, self.ca_key, rsa_pss=self._rsa_pss)
 
         # Persist in DB
+        _client_der = cert.public_bytes(Encoding.DER)
+        try:
+            import agility as _agility_mod
+            _client_class = _agility_mod.classify_der(_client_der)
+        except Exception:
+            _client_class = "unknown"
         self._pki_db.execute(
-            "INSERT INTO certificates VALUES (?,?,?,?,?,0,NULL,NULL)",
+            "INSERT INTO certificates"
+            "(serial,subject,not_before,not_after,der,revoked,revoked_at,reason,profile,crypto_class)"
+            " VALUES(?,?,?,?,?,0,NULL,NULL,?,?)",
             (
                 serial, subject_str, now.isoformat(),
                 (now + datetime.timedelta(days=validity_days)).isoformat(),
-                cert.public_bytes(Encoding.DER),
+                _client_der, "default", _client_class,
             ),
         )
 
@@ -3133,14 +3179,19 @@ class CertificateAuthority:
         cert_der = _build_cert_der_from_tbs(tbs, self.ca_key, rsa_pss=self._rsa_pss)
 
         subject_str_out = subject.rfc4514_string()
+        try:
+            import agility as _agility_mod
+            _mldsa_class = _agility_mod.classify_der(cert_der)
+        except Exception:
+            _mldsa_class = "mldsa-only"
         self._pki_db.execute(
             "INSERT OR REPLACE INTO certificates"
-            "(serial,subject,not_before,not_after,der,revoked,revoked_at,reason,profile) "
-            "VALUES(?,?,?,?,?,0,NULL,NULL,?)",
+            "(serial,subject,not_before,not_after,der,revoked,revoked_at,reason,profile,crypto_class) "
+            "VALUES(?,?,?,?,?,0,NULL,NULL,?,?)",
             (serial, subject_str_out,
              not_before.isoformat(),
              not_after.isoformat(),
-             cert_der, profile),
+             cert_der, profile, _mldsa_class),
         )
         if audit:
             audit.record("issue_ml_dsa",
@@ -3297,11 +3348,11 @@ class CertificateAuthority:
         subject_str_out = subject.rfc4514_string()
         self._pki_db.execute(
             "INSERT OR REPLACE INTO certificates"
-            "(serial,subject,not_before,not_after,der,revoked,revoked_at,reason,profile) "
-            "VALUES(?,?,?,?,?,0,NULL,NULL,?)",
+            "(serial,subject,not_before,not_after,der,revoked,revoked_at,reason,profile,crypto_class) "
+            "VALUES(?,?,?,?,?,0,NULL,NULL,?,?)",
             (serial, subject_str_out,
              not_before.isoformat(), not_after.isoformat(),
-             cert_der, profile),
+             cert_der, profile, "composite-mldsa"),
         )
         if audit:
             audit.record("issue_composite",
@@ -3426,11 +3477,11 @@ class CertificateAuthority:
         subject_str_out = subject.rfc4514_string()
         self._pki_db.execute(
             "INSERT OR REPLACE INTO certificates"
-            "(serial,subject,not_before,not_after,der,revoked,revoked_at,reason,profile) "
-            "VALUES(?,?,?,?,?,0,NULL,NULL,?)",
+            "(serial,subject,not_before,not_after,der,revoked,revoked_at,reason,profile,crypto_class) "
+            "VALUES(?,?,?,?,?,0,NULL,NULL,?,?)",
             (serial, subject_str_out,
              not_before.isoformat(), not_after.isoformat(),
-             cert_der, profile),
+             cert_der, profile, "slhdsa-only"),
         )
         if audit:
             audit.record("issue_slh_dsa",
@@ -3591,15 +3642,25 @@ class CertificateAuthority:
                         x509.BasicConstraints(ca=False, path_length=None), critical=True
                     )
 
-        # AIA (OCSP) from this CA's configuration
+        # AIA (caIssuers + OCSP) from this CA's configuration; single extension required
+        _cross_aia = []
+        if self._ca_issuers_url:
+            _cross_aia.append(
+                x509.AccessDescription(
+                    x509.AuthorityInformationAccessOID.CA_ISSUERS,
+                    x509.UniformResourceIdentifier(self._ca_issuers_url),
+                )
+            )
         if self._ocsp_url:
+            _cross_aia.append(
+                x509.AccessDescription(
+                    x509.AuthorityInformationAccessOID.OCSP,
+                    x509.UniformResourceIdentifier(self._ocsp_url),
+                )
+            )
+        if _cross_aia:
             builder = builder.add_extension(
-                x509.AuthorityInformationAccess([
-                    x509.AccessDescription(
-                        x509.AuthorityInformationAccessOID.OCSP,
-                        x509.UniformResourceIdentifier(self._ocsp_url),
-                    )
-                ]),
+                x509.AuthorityInformationAccess(_cross_aia),
                 critical=False,
             )
 
@@ -3620,17 +3681,24 @@ class CertificateAuthority:
         cert = _sign_builder(builder, self.ca_key, rsa_pss=self._rsa_pss)
 
         # Store in DB
+        _cross_der = cert.public_bytes(Encoding.DER)
+        try:
+            import agility as _agility_mod
+            _cross_class = _agility_mod.classify_der(_cross_der)
+        except Exception:
+            _cross_class = "unknown"
         self._pki_db.execute(
             "INSERT OR REPLACE INTO certificates"
-            "(serial,subject,not_before,not_after,der,revoked,revoked_at,reason,profile) "
-            "VALUES(?,?,?,?,?,0,NULL,NULL,?)",
+            "(serial,subject,not_before,not_after,der,revoked,revoked_at,reason,profile,crypto_class) "
+            "VALUES(?,?,?,?,?,0,NULL,NULL,?,?)",
             (
                 serial,
                 subject_str,
                 now.isoformat(),
                 (now + datetime.timedelta(days=validity_days)).isoformat(),
-                cert.public_bytes(Encoding.DER),
+                _cross_der,
                 "cross_signed",
+                _cross_class,
             ),
         )
 
@@ -4233,6 +4301,17 @@ class CertificateAuthority:
         # §5.11 — histogram metrics (issuance, OCSP, ACME order)
         for hist in (_hist_issuance, _hist_ocsp, _hist_acme_order):
             lines.extend(hist.exposition())
+        # Agility metrics (appended from sweeper cache or computed inline)
+        try:
+            if self._agility_sweeper is not None:
+                _ag = self._agility_sweeper.cached_prometheus()
+            else:
+                import agility as _agility_mod
+                _ag = _agility_mod.agility_prometheus(self._pki_db)
+            if _ag:
+                lines.append(_ag.rstrip())
+        except Exception:
+            pass
         lines.append("")  # trailing newline
         return "\n".join(lines) + "\n"
 
@@ -5523,6 +5602,13 @@ def main():
              "(e.g. http://pki.internal:8080/ca/crl)"
     )
     infra_group.add_argument(
+        "--ca-issuers-url", default="", metavar="URL",
+        help="Public URL serving this CA's certificate, embedded as the "
+             "id-ad-caIssuers AccessDescription in the AIA extension of all issued "
+             "certs (RFC 5280 §4.2.2.1). Enables RFC 4158 path building. "
+             "(e.g. http://pki.internal:8080/ca/ca.crt)"
+    )
+    infra_group.add_argument(
         "--ocsp-cache-seconds", type=int, default=300,
         help="OCSP response cache TTL in seconds (default: 300)"
     )
@@ -5770,6 +5856,23 @@ def main():
              "Warning: signatures are 8–50 KB depending on parameter set."
     )
 
+    agility_group = parser.add_argument_group(
+        "Crypto agility dashboard",
+        "PQ migration tracker: classifies active certs by algorithm and exposes metrics."
+    )
+    agility_group.add_argument(
+        "--agility-enabled", action="store_true", default=False,
+        help="Enable the crypto-agility dashboard background sweeper and /api/agility/* endpoints.",
+    )
+    agility_group.add_argument(
+        "--agility-sweep-interval-seconds", type=int, default=60, metavar="N",
+        help="How often the agility sweeper refreshes Prometheus metrics (default: 60).",
+    )
+    agility_group.add_argument(
+        "--agility-forecast-window-days", type=int, default=180, metavar="N",
+        help="Rolling window for the migration forecast linear regression (default: 180).",
+    )
+
     # --- Deployment / operations ---
     parser.add_argument(
         "--topology-hint", default=None,
@@ -5912,15 +6015,17 @@ def main():
     rate_limit_n = getattr(args, "rate_limit", 0)
     rate_limiter = RateLimiter(max_per_minute=rate_limit_n) if rate_limit_n > 0 else None
 
-    # OCSP / CRL URLs to embed in issued certs
-    ocsp_url = getattr(args, "ocsp_url", "")
-    crl_url  = getattr(args, "crl_url", "")
+    # URLs to embed in issued certs
+    ocsp_url        = getattr(args, "ocsp_url", "")
+    crl_url         = getattr(args, "crl_url", "")
+    ca_issuers_url  = getattr(args, "ca_issuers_url", "")
 
     ca = CertificateAuthority(
         ca_dir=args.ca_dir,
         config=config,
         ocsp_url=ocsp_url,
         crl_url=crl_url,
+        ca_issuers_url=ca_issuers_url,
         parent_chain_path=getattr(args, "parent_cert", None),
         ca_key_type=getattr(args, "ca_key_type", "rsa-4096"),
         sig_algorithm=getattr(args, "sig_algorithm", "rsa-pkcs1v15"),
@@ -5960,6 +6065,20 @@ def main():
             check_interval_seconds=86400,
             audit=audit_log,
         )
+
+    # Crypto-agility dashboard sweeper
+    if getattr(args, "agility_enabled", False):
+        try:
+            import agility as _agility_mod
+            _sweep_interval = getattr(args, "agility_sweep_interval_seconds", 60)
+            _sweeper = _agility_mod.AgilitySweeper(
+                ca._pki_db, interval_seconds=_sweep_interval
+            )
+            _sweeper.start()
+            ca._agility_sweeper = _sweeper
+            logger.info("Agility sweeper started (interval=%ds)", _sweep_interval)
+        except Exception as _ae:
+            logger.warning("Agility sweeper failed to start: %s", _ae)
 
     # §5.9 — Lifecycle webhook dispatcher
     _wh_urls = getattr(args, "webhook_urls", []) or []

@@ -34,6 +34,7 @@ A self-contained, production-grade private Certificate Authority with support fo
 | [`docs/BACKUP.md`](docs/BACKUP.md) | Backup and restore procedures |
 | [`docs/DR.md`](docs/DR.md) | Disaster recovery runbooks |
 | [`docs/CEREMONY.md`](docs/CEREMONY.md) | Offline root key ceremony procedure |
+| [`docs/AGILITY.md`](docs/AGILITY.md) | PQ migration playbook — interpreting the agility dashboard, CLI, and Prometheus metrics |
 
 ---
 

@@ -862,6 +862,42 @@ def build_parser() -> argparse.ArgumentParser:
                     choices=["DEBUG", "INFO", "WARNING", "ERROR"])
     cr.set_defaults(func=cmd_ca_recover)
 
+    # ------------------------------------------------------------------
+    # Crypto agility subcommands
+    # ------------------------------------------------------------------
+
+    ag_sum = sub.add_parser(
+        "agility-summary",
+        help="Print a text table of active cert distribution by crypto class.",
+    )
+    ag_sum.add_argument("--ca-dir", default="./ca", metavar="DIR")
+    ag_sum.add_argument("--pki-db-url", default=None, metavar="URL")
+    ag_sum.add_argument("--log-level", default="WARNING",
+                        choices=["DEBUG", "INFO", "WARNING", "ERROR"])
+    ag_sum.set_defaults(func=cmd_agility_summary)
+
+    ag_re = sub.add_parser(
+        "agility-reclassify",
+        help="Re-run the crypto classifier over all certs with class 'unknown'.",
+    )
+    ag_re.add_argument("--ca-dir", default="./ca", metavar="DIR")
+    ag_re.add_argument("--pki-db-url", default=None, metavar="URL")
+    ag_re.add_argument("--log-level", default="WARNING",
+                       choices=["DEBUG", "INFO", "WARNING", "ERROR"])
+    ag_re.set_defaults(func=cmd_agility_reclassify)
+
+    ag_ex = sub.add_parser(
+        "agility-export",
+        help="Export all certificates with their crypto classification.",
+    )
+    ag_ex.add_argument("--format", default="csv", choices=["csv", "json"],
+                       help="Output format (default: csv).")
+    ag_ex.add_argument("--ca-dir", default="./ca", metavar="DIR")
+    ag_ex.add_argument("--pki-db-url", default=None, metavar="URL")
+    ag_ex.add_argument("--log-level", default="WARNING",
+                       choices=["DEBUG", "INFO", "WARNING", "ERROR"])
+    ag_ex.set_defaults(func=cmd_agility_export)
+
     return root
 
 
@@ -1972,6 +2008,87 @@ def cmd_ca_recover(args: argparse.Namespace) -> int:
         log_level=args.log_level,
     )
     return _ceremony_cmd("sign_csr")(ceremony_args)
+
+
+def cmd_agility_summary(args: argparse.Namespace) -> int:
+    """Print a text summary of the crypto-agility posture."""
+    _setup_logging(args.log_level)
+    from pathlib import Path as _Path
+    from db import make_db as _make_db
+    db_url = getattr(args, "pki_db_url", None) or f"sqlite:///{_Path(args.ca_dir)/'certificates.db'}"
+    db = _make_db(db_url)
+    try:
+        import agility as _ag
+        summ = _ag.summary(db)
+    except Exception as exc:
+        print(f"ERROR: {exc}")
+        return 1
+
+    print(f"As of:        {summ['as_of']}")
+    print(f"Active certs: {summ['total_active_certs']:,}")
+    print(f"PQ-capable:   {summ['pq_capable_pct']}%")
+    print()
+    print(f"{'Class':<22} {'Count':>8}  {'%':>6}")
+    print("-" * 42)
+    for cls, info in sorted(summ["by_class"].items(), key=lambda kv: -kv[1]["count"]):
+        print(f"{cls:<22} {info['count']:>8,}  {info['pct']:>5.1f}%")
+    if summ["ca_key_backends"]:
+        print()
+        print("CA key backends:")
+        for backend, n in summ["ca_key_backends"].items():
+            print(f"  {backend}: {n}")
+    return 0
+
+
+def cmd_agility_reclassify(args: argparse.Namespace) -> int:
+    """Re-run the classifier over all certs with crypto_class = 'unknown'."""
+    _setup_logging(args.log_level)
+    from pathlib import Path as _Path
+    from db import make_db as _make_db
+    db_url = getattr(args, "pki_db_url", None) or f"sqlite:///{_Path(args.ca_dir)/'certificates.db'}"
+    db = _make_db(db_url)
+    try:
+        import agility as _ag
+        updated, skipped = _ag.backfill(db)
+    except Exception as exc:
+        print(f"ERROR: {exc}")
+        return 1
+    print(f"Reclassified: {updated} cert(s) updated, {skipped} remain unknown.")
+    return 0
+
+
+def cmd_agility_export(args: argparse.Namespace) -> int:
+    """Export all active certs with their crypto classification to CSV or JSON."""
+    _setup_logging(args.log_level)
+    from pathlib import Path as _Path
+    from db import make_db as _make_db
+    import datetime
+    db_url = getattr(args, "pki_db_url", None) or f"sqlite:///{_Path(args.ca_dir)/'certificates.db'}"
+    db = _make_db(db_url)
+    now = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    rows = db.fetchall(
+        "SELECT serial, subject, not_before, not_after, profile, crypto_class, revoked "
+        "FROM certificates ORDER BY serial",
+    )
+    fmt = getattr(args, "format", "csv")
+    if fmt == "json":
+        import json
+        data = [
+            {
+                "serial": row[0], "subject": row[1],
+                "not_before": row[2], "not_after": row[3],
+                "profile": row[4], "crypto_class": row[5] or "unknown",
+                "revoked": bool(row[6]),
+            }
+            for row in rows
+        ]
+        print(json.dumps(data, indent=2))
+    else:
+        print("serial,subject,not_before,not_after,profile,crypto_class,revoked")
+        for row in rows:
+            subject = str(row[1] or "").replace('"', '""')
+            print(f'{row[0]},"{subject}",{row[2]},{row[3]},{row[4] or ""},{row[5] or "unknown"},{int(row[6])}')
+    return 0
 
 
 def main(argv: Optional[List[str]] = None) -> int:
