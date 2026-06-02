@@ -25,6 +25,7 @@ import datetime
 import http.server
 import json
 import logging
+import re
 import secrets
 import threading
 import time
@@ -1124,6 +1125,19 @@ class WebUIHandler(http.server.BaseHTTPRequestHandler):
                 self._api_ssh_known_hosts()
             elif path == "/api/ssh/certs":
                 self._api_ssh_list()
+            # WireGuard GET routes
+            elif path == "/api/wg/peers":
+                self._api_wg_list_peers()
+            elif path == "/api/wg/servers":
+                self._api_wg_list_servers()
+            elif re.match(r"^/api/wg/server-config/[^/]+$", path):
+                server_id = path.split("/")[-1]
+                self._api_wg_server_config(server_id)
+            # Matter GET routes
+            elif path == "/api/matter/authorities":
+                self._api_matter_list_authorities()
+            elif path == "/api/matter/dacs":
+                self._api_matter_list_dacs()
             elif path in ("/ca/cert.pem", "/ca/cert"):
                 # Serve full chain PEM (leaf + intermediates) for intermediate CA mode.
                 self._send_raw(200, "application/x-pem-file", self.ca.ca_chain_pem)
@@ -1196,6 +1210,21 @@ class WebUIHandler(http.server.BaseHTTPRequestHandler):
             elif path.startswith("/api/ra/deny/"):
                 req_id = path.split("/api/ra/deny/", 1)[1].strip("/")
                 self._api_ra_deny(req_id, data)
+            # WireGuard PKI
+            elif path == "/api/wg/peers":
+                self._api_wg_enroll_peer(data)
+            elif path == "/api/wg/servers":
+                self._api_wg_register_server(data)
+            elif re.match(r"^/api/wg/peers/[^/]+/revoke$", path):
+                peer_id = path.split("/")[3]
+                self._api_wg_revoke_peer(peer_id)
+            # Matter PKI
+            elif path == "/api/matter/dac":
+                self._api_matter_issue_dac(data)
+            elif path == "/api/matter/dac/bulk":
+                self._api_matter_bulk_dac(data)
+            elif path == "/api/matter/pai":
+                self._api_matter_issue_pai(data)
             else:
                 self._send_json({"error": "not found"}, 404)
         except Exception as e:
@@ -3079,6 +3108,184 @@ async function getKnownHosts() {
         }.get(name)
         if attr:
             setattr(type(self), attr, url)
+
+    # ------------------------------------------------------------------
+    # WireGuard PKI API handlers
+    # ------------------------------------------------------------------
+
+    def _wg_ca(self):
+        import wireguard_ca as _wg
+        return _wg.WireGuardCA(self.ca._pki_db, self.audit_log)
+
+    def _api_wg_enroll_peer(self, data: dict):
+        import wireguard_ca as _wg
+        wg = self._wg_ca()
+        peer_name   = data.get("peer_name", "unnamed")
+        allowed_ips = data.get("allowed_ips", [])
+        profile     = data.get("profile", "wg_user_vpn")
+        public_key  = data.get("public_key") or None
+        result = wg.enroll_peer(
+            peer_name=peer_name,
+            allowed_ips=allowed_ips,
+            profile_name=profile,
+            public_key=public_key,
+            endpoint=data.get("endpoint"),
+            persistent_keepalive=data.get("persistent_keepalive"),
+            valid_seconds=data.get("valid_seconds"),
+            server_ids=data.get("server_ids"),
+            requester_ip=self.client_address[0],
+        )
+        self._send_json(result, 201)
+
+    def _api_wg_register_server(self, data: dict):
+        wg = self._wg_ca()
+        result = wg.register_server(
+            server_id=data.get("server_id", ""),
+            public_key=data.get("public_key", ""),
+            endpoint=data.get("endpoint", ""),
+            listen_port=data.get("listen_port", 51820),
+            network_cidr=data.get("network_cidr", "10.10.0.0/24"),
+        )
+        self._send_json(result, 201)
+
+    def _api_wg_revoke_peer(self, peer_id: str):
+        wg = self._wg_ca()
+        ok = wg.revoke_peer(peer_id, requester_ip=self.client_address[0])
+        if ok:
+            self._send_json({"revoked": peer_id})
+        else:
+            self._send_json({"error": "peer not found"}, 404)
+
+    def _api_wg_list_peers(self):
+        wg = self._wg_ca()
+        include_revoked = "include_revoked" in self.path
+        self._send_json(wg.list_peers(include_revoked=include_revoked))
+
+    def _api_wg_list_servers(self):
+        self._send_json(self._wg_ca().list_servers())
+
+    def _api_wg_server_config(self, server_id: str):
+        wg = self._wg_ca()
+        cfg = wg.get_server_config(server_id)
+        if cfg is None:
+            self._send_json({"error": "server not found"}, 404)
+            return
+        body = cfg.encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    # ------------------------------------------------------------------
+    # Matter PKI API handlers
+    # ------------------------------------------------------------------
+
+    def _matter_ca(self):
+        import matter as _matter
+        return _matter.MatterCA(self.ca._pki_db, self.ca, self.audit_log)
+
+    def _api_matter_issue_dac(self, data: dict):
+        from cryptography.hazmat.primitives.serialization import load_pem_public_key
+        mc = self._matter_ca()
+        public_key = load_pem_public_key(data["public_key_pem"].encode())
+        cert, pem_chain = mc.issue_dac(
+            vendor_id=data["vendor_id"],
+            product_id=data["product_id"],
+            subject_serial=data.get("subject_serial", ""),
+            public_key=public_key,
+            pai_id=data.get("pai_id"),
+            valid_years=data.get("valid_years", 10),
+            requester_ip=self.client_address[0],
+        )
+        self._send_json({
+            "cert_serial": format(cert.serial_number, "x"),
+            "pem":         pem_chain,
+        }, 201)
+
+    def _api_matter_bulk_dac(self, data):
+        from cryptography.hazmat.primitives.serialization import load_pem_public_key
+        import json as _json
+        mc = self._matter_ca()
+        if not isinstance(data, dict):
+            self._send_json({"error": "body must be a JSON object with items[]"}, 400)
+            return
+        vendor_id  = data.get("vendor_id", "")
+        product_id = data.get("product_id", "")
+        pai_id     = data.get("pai_id")
+        valid_years= data.get("valid_years", 10)
+        items      = data.get("items", [])
+
+        self.send_response(200)
+        self.send_header("Content-Type", "application/x-ndjson")
+        self.send_header("Transfer-Encoding", "chunked")
+        self.end_headers()
+        for result in mc.issue_dac_bulk(
+            vendor_id, product_id, items,
+            pai_id=pai_id, valid_years=valid_years,
+            requester_ip=self.client_address[0],
+        ):
+            line = (_json.dumps(result) + "\n").encode()
+            self.wfile.write(line)
+
+    def _api_matter_issue_pai(self, data: dict):
+        mc = self._matter_ca()
+        import matter as _matter
+        from cryptography.hazmat.primitives.asymmetric import ec as _ec
+        # PAI uses a freshly generated P-256 key
+        pai_key  = _ec.generate_private_key(_ec.SECP256R1())
+        name     = data.get("name", "Matter PAI")
+        vendor_id= data.get("vendor_id", "")
+        product_ids = data.get("product_ids")
+        valid_years = data.get("valid_years", 20)
+
+        subject_name = _matter.build_pai_subject(vendor_id, name, product_ids)
+        cert = self.ca.issue_certificate(
+            subject_str=name,
+            public_key=pai_key.public_key(),
+            profile="matter_pai",
+            subject_name=subject_name,
+            is_ca=True,
+            path_length=0,
+            validity_days=valid_years * 365,
+            crl_url="",
+            ocsp_url="",
+            ca_issuers_url="",
+        )
+        serial_hex = format(cert.serial_number, "x")
+        from cryptography.hazmat.primitives import serialization
+        not_after_ts = int(cert.not_valid_after_utc.timestamp())
+        auth_id = mc.register_authority(
+            name=name, role="pai",
+            vendor_id=vendor_id,
+            serial=serial_hex,
+            not_after=not_after_ts,
+            product_ids=product_ids,
+        )
+        pem_cert = cert.public_bytes(serialization.Encoding.PEM).decode()
+        pem_key  = pai_key.private_bytes(
+            serialization.Encoding.PEM,
+            serialization.PrivateFormat.PKCS8,
+            serialization.NoEncryption(),
+        ).decode()
+        self._send_json({
+            "pai_id":      auth_id,
+            "cert_serial": serial_hex,
+            "cert_pem":    pem_cert,
+            "private_key_pem": pem_key,
+        }, 201)
+
+    def _api_matter_list_authorities(self):
+        self._send_json(self._matter_ca().list_authorities())
+
+    def _api_matter_list_dacs(self):
+        import urllib.parse as _up
+        qs = dict(_up.parse_qsl(self.path.split("?", 1)[1] if "?" in self.path else ""))
+        mc = self._matter_ca()
+        self._send_json(mc.list_dacs(
+            vendor_id=qs.get("vendor_id"),
+            product_id=qs.get("product_id"),
+        ))
 
     # ------------------------------------------------------------------
     # Low-level send helpers

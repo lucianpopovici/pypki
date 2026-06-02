@@ -3049,7 +3049,8 @@ class TestModuleStructure(unittest.TestCase):
                     "ocsp_signing", "tsa_signing", "document_signing", "sub_ca",
                     "short_lived", "default",
                     "ml_dsa_signing", "composite_signing", "onion_eligible", "slh_dsa_signing",
-                    "pypki_self_tls"}
+                    "pypki_self_tls",
+                    "matter_dac", "matter_pai", "matter_paa"}
         actual = set(pki.CertProfile.PROFILES.keys())
         self.assertEqual(actual, expected,
                          f"Missing profiles: {expected - actual}")
@@ -15393,6 +15394,306 @@ class TestAgilityMetrics(unittest.TestCase):
         cached = sweeper.cached_prometheus()
         # May be empty string if DB has no data, but must not raise
         self.assertIsInstance(cached, str)
+
+
+# ===========================================================================
+# TestWireGuardPeerLifecycle — WireGuardCA peer management
+# ===========================================================================
+
+class TestWireGuardPeerLifecycle(unittest.TestCase):
+    """WireGuard peer enrollment, revocation, and config generation."""
+
+    def setUp(self):
+        from migrations import MigrationRunner
+        self._tmp = tempfile.mkdtemp()
+        self.ca   = _make_ca(self._tmp)
+        runner = MigrationRunner(
+            self.ca._pki_db,
+            Path(__file__).parent / "db_migrations" / "pki",
+            namespace="pki",
+        )
+        runner.apply_pending()
+        import wireguard_ca as _wg
+        self.wg = _wg.WireGuardCA(self.ca._pki_db)
+
+    def _register_server(self):
+        import wireguard_ca as _wg
+        priv, pub = _wg.generate_keypair()
+        self.wg.register_server(
+            server_id="srv-01",
+            public_key=pub,
+            endpoint="vpn.example.com:51820",
+            network_cidr="10.10.0.0/24",
+        )
+        return pub
+
+    def test_server_generated_keypair_returned(self):
+        result = self.wg.enroll_peer(
+            "alice@laptop", allowed_ips=["10.10.0.5/32"]
+        )
+        self.assertIn("private_key", result)
+        self.assertIn("public_key", result)
+        self.assertNotEqual(result["private_key"], result["public_key"])
+
+    def test_server_generated_private_key_not_stored(self):
+        result = self.wg.enroll_peer("alice", allowed_ips=["10.10.0.5/32"])
+        peer = self.wg.get_peer(result["peer_id"])
+        self.assertIsNotNone(peer)
+        # private_key must NOT be in the DB row
+        self.assertNotIn("private_key", peer)
+
+    def test_csr_mode_returns_no_private_key(self):
+        import wireguard_ca as _wg
+        _, pub = _wg.generate_keypair()
+        result = self.wg.enroll_peer(
+            "alice@laptop", allowed_ips=["10.10.0.5/32"], public_key=pub
+        )
+        self.assertNotIn("private_key", result)
+        self.assertEqual(result["public_key"], pub)
+
+    def test_allowed_ips_regex_enforced(self):
+        with self.assertRaises(ValueError):
+            self.wg.enroll_peer(
+                "bad-peer",
+                allowed_ips=["192.168.1.1/32"],  # doesn't match wg_user_vpn pattern (10.x.x.x)
+                profile_name="wg_user_vpn",
+            )
+
+    def test_validity_capped_at_profile_max(self):
+        import wireguard_ca as _wg
+        import time as _time
+        prof = _wg.WG_PROFILES["wg_user_vpn"]
+        result = self.wg.enroll_peer(
+            "bob", allowed_ips=["10.10.0.6/32"],
+            valid_seconds=prof.max_validity_seconds * 10,  # request more than max
+        )
+        peer = self.wg.get_peer(result["peer_id"])
+        now = int(_time.time())
+        actual_secs = peer["valid_before"] - now
+        self.assertLessEqual(actual_secs, prof.max_validity_seconds + 5)
+
+    def test_peer_revocation_removes_from_config(self):
+        srv_pub = self._register_server()
+        result = self.wg.enroll_peer("eve", allowed_ips=["10.10.0.7/32"])
+        peer_id = result["peer_id"]
+        self.wg.revoke_peer(peer_id)
+        cfg = self.wg.get_server_config("srv-01")
+        self.assertNotIn(result["public_key"], cfg)
+
+    def test_config_output_has_correct_sections(self):
+        import wireguard_ca as _wg
+        _, srv_pub = _wg.generate_keypair()
+        self.wg.register_server("srv-02", srv_pub, "vpn2.example.com:51820")
+        self.wg.enroll_peer("carol", allowed_ips=["10.10.0.8/32"])
+        cfg = self.wg.get_server_config("srv-02")
+        self.assertIn("[Interface]", cfg)
+        self.assertIn("[Peer]", cfg)
+
+    def test_peer_id_format(self):
+        import re as _re
+        result = self.wg.enroll_peer("dave", allowed_ips=["10.10.0.9/32"])
+        self.assertRegex(result["peer_id"], r"^wg-\d{4}-\d{4}$")
+
+
+# ===========================================================================
+# TestWireGuardConfigDistribution — config generation helpers
+# ===========================================================================
+
+class TestWireGuardConfigDistribution(unittest.TestCase):
+    """Server config generation and idempotency."""
+
+    def setUp(self):
+        from migrations import MigrationRunner
+        self._tmp = tempfile.mkdtemp()
+        self.ca   = _make_ca(self._tmp)
+        runner = MigrationRunner(
+            self.ca._pki_db,
+            Path(__file__).parent / "db_migrations" / "pki",
+            namespace="pki",
+        )
+        runner.apply_pending()
+        import wireguard_ca as _wg
+        self.wg  = _wg.WireGuardCA(self.ca._pki_db)
+        _, pub   = _wg.generate_keypair()
+        self.wg.register_server("srv-a", pub, "vpn.example.com:51820")
+
+    def test_revoked_peer_excluded_from_config(self):
+        result = self.wg.enroll_peer("alice", allowed_ips=["10.10.0.5/32"])
+        self.wg.revoke_peer(result["peer_id"])
+        cfg = self.wg.get_server_config("srv-a")
+        self.assertNotIn(result["public_key"], cfg)
+
+    def test_active_peer_included_in_config(self):
+        result = self.wg.enroll_peer("bob", allowed_ips=["10.10.0.6/32"])
+        cfg = self.wg.get_server_config("srv-a")
+        self.assertIn(result["public_key"], cfg)
+
+    def test_config_is_idempotent(self):
+        self.wg.enroll_peer("carol", allowed_ips=["10.10.0.7/32"])
+        cfg1 = self.wg.get_server_config("srv-a")
+        cfg2 = self.wg.get_server_config("srv-a")
+        self.assertEqual(cfg1, cfg2)
+
+    def test_unknown_server_returns_none(self):
+        cfg = self.wg.get_server_config("nonexistent-server")
+        self.assertIsNone(cfg)
+
+    def test_keypair_roundtrip(self):
+        import wireguard_ca as _wg
+        priv, pub = _wg.generate_keypair()
+        derived = _wg.pubkey_from_privkey(priv)
+        self.assertEqual(pub, derived)
+
+
+# ===========================================================================
+# TestMatterDAC — Matter X.509 profile (DAC, PAI, chain)
+# ===========================================================================
+
+class TestMatterDAC(unittest.TestCase):
+    """Matter DAC issuance and X.509 profile enforcement."""
+
+    def setUp(self):
+        from migrations import MigrationRunner
+        self._tmp = tempfile.mkdtemp()
+        self.ca   = _make_ca(self._tmp)
+        runner = MigrationRunner(
+            self.ca._pki_db,
+            Path(__file__).parent / "db_migrations" / "pki",
+            namespace="pki",
+        )
+        runner.apply_pending()
+        from cryptography.hazmat.primitives.asymmetric import ec as _ec
+        self.device_key = _ec.generate_private_key(_ec.SECP256R1())
+
+    def _issue_dac(self, vid="FFF1", pid="8000", serial="DEVICE001"):
+        import matter as _matter
+        return _matter.issue_dac(
+            self.ca, vid, pid, serial, self.device_key.public_key()
+        )
+
+    def test_dac_has_matter_vid_oid_in_subject(self):
+        import matter as _matter
+        cert = self._issue_dac()
+        oids = [a.oid for a in cert.subject]
+        self.assertIn(_matter.MATTER_VID_OID, oids)
+
+    def test_dac_has_matter_pid_oid_in_subject(self):
+        import matter as _matter
+        cert = self._issue_dac()
+        oids = [a.oid for a in cert.subject]
+        self.assertIn(_matter.MATTER_PID_OID, oids)
+
+    def test_dac_has_no_sans(self):
+        from cryptography.x509 import SubjectAlternativeName
+        cert = self._issue_dac()
+        with self.assertRaises(Exception):
+            cert.extensions.get_extension_for_class(SubjectAlternativeName)
+
+    def test_dac_has_no_crl_dp(self):
+        from cryptography.x509 import CRLDistributionPoints
+        cert = self._issue_dac()
+        with self.assertRaises(Exception):
+            cert.extensions.get_extension_for_class(CRLDistributionPoints)
+
+    def test_dac_has_no_ocsp_aia(self):
+        from cryptography.x509 import AuthorityInformationAccess, AuthorityInformationAccessOID
+        cert = self._issue_dac()
+        try:
+            aia = cert.extensions.get_extension_for_class(AuthorityInformationAccess).value
+            methods = {ad.access_method for ad in aia}
+            self.assertNotIn(AuthorityInformationAccessOID.OCSP, methods)
+        except Exception:
+            pass  # no AIA at all — also correct
+
+    def test_dac_uses_digital_signature_only(self):
+        cert = self._issue_dac()
+        ku = cert.extensions.get_extension_for_class(x509.KeyUsage).value
+        self.assertTrue(ku.digital_signature)
+        self.assertFalse(ku.key_cert_sign)
+        self.assertFalse(ku.crl_sign)
+
+    def test_dac_basic_constraints_not_ca(self):
+        cert = self._issue_dac()
+        bc = cert.extensions.get_extension_for_class(x509.BasicConstraints).value
+        self.assertFalse(bc.ca)
+
+    def test_dac_vid_normalised_to_4_hex(self):
+        import matter as _matter
+        cert = _matter.issue_dac(
+            self.ca, "0xFFF1", "0x8000", "DEV002", self.device_key.public_key()
+        )
+        vid_attr = next(a for a in cert.subject if a.oid == _matter.MATTER_VID_OID)
+        self.assertEqual(vid_attr.value, "FFF1")
+
+    def test_bulk_issue_returns_results_for_each_item(self):
+        from cryptography.hazmat.primitives.asymmetric import ec as _ec
+        from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
+        import matter as _matter
+        mc = _matter.MatterCA(self.ca._pki_db, self.ca)
+        items = []
+        for i in range(5):
+            k = _ec.generate_private_key(_ec.SECP256R1())
+            pem = k.public_key().public_bytes(Encoding.PEM, PublicFormat.SubjectPublicKeyInfo).decode()
+            items.append({"subject_serial": f"DEV{i:03d}", "public_key_pem": pem})
+        results = list(mc.issue_dac_bulk("FFF1", "8000", items))
+        self.assertEqual(len(results), 5)
+        self.assertTrue(all(r["status"] == "ok" for r in results))
+
+    def test_bulk_issue_handles_bad_key(self):
+        import matter as _matter
+        mc = _matter.MatterCA(self.ca._pki_db, self.ca)
+        items = [{"subject_serial": "BAD", "public_key_pem": "not-a-pem"}]
+        results = list(mc.issue_dac_bulk("FFF1", "8000", items))
+        self.assertEqual(results[0]["status"], "error")
+
+
+# ===========================================================================
+# TestMatterProfileEnforcement — profile constraints
+# ===========================================================================
+
+class TestMatterProfileEnforcement(unittest.TestCase):
+    """Matter profile constraint enforcement."""
+
+    def test_matter_dac_profile_exists(self):
+        prof = pki.CertProfile.get("matter_dac")
+        self.assertFalse(prof["bc_ca"])
+        self.assertEqual(prof["eku"], [])
+        self.assertTrue(prof.get("suppress_cdp"))
+        self.assertTrue(prof.get("suppress_ocsp_aia"))
+
+    def test_matter_pai_profile_is_ca(self):
+        prof = pki.CertProfile.get("matter_pai")
+        self.assertTrue(prof["bc_ca"])
+        self.assertEqual(prof.get("path_length"), 0)
+
+    def test_matter_paa_profile_path_length_1(self):
+        prof = pki.CertProfile.get("matter_paa")
+        self.assertTrue(prof["bc_ca"])
+        self.assertEqual(prof.get("path_length"), 1)
+
+    def test_dac_rejects_non_p256_key(self):
+        import matter as _matter
+        from cryptography.hazmat.primitives.asymmetric import ec as _ec
+        p384_key = _ec.generate_private_key(_ec.SECP384R1())
+        with self.assertRaises(ValueError):
+            _matter.issue_dac(
+                _make_ca(tempfile.mkdtemp()), "FFF1", "8000", "S001", p384_key.public_key()
+            )
+
+    def test_dac_rejects_rsa_key(self):
+        import matter as _matter
+        from cryptography.hazmat.primitives.asymmetric import rsa as _rsa
+        rsa_key = _rsa.generate_private_key(65537, 2048)
+        with self.assertRaises(ValueError):
+            _matter.issue_dac(
+                _make_ca(tempfile.mkdtemp()), "FFF1", "8000", "S002", rsa_key.public_key()
+            )
+
+    def test_matter_profile_in_all_profiles(self):
+        profiles = set(pki.CertProfile.PROFILES.keys())
+        self.assertIn("matter_dac", profiles)
+        self.assertIn("matter_pai", profiles)
+        self.assertIn("matter_paa", profiles)
 
 
 # ===========================================================================

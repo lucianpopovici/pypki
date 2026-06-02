@@ -984,6 +984,63 @@ def build_parser() -> argparse.ArgumentParser:
                         choices=["DEBUG", "INFO", "WARNING", "ERROR"])
     premap.set_defaults(func=cmd_portal_remap)
 
+    # ------------------------------------------------------------------
+    # WireGuard subcommands
+    # ------------------------------------------------------------------
+
+    wg_list = sub.add_parser(
+        "wg-peer-list",
+        help="List active WireGuard peers.",
+    )
+    wg_list.add_argument("--include-revoked", action="store_true")
+    wg_list.add_argument("--ca-dir", default="./ca", metavar="DIR")
+    wg_list.add_argument("--pki-db-url", default=None, metavar="URL")
+    wg_list.add_argument("--log-level", default="WARNING",
+                         choices=["DEBUG", "INFO", "WARNING", "ERROR"])
+    wg_list.set_defaults(func=cmd_wg_peer_list)
+
+    wg_rev = sub.add_parser(
+        "wg-peer-revoke",
+        help="Revoke a WireGuard peer by peer_id.",
+    )
+    wg_rev.add_argument("peer_id", metavar="PEER_ID")
+    wg_rev.add_argument("--ca-dir", default="./ca", metavar="DIR")
+    wg_rev.add_argument("--pki-db-url", default=None, metavar="URL")
+    wg_rev.add_argument("--log-level", default="WARNING",
+                        choices=["DEBUG", "INFO", "WARNING", "ERROR"])
+    wg_rev.set_defaults(func=cmd_wg_peer_revoke)
+
+    # ------------------------------------------------------------------
+    # Matter subcommands
+    # ------------------------------------------------------------------
+
+    mat_list = sub.add_parser(
+        "matter-paa-list",
+        help="List registered Matter PAA/PAI authorities.",
+    )
+    mat_list.add_argument("--ca-dir", default="./ca", metavar="DIR")
+    mat_list.add_argument("--pki-db-url", default=None, metavar="URL")
+    mat_list.add_argument("--log-level", default="WARNING",
+                          choices=["DEBUG", "INFO", "WARNING", "ERROR"])
+    mat_list.set_defaults(func=cmd_matter_paa_list)
+
+    mat_bulk = sub.add_parser(
+        "matter-dac-bulk-issue",
+        help="Bulk-issue Matter DACs from a JSON file.",
+    )
+    mat_bulk.add_argument("--vendor-id",   required=True, metavar="HEX")
+    mat_bulk.add_argument("--product-id",  required=True, metavar="HEX")
+    mat_bulk.add_argument("--input-file",  required=True, metavar="FILE",
+                          help="JSON array of {subject_serial, public_key_pem}.")
+    mat_bulk.add_argument("--output-file", default=None, metavar="FILE",
+                          help="NDJSON output file (default: stdout).")
+    mat_bulk.add_argument("--valid-years", type=int, default=10, metavar="N")
+    mat_bulk.add_argument("--ca-dir", default="./ca", metavar="DIR")
+    mat_bulk.add_argument("--pki-db-url", default=None, metavar="URL")
+    mat_bulk.add_argument("--log-level", default="WARNING",
+                          choices=["DEBUG", "INFO", "WARNING", "ERROR"])
+    mat_bulk.set_defaults(func=cmd_matter_dac_bulk)
+
     return root
 
 
@@ -2317,6 +2374,99 @@ def cmd_portal_remap(args: argparse.Namespace) -> int:
     n = _portal.apply_static_mappings(mappings, db)
     print(f"Applied {n} ownership row(s) from {len(mappings)} mapping(s).")
     return 0
+
+
+def cmd_wg_peer_list(args: argparse.Namespace) -> int:
+    """List active WireGuard peers."""
+    _setup_logging(args.log_level)
+    db = _open_pki_db(args)
+    import wireguard_ca as _wg
+    wg = _wg.WireGuardCA(db)
+    peers = wg.list_peers(include_revoked=getattr(args, "include_revoked", False))
+    if not peers:
+        print("No peers found.")
+        return 0
+    print(f"{'PEER_ID':<18} {'NAME':<20} {'ALLOWED_IPS':<22} {'EXPIRES':<22} STATUS")
+    print("-" * 90)
+    import datetime as _dt
+    for p in peers:
+        exp = _dt.datetime.fromtimestamp(p["valid_before"]).strftime("%Y-%m-%d %H:%M")
+        ips = ", ".join(p["allowed_ips"])[:20]
+        tag = "[REVOKED] " if p["revoked"] else ""
+        print(f"{tag}{p['peer_id']:<18} {p['peer_name']:<20} {ips:<22} {exp:<22}")
+    return 0
+
+
+def cmd_wg_peer_revoke(args: argparse.Namespace) -> int:
+    """Revoke a WireGuard peer."""
+    _setup_logging(args.log_level)
+    db = _open_pki_db(args)
+    import wireguard_ca as _wg
+    wg = _wg.WireGuardCA(db)
+    ok = wg.revoke_peer(args.peer_id)
+    if ok:
+        print(f"Peer revoked: {args.peer_id}")
+        return 0
+    print(f"ERROR: peer not found: {args.peer_id!r}")
+    return 1
+
+
+def cmd_matter_paa_list(args: argparse.Namespace) -> int:
+    """List Matter PAA/PAI authorities."""
+    _setup_logging(args.log_level)
+    db = _open_pki_db(args)
+    import matter as _matter
+    from pki_server import CertificateAuthority
+    ca = CertificateAuthority(ca_dir=getattr(args, "ca_dir", "./ca"), pki_db_url=getattr(args, "pki_db_url", None) or "")
+    mc = _matter.MatterCA(db, ca)
+    auths = mc.list_authorities()
+    if not auths:
+        print("No Matter authorities registered.")
+        return 0
+    for a in auths:
+        print(f"[{a['role'].upper()}] id={a['id']} name={a['name']!r} vid={a['vendor_id_hex']}")
+    return 0
+
+
+def cmd_matter_dac_bulk(args: argparse.Namespace) -> int:
+    """Bulk-issue Matter DACs from a JSON input file."""
+    _setup_logging(args.log_level)
+    import json as _json
+    from cryptography.hazmat.primitives.serialization import load_pem_public_key
+    db = _open_pki_db(args)
+
+    try:
+        items = _json.loads(Path(getattr(args, "input_file", "")).read_text())
+    except Exception as exc:
+        print(f"ERROR: could not read input file: {exc}")
+        return 1
+
+    from pki_server import CertificateAuthority
+    import matter as _matter
+    ca = CertificateAuthority(ca_dir=getattr(args, "ca_dir", "./ca"), pki_db_url=getattr(args, "pki_db_url", None) or "")
+    mc = _matter.MatterCA(db, ca)
+
+    out = open(getattr(args, "output_file") or "/dev/stdout", "w") if getattr(args, "output_file", None) else None
+
+    ok_count = err_count = 0
+    for result in mc.issue_dac_bulk(
+        args.vendor_id, args.product_id, items,
+        valid_years=args.valid_years,
+    ):
+        line = _json.dumps(result)
+        if out:
+            out.write(line + "\n")
+        else:
+            print(line)
+        if result.get("status") == "ok":
+            ok_count += 1
+        else:
+            err_count += 1
+
+    if out:
+        out.close()
+    print(f"Done: {ok_count} issued, {err_count} errors.", file=__import__("sys").stderr)
+    return 0 if err_count == 0 else 1
 
 
 def main(argv: Optional[List[str]] = None) -> int:

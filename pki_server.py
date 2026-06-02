@@ -1664,6 +1664,48 @@ class CertProfile:
             "san_required": False,
             "bc_ca": False,
         },
+        # Matter DAC — Device Attestation Certificate (leaf, one per device).
+        # ECDSA P-256 only; no EKU, no SAN, no CRL DP, no OCSP AIA.
+        # Matter Core Spec §6.2.2.
+        "matter_dac": {
+            "key_usage": dict(digital_signature=True, content_commitment=False,
+                              key_encipherment=False, data_encipherment=False,
+                              key_agreement=False, key_cert_sign=False,
+                              crl_sign=False, encipher_only=False, decipher_only=False),
+            "eku": [],
+            "san_required": False,
+            "bc_ca": False,
+            "suppress_cdp": True,    # Matter §6.2.2: no CRL DP on DACs
+            "suppress_ocsp_aia": True,
+            "portal_self_revoke": False,
+            "portal_self_renew":  False,
+        },
+        # Matter PAI — Product Attestation Intermediate.
+        "matter_pai": {
+            "key_usage": dict(digital_signature=True, content_commitment=False,
+                              key_encipherment=False, data_encipherment=False,
+                              key_agreement=False, key_cert_sign=True,
+                              crl_sign=True, encipher_only=False, decipher_only=False),
+            "eku": [],
+            "san_required": False,
+            "bc_ca": True,
+            "path_length": 0,
+            "suppress_cdp": True,
+            "suppress_ocsp_aia": True,
+        },
+        # Matter PAA — Product Attestation Authority (root).
+        "matter_paa": {
+            "key_usage": dict(digital_signature=True, content_commitment=False,
+                              key_encipherment=False, data_encipherment=False,
+                              key_agreement=False, key_cert_sign=True,
+                              crl_sign=True, encipher_only=False, decipher_only=False),
+            "eku": [],
+            "san_required": False,
+            "bc_ca": True,
+            "path_length": 1,
+            "suppress_cdp": True,
+            "suppress_ocsp_aia": True,
+        },
         # RFC 9336 — document-signing certificate.
         # id-kp-documentSigning (1.3.6.1.5.5.7.3.36); KU digitalSignature +
         # contentCommitment (nonRepudiation) for non-repudiable document signatures.
@@ -2274,6 +2316,7 @@ class CertificateAuthority:
         path_length: Optional[int] = None,
         protocol: str = "",
         policy_req: Optional[Any] = None,
+        subject_name: Optional[x509.Name] = None,
     ) -> x509.Certificate:
         """
         Issue a certificate signed by this CA.
@@ -2392,7 +2435,7 @@ class CertificateAuthority:
         if not attrs and not (san_dns or san_emails or san_ips or san_uris):
             attrs = [x509.NameAttribute(NameOID.COMMON_NAME, subject_str or "PyPKI Entity")]
 
-        subject = x509.Name(attrs)
+        subject = subject_name if subject_name is not None else x509.Name(attrs)
         serial = forced_serial if forced_serial is not None else self._next_serial()
         now = forced_time if forced_time is not None else datetime.datetime.now(datetime.timezone.utc)
         path_len = (

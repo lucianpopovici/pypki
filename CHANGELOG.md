@@ -24,6 +24,24 @@ This project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `TestOIDCTokenVerification`, `TestOIDCFlow`, `TestSessionStore`, `TestOIDCDiscovery`.
   Setup guides for Keycloak, Okta, Entra ID, and Google Workspace in `docs/SSO.md`.
 
+- **Embedded Device Enrollment** (`wireguard_ca.py`, `matter.py`,
+  `db_migrations/pki/010_wireguard.sql`, `db_migrations/pki/011_matter.sql`,
+  `tools/pypki-wg-sync/sync.py`, `docs/WIREGUARD.md`, `docs/MATTER.md`):
+  - *WireGuard PKI*: Curve25519 peer registry with `WireGuardCA` (enroll, revoke,
+    list, server-config distribution). Two profiles: `wg_user_vpn` (30-day, /32,
+    optional server-side keygen) and `wg_site_to_site` (1-year, CSR-only).
+    REST API: `POST /api/wg/peers`, `POST /api/wg/servers`, `GET /api/wg/peers`,
+    `GET /api/wg/server-config/<id>`. Pull-mode sync agent (`tools/pypki-wg-sync/sync.py`)
+    polls and applies config via `wg syncconf`. Admin CLI: `wg-peer-list`, `wg-peer-revoke`.
+  - *Matter device certs* (§6.2.2): `MatterCA` issues DACs, PAIs; vendor/product OIDs
+    `1.3.6.1.4.1.37244.2.1`/`.2.2` in Subject DN; ECDSA P-256 enforced; no SAN/CRL/OCSP
+    on DACs. Three new `CertProfile` entries: `matter_dac`, `matter_pai`, `matter_paa`.
+    Bulk NDJSON streaming endpoint (`POST /api/matter/dac/bulk`). Admin CLI:
+    `matter-paa-list`, `matter-dac-bulk-issue`. `issue_certificate()` gains
+    `subject_name` override for pre-built `x509.Name` objects.
+  - 29 new tests across `TestWireGuardPeerLifecycle`, `TestWireGuardConfigDistribution`,
+    `TestMatterDAC`, `TestMatterProfileEnforcement`.
+
 - **Self-Service Portal** (`portal.py`, `db_migrations/pki/009_portal.sql`, `docs/PORTAL.md`):
   Scope-restricted view at `--portal-prefix /portal` where each authenticated user sees
   and manages only their own certificates. Ownership stored in `cert_owners` table; supports
