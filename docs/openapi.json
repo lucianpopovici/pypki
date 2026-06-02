@@ -1,0 +1,773 @@
+{
+  "openapi": "3.0.3",
+  "info": {
+    "title": "PyPKI REST API",
+    "version": "1.0.0",
+    "description": "PyPKI private certificate authority REST API. All endpoints require Bearer token authentication except /api/health and /api/version. Tokens are created with `pypki_admin token-create`.\n\nStability: endpoints documented here are stable and versioned. Breaking changes bump the minor version. A /api/v1/ prefix alias is available for all paths.",
+    "contact": {
+      "name": "PyPKI",
+      "url": "https://github.com/lucianpopovici/pypki"
+    },
+    "license": {
+      "name": "MIT"
+    }
+  },
+  "servers": [
+    {"url": "/", "description": "Default (path-relative)"},
+    {"url": "/api/v1", "description": "Versioned alias (Terraform provider uses this)"}
+  ],
+  "security": [{"bearerAuth": []}],
+  "components": {
+    "securitySchemes": {
+      "bearerAuth": {
+        "type": "http",
+        "scheme": "bearer",
+        "description": "Long-lived API token from `pypki_admin token-create`"
+      }
+    },
+    "schemas": {
+      "Error": {
+        "type": "object",
+        "required": ["error"],
+        "properties": {
+          "error": {"type": "string", "description": "Human-readable error message"}
+        }
+      },
+      "Certificate": {
+        "type": "object",
+        "properties": {
+          "serial":     {"type": "integer", "description": "X.509 serial number"},
+          "subject":    {"type": "string",  "description": "Subject DN, e.g. CN=example.com"},
+          "not_before": {"type": "string",  "format": "date-time"},
+          "not_after":  {"type": "string",  "format": "date-time"},
+          "revoked":    {"type": "boolean"},
+          "profile":    {"type": "string",  "description": "CertProfile name"},
+          "cert_pem":   {"type": "string",  "description": "PEM-encoded certificate"},
+          "chain_pem":  {"type": "string",  "description": "PEM-encoded issuer chain"},
+          "sha256_fingerprint": {"type": "string"}
+        }
+      },
+      "IssueRequest": {
+        "type": "object",
+        "properties": {
+          "subject":      {"type": "string",  "example": "CN=web01.example.com,O=Example"},
+          "san_dns":      {"type": "array",   "items": {"type": "string"}, "example": ["web01.example.com"]},
+          "san_ips":      {"type": "array",   "items": {"type": "string"}, "example": ["10.0.0.1"]},
+          "san_uris":     {"type": "array",   "items": {"type": "string"}},
+          "san_emails":   {"type": "array",   "items": {"type": "string"}},
+          "profile":      {"type": "string",  "default": "tls_server"},
+          "validity_days":{"type": "integer", "default": 90},
+          "csr_pem":      {"type": "string",  "description": "PEM-encoded PKCS#10 CSR (if provided, server uses the CSR's public key and SANs)"}
+        }
+      },
+      "IssueResponse": {
+        "type": "object",
+        "properties": {
+          "serial":       {"type": "integer"},
+          "cert_pem":     {"type": "string"},
+          "chain_pem":    {"type": "string"},
+          "fullchain_pem":{"type": "string"},
+          "not_before":   {"type": "string", "format": "date-time"},
+          "not_after":    {"type": "string", "format": "date-time"},
+          "sha256_fingerprint": {"type": "string"}
+        }
+      },
+      "RevokeRequest": {
+        "type": "object",
+        "required": ["serial"],
+        "properties": {
+          "serial": {"type": "integer"},
+          "reason": {"type": "integer", "default": 0,
+                     "description": "RFC 5280 revocation reason code (0=unspecified, 1=keyCompromise, 3=affiliationChanged, 4=superseded, 5=cessationOfOperation)"}
+        }
+      },
+      "SubCARequest": {
+        "type": "object",
+        "properties": {
+          "cn":           {"type": "string",  "example": "Team A Intermediate CA"},
+          "validity_days":{"type": "integer", "default": 3650},
+          "key_type":     {"type": "string",  "default": "ec-p384"},
+          "path_length":  {"type": "integer", "default": 0},
+          "permitted_dns":{"type": "array",   "items": {"type": "string"}},
+          "excluded_dns": {"type": "array",   "items": {"type": "string"}}
+        }
+      },
+      "WgPeerRequest": {
+        "type": "object",
+        "required": ["peer_name", "allowed_ips"],
+        "properties": {
+          "peer_name":            {"type": "string"},
+          "allowed_ips":          {"type": "array", "items": {"type": "string"}, "example": ["10.10.0.5/32"]},
+          "public_key":           {"type": "string", "description": "Curve25519 public key base64. Omit for server-side keygen."},
+          "profile":              {"type": "string", "default": "wg_user_vpn"},
+          "endpoint":             {"type": "string"},
+          "persistent_keepalive": {"type": "integer"},
+          "valid_seconds":        {"type": "integer"}
+        }
+      },
+      "WgPeer": {
+        "type": "object",
+        "properties": {
+          "peer_id":              {"type": "string"},
+          "peer_name":            {"type": "string"},
+          "public_key":           {"type": "string"},
+          "private_key":          {"type": "string", "description": "Only present in enrollment response when server generated the key; never stored."},
+          "allowed_ips":          {"type": "array", "items": {"type": "string"}},
+          "valid_before":         {"type": "integer"},
+          "config":               {"type": "string", "description": "Ready-to-paste wg0.conf snippet"}
+        }
+      },
+      "MatterDacRequest": {
+        "type": "object",
+        "required": ["vendor_id", "product_id", "subject_serial", "public_key_pem"],
+        "properties": {
+          "vendor_id":      {"type": "string", "example": "0xFFF1"},
+          "product_id":     {"type": "string", "example": "0x8000"},
+          "subject_serial": {"type": "string", "example": "ABCD1234EFGH5678"},
+          "public_key_pem": {"type": "string"},
+          "pai_id":         {"type": "integer"},
+          "valid_years":    {"type": "integer", "default": 10}
+        }
+      },
+      "HealthResponse": {
+        "type": "object",
+        "properties": {
+          "status":  {"type": "string", "enum": ["ok"]},
+          "ca_name": {"type": "string"},
+          "uptime_seconds": {"type": "number"}
+        }
+      },
+      "VersionResponse": {
+        "type": "object",
+        "properties": {
+          "version":    {"type": "string"},
+          "api_version":{"type": "string"},
+          "python":     {"type": "string"}
+        }
+      }
+    }
+  },
+  "paths": {
+    "/api/health": {
+      "get": {
+        "summary": "Health check",
+        "description": "Returns 200 if the CA is running and the DB is accessible. No authentication required.",
+        "security": [],
+        "operationId": "getHealth",
+        "tags": ["Infrastructure"],
+        "responses": {
+          "200": {
+            "description": "CA is healthy",
+            "content": {"application/json": {"schema": {"$ref": "#/components/schemas/HealthResponse"}}}
+          },
+          "503": {"description": "CA unhealthy"}
+        }
+      }
+    },
+    "/api/version": {
+      "get": {
+        "summary": "Version information",
+        "security": [],
+        "operationId": "getVersion",
+        "tags": ["Infrastructure"],
+        "responses": {
+          "200": {
+            "description": "Version metadata",
+            "content": {"application/json": {"schema": {"$ref": "#/components/schemas/VersionResponse"}}}
+          }
+        }
+      }
+    },
+    "/api/openapi.json": {
+      "get": {
+        "summary": "OpenAPI spec",
+        "description": "Returns this document as JSON.",
+        "security": [],
+        "operationId": "getOpenAPI",
+        "tags": ["Infrastructure"],
+        "responses": {
+          "200": {
+            "description": "OpenAPI 3.0 spec",
+            "content": {"application/json": {"schema": {"type": "object"}}}
+          }
+        }
+      }
+    },
+    "/api/certs": {
+      "get": {
+        "summary": "List all certificates",
+        "operationId": "listCerts",
+        "tags": ["Certificates"],
+        "responses": {
+          "200": {
+            "description": "Certificate list",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "certificates": {"type": "array", "items": {"$ref": "#/components/schemas/Certificate"}}
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/certs/{serial}": {
+      "get": {
+        "summary": "Get certificate details",
+        "operationId": "getCert",
+        "tags": ["Certificates"],
+        "parameters": [
+          {"name": "serial", "in": "path", "required": true, "schema": {"type": "integer"},
+           "description": "X.509 serial number (decimal)"}
+        ],
+        "responses": {
+          "200": {
+            "description": "Certificate metadata + PEM",
+            "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Certificate"}}}
+          },
+          "404": {"description": "Certificate not found", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Error"}}}}
+        }
+      }
+    },
+    "/api/certs/{serial}/pem": {
+      "get": {
+        "summary": "Download certificate PEM",
+        "operationId": "getCertPem",
+        "tags": ["Certificates"],
+        "parameters": [
+          {"name": "serial", "in": "path", "required": true, "schema": {"type": "integer"}}
+        ],
+        "responses": {
+          "200": {
+            "description": "PEM-encoded certificate",
+            "content": {"application/x-pem-file": {"schema": {"type": "string"}}}
+          },
+          "404": {"description": "Not found"}
+        }
+      }
+    },
+    "/api/certs/{serial}/p12": {
+      "get": {
+        "summary": "Download certificate + chain as PKCS#12",
+        "operationId": "getCertP12",
+        "tags": ["Certificates"],
+        "parameters": [
+          {"name": "serial", "in": "path", "required": true, "schema": {"type": "integer"}}
+        ],
+        "responses": {
+          "200": {
+            "description": "PKCS#12 bundle",
+            "content": {"application/x-pkcs12": {"schema": {"type": "string", "format": "binary"}}}
+          },
+          "404": {"description": "Not found"}
+        }
+      }
+    },
+    "/api/issue": {
+      "post": {
+        "summary": "Issue a certificate",
+        "description": "Issue a new end-entity certificate. Supply either a subject string (server builds the cert) or a csr_pem (CSR-based, private key never leaves the requester — recommended for production).",
+        "operationId": "issueCert",
+        "tags": ["Certificates"],
+        "requestBody": {
+          "required": true,
+          "content": {"application/json": {"schema": {"$ref": "#/components/schemas/IssueRequest"}}}
+        },
+        "responses": {
+          "201": {
+            "description": "Certificate issued",
+            "content": {"application/json": {"schema": {"$ref": "#/components/schemas/IssueResponse"}}}
+          },
+          "400": {"description": "Invalid request"},
+          "403": {"description": "Denied by policy"},
+          "500": {"description": "Issuance failed"}
+        }
+      }
+    },
+    "/api/revoke": {
+      "post": {
+        "summary": "Revoke a certificate",
+        "operationId": "revokeCert",
+        "tags": ["Certificates"],
+        "requestBody": {
+          "required": true,
+          "content": {"application/json": {"schema": {"$ref": "#/components/schemas/RevokeRequest"}}}
+        },
+        "responses": {
+          "200": {"description": "Certificate revoked"},
+          "404": {"description": "Certificate not found"},
+          "400": {"description": "Already revoked"}
+        }
+      }
+    },
+    "/api/renew": {
+      "post": {
+        "summary": "Renew a certificate (re-issue with same key and subject)",
+        "operationId": "renewCert",
+        "tags": ["Certificates"],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["serial"],
+                "properties": {
+                  "serial": {"type": "integer"},
+                  "validity_days": {"type": "integer"}
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {"description": "Certificate renewed", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/IssueResponse"}}}},
+          "404": {"description": "Not found"}
+        }
+      }
+    },
+    "/api/issue-sub-ca": {
+      "post": {
+        "summary": "Issue a subordinate CA certificate",
+        "operationId": "issueSubCa",
+        "tags": ["Certificate Authority"],
+        "requestBody": {
+          "required": true,
+          "content": {"application/json": {"schema": {"$ref": "#/components/schemas/SubCARequest"}}}
+        },
+        "responses": {
+          "201": {
+            "description": "Sub-CA issued",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "serial": {"type": "integer"},
+                    "cert_pem": {"type": "string"},
+                    "private_key_pem": {"type": "string"}
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/audit": {
+      "get": {
+        "summary": "Audit log",
+        "operationId": "getAudit",
+        "tags": ["Operations"],
+        "parameters": [
+          {"name": "limit", "in": "query", "schema": {"type": "integer", "default": 200}},
+          {"name": "offset","in": "query", "schema": {"type": "integer", "default": 0}}
+        ],
+        "responses": {
+          "200": {
+            "description": "Audit entries",
+            "content": {"application/json": {"schema": {"type": "array", "items": {"type": "object"}}}}
+          }
+        }
+      }
+    },
+    "/api/metrics": {
+      "get": {
+        "summary": "Prometheus metrics",
+        "description": "Prometheus text format. Scrape this endpoint with your Prometheus instance.",
+        "operationId": "getMetrics",
+        "tags": ["Operations"],
+        "responses": {
+          "200": {
+            "description": "Prometheus exposition format",
+            "content": {"text/plain": {"schema": {"type": "string"}}}
+          }
+        }
+      }
+    },
+    "/api/config": {
+      "get": {
+        "summary": "Get server configuration",
+        "operationId": "getConfig",
+        "tags": ["Operations"],
+        "responses": {
+          "200": {"description": "Configuration JSON", "content": {"application/json": {"schema": {"type": "object"}}}}
+        }
+      },
+      "patch": {
+        "summary": "Update server configuration",
+        "operationId": "patchConfig",
+        "tags": ["Operations"],
+        "requestBody": {
+          "required": true,
+          "content": {"application/json": {"schema": {"type": "object"}}}
+        },
+        "responses": {
+          "200": {"description": "Updated config"}
+        }
+      }
+    },
+    "/api/agility/summary": {
+      "get": {
+        "summary": "Crypto-agility summary by class",
+        "operationId": "getAgilitySummary",
+        "tags": ["Agility"],
+        "responses": {"200": {"description": "Agility summary", "content": {"application/json": {"schema": {"type": "object"}}}}}
+      }
+    },
+    "/api/agility/breakdown": {
+      "get": {
+        "summary": "Cert distribution breakdown",
+        "operationId": "getAgilityBreakdown",
+        "tags": ["Agility"],
+        "responses": {"200": {"description": "Breakdown", "content": {"application/json": {"schema": {"type": "object"}}}}}
+      }
+    },
+    "/api/agility/migration-forecast": {
+      "get": {
+        "summary": "PQ migration forecast",
+        "operationId": "getAgilityForecast",
+        "tags": ["Agility"],
+        "responses": {"200": {"description": "Forecast", "content": {"application/json": {"schema": {"type": "object"}}}}}
+      }
+    },
+    "/api/agility/csr-demand": {
+      "get": {
+        "summary": "CSR algorithm demand by class",
+        "operationId": "getAgilityCsrDemand",
+        "tags": ["Agility"],
+        "responses": {"200": {"description": "Demand", "content": {"application/json": {"schema": {"type": "object"}}}}}
+      }
+    },
+    "/api/ssh/sign": {
+      "post": {
+        "summary": "Issue an SSH user certificate",
+        "operationId": "sshSign",
+        "tags": ["SSH CA"],
+        "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object"}}}},
+        "responses": {"201": {"description": "SSH certificate"}}
+      }
+    },
+    "/api/ssh/host-cert": {
+      "post": {
+        "summary": "Issue an SSH host certificate",
+        "operationId": "sshHostCert",
+        "tags": ["SSH CA"],
+        "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object"}}}},
+        "responses": {"201": {"description": "SSH host certificate"}}
+      }
+    },
+    "/api/ssh/certs": {
+      "get": {
+        "summary": "List SSH certificates",
+        "operationId": "listSshCerts",
+        "tags": ["SSH CA"],
+        "responses": {"200": {"description": "SSH cert list", "content": {"application/json": {"schema": {"type": "object"}}}}}
+      }
+    },
+    "/api/ssh/known-hosts": {
+      "get": {
+        "summary": "Known-hosts file for all host certs",
+        "operationId": "getSshKnownHosts",
+        "tags": ["SSH CA"],
+        "responses": {"200": {"description": "known_hosts format", "content": {"text/plain": {"schema": {"type": "string"}}}}}
+      }
+    },
+    "/api/ssh/krl/{fingerprint}": {
+      "get": {
+        "summary": "Download KRL (Key Revocation List) for an SSH CA",
+        "operationId": "getSshKrl",
+        "tags": ["SSH CA"],
+        "parameters": [
+          {"name": "fingerprint", "in": "path", "required": true, "schema": {"type": "string"}}
+        ],
+        "responses": {"200": {"description": "Binary KRL file"}}
+      }
+    },
+    "/api/wg/peers": {
+      "get": {
+        "summary": "List WireGuard peers",
+        "operationId": "listWgPeers",
+        "tags": ["WireGuard"],
+        "responses": {"200": {"description": "Peer list", "content": {"application/json": {"schema": {"type": "array", "items": {"$ref": "#/components/schemas/WgPeer"}}}}}}
+      },
+      "post": {
+        "summary": "Enroll a WireGuard peer",
+        "operationId": "enrollWgPeer",
+        "tags": ["WireGuard"],
+        "requestBody": {"required": true, "content": {"application/json": {"schema": {"$ref": "#/components/schemas/WgPeerRequest"}}}},
+        "responses": {
+          "201": {"description": "Peer enrolled", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/WgPeer"}}}}
+        }
+      }
+    },
+    "/api/wg/peers/{peer_id}/revoke": {
+      "post": {
+        "summary": "Revoke a WireGuard peer",
+        "operationId": "revokeWgPeer",
+        "tags": ["WireGuard"],
+        "parameters": [
+          {"name": "peer_id", "in": "path", "required": true, "schema": {"type": "string"}}
+        ],
+        "responses": {
+          "200": {"description": "Peer revoked"},
+          "404": {"description": "Peer not found"}
+        }
+      }
+    },
+    "/api/wg/servers": {
+      "get": {
+        "summary": "List WireGuard servers",
+        "operationId": "listWgServers",
+        "tags": ["WireGuard"],
+        "responses": {"200": {"description": "Server list"}}
+      },
+      "post": {
+        "summary": "Register a WireGuard server",
+        "operationId": "registerWgServer",
+        "tags": ["WireGuard"],
+        "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object"}}}},
+        "responses": {"201": {"description": "Server registered"}}
+      }
+    },
+    "/api/wg/server-config/{server_id}": {
+      "get": {
+        "summary": "Get wg.conf for a server (all active peers)",
+        "description": "Used by the pypki-wg-sync pull agent. Returns a ready-to-apply wg.conf.",
+        "operationId": "getWgServerConfig",
+        "tags": ["WireGuard"],
+        "parameters": [
+          {"name": "server_id", "in": "path", "required": true, "schema": {"type": "string"}}
+        ],
+        "responses": {
+          "200": {"description": "WireGuard server config", "content": {"text/plain": {"schema": {"type": "string"}}}},
+          "404": {"description": "Server not found"}
+        }
+      }
+    },
+    "/api/matter/dac": {
+      "post": {
+        "summary": "Issue a Matter DAC (Device Attestation Certificate)",
+        "operationId": "issueMatterDac",
+        "tags": ["Matter"],
+        "requestBody": {"required": true, "content": {"application/json": {"schema": {"$ref": "#/components/schemas/MatterDacRequest"}}}},
+        "responses": {
+          "201": {"description": "DAC issued", "content": {"application/json": {"schema": {"type": "object", "properties": {"cert_serial": {"type": "string"}, "pem": {"type": "string"}}}}}}
+        }
+      }
+    },
+    "/api/matter/dac/bulk": {
+      "post": {
+        "summary": "Bulk-issue Matter DACs (manufacturing line)",
+        "description": "Accepts a JSON object with vendor_id, product_id, and items[]. Returns NDJSON (one result per line), streamed.",
+        "operationId": "bulkIssueMatterDac",
+        "tags": ["Matter"],
+        "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object"}}}},
+        "responses": {
+          "200": {"description": "NDJSON stream of per-device results", "content": {"application/x-ndjson": {"schema": {"type": "string"}}}}
+        }
+      }
+    },
+    "/api/matter/pai": {
+      "post": {
+        "summary": "Issue a Matter PAI (Product Attestation Intermediate)",
+        "operationId": "issueMatterPai",
+        "tags": ["Matter"],
+        "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object"}}}},
+        "responses": {"201": {"description": "PAI issued"}}
+      }
+    },
+    "/api/matter/authorities": {
+      "get": {
+        "summary": "List Matter PAA/PAI authorities",
+        "operationId": "listMatterAuthorities",
+        "tags": ["Matter"],
+        "responses": {"200": {"description": "Authority list", "content": {"application/json": {"schema": {"type": "array", "items": {"type": "object"}}}}}}
+      }
+    },
+    "/api/matter/dacs": {
+      "get": {
+        "summary": "List issued Matter DACs",
+        "operationId": "listMatterDacs",
+        "tags": ["Matter"],
+        "parameters": [
+          {"name": "vendor_id",  "in": "query", "schema": {"type": "string"}},
+          {"name": "product_id", "in": "query", "schema": {"type": "string"}}
+        ],
+        "responses": {"200": {"description": "DAC list", "content": {"application/json": {"schema": {"type": "array", "items": {"type": "object"}}}}}}
+      }
+    },
+    "/api/acme/eab/mint": {
+      "post": {
+        "summary": "Generate ACME External Account Binding credentials",
+        "operationId": "mintAcmeEab",
+        "tags": ["ACME"],
+        "responses": {"200": {"description": "EAB key_id + hmac_key"}}
+      }
+    },
+    "/api/acme/eab/revoke/{kid}": {
+      "post": {
+        "summary": "Revoke an ACME EAB credential",
+        "operationId": "revokeAcmeEab",
+        "tags": ["ACME"],
+        "parameters": [
+          {"name": "kid", "in": "path", "required": true, "schema": {"type": "string"}}
+        ],
+        "responses": {"200": {"description": "Revoked"}}
+      }
+    },
+    "/api/acme/eab/keys": {
+      "get": {
+        "summary": "List ACME EAB credentials",
+        "operationId": "listAcmeEab",
+        "tags": ["ACME"],
+        "responses": {"200": {"description": "EAB key list"}}
+      }
+    },
+    "/api/scep/otp": {
+      "post": {
+        "summary": "Mint a SCEP one-time password",
+        "operationId": "mintScepOtp",
+        "tags": ["SCEP"],
+        "responses": {"200": {"description": "One-time password"}}
+      }
+    },
+    "/api/cross-sign": {
+      "post": {
+        "summary": "Cross-sign a certificate under this CA",
+        "operationId": "crossSign",
+        "tags": ["Certificates"],
+        "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object"}}}},
+        "responses": {"201": {"description": "Cross-signed certificate"}}
+      }
+    },
+    "/api/paired-issue": {
+      "post": {
+        "summary": "Issue a paired hybrid certificate (RFC 9763)",
+        "operationId": "pairedIssue",
+        "tags": ["Certificates"],
+        "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object"}}}},
+        "responses": {"201": {"description": "Paired certificate"}}
+      }
+    },
+    "/api/composite-issue": {
+      "post": {
+        "summary": "Issue a composite ML-DSA certificate",
+        "operationId": "compositeIssue",
+        "tags": ["Certificates"],
+        "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object"}}}},
+        "responses": {"201": {"description": "Composite certificate"}}
+      }
+    },
+    "/api/slh-dsa-issue": {
+      "post": {
+        "summary": "Issue an SLH-DSA certificate (FIPS 205)",
+        "operationId": "slhDsaIssue",
+        "tags": ["Certificates"],
+        "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object"}}}},
+        "responses": {"201": {"description": "SLH-DSA certificate"}}
+      }
+    },
+    "/api/services": {
+      "get": {
+        "summary": "List protocol service status",
+        "operationId": "listServices",
+        "tags": ["Services"],
+        "responses": {"200": {"description": "Service status map"}}
+      }
+    },
+    "/api/services/{name}/start": {
+      "post": {
+        "summary": "Start a protocol service",
+        "operationId": "startService",
+        "tags": ["Services"],
+        "parameters": [
+          {"name": "name", "in": "path", "required": true, "schema": {"type": "string", "enum": ["cmp","acme","scep","est","ocsp","ipsec"]}}
+        ],
+        "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object"}}}},
+        "responses": {"200": {"description": "Service started"}}
+      }
+    },
+    "/api/services/{name}/stop": {
+      "post": {
+        "summary": "Stop a protocol service",
+        "operationId": "stopService",
+        "tags": ["Services"],
+        "parameters": [
+          {"name": "name", "in": "path", "required": true, "schema": {"type": "string"}}
+        ],
+        "responses": {"200": {"description": "Service stopped"}}
+      }
+    },
+    "/api/ra/approve/{id}": {
+      "post": {
+        "summary": "Approve a pending RA certificate request",
+        "operationId": "raApprove",
+        "tags": ["RA"],
+        "parameters": [
+          {"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}
+        ],
+        "responses": {"200": {"description": "Request approved"}}
+      }
+    },
+    "/api/ra/deny/{id}": {
+      "post": {
+        "summary": "Deny a pending RA certificate request",
+        "operationId": "raDeny",
+        "tags": ["RA"],
+        "parameters": [
+          {"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}
+        ],
+        "requestBody": {"required": false, "content": {"application/json": {"schema": {"type": "object", "properties": {"reason": {"type": "string"}}}}}},
+        "responses": {"200": {"description": "Request denied"}}
+      }
+    },
+    "/ca/cert.pem": {
+      "get": {
+        "summary": "Download CA certificate chain (PEM)",
+        "description": "Returns the full chain: leaf CA cert + any intermediate(s). For root CAs this is the self-signed root cert only.",
+        "operationId": "getCaCert",
+        "tags": ["Certificate Authority"],
+        "security": [],
+        "responses": {
+          "200": {
+            "description": "PEM chain",
+            "content": {"application/x-pem-file": {"schema": {"type": "string"}}}
+          }
+        }
+      }
+    },
+    "/ca/crl": {
+      "get": {
+        "summary": "Download the current CRL (DER format)",
+        "operationId": "getCrl",
+        "tags": ["Certificate Authority"],
+        "security": [],
+        "responses": {
+          "200": {
+            "description": "DER-encoded CRL",
+            "content": {"application/pkix-crl": {"schema": {"type": "string", "format": "binary"}}}
+          }
+        }
+      }
+    }
+  },
+  "tags": [
+    {"name": "Infrastructure", "description": "Health, version, and spec endpoints"},
+    {"name": "Certificates",   "description": "Issue, revoke, renew, and query end-entity certificates"},
+    {"name": "Certificate Authority", "description": "Sub-CA issuance and CA chain"},
+    {"name": "Operations",     "description": "Config, audit, metrics"},
+    {"name": "Agility",        "description": "Crypto-agility dashboard and forecasting"},
+    {"name": "SSH CA",         "description": "SSH certificate authority (--ssh-ca-enabled)"},
+    {"name": "WireGuard",      "description": "WireGuard peer identity registry"},
+    {"name": "Matter",         "description": "Matter DAC/PAI/PAA device attestation"},
+    {"name": "ACME",           "description": "ACME EAB credential management"},
+    {"name": "SCEP",           "description": "SCEP one-time password minting"},
+    {"name": "RA",             "description": "Registration Authority workflow"},
+    {"name": "Services",       "description": "Live service management"}
+  ]
+}

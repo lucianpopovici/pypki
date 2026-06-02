@@ -1041,6 +1041,24 @@ def build_parser() -> argparse.ArgumentParser:
                           choices=["DEBUG", "INFO", "WARNING", "ERROR"])
     mat_bulk.set_defaults(func=cmd_matter_dac_bulk)
 
+    # ------------------------------------------------------------------
+    # OpenAPI subcommand
+    # ------------------------------------------------------------------
+
+    oa = sub.add_parser(
+        "openapi-export",
+        help="Export the OpenAPI 3.0 spec to stdout or a file.",
+    )
+    oa.add_argument("--output", default=None, metavar="FILE",
+                    help="Output file (default: stdout).")
+    oa.add_argument("--pretty", action="store_true",
+                    help="Pretty-print JSON (default: compact).")
+    oa.add_argument("--check-drift", action="store_true",
+                    help="Print any handler/spec drift warnings and exit.")
+    oa.add_argument("--log-level", default="WARNING",
+                    choices=["DEBUG", "INFO", "WARNING", "ERROR"])
+    oa.set_defaults(func=cmd_openapi_export)
+
     return root
 
 
@@ -2467,6 +2485,34 @@ def cmd_matter_dac_bulk(args: argparse.Namespace) -> int:
         out.close()
     print(f"Done: {ok_count} issued, {err_count} errors.", file=__import__("sys").stderr)
     return 0 if err_count == 0 else 1
+
+
+def cmd_openapi_export(args: argparse.Namespace) -> int:
+    """Export the OpenAPI spec."""
+    _setup_logging(args.log_level)
+    import openapi as _oa
+    if getattr(args, "check_drift", False):
+        undoc, unimp = _oa.check_drift()
+        if undoc:
+            print(f"Undocumented handler paths ({len(undoc)}):")
+            for p in sorted(undoc):
+                print(f"  {p}")
+        if unimp:
+            print(f"Spec paths with no handler ({len(unimp)}):")
+            for p in sorted(unimp):
+                print(f"  {p}")
+        if not undoc and not unimp:
+            print("No drift detected.")
+        return 1 if (undoc or unimp) else 0
+
+    text = _oa.spec_json_pretty() if getattr(args, "pretty", False) else _oa.spec_json()
+    output = getattr(args, "output", None)
+    if output:
+        Path(output).write_text(text)
+        print(f"OpenAPI spec written to {output}")
+    else:
+        print(text)
+    return 0
 
 
 def main(argv: Optional[List[str]] = None) -> int:

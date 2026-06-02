@@ -1051,9 +1051,23 @@ class WebUIHandler(http.server.BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_GET(self):
-        path = self.path.split("?")[0].rstrip("/") or "/"
+        raw = self.path.split("?")[0].rstrip("/") or "/"
+        # /api/v1/* is an alias for /api/* (Terraform provider uses versioned prefix)
+        if raw.startswith("/api/v1/"):
+            path = "/api/" + raw[len("/api/v1/"):]
+        else:
+            path = raw
         try:
-            # Auth-exempt routes
+            # Auth-exempt routes — health, version, spec, CA materials
+            if path == "/api/health":
+                self._api_health()
+                return
+            if path == "/api/version":
+                self._api_version()
+                return
+            if path == "/api/openapi.json":
+                self._api_openapi()
+                return
             if path == "/login":
                 self._handle_login_get()
                 return
@@ -1153,7 +1167,8 @@ class WebUIHandler(http.server.BaseHTTPRequestHandler):
             self._send_html(500, "<pre>Internal error: {}</pre>".format(e))
 
     def do_POST(self):
-        path = self.path.split("?")[0].rstrip("/")
+        raw  = self.path.split("?")[0].rstrip("/")
+        path = ("/api/" + raw[len("/api/v1/"):]) if raw.startswith("/api/v1/") else raw
 
         # Auth-exempt: login form
         if path == "/login":
@@ -1175,7 +1190,9 @@ class WebUIHandler(http.server.BaseHTTPRequestHandler):
                 return
             data = {}
         try:
-            if path == "/api/revoke":
+            if path == "/api/issue":
+                self._api_issue(data)
+            elif path == "/api/revoke":
                 self._api_revoke(data)
             elif path == "/api/renew":
                 self._api_renew(data)
@@ -1923,8 +1940,16 @@ class WebUIHandler(http.server.BaseHTTPRequestHandler):
 
     def _route_api_cert(self, path):
         parts = path.split("/")
-        # ['', 'api', 'certs', '<serial>', '<fmt>']
-        if len(parts) == 5:
+        # ['', 'api', 'certs', '<serial>']         → JSON detail
+        # ['', 'api', 'certs', '<serial>', '<fmt>'] → file download
+        if len(parts) == 4:
+            try:
+                serial = int(parts[3])
+                self._api_cert_detail(serial)
+                return
+            except ValueError:
+                pass
+        elif len(parts) == 5:
             try:
                 serial = int(parts[3])
                 fmt    = parts[4]
@@ -1934,6 +1959,33 @@ class WebUIHandler(http.server.BaseHTTPRequestHandler):
             except (ValueError, IndexError):
                 pass
         self._send_json({"error": "not found"}, 404)
+
+    def _api_cert_detail(self, serial: int):
+        """GET /api/certs/<serial> — JSON cert metadata + PEM."""
+        from cryptography import x509 as _x509
+        from cryptography.hazmat.primitives.serialization import Encoding as _Enc
+        import hashlib as _hashlib
+        der = self.ca.get_cert_by_serial(serial)
+        if not der:
+            self._send_json({"error": "certificate not found"}, 404)
+            return
+        try:
+            cert = _x509.load_der_x509_certificate(der)
+            pem  = cert.public_bytes(_Enc.PEM).decode()
+            fp   = _hashlib.sha256(der).hexdigest()
+            row  = next((c for c in self.ca.list_certificates() if c["serial"] == serial), {})
+            self._send_json({
+                "serial":            serial,
+                "subject":           cert.subject.rfc4514_string(),
+                "not_before":        cert.not_valid_before_utc.isoformat(),
+                "not_after":         cert.not_valid_after_utc.isoformat(),
+                "revoked":           bool(row.get("revoked", False)),
+                "profile":           row.get("profile", "default"),
+                "cert_pem":          pem,
+                "sha256_fingerprint": fp,
+            })
+        except Exception as exc:
+            self._send_json({"error": str(exc)}, 500)
 
     def _api_cert_download(self, serial: int, fmt: str):
         from cryptography import x509 as _x509
@@ -3309,6 +3361,128 @@ async function getKnownHosts() {
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
+
+    # ------------------------------------------------------------------
+    # Infrastructure API handlers (no auth required)
+    # ------------------------------------------------------------------
+
+    def _api_health(self):
+        """GET /api/health — health check (no auth)."""
+        try:
+            # Quick DB check
+            self.ca._pki_db.fetchone("SELECT 1")
+            status = "ok"
+            code   = 200
+        except Exception:
+            status = "error"
+            code   = 503
+        import time as _time
+        self._send_json({"status": status, "ca_name": str(self.ca.ca_dir)}, code)
+
+    def _api_version(self):
+        """GET /api/version — version metadata (no auth)."""
+        import sys as _sys
+        self._send_json({
+            "version":     "1.0.0",
+            "api_version": "1.0",
+            "python":      _sys.version.split()[0],
+        })
+
+    def _api_openapi(self):
+        """GET /api/openapi.json — serve OpenAPI spec (no auth)."""
+        try:
+            import openapi as _openapi
+            body = _openapi.spec_json_pretty().encode()
+        except Exception as exc:
+            self._send_json({"error": str(exc)}, 500)
+            return
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    # ------------------------------------------------------------------
+    # POST /api/issue — issue a certificate (Terraform provider path)
+    # ------------------------------------------------------------------
+
+    def _api_issue(self, data: dict):
+        """
+        POST /api/issue — issue an end-entity certificate.
+
+        Accepts either a subject string + optional SANs (server builds the
+        cert) or a csr_pem (CSR-based — private key never leaves requester).
+        """
+        from cryptography import x509 as _x509
+        from cryptography.hazmat.primitives.serialization import Encoding as _Enc
+        import hashlib as _hashlib
+
+        profile     = data.get("profile", "tls_server")
+        validity    = data.get("validity_days", 90)
+        csr_pem     = data.get("csr_pem")
+
+        if csr_pem:
+            # CSR-based issuance: extract public key and SANs from the CSR
+            from cryptography.x509 import load_pem_x509_csr
+            csr     = load_pem_x509_csr(csr_pem.encode())
+            pub_key = csr.public_key()
+            subject = csr.subject.rfc4514_string() or data.get("subject", "")
+            san_dns = []
+            san_ips = []
+            san_uris= []
+            try:
+                san_ext = csr.extensions.get_extension_for_class(_x509.SubjectAlternativeName).value
+                san_dns = [n.value for n in san_ext if isinstance(n, _x509.DNSName)]
+                san_ips = [str(n.value) for n in san_ext if isinstance(n, _x509.IPAddress)]
+                san_uris= [n.value for n in san_ext if isinstance(n, _x509.UniformResourceIdentifier)]
+            except Exception:
+                pass
+        else:
+            subject = data.get("subject", "")
+            san_dns = data.get("san_dns", [])
+            san_ips = data.get("san_ips", [])
+            san_uris= data.get("san_uris", [])
+            if not subject and not san_dns:
+                self._send_json({"error": "subject or csr_pem required"}, 400)
+                return
+            # Generate an ephemeral key so the endpoint can work without CSR;
+            # for production use csr_pem so the private key never leaves the client.
+            from cryptography.hazmat.primitives.asymmetric import ec as _ec
+            priv    = _ec.generate_private_key(_ec.SECP256R1())
+            pub_key = priv.public_key()
+
+        try:
+            cert = self.ca.issue_certificate(
+                subject_str  = subject,
+                public_key   = pub_key,
+                profile      = profile,
+                validity_days= validity,
+                san_dns      = san_dns or None,
+                san_ips      = san_ips or None,
+                san_uris     = san_uris or None,
+                requester_ip = self.client_address[0],
+            )
+        except PermissionError as exc:
+            self._send_json({"error": str(exc)}, 403)
+            return
+        except Exception as exc:
+            self._send_json({"error": str(exc)}, 500)
+            return
+
+        der     = cert.public_bytes(_Enc.DER)
+        pem     = cert.public_bytes(_Enc.PEM).decode()
+        chain   = self.ca.ca_chain_pem.decode() if isinstance(self.ca.ca_chain_pem, bytes) else self.ca.ca_chain_pem
+        fp      = _hashlib.sha256(der).hexdigest()
+
+        self._send_json({
+            "serial":            cert.serial_number,
+            "cert_pem":          pem,
+            "chain_pem":         chain,
+            "fullchain_pem":     pem + chain,
+            "not_before":        cert.not_valid_before_utc.isoformat(),
+            "not_after":         cert.not_valid_after_utc.isoformat(),
+            "sha256_fingerprint":fp,
+        }, 201)
 
     def _send_raw(self, code: int, ctype: str, data: bytes):
         self.send_response(code)

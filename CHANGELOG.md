@@ -24,6 +24,17 @@ This project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `TestOIDCTokenVerification`, `TestOIDCFlow`, `TestSessionStore`, `TestOIDCDiscovery`.
   Setup guides for Keycloak, Okta, Entra ID, and Google Workspace in `docs/SSO.md`.
 
+- **Terraform provider contract** (`openapi.py`, `docs/openapi.json`, `docs/INTEGRATIONS.md`):
+  PyPKI-side changes that enable the `terraform-provider-pypki` Go repo:
+  OpenAPI 3.0.3 spec (`docs/openapi.json`, 50+ endpoints) served at `GET /api/openapi.json`.
+  `/api/v1/` versioned prefix alias (all `/api/*` routes also reachable as `/api/v1/*`).
+  New endpoints: `GET /api/health`, `GET /api/version`, `GET /api/certs/{serial}` (JSON),
+  `POST /api/issue` (end-entity cert from subject string or CSR PEM).
+  `pypki_admin openapi-export [--pretty] [--check-drift]` to export spec and warn on drift.
+  `openapi.py`: spec loader, drift checker, `_KNOWN_HANDLER_PATHS` set.
+  10 new tests in `TestOpenAPISpec`. `docs/INTEGRATIONS.md`: Terraform, cert-manager,
+  Vault PKI, Prometheus+Grafana, WireGuard sync, Matter manufacturing.
+
 - **Embedded Device Enrollment** (`wireguard_ca.py`, `matter.py`,
   `db_migrations/pki/010_wireguard.sql`, `db_migrations/pki/011_matter.sql`,
   `tools/pypki-wg-sync/sync.py`, `docs/WIREGUARD.md`, `docs/MATTER.md`):
