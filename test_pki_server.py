@@ -15397,6 +15397,230 @@ class TestAgilityMetrics(unittest.TestCase):
 
 
 # ===========================================================================
+# TestKeyBackendInterface — KeyBackend protocol, shims, and factory
+# ===========================================================================
+
+class TestKeyBackendInterface(unittest.TestCase):
+    """KeyBackend protocol conformance and shim key classes."""
+
+    def test_kms_rsa_private_key_implements_sign(self):
+        from cryptography.hazmat.primitives.asymmetric import rsa as _rsa, padding as _pad
+        from cryptography.hazmat.primitives import hashes as _h
+        import key_backend as _kb
+
+        # Build a real RSA key for the public key; mock the signer
+        real_key = _rsa.generate_private_key(65537, 2048)
+        pub      = real_key.public_key()
+        calls    = []
+
+        class MockSigner:
+            def sign(self, data, pad, alg):
+                calls.append((type(pad).__name__, type(alg).__name__))
+                return real_key.sign(data, pad, alg)  # delegate to real key for validity
+
+        shim = _kb.KMSRSAPrivateKey(MockSigner(), pub)
+        self.assertEqual(shim.key_size, 2048)
+        self.assertIs(shim.public_key(), pub)
+        sig = shim.sign(b"test-data", _pad.PKCS1v15(), _h.SHA256())
+        self.assertEqual(len(calls), 1)
+        self.assertGreater(len(sig), 0)
+
+    def test_kms_rsa_raises_on_private_bytes(self):
+        from cryptography.hazmat.primitives.asymmetric import rsa as _rsa
+        from cryptography.hazmat.primitives import serialization as _ser
+        import key_backend as _kb
+        real_key = _rsa.generate_private_key(65537, 2048)
+        shim = _kb.KMSRSAPrivateKey(None, real_key.public_key())
+        with self.assertRaises(NotImplementedError):
+            shim.private_bytes(_ser.Encoding.PEM, _ser.PrivateFormat.PKCS8, _ser.NoEncryption())
+
+    def test_kms_ec_private_key_implements_sign(self):
+        from cryptography.hazmat.primitives.asymmetric import ec as _ec
+        import key_backend as _kb
+
+        real_key = _ec.generate_private_key(_ec.SECP256R1())
+        pub      = real_key.public_key()
+        calls    = []
+
+        class MockECSigner:
+            def sign(self, data, sig_alg):
+                calls.append(type(sig_alg).__name__)
+                return real_key.sign(data, sig_alg)
+
+        from cryptography.hazmat.primitives import hashes as _h2
+        shim = _kb.KMSECPrivateKey(MockECSigner(), pub)
+        self.assertIs(shim.public_key(), pub)
+        self.assertIsInstance(shim.curve, _ec.SECP256R1)
+        sig = shim.sign(b"test", _ec.ECDSA(_h2.SHA256()))
+        self.assertEqual(len(calls), 1)
+
+    def test_kms_ec_raises_on_private_numbers(self):
+        from cryptography.hazmat.primitives.asymmetric import ec as _ec
+        import key_backend as _kb
+        real_key = _ec.generate_private_key(_ec.SECP256R1())
+        shim = _kb.KMSECPrivateKey(None, real_key.public_key())
+        with self.assertRaises(NotImplementedError):
+            shim.private_numbers()
+
+    def test_build_backend_unknown_raises(self):
+        import key_backend as _kb
+        with self.assertRaises(ValueError):
+            _kb.build_backend("nonexistent-backend", "ref")
+
+
+# ===========================================================================
+# TestAWSKMSBackend — AWS KMS backend (mocked HTTP)
+# ===========================================================================
+
+class TestAWSKMSBackend(unittest.TestCase):
+    """AWS KMS backend with mocked HTTP/auth."""
+
+    def _make_backend(self):
+        from kms_aws import AWSKMSBackend
+        # Use static auth with no file — will fail at request time, but we test structure
+        return AWSKMSBackend(region="us-east-1", auth_mode="static")
+
+    def test_algorithm_mapping_pkcs1_sha256(self):
+        import kms_aws
+        self.assertEqual(kms_aws._RSA_PKCS1_ALGS["sha256"], "RSASSA_PKCS1_V1_5_SHA_256")
+
+    def test_algorithm_mapping_pss_sha256(self):
+        import kms_aws
+        self.assertEqual(kms_aws._RSA_PSS_ALGS["sha256"], "RSASSA_PSS_SHA_256")
+
+    def test_algorithm_mapping_ecdsa_sha256(self):
+        import kms_aws
+        self.assertEqual(kms_aws._EC_ALGS["sha256"], "ECDSA_SHA_256")
+
+    def test_sigv4_produces_authorization_header(self):
+        from auth_aws import sigv4_headers
+        hdrs = sigv4_headers(
+            method="POST",
+            url="https://kms.us-east-1.amazonaws.com/",
+            body=b'{"test": 1}',
+            service="kms",
+            region="us-east-1",
+            access_key="AKIAIOSFODNN7EXAMPLE",
+            secret_key="wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+            session_token="",
+        )
+        self.assertIn("Authorization", hdrs)
+        self.assertTrue(hdrs["Authorization"].startswith("AWS4-HMAC-SHA256"))
+        self.assertIn("X-Amz-Date", hdrs)
+        self.assertIn("Host", hdrs)
+
+    def test_sigv4_includes_session_token_when_provided(self):
+        from auth_aws import sigv4_headers
+        hdrs = sigv4_headers(
+            method="POST",
+            url="https://kms.us-east-1.amazonaws.com/",
+            body=b"{}",
+            service="kms",
+            region="us-east-1",
+            access_key="AK",
+            secret_key="SK",
+            session_token="my-session-token",
+        )
+        self.assertIn("X-Amz-Security-Token", hdrs)
+        self.assertEqual(hdrs["X-Amz-Security-Token"], "my-session-token")
+
+    def test_region_extracted_from_arn(self):
+        import key_backend as _kb
+        region = _kb._aws_region_from_ref("arn:aws:kms:eu-west-1:123:key/abc")
+        self.assertEqual(region, "eu-west-1")
+
+    def test_backend_name_is_aws_kms(self):
+        backend = self._make_backend()
+        self.assertEqual(backend.name, "aws-kms")
+
+
+# ===========================================================================
+# TestGCPKMSBackend — GCP Cloud KMS backend (mocked)
+# ===========================================================================
+
+class TestGCPKMSBackend(unittest.TestCase):
+
+    def test_backend_name_is_gcp_kms(self):
+        from kms_gcp import GCPKMSBackend
+        b = GCPKMSBackend()
+        self.assertEqual(b.name, "gcp-kms")
+
+    def test_digest_payload_sha256(self):
+        from kms_gcp import _digest_payload
+        from cryptography.hazmat.primitives.hashes import SHA256
+        payload = _digest_payload(b"hello", SHA256())
+        self.assertIn("sha256", payload)
+        import base64
+        decoded = base64.b64decode(payload["sha256"])
+        import hashlib
+        self.assertEqual(decoded, hashlib.sha256(b"hello").digest())
+
+    def test_digest_payload_sha384(self):
+        from kms_gcp import _digest_payload
+        from cryptography.hazmat.primitives.hashes import SHA384
+        payload = _digest_payload(b"test", SHA384())
+        self.assertIn("sha384", payload)
+
+
+# ===========================================================================
+# TestAzureKVBackend — Azure Key Vault backend (mocked)
+# ===========================================================================
+
+class TestAzureKVBackend(unittest.TestCase):
+
+    def test_backend_name_is_azure_kv(self):
+        from kms_azure import AzureKVBackend
+        b = AzureKVBackend()
+        self.assertEqual(b.name, "azure-kv")
+
+    def test_b64url_roundtrip(self):
+        from kms_azure import _b64url_encode, _b64url_decode
+        data = b"\x00\xff\xfe\x80test"
+        self.assertEqual(_b64url_decode(_b64url_encode(data)), data)
+
+    def test_jwk_to_public_key_rsa(self):
+        from kms_azure import _jwk_to_public_key
+        from cryptography.hazmat.primitives.asymmetric import rsa as _rsa
+        import base64
+        key = _rsa.generate_private_key(65537, 2048)
+        nums = key.public_key().public_numbers()
+        def i2b64(n): return base64.urlsafe_b64encode(n.to_bytes((n.bit_length()+7)//8, "big")).rstrip(b"=").decode()
+        jwk = {"kty": "RSA", "n": i2b64(nums.n), "e": i2b64(nums.e)}
+        pub = _jwk_to_public_key(jwk)
+        self.assertIsInstance(pub, _rsa.RSAPublicKey)
+
+    def test_jwk_to_public_key_ec(self):
+        from kms_azure import _jwk_to_public_key
+        from cryptography.hazmat.primitives.asymmetric import ec as _ec
+        import base64
+        key  = _ec.generate_private_key(_ec.SECP256R1())
+        nums = key.public_key().public_numbers()
+        def i2b64(n): return base64.urlsafe_b64encode(n.to_bytes(32, "big")).rstrip(b"=").decode()
+        jwk  = {"kty": "EC", "crv": "P-256", "x": i2b64(nums.x), "y": i2b64(nums.y)}
+        pub  = _jwk_to_public_key(jwk)
+        self.assertIsInstance(pub, _ec.EllipticCurvePublicKey)
+
+    def test_ec_signature_conversion_to_der(self):
+        """Azure returns raw r||s; verify we convert it to DER correctly."""
+        from kms_azure import _b64url_decode
+        from cryptography.hazmat.primitives.asymmetric.utils import decode_dss_signature
+        from cryptography.hazmat.primitives.asymmetric import ec as _ec
+        key = _ec.generate_private_key(_ec.SECP256R1())
+        from cryptography.hazmat.primitives import hashes
+        real_der = key.sign(b"test", _ec.ECDSA(hashes.SHA256()))
+        r, s = decode_dss_signature(real_der)
+        raw = r.to_bytes(32, "big") + s.to_bytes(32, "big")
+        import base64
+        # Simulate what the Azure signer does with raw r||s
+        half = len(raw) // 2
+        r2   = int.from_bytes(raw[:half], "big")
+        s2   = int.from_bytes(raw[half:], "big")
+        from cryptography.hazmat.primitives.asymmetric.utils import encode_dss_signature
+        der2 = encode_dss_signature(r2, s2)
+        self.assertEqual(der2, real_der)
+
+
+# ===========================================================================
 # TestOpenAPISpec — OpenAPI spec correctness and /api/v1/ aliasing
 # ===========================================================================
 

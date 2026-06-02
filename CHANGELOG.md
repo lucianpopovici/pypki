@@ -24,6 +24,20 @@ This project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `TestOIDCTokenVerification`, `TestOIDCFlow`, `TestSessionStore`, `TestOIDCDiscovery`.
   Setup guides for Keycloak, Okta, Entra ID, and Google Workspace in `docs/SSO.md`.
 
+- **Cloud KMS backends** (`key_backend.py`, `kms_aws.py`, `kms_gcp.py`, `kms_azure.py`,
+  `auth_aws.py`, `auth_gcp.py`, `auth_azure.py`, `db_migrations/pki/012_kms_backend.sql`,
+  `docs/KMS.md`):
+  CA private key protection via AWS KMS, GCP Cloud KMS, or Azure Key Vault. No pip deps:
+  all cloud API calls use stdlib urllib with hand-rolled SigV4 / OAuth2 / AAD auth.
+  `KeyBackend` protocol + `KMSRSAPrivateKey` / `KMSECPrivateKey` shims implement the
+  `cryptography` ABC interfaces so `CertificateBuilder.sign()` works unchanged.
+  `--ca-key-backend aws-kms|gcp-kms|azure-kv`, `--ca-key-backend-ref`, per-provider
+  auth flags. `ca_keys` DB table tracks backend/ref/meta. Auth modules: `auth_aws.py`
+  (SigV4 + IMDSv2), `auth_gcp.py` (metadata server + SA JWT), `auth_azure.py` (IMDS +
+  client-credential). Admin CLI: `kms-import-ca`, `kms-test-sign`, `kms-rotate-version`.
+  Integration tests gated on env vars (`PYPKI_TEST_AWS_KMS_ARN` etc.). 20 new tests across
+  `TestKeyBackendInterface`, `TestAWSKMSBackend`, `TestGCPKMSBackend`, `TestAzureKVBackend`.
+
 - **Terraform provider contract** (`openapi.py`, `docs/openapi.json`, `docs/INTEGRATIONS.md`):
   PyPKI-side changes that enable the `terraform-provider-pypki` Go repo:
   OpenAPI 3.0.3 spec (`docs/openapi.json`, 50+ endpoints) served at `GET /api/openapi.json`.

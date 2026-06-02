@@ -5391,6 +5391,58 @@ def main():
         help="Generate a 4096-bit RSA key on the token if the label is absent. "
              "The generated key has CKA_EXTRACTABLE=False — it can never be exported."
     )
+    kms_group = parser.add_argument_group(
+        "Cloud KMS key backends",
+        "AWS KMS, GCP Cloud KMS, or Azure Key Vault as CA signing key backends. "
+        "The private key never leaves the cloud provider. "
+        "Use instead of (or alongside) --hsm-module.",
+    )
+    kms_group.add_argument(
+        "--ca-key-backend",
+        default="file",
+        choices=["file", "pkcs11", "aws-kms", "gcp-kms", "azure-kv"],
+        metavar="BACKEND",
+        help="CA signing key backend: file (default), pkcs11, aws-kms, gcp-kms, azure-kv",
+    )
+    kms_group.add_argument(
+        "--ca-key-backend-ref", default="", metavar="REF",
+        help="Backend-specific key reference: ARN for AWS, resource path for GCP, "
+             "versioned key URL for Azure.",
+    )
+    kms_group.add_argument(
+        "--aws-region", default="us-east-1", metavar="REGION",
+        help="AWS region for KMS requests (default: us-east-1)",
+    )
+    kms_group.add_argument(
+        "--aws-auth", default="imdsv2", choices=["imdsv2", "iam-role", "static"],
+        metavar="MODE",
+        help="AWS auth mode: imdsv2 (default), iam-role (alias), static",
+    )
+    kms_group.add_argument(
+        "--aws-static-credentials-file", default="", metavar="FILE",
+        help="Path to JSON file with AWS static credentials (discouraged).",
+    )
+    kms_group.add_argument(
+        "--gcp-auth", default="metadata-server",
+        choices=["metadata-server", "workload-identity", "service-account-file"],
+        metavar="MODE",
+        help="GCP auth mode: metadata-server (default), workload-identity, service-account-file",
+    )
+    kms_group.add_argument(
+        "--gcp-service-account-file", default="", metavar="FILE",
+        help="Path to GCP service-account JSON key file (discouraged).",
+    )
+    kms_group.add_argument(
+        "--azure-auth", default="managed-identity",
+        choices=["managed-identity", "workload-identity", "client-secret"],
+        metavar="MODE",
+        help="Azure auth mode: managed-identity (default), workload-identity, client-secret",
+    )
+    kms_group.add_argument(
+        "--azure-client-secret-file", default="", metavar="FILE",
+        help="Path to file containing the Azure client secret (discouraged).",
+    )
+
     ra_group = parser.add_argument_group(
         "RA / approval workflow (§5.4)",
         "Registration Authority controls. By default all requests are auto-approved "
@@ -6139,6 +6191,48 @@ def main():
         pki_db_url=getattr(args, "pki_db_url", None) or "",
         hsm_cfg=_build_hsm_cfg(args),
     )
+
+    # Cloud KMS backend: replace ca.ca_key with the KMS-backed shim if requested
+    _kms_backend_name = getattr(args, "ca_key_backend", "file")
+    _kms_ref          = getattr(args, "ca_key_backend_ref", "")
+    if _kms_backend_name not in ("file", "pkcs11") and _kms_ref:
+        try:
+            import key_backend as _kb
+            _kms_cfg = {
+                "region":                   getattr(args, "aws_region", "us-east-1"),
+                "auth_mode":                getattr(args, "aws_auth", "imdsv2"),
+                "static_credentials_file":  getattr(args, "aws_static_credentials_file", "") or None,
+                "service_account_file":     getattr(args, "gcp_service_account_file", "") or None,
+                "tenant_id":                None,
+                "client_id":                None,
+                "client_secret_file":       getattr(args, "azure_client_secret_file", "") or None,
+            }
+            if _kms_backend_name == "gcp-kms":
+                _kms_cfg["auth_mode"] = getattr(args, "gcp_auth", "metadata-server")
+            elif _kms_backend_name == "azure-kv":
+                _kms_cfg["auth_mode"] = getattr(args, "azure_auth", "managed-identity")
+            _kms_bk  = _kb.build_backend(_kms_backend_name, _kms_ref, _kms_cfg)
+            ca.ca_key = _kms_bk.get_private_key(_kms_ref)
+            logger.info("CA signing key loaded from %s backend (ref=%s)",
+                        _kms_backend_name, _kms_ref)
+            # Record in ca_keys table
+            import time as _time, json as _json
+            try:
+                ca._pki_db.execute(
+                    "INSERT OR REPLACE INTO ca_keys "
+                    "(name, backend, backend_ref, backend_meta_json, created_at) "
+                    "VALUES (?, ?, ?, ?, ?)",
+                    (args.ca_dir, _kms_backend_name, _kms_ref,
+                     _json.dumps({"region": _kms_cfg.get("region")}),
+                     int(_time.time())),
+                )
+            except Exception as _e:
+                logger.debug("Could not record ca_keys entry: %s", _e)
+        except Exception as _exc:
+            logger.error("Failed to load cloud KMS backend %s: %s — aborting",
+                         _kms_backend_name, _exc)
+            raise SystemExit(1) from _exc
+
     # Store reload interval on ca so sub-modules (ipsec_server) can read it
     ca._tls_reload_interval = getattr(args, "tls_reload_interval", 60)
 

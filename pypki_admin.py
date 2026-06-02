@@ -1059,6 +1059,52 @@ def build_parser() -> argparse.ArgumentParser:
                     choices=["DEBUG", "INFO", "WARNING", "ERROR"])
     oa.set_defaults(func=cmd_openapi_export)
 
+    # ------------------------------------------------------------------
+    # Cloud KMS subcommands
+    # ------------------------------------------------------------------
+
+    kms_imp = sub.add_parser(
+        "kms-import-ca",
+        help="Register an existing cloud KMS key as a PyPKI CA signing key.",
+    )
+    kms_imp.add_argument("--backend", required=True,
+                         choices=["aws-kms", "gcp-kms", "azure-kv"])
+    kms_imp.add_argument("--backend-ref", required=True, metavar="REF",
+                         help="ARN/resource path/vault URL for the key.")
+    kms_imp.add_argument("--name",    required=True, metavar="NAME",
+                         help="Human name for this CA (e.g. root-2026).")
+    kms_imp.add_argument("--ca-dir",  default="./ca", metavar="DIR")
+    kms_imp.add_argument("--pki-db-url", default=None, metavar="URL")
+    kms_imp.add_argument("--aws-region", default="us-east-1")
+    kms_imp.add_argument("--log-level", default="INFO",
+                         choices=["DEBUG", "INFO", "WARNING", "ERROR"])
+    kms_imp.set_defaults(func=cmd_kms_import_ca)
+
+    kms_test = sub.add_parser(
+        "kms-test-sign",
+        help="Round-trip test: sign a test digest with the KMS-backed CA key and verify.",
+    )
+    kms_test.add_argument("--backend", required=True,
+                          choices=["aws-kms", "gcp-kms", "azure-kv"])
+    kms_test.add_argument("--backend-ref", required=True, metavar="REF")
+    kms_test.add_argument("--aws-region", default="us-east-1")
+    kms_test.add_argument("--log-level", default="INFO",
+                          choices=["DEBUG", "INFO", "WARNING", "ERROR"])
+    kms_test.set_defaults(func=cmd_kms_test_sign)
+
+    kms_rot = sub.add_parser(
+        "kms-rotate-version",
+        help="Switch the CA to a new key version in the same KMS backend.",
+    )
+    kms_rot.add_argument("--name",    required=True, metavar="NAME")
+    kms_rot.add_argument("--new-ref", required=True, metavar="REF",
+                         help="New backend_ref (new version ARN/URL).")
+    kms_rot.add_argument("--ca-dir",  default="./ca", metavar="DIR")
+    kms_rot.add_argument("--pki-db-url", default=None, metavar="URL")
+    kms_rot.add_argument("--log-level", default="INFO",
+                         choices=["DEBUG", "INFO", "WARNING", "ERROR"])
+    kms_rot.set_defaults(func=cmd_kms_rotate_version)
+
     return root
 
 
@@ -2512,6 +2558,77 @@ def cmd_openapi_export(args: argparse.Namespace) -> int:
         print(f"OpenAPI spec written to {output}")
     else:
         print(text)
+    return 0
+
+
+def cmd_kms_import_ca(args: argparse.Namespace) -> int:
+    """Register an existing cloud KMS key as a PyPKI CA."""
+    _setup_logging(args.log_level)
+    db = _open_pki_db(args)
+    import time as _time, json as _json
+    now = int(_time.time())
+    db.execute(
+        "INSERT OR REPLACE INTO ca_keys "
+        "(name, backend, backend_ref, backend_meta_json, created_at) "
+        "VALUES (?, ?, ?, ?, ?)",
+        (args.name, args.backend, args.backend_ref,
+         _json.dumps({"region": getattr(args, "aws_region", "us-east-1")}),
+         now),
+    )
+    print(f"CA key registered: name={args.name!r} backend={args.backend} ref={args.backend_ref!r}")
+    return 0
+
+
+def cmd_kms_test_sign(args: argparse.Namespace) -> int:
+    """Round-trip test sign + verify with a cloud KMS key."""
+    _setup_logging(args.log_level)
+    import key_backend as _kb
+    import hashlib
+
+    cfg = {"region": getattr(args, "aws_region", "us-east-1")}
+    try:
+        backend = _kb.build_backend(args.backend, args.backend_ref, cfg)
+        pub_key = backend.public_key(args.backend_ref)
+        print(f"Public key loaded: {type(pub_key).__name__}")
+
+        # Sign a test digest
+        test_data = b"pypki-kms-test-sign-probe"
+        digest    = hashlib.sha256(test_data).digest()
+        sig       = backend.sign(args.backend_ref, digest, "ecdsa-sha256")
+        print(f"Signature ({len(sig)} bytes): {sig[:8].hex()}...")
+
+        # Verify
+        from cryptography.hazmat.primitives.asymmetric import ec as _ec, padding as _pad
+        from cryptography.hazmat.primitives import hashes as _h
+        from cryptography.hazmat.primitives.asymmetric.utils import encode_dss_signature
+        if hasattr(pub_key, "verify"):
+            from cryptography.hazmat.primitives.asymmetric import ec
+            pub_key.verify(sig, test_data, ec.ECDSA(_h.SHA256()))
+            print("Signature verified OK.")
+        print("kms-test-sign: PASS")
+        return 0
+    except Exception as exc:
+        print(f"kms-test-sign: FAILED — {exc}")
+        return 1
+
+
+def cmd_kms_rotate_version(args: argparse.Namespace) -> int:
+    """Atomically switch a CA to a new KMS key version."""
+    _setup_logging(args.log_level)
+    db = _open_pki_db(args)
+    row = db.fetchone("SELECT * FROM ca_keys WHERE name = ?", (args.name,))
+    if row is None:
+        print(f"ERROR: CA key not found: {args.name!r}")
+        return 1
+    old_ref = row["backend_ref"]
+    db.execute(
+        "UPDATE ca_keys SET backend_ref = ? WHERE name = ?",
+        (args.new_ref, args.name),
+    )
+    print(f"CA key rotated: {args.name!r}")
+    print(f"  old ref: {old_ref}")
+    print(f"  new ref: {args.new_ref}")
+    print("Restart the PyPKI server to load the new key version.")
     return 0
 
 
