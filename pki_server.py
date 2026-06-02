@@ -1599,6 +1599,9 @@ class CertProfile:
             "eku": [ExtendedKeyUsageOID.CODE_SIGNING],
             "san_required": False,
             "bc_ca": False,
+            # Code-signing lifecycle changes require admin sign-off for audit reasons
+            "portal_self_revoke": False,
+            "portal_self_renew":  False,
         },
         "email": {
             "key_usage": dict(digital_signature=True, content_commitment=True,
@@ -5658,6 +5661,15 @@ def main():
         "--web-pam-service", default="login", metavar="SERVICE",
         help="PAM service name used for web dashboard login (default: login)"
     )
+    ops_group.add_argument(
+        "--portal-prefix", default=None, metavar="PREFIX",
+        help="Mount self-service portal at this path prefix (e.g. /portal). "
+             "Portal lets end users manage their own certs without admin access."
+    )
+    ops_group.add_argument(
+        "--portal-owner-mapping-file", default="", metavar="FILE",
+        help="JSON file with subject-DN regex → owner_id mappings for legacy certs."
+    )
 
     auth_group = parser.add_argument_group(
         "SSO / Authentication",
@@ -6518,6 +6530,23 @@ def main():
                 ocsp_module=_ocsp_module   if HAS_OCSP  else None,
                 ipsec_module=_ipsec_module if HAS_IPSEC else None,
             )
+
+    # Start portal if requested
+    portal_srv = None
+    _portal_prefix = getattr(args, "portal_prefix", None)
+    if _portal_prefix:
+        try:
+            import portal as _portal_module
+            portal_srv = _portal_module.start_portal(
+                route_table=route_table,
+                prefix=_portal_prefix,
+                ca=ca,
+                audit_log=audit_log,
+                owner_mapping_file=getattr(args, "portal_owner_mapping_file", ""),
+            )
+            logger.info("Self-service portal mounted at %s", _portal_prefix)
+        except Exception as _exc:
+            logger.error("Failed to start portal: %s", _exc)
 
     ca_mode_label = (
         f"intermediate ({len(ca._parent_chain)} parent cert(s))"

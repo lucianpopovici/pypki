@@ -24,6 +24,16 @@ This project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `TestOIDCTokenVerification`, `TestOIDCFlow`, `TestSessionStore`, `TestOIDCDiscovery`.
   Setup guides for Keycloak, Okta, Entra ID, and Google Workspace in `docs/SSO.md`.
 
+- **Self-Service Portal** (`portal.py`, `db_migrations/pki/009_portal.sql`, `docs/PORTAL.md`):
+  Scope-restricted view at `--portal-prefix /portal` where each authenticated user sees
+  and manages only their own certificates. Ownership stored in `cert_owners` table; supports
+  OIDC subject, PAM username, ACME/SCEP/static kinds. Same-key renewal (issues new cert,
+  revokes predecessor with reason `superseded`), self-service revocation, scoped audit log
+  view. Profile-level gates: `code_signing` sets `portal_self_revoke: false` and
+  `portal_self_renew: false`. Static subject-DN regex mappings via `--portal-owner-mapping-file`.
+  Admin CLI: `link-account`, `portal-remap`. 24 new tests across `TestPortalOwnership`,
+  `TestPortalRenewal`, `TestPortalRevocation`, `TestPortalScopeIsolation`.
+
 ### Security
 
 - JWS `alg: none` and unknown algorithm values are rejected before any signature check.

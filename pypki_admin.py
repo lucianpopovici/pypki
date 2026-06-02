@@ -951,6 +951,39 @@ def build_parser() -> argparse.ArgumentParser:
                           choices=["DEBUG", "INFO", "WARNING", "ERROR"])
     tok_list.set_defaults(func=cmd_token_list)
 
+    # ------------------------------------------------------------------
+    # Portal subcommands
+    # ------------------------------------------------------------------
+
+    lnk = sub.add_parser(
+        "link-account",
+        help="Grant portal ownership of a certificate to a user identity.",
+    )
+    lnk.add_argument("--serial", required=True, type=int, metavar="SERIAL",
+                     help="Certificate serial number.")
+    lnk.add_argument("--identity", required=True, metavar="IDENTITY",
+                     help="User identity (email, username, OIDC sub, etc.).")
+    lnk.add_argument("--kind", default="static", metavar="KIND",
+                     choices=["oidc", "pam", "acme", "scep", "est", "cmp", "ssh", "static"],
+                     help="Owner kind (default: static).")
+    lnk.add_argument("--ca-dir", default="./ca", metavar="DIR")
+    lnk.add_argument("--pki-db-url", default=None, metavar="URL")
+    lnk.add_argument("--log-level", default="WARNING",
+                     choices=["DEBUG", "INFO", "WARNING", "ERROR"])
+    lnk.set_defaults(func=cmd_link_account)
+
+    premap = sub.add_parser(
+        "portal-remap",
+        help="Re-apply static owner mappings from --portal-owner-mapping-file to all certs.",
+    )
+    premap.add_argument("--mapping-file", required=True, metavar="FILE",
+                        help="JSON owner-mapping file.")
+    premap.add_argument("--ca-dir", default="./ca", metavar="DIR")
+    premap.add_argument("--pki-db-url", default=None, metavar="URL")
+    premap.add_argument("--log-level", default="WARNING",
+                        choices=["DEBUG", "INFO", "WARNING", "ERROR"])
+    premap.set_defaults(func=cmd_portal_remap)
+
     return root
 
 
@@ -2259,6 +2292,30 @@ def cmd_token_list(args: argparse.Namespace) -> int:
         ident = (row["identity"] or "")[:28]
         roles = (row["roles"] or "[]")[:18]
         print(f"{tag}{short:<22} {ident:<30} {roles:<20} {exp}")
+    return 0
+
+
+def cmd_link_account(args: argparse.Namespace) -> int:
+    """Grant portal ownership of a cert to a user identity."""
+    _setup_logging(args.log_level)
+    db = _open_pki_db(args)
+    import portal as _portal
+    _portal.tag_owner(db, args.serial, args.kind, args.identity)
+    print(f"Ownership granted: serial={args.serial} kind={args.kind} identity={args.identity!r}")
+    return 0
+
+
+def cmd_portal_remap(args: argparse.Namespace) -> int:
+    """Re-apply static owner mappings from a JSON file."""
+    _setup_logging(args.log_level)
+    db = _open_pki_db(args)
+    import portal as _portal
+    mappings = _portal.load_owner_mapping_file(args.mapping_file)
+    if not mappings:
+        print("No mappings found in file.")
+        return 0
+    n = _portal.apply_static_mappings(mappings, db)
+    print(f"Applied {n} ownership row(s) from {len(mappings)} mapping(s).")
     return 0
 
 
