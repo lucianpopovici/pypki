@@ -6,45 +6,38 @@ GCP authentication helpers — metadata server and service-account JWT auth.
 Stdlib only; no google-cloud-auth dependency.
 """
 
-import base64
 import hashlib
 import hmac
 import json
 import logging
 import os
-import threading
 import time
 import urllib.request
 from typing import Dict, Optional, Tuple
 
+from oidc import _b64url_encode
+
 log = logging.getLogger("pypki.auth_gcp")
 
-_TOKEN_REFRESH_SLACK = 300   # refresh 5 min before expiry
 _METADATA_SERVER     = "http://metadata.google.internal"
 _METADATA_FLAVOR_HDR = {"Metadata-Flavor": "Google"}
+
+from auth import _CachedToken
 
 
 # ---------------------------------------------------------------------------
 # Metadata server token retrieval
 # ---------------------------------------------------------------------------
 
-class GCPMetadataToken:
+class GCPMetadataToken(_CachedToken):
     """Thread-safe GCP access-token cache backed by the metadata server."""
 
     def __init__(self, service_account: str = "default") -> None:
-        self._sa     = service_account
-        self._lock   = threading.Lock()
-        self._token: str = ""
-        self._expiry: float = 0.0
+        super().__init__()
+        self._sa = service_account
 
-    def get(self) -> str:
-        with self._lock:
-            if self._token and time.time() < self._expiry - _TOKEN_REFRESH_SLACK:
-                return self._token
-            tok, expires_in = _fetch_metadata_token(self._sa)
-            self._token  = tok
-            self._expiry = time.time() + expires_in
-            return self._token
+    def _fetch(self) -> tuple:
+        return _fetch_metadata_token(self._sa)
 
 
 def _fetch_metadata_token(service_account: str = "default") -> Tuple[str, int]:
@@ -62,10 +55,6 @@ def _fetch_metadata_token(service_account: str = "default") -> Tuple[str, int]:
 # ---------------------------------------------------------------------------
 # Service-account JSON key (offline, static credentials)
 # ---------------------------------------------------------------------------
-
-def _b64url_encode(b: bytes) -> str:
-    return base64.urlsafe_b64encode(b).rstrip(b"=").decode()
-
 
 def _sa_jwt(sa_info: dict, scopes: str = "https://www.googleapis.com/auth/cloudkms") -> str:
     """
@@ -112,23 +101,15 @@ def _exchange_sa_jwt(sa_info: dict) -> Tuple[str, int]:
     return data["access_token"], int(data.get("expires_in", 3600))
 
 
-class GCPServiceAccountToken:
+class GCPServiceAccountToken(_CachedToken):
     """Thread-safe token cache for service-account JSON key files."""
 
     def __init__(self, sa_file: str) -> None:
+        super().__init__()
         self._sa_info = json.loads(open(sa_file).read())
-        self._lock    = threading.Lock()
-        self._token:  str   = ""
-        self._expiry: float = 0.0
 
-    def get(self) -> str:
-        with self._lock:
-            if self._token and time.time() < self._expiry - _TOKEN_REFRESH_SLACK:
-                return self._token
-            tok, exp = _exchange_sa_jwt(self._sa_info)
-            self._token  = tok
-            self._expiry = time.time() + exp
-            return self._token
+    def _fetch(self) -> tuple:
+        return _exchange_sa_jwt(self._sa_info)
 
 
 def resolve_token(

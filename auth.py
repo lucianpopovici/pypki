@@ -25,6 +25,39 @@ from typing import Optional, List
 
 log = logging.getLogger("pypki.auth")
 
+_TOKEN_REFRESH_SLACK = 300   # refresh 5 min before expiry
+
+
+# ---------------------------------------------------------------------------
+# Shared token-cache base (used by cloud auth helpers)
+# ---------------------------------------------------------------------------
+
+class _CachedToken:
+    """
+    Thread-safe token cache with TTL-based refresh.
+
+    Subclasses implement `_fetch() -> (token, expires_in_seconds)`.
+    `get()` returns the cached token, refreshing if within
+    `_TOKEN_REFRESH_SLACK` seconds of expiry.
+    """
+
+    def __init__(self) -> None:
+        self._lock:   threading.Lock = threading.Lock()
+        self._token:  str   = ""
+        self._expiry: float = 0.0
+
+    def _fetch(self) -> tuple:
+        raise NotImplementedError
+
+    def get(self) -> str:
+        with self._lock:
+            if self._token and time.time() < self._expiry - _TOKEN_REFRESH_SLACK:
+                return self._token
+            tok, expires_in = self._fetch()
+            self._token  = tok
+            self._expiry = time.time() + expires_in
+            return self._token
+
 
 # ---------------------------------------------------------------------------
 # Exceptions

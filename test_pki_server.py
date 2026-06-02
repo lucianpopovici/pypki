@@ -15398,6 +15398,48 @@ class TestAgilityMetrics(unittest.TestCase):
 
 
 # ===========================================================================
+# ---------------------------------------------------------------------------
+# Shared helper for codesign test classes
+# ---------------------------------------------------------------------------
+
+def _make_codesign_oidc_token(
+    iss: str = "https://test.example.com",
+    sub: str = "ci@example.com",
+    aud: str = "pypki-codesign",
+):
+    """
+    Create a real RS256 JWT + matching fake JWKS cache for codesign tests.
+    Returns (token_str, fake_cache_object).
+    """
+    from cryptography.hazmat.primitives.asymmetric import rsa as _rsa, padding as _pad
+    from cryptography.hazmat.primitives import hashes as _h
+    import base64 as _b64, json as _json
+
+    key = _rsa.generate_private_key(65537, 2048)
+    pub = key.public_key().public_numbers()
+
+    def i2b64(n):
+        return _b64.urlsafe_b64encode(n.to_bytes((n.bit_length() + 7) // 8, "big")).rstrip(b"=").decode()
+    def b64u(b):
+        return _b64.urlsafe_b64encode(b).rstrip(b"=").decode()
+
+    jwk = {"kty": "RSA", "kid": "k1", "n": i2b64(pub.n), "e": i2b64(pub.e)}
+    now = int(time.time())
+    h   = b64u(_json.dumps({"alg": "RS256", "kid": "k1"}).encode())
+    p   = b64u(_json.dumps({"iss": iss, "aud": aud, "sub": sub,
+                             "exp": now + 3600, "iat": now}).encode())
+    sig = key.sign(f"{h}.{p}".encode(), _pad.PKCS1v15(), _h.SHA256())
+    token = f"{h}.{p}.{b64u(sig)}"
+
+    class _FakeJWKSCache:
+        _jwks = [jwk]
+        def get_jwks_for_kid(self, kid): return self._jwks
+        def get_jwks(self): return self._jwks
+
+    return token, _FakeJWKSCache()
+
+
+# ===========================================================================
 # TestDSSE — DSSE envelope PAE, parsing, signing, verification
 # ===========================================================================
 
@@ -15621,31 +15663,7 @@ class TestCodeSignSubmit(unittest.TestCase):
         )
 
     def _make_oidc_token(self, iss="https://test.example.com", sub="ci@example.com"):
-        """Create a real RS256 JWT for testing."""
-        from cryptography.hazmat.primitives.asymmetric import rsa as _rsa, padding as _pad
-        from cryptography.hazmat.primitives import hashes as _h
-        import base64 as _b64, json as _json
-        key = _rsa.generate_private_key(65537, 2048)
-        pub = key.public_key().public_numbers()
-
-        def i2b64(n): return _b64.urlsafe_b64encode(n.to_bytes((n.bit_length()+7)//8,"big")).rstrip(b"=").decode()
-        def b64u(b):  return _b64.urlsafe_b64encode(b).rstrip(b"=").decode()
-
-        jwk = {"kty":"RSA","kid":"k1","n":i2b64(pub.n),"e":i2b64(pub.e)}
-        now = int(time.time())
-        h = b64u(_json.dumps({"alg":"RS256","kid":"k1"}).encode())
-        p = b64u(_json.dumps({"iss":iss,"aud":"pypki-codesign","sub":sub,"exp":now+3600,"iat":now}).encode())
-        msg = f"{h}.{p}".encode()
-        sig = key.sign(msg, _pad.PKCS1v15(), _h.SHA256())
-        token = f"{h}.{p}.{b64u(sig)}"
-
-        # Build a fake JWKS cache
-        class _FakeCache:
-            _jwks = [jwk]
-            def get_jwks_for_kid(self, kid): return self._jwks
-            def get_jwks(self): return self._jwks
-
-        return token, _FakeCache()
+        return _make_codesign_oidc_token(iss=iss, sub=sub)
 
     def test_valid_submission_returns_bundle(self):
         token, cache = self._make_oidc_token()
@@ -15752,25 +15770,7 @@ class TestCodeSignVerify(unittest.TestCase):
         )
 
     def _make_token(self, sub="ci@example.com"):
-        from cryptography.hazmat.primitives.asymmetric import rsa as _rsa, padding as _pad
-        from cryptography.hazmat.primitives import hashes as _h
-        import base64 as _b64, json as _json
-        key = _rsa.generate_private_key(65537, 2048)
-        pub = key.public_key().public_numbers()
-        def i2b64(n): return _b64.urlsafe_b64encode(n.to_bytes((n.bit_length()+7)//8,"big")).rstrip(b"=").decode()
-        def b64u(b): return _b64.urlsafe_b64encode(b).rstrip(b"=").decode()
-        jwk = {"kty":"RSA","kid":"k1","n":i2b64(pub.n),"e":i2b64(pub.e)}
-        now = int(time.time())
-        h = b64u(_json.dumps({"alg":"RS256","kid":"k1"}).encode())
-        p = b64u(_json.dumps({"iss":"https://test.example.com","aud":"pypki-codesign","sub":sub,"exp":now+3600,"iat":now}).encode())
-        msg = f"{h}.{p}".encode()
-        sig = key.sign(msg, _pad.PKCS1v15(), _h.SHA256())
-        token = f"{h}.{p}.{b64u(sig)}"
-        class _Cache:
-            _jwks=[jwk]
-            def get_jwks_for_kid(self,k): return self._jwks
-            def get_jwks(self): return self._jwks
-        return token, _Cache()
+        return _make_codesign_oidc_token(sub=sub)
 
     def test_verify_by_digest_returns_entry(self):
         self.svc.submit(

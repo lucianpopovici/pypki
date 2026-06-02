@@ -16,7 +16,6 @@ Supported algorithms (verify at release time):
   ECDSA: ES256, ES384, ES512
 """
 
-import base64
 import json
 import logging
 import threading
@@ -28,6 +27,9 @@ from typing import Any, Dict, Optional
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec, rsa, padding as asym_padding
 from cryptography.hazmat.primitives.asymmetric.utils import encode_dss_signature
+
+from oidc import _b64url_encode, _b64url_decode
+from kms_aws import _compute_digest
 
 from key_backend import KMSRSAPrivateKey, KMSECPrivateKey
 
@@ -64,21 +66,6 @@ def _akv_request(url: str, token: str, body: Optional[dict] = None) -> dict:
     with urllib.request.urlopen(req, timeout=10) as r:
         return json.loads(r.read())
 
-
-def _b64url_encode(b: bytes) -> str:
-    return base64.urlsafe_b64encode(b).rstrip(b"=").decode()
-
-
-def _b64url_decode(s: str) -> bytes:
-    pad = (-len(s)) % 4
-    return base64.urlsafe_b64decode(s + "=" * pad)
-
-
-def _compute_digest(data: bytes, algorithm: hashes.HashAlgorithm) -> bytes:
-    from cryptography.hazmat.backends import default_backend
-    h = hashes.Hash(algorithm, default_backend())
-    h.update(data)
-    return h.finalize()
 
 
 def _jwk_to_public_key(jwk: dict) -> Any:

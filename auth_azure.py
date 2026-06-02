@@ -9,7 +9,6 @@ Stdlib only; no azure-identity dependency.
 import json
 import logging
 import os
-import threading
 import time
 import urllib.parse
 import urllib.request
@@ -17,32 +16,25 @@ from typing import Optional, Tuple
 
 log = logging.getLogger("pypki.auth_azure")
 
-_TOKEN_REFRESH_SLACK = 300
-_IMDS_URL = "http://169.254.169.254/metadata/identity/oauth2/token"
-_IMDS_API_VERSION    = "2018-02-01"
+_IMDS_URL         = "http://169.254.169.254/metadata/identity/oauth2/token"
+_IMDS_API_VERSION = "2018-02-01"
+
+from auth import _CachedToken
 
 
 # ---------------------------------------------------------------------------
 # Managed Identity token retrieval (IMDS)
 # ---------------------------------------------------------------------------
 
-class ManagedIdentityToken:
+class ManagedIdentityToken(_CachedToken):
     """Thread-safe Azure access-token cache using IMDS managed identity."""
 
     def __init__(self, resource: str = "https://vault.azure.net") -> None:
+        super().__init__()
         self._resource = resource
-        self._lock     = threading.Lock()
-        self._token:   str   = ""
-        self._expiry:  float = 0.0
 
-    def get(self) -> str:
-        with self._lock:
-            if self._token and time.time() < self._expiry - _TOKEN_REFRESH_SLACK:
-                return self._token
-            tok, exp = _fetch_imds_token(self._resource)
-            self._token  = tok
-            self._expiry = time.time() + exp
-            return self._token
+    def _fetch(self) -> tuple:
+        return _fetch_imds_token(self._resource)
 
 
 def _fetch_imds_token(resource: str) -> Tuple[str, int]:
@@ -64,7 +56,7 @@ def _fetch_imds_token(resource: str) -> Tuple[str, int]:
 # Client-credential flow (for non-managed deployments)
 # ---------------------------------------------------------------------------
 
-class ClientCredentialToken:
+class ClientCredentialToken(_CachedToken):
     """Thread-safe AAD token cache using client-secret credential flow."""
 
     def __init__(
@@ -74,24 +66,16 @@ class ClientCredentialToken:
         client_secret: str,
         resource: str = "https://vault.azure.net",
     ) -> None:
+        super().__init__()
         self._tenant    = tenant_id
         self._client_id = client_id
         self._secret    = client_secret
         self._resource  = resource
-        self._lock      = threading.Lock()
-        self._token:    str   = ""
-        self._expiry:   float = 0.0
 
-    def get(self) -> str:
-        with self._lock:
-            if self._token and time.time() < self._expiry - _TOKEN_REFRESH_SLACK:
-                return self._token
-            tok, exp = _fetch_client_credential_token(
-                self._tenant, self._client_id, self._secret, self._resource
-            )
-            self._token  = tok
-            self._expiry = time.time() + exp
-            return self._token
+    def _fetch(self) -> tuple:
+        return _fetch_client_credential_token(
+            self._tenant, self._client_id, self._secret, self._resource
+        )
 
 
 def _fetch_client_credential_token(
