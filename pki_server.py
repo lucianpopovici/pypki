@@ -5658,6 +5658,58 @@ def main():
         "--web-pam-service", default="login", metavar="SERVICE",
         help="PAM service name used for web dashboard login (default: login)"
     )
+
+    auth_group = parser.add_argument_group(
+        "SSO / Authentication",
+        "OIDC Authorization Code + PKCE (RFC 7636) for enterprise SSO. "
+        "Default is system PAM (--auth pam). Requires --web-prefix to be set.",
+    )
+    auth_group.add_argument(
+        "--auth", default="pam", choices=["pam", "oidc"], metavar="BACKEND",
+        help="Authentication backend: pam (default) or oidc"
+    )
+    auth_group.add_argument(
+        "--oidc-issuer", default="", metavar="URL",
+        help="OIDC issuer URL (e.g. https://accounts.google.com). "
+             "Discovery doc fetched from {issuer}/.well-known/openid-configuration"
+    )
+    auth_group.add_argument(
+        "--oidc-client-id", default="", metavar="ID",
+        help="OIDC client_id registered with the IdP"
+    )
+    auth_group.add_argument(
+        "--oidc-client-secret-file", default="", metavar="FILE",
+        help="Path to a file containing the OIDC client secret (one line, no trailing newline)"
+    )
+    auth_group.add_argument(
+        "--oidc-redirect-uri", default="", metavar="URL",
+        help="OIDC redirect_uri registered with the IdP (e.g. https://pki.example.com/callback)"
+    )
+    auth_group.add_argument(
+        "--oidc-identity-claim", default="email", metavar="CLAIM",
+        help="JWT claim used as the PyPKI identity (default: email)"
+    )
+    auth_group.add_argument(
+        "--oidc-roles-claim", default="groups", metavar="CLAIM",
+        help="JWT claim containing group memberships for role mapping (default: groups)"
+    )
+    auth_group.add_argument(
+        "--oidc-role-map", default="", metavar="MAP",
+        help="Comma-separated group=role pairs, e.g. admins=pki:admin,ops=pki:operator"
+    )
+    auth_group.add_argument(
+        "--oidc-default-role", default="pki:viewer", metavar="ROLE",
+        help="Role assigned to users not matched by --oidc-role-map "
+             "(default: pki:viewer; use pki:none for fail-closed)"
+    )
+    auth_group.add_argument(
+        "--oidc-session-ttl", type=int, default=28800, metavar="SECONDS",
+        help="OIDC session lifetime in seconds (default: 28800 = 8h)"
+    )
+    auth_group.add_argument(
+        "--oidc-jwks-refresh-interval", type=int, default=86400, metavar="SECONDS",
+        help="How often to refresh the IdP JWKS (default: 86400 = 24h)"
+    )
     ops_group.add_argument(
         "--acme-port", type=int, default=None, metavar="PORT",
         help="Port hint for ACME (informational in dispatcher mode; the dispatcher binds --port)"
@@ -6408,6 +6460,34 @@ def main():
             _acme_base2 = f"{_dispatcher_base}{args.acme_prefix}/directory" if getattr(args, "acme_prefix", None) else ""
             _scep_base  = f"{_dispatcher_base}{args.scep_prefix}"  if getattr(args, "scep_prefix",  None) else ""
             _est_base   = f"{_dispatcher_base}{args.est_prefix}/.well-known/est" if getattr(args, "est_prefix",  None) else ""
+            # Build OIDC config if --auth oidc is requested
+            _oidc_cfg = None
+            if getattr(args, "auth", "pam") == "oidc":
+                try:
+                    import auth as _auth_mod
+                    _secret = ""
+                    _sf = getattr(args, "oidc_client_secret_file", "")
+                    if _sf:
+                        _secret = Path(_sf).read_text().strip()
+                    _rmap: dict = {}
+                    for _pair in getattr(args, "oidc_role_map", "").split(","):
+                        if "=" in _pair:
+                            _k, _v = _pair.split("=", 1)
+                            _rmap[_k.strip()] = _v.strip()
+                    _oidc_cfg = _auth_mod.OIDCConfig(
+                        issuer                = getattr(args, "oidc_issuer", ""),
+                        client_id             = getattr(args, "oidc_client_id", ""),
+                        client_secret         = _secret,
+                        redirect_uri          = getattr(args, "oidc_redirect_uri", ""),
+                        identity_claim        = getattr(args, "oidc_identity_claim", "email"),
+                        roles_claim           = getattr(args, "oidc_roles_claim", "groups"),
+                        role_map              = _rmap,
+                        default_role          = getattr(args, "oidc_default_role", "pki:viewer"),
+                        session_ttl           = getattr(args, "oidc_session_ttl", 28800),
+                        jwks_refresh_interval = getattr(args, "oidc_jwks_refresh_interval", 86400),
+                    )
+                except Exception as _exc:
+                    logger.error("Failed to build OIDCConfig: %s", _exc)
             web_srv = _web_ui_module.start_web_ui(
                 route_table=route_table,
                 prefix=args.web_prefix,
@@ -6416,6 +6496,7 @@ def main():
                 rate_limiter=rate_limiter,
                 require_auth=not getattr(args, "web_no_auth", False),
                 pam_service=getattr(args, "web_pam_service", "login"),
+                oidc_config=_oidc_cfg,
                 dispatcher_base_url=_dispatcher_base,
                 cmp_base_url=f"{_dispatcher_base}{getattr(args, 'cmp_prefix', '/cmp')}",
                 acme_base_url=_acme_base2,

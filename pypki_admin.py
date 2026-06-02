@@ -898,6 +898,59 @@ def build_parser() -> argparse.ArgumentParser:
                        choices=["DEBUG", "INFO", "WARNING", "ERROR"])
     ag_ex.set_defaults(func=cmd_agility_export)
 
+    # ------------------------------------------------------------------
+    # SSO session management subcommands
+    # ------------------------------------------------------------------
+
+    ss_list = sub.add_parser(
+        "session-list",
+        help="List active SSO sessions (PAM, OIDC, and API tokens).",
+    )
+    ss_list.add_argument("--ca-dir", default="./ca", metavar="DIR")
+    ss_list.add_argument("--pki-db-url", default=None, metavar="URL")
+    ss_list.add_argument("--all", action="store_true", dest="include_all",
+                         help="Include expired and revoked sessions.")
+    ss_list.add_argument("--log-level", default="WARNING",
+                         choices=["DEBUG", "INFO", "WARNING", "ERROR"])
+    ss_list.set_defaults(func=cmd_session_list)
+
+    ss_rev = sub.add_parser(
+        "session-revoke",
+        help="Revoke a specific session by its session ID.",
+    )
+    ss_rev.add_argument("session_id", metavar="SESSION_ID")
+    ss_rev.add_argument("--ca-dir", default="./ca", metavar="DIR")
+    ss_rev.add_argument("--pki-db-url", default=None, metavar="URL")
+    ss_rev.add_argument("--log-level", default="WARNING",
+                        choices=["DEBUG", "INFO", "WARNING", "ERROR"])
+    ss_rev.set_defaults(func=cmd_session_revoke)
+
+    tok_create = sub.add_parser(
+        "token-create",
+        help="Create a long-lived API token for service-account automation.",
+    )
+    tok_create.add_argument("--identity", required=True, metavar="NAME",
+                            help="Name or email of the service account.")
+    tok_create.add_argument("--role", default="pki:operator", metavar="ROLE",
+                            help="PyPKI role (default: pki:operator).")
+    tok_create.add_argument("--ttl", type=int, default=365, metavar="DAYS",
+                            help="Token lifetime in days (default: 365).")
+    tok_create.add_argument("--ca-dir", default="./ca", metavar="DIR")
+    tok_create.add_argument("--pki-db-url", default=None, metavar="URL")
+    tok_create.add_argument("--log-level", default="WARNING",
+                            choices=["DEBUG", "INFO", "WARNING", "ERROR"])
+    tok_create.set_defaults(func=cmd_token_create)
+
+    tok_list = sub.add_parser(
+        "token-list",
+        help="List active API tokens.",
+    )
+    tok_list.add_argument("--ca-dir", default="./ca", metavar="DIR")
+    tok_list.add_argument("--pki-db-url", default=None, metavar="URL")
+    tok_list.add_argument("--log-level", default="WARNING",
+                          choices=["DEBUG", "INFO", "WARNING", "ERROR"])
+    tok_list.set_defaults(func=cmd_token_list)
+
     return root
 
 
@@ -2088,6 +2141,124 @@ def cmd_agility_export(args: argparse.Namespace) -> int:
         for row in rows:
             subject = str(row[1] or "").replace('"', '""')
             print(f'{row[0]},"{subject}",{row[2]},{row[3]},{row[4] or ""},{row[5] or "unknown"},{int(row[6])}')
+    return 0
+
+
+def _open_pki_db(args):
+    """Open the PKI database for SSO admin subcommands."""
+    from db import make_db
+    url = getattr(args, "pki_db_url", None)
+    if not url:
+        ca_dir = Path(getattr(args, "ca_dir", "./ca"))
+        url = f"sqlite:///{ca_dir / 'certificates.db'}"
+    return make_db(url)
+
+
+def cmd_session_list(args: argparse.Namespace) -> int:
+    """List active SSO sessions."""
+    _setup_logging(args.log_level)
+    db = _open_pki_db(args)
+    import time as _time
+    now = int(_time.time())
+    include_all = getattr(args, "include_all", False)
+
+    cond = "" if include_all else "WHERE (revoked = 0 AND expires_at > ?)"
+    params = () if include_all else (now,)
+    rows = db.fetchall(
+        "SELECT session_id, auth_backend, identity, roles, created_at, "
+        "expires_at, revoked FROM sso_sessions " + cond +
+        " ORDER BY created_at DESC LIMIT 200",
+        params,
+    )
+    if not rows:
+        print("No active sessions.")
+        return 0
+    print(f"{'SESSION_ID':<44} {'BACKEND':<7} {'IDENTITY':<30} {'ROLES':<20} {'EXPIRES'}")
+    print("-" * 120)
+    for row in rows:
+        import datetime as _dt
+        exp = _dt.datetime.fromtimestamp(row["expires_at"]).strftime("%Y-%m-%d %H:%M")
+        tag = "[REVOKED] " if row["revoked"] else ("[EXP] " if row["expires_at"] < now else "")
+        sid = row["session_id"][:40] + ".."
+        ident = (row["identity"] or "")[:28]
+        roles = (row["roles"] or "[]")[:18]
+        print(f"{tag}{sid:<44} {row['auth_backend']:<7} {ident:<30} {roles:<20} {exp}")
+    return 0
+
+
+def cmd_session_revoke(args: argparse.Namespace) -> int:
+    """Revoke a session by ID."""
+    _setup_logging(args.log_level)
+    db = _open_pki_db(args)
+    session_id = args.session_id
+    row = db.fetchone(
+        "SELECT identity, auth_backend FROM sso_sessions WHERE session_id = ?",
+        (session_id,),
+    )
+    if row is None:
+        print(f"ERROR: session not found: {session_id!r}")
+        return 1
+    db.execute(
+        "UPDATE sso_sessions SET revoked = 1 WHERE session_id = ?",
+        (session_id,),
+    )
+    print(f"Session revoked: identity={row['identity']} backend={row['auth_backend']}")
+    return 0
+
+
+def cmd_token_create(args: argparse.Namespace) -> int:
+    """Create a long-lived API token for automation."""
+    _setup_logging(args.log_level)
+    db = _open_pki_db(args)
+    import time as _time, secrets as _sec, json as _json
+
+    identity = args.identity
+    role     = args.role
+    ttl_days = args.ttl
+    ttl_sec  = ttl_days * 86400
+    now      = int(_time.time())
+    token    = _sec.token_urlsafe(32)
+
+    db.execute(
+        "INSERT INTO sso_sessions "
+        "(session_id, auth_backend, identity, idp_subject, idp_issuer, "
+        "roles, created_at, expires_at, last_seen_at, revoked) "
+        "VALUES (?, 'token', ?, NULL, NULL, ?, ?, ?, ?, 0)",
+        (token, identity, _json.dumps([role]), now, now + ttl_sec, now),
+    )
+    import datetime as _dt
+    exp = _dt.datetime.fromtimestamp(now + ttl_sec).strftime("%Y-%m-%d %H:%M UTC")
+    print(f"API token created for {identity!r} (role={role}, expires={exp}):")
+    print(f"  {token}")
+    print("Pass as: Authorization: Bearer <token>")
+    return 0
+
+
+def cmd_token_list(args: argparse.Namespace) -> int:
+    """List active API tokens."""
+    _setup_logging(args.log_level)
+    db = _open_pki_db(args)
+    import time as _time
+    now = int(_time.time())
+
+    rows = db.fetchall(
+        "SELECT session_id, identity, roles, created_at, expires_at, revoked "
+        "FROM sso_sessions WHERE auth_backend = 'token' ORDER BY created_at DESC",
+    )
+    if not rows:
+        print("No API tokens found.")
+        return 0
+    print(f"{'TOKEN (first 20)':<22} {'IDENTITY':<30} {'ROLES':<20} {'EXPIRES'}")
+    print("-" * 90)
+    for row in rows:
+        import datetime as _dt
+        expired = row["expires_at"] < now
+        tag = "[REVOKED] " if row["revoked"] else ("[EXP] " if expired else "")
+        exp = _dt.datetime.fromtimestamp(row["expires_at"]).strftime("%Y-%m-%d %H:%M")
+        short = row["session_id"][:20] + ".."
+        ident = (row["identity"] or "")[:28]
+        roles = (row["roles"] or "[]")[:18]
+        print(f"{tag}{short:<22} {ident:<30} {roles:<20} {exp}")
     return 0
 
 

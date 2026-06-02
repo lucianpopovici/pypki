@@ -237,7 +237,9 @@ class SessionStore:
             self._failures.pop(ip, None)
 
 
-# Module-level session store (shared across all handler instances)
+# Module-level session store. Replaced by DbSessionStore in start_web_ui()
+# once the CA (and its DB) is available. Falls back to in-memory SessionStore
+# for the brief window before start_web_ui() runs (no sessions are issued then).
 _session_store = SessionStore()
 
 # Set to True when the server is started with authentication enabled.
@@ -689,6 +691,10 @@ class WebUIHandler(http.server.BaseHTTPRequestHandler):
     rate_limiter  = None   # RateLimiter | None
     require_auth: bool = True   # PAM auth gate; set False with --web-no-auth
     pam_service:  str  = "login"  # PAM service name (e.g. "login", "sshd")
+    # OIDC configuration (None = PAM mode)
+    oidc_config  = None   # Optional[auth.OIDCConfig]
+    jwks_cache   = None   # Optional[auth.JWKSCache]
+    flow_cookie_key: bytes = b""   # HMAC key for flow cookie (set in start_web_ui)
     # Per-service base URLs (updated live when a service is started/stopped)
     cmp_base_url:   str = "http://localhost:8080"
     acme_base_url:  str = ""
@@ -723,6 +729,12 @@ class WebUIHandler(http.server.BaseHTTPRequestHandler):
         """Return the authenticated username or None."""
         if not self.require_auth:
             return "anonymous"
+        # Bearer token (Authorization header) for API automation
+        auth_hdr = self.headers.get("Authorization", "")
+        if auth_hdr.startswith("Bearer "):
+            bearer = auth_hdr[7:].strip()
+            if bearer:
+                return _session_store.validate(bearer)
         token = self._get_session_token()
         if not token:
             return None
@@ -773,9 +785,13 @@ class WebUIHandler(http.server.BaseHTTPRequestHandler):
     # ------------------------------------------------------------------
 
     def _handle_login_get(self) -> None:
-        """Show the login form.  If already authenticated, redirect to /."""
+        """Show login form (PAM) or redirect to IdP (OIDC)."""
         if self._current_user():
             self._redirect("/")
+            return
+        # OIDC mode: redirect to IdP instead of showing the form
+        if self.oidc_config is not None and self.jwks_cache is not None:
+            self._handle_oidc_login_redirect()
             return
         body = _login_page().encode()
         self.send_response(200)
@@ -832,7 +848,7 @@ class WebUIHandler(http.server.BaseHTTPRequestHandler):
 
         if ok:
             _session_store.clear_failures(ip)
-            token = _session_store.create(username)
+            token = _session_store.create(username, auth_backend="pam")
             logger.info("WebUI login: user=%s ip=%s", username, ip)
             if self.audit_log:
                 try:
@@ -874,7 +890,164 @@ class WebUIHandler(http.server.BaseHTTPRequestHandler):
         self.send_header("Content-Length", "0")
         self.end_headers()
 
+    # ------------------------------------------------------------------
+    # OIDC flow handlers
+    # ------------------------------------------------------------------
 
+    def _handle_oidc_login_redirect(self) -> None:
+        """Generate PKCE + state, encode in a flow cookie, redirect to IdP."""
+        import oidc as _oidc_mod
+        import auth as _auth_mod
+        verifier, challenge = _oidc_mod.generate_pkce()
+        state = _oidc_mod.generate_state()
+        auth_url = _oidc_mod.build_authorization_url(
+            authorization_endpoint=self.jwks_cache.authorization_endpoint,
+            client_id=self.oidc_config.client_id,
+            redirect_uri=self.oidc_config.redirect_uri,
+            state=state,
+            code_challenge=challenge,
+        )
+        flow_val = _auth_mod.encode_flow_cookie(state, verifier, self.flow_cookie_key)
+        self.send_response(302)
+        self.send_header(
+            "Set-Cookie",
+            f"{_auth_mod._FLOW_COOKIE_NAME}={flow_val}; "
+            "Max-Age=600; HttpOnly; SameSite=Lax; Path=/"
+        )
+        self.send_header("Location", auth_url)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+    def _get_flow_cookie(self) -> Optional[str]:
+        import auth as _auth_mod
+        cookie_header = self.headers.get("Cookie", "")
+        name = _auth_mod._FLOW_COOKIE_NAME + "="
+        for part in cookie_header.split(";"):
+            part = part.strip()
+            if part.startswith(name):
+                return part[len(name):]
+        return None
+
+    def _clear_flow_cookie(self) -> None:
+        import auth as _auth_mod
+        self.send_header(
+            "Set-Cookie",
+            f"{_auth_mod._FLOW_COOKIE_NAME}=; Max-Age=0; HttpOnly; SameSite=Lax; Path=/"
+        )
+
+    def _handle_oidc_callback(self) -> None:
+        """Handle IdP redirect: verify state, exchange code, create session."""
+        import oidc as _oidc_mod
+        import auth as _auth_mod
+        import urllib.parse as _up
+
+        qs = _up.parse_qs(self.path.split("?", 1)[1] if "?" in self.path else "")
+        code    = qs.get("code",  [""])[0]
+        state   = qs.get("state", [""])[0]
+        error   = qs.get("error", [""])[0]
+        ip      = self.client_address[0]
+
+        if error:
+            logger.warning("OIDC callback error from IdP: %s ip=%s", error, ip)
+            self._oidc_error("IdP returned an error. Please try again.")
+            return
+
+        flow_raw = self._get_flow_cookie()
+        if not flow_raw:
+            self._oidc_error("Login session expired. Please try again.")
+            return
+
+        try:
+            flow = _auth_mod.decode_flow_cookie(flow_raw, self.flow_cookie_key)
+        except _auth_mod.AuthError as exc:
+            logger.warning("OIDC flow cookie invalid: %s ip=%s", exc, ip)
+            self._oidc_error("Login session invalid or expired. Please try again.")
+            return
+
+        if flow.get("s") != state:
+            logger.warning("OIDC state mismatch ip=%s", ip)
+            self._oidc_error("CSRF state mismatch. Please try again.")
+            return
+
+        try:
+            token_resp = _oidc_mod.exchange_code(
+                token_endpoint=self.jwks_cache.token_endpoint,
+                client_id=self.oidc_config.client_id,
+                client_secret=self.oidc_config.client_secret,
+                code=code,
+                redirect_uri=self.oidc_config.redirect_uri,
+                code_verifier=flow["v"],
+            )
+        except Exception as exc:
+            logger.error("OIDC token exchange failed: %s ip=%s", exc, ip)
+            self._oidc_error("Token exchange failed. Please try again.")
+            return
+
+        id_token = token_resp.get("id_token", "")
+        if not id_token:
+            self._oidc_error("No id_token in token response.")
+            return
+
+        try:
+            header_b64 = id_token.split(".")[0]
+            import base64 as _b64, json as _json
+            hdr = _json.loads(_b64.urlsafe_b64decode(header_b64 + "=="))
+            kid  = hdr.get("kid", "")
+            jwks = self.jwks_cache.get_jwks_for_kid(kid)
+            claims = _oidc_mod.verify_id_token(
+                id_token, jwks,
+                issuer=self.oidc_config.issuer,
+                audience=self.oidc_config.client_id,
+            )
+        except Exception as exc:
+            logger.warning("OIDC id_token verification failed: %s ip=%s", exc, ip)
+            self._oidc_error("Authentication token invalid. Please try again.")
+            return
+
+        identity = claims.get(self.oidc_config.identity_claim) or claims.get("sub", "")
+        if not identity:
+            self._oidc_error("No identity claim found in token.")
+            return
+
+        roles = _auth_mod.map_roles(claims, self.oidc_config)
+        token = _session_store.create(
+            identity,
+            auth_backend="oidc",
+            roles=roles,
+            ttl_seconds=self.oidc_config.session_ttl,
+            idp_subject=claims.get("sub"),
+            idp_issuer=claims.get("iss"),
+        )
+
+        claims_hash = __import__("hashlib").sha256(id_token.encode()).hexdigest()[:16]
+        logger.info("OIDC login: user=%s roles=%s ip=%s", identity, roles, ip)
+        if self.audit_log:
+            try:
+                self.audit_log.record(
+                    "web_login",
+                    f"user={identity} backend=oidc roles={roles} claims_hash={claims_hash}",
+                    ip,
+                )
+            except Exception:
+                pass
+
+        self.send_response(302)
+        self._clear_flow_cookie()
+        self._set_session_cookie(token)
+        self.send_header("Location", "/")
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+    def _oidc_error(self, message: str) -> None:
+        """Render an OIDC-specific error page and clear the flow cookie."""
+        body = _login_page(f"OIDC error: {message}").encode()
+        self.send_response(400)
+        self._clear_flow_cookie()
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(body)
 
     def do_GET(self):
         path = self.path.split("?")[0].rstrip("/") or "/"
@@ -885,6 +1058,9 @@ class WebUIHandler(http.server.BaseHTTPRequestHandler):
                 return
             if path == "/logout":
                 self._handle_logout()
+                return
+            if path == "/callback":
+                self._handle_oidc_callback()
                 return
 
             # All other routes require authentication
@@ -2948,6 +3124,7 @@ def start_web_ui(
     # Authentication
     require_auth: bool = True,   # set False with --web-no-auth
     pam_service:  str  = "login",
+    oidc_config=None,            # Optional[auth.OIDCConfig] — set for OIDC mode
     # Standalone mode: pass host + port instead of route_table + prefix
     host: str = None,
     port: int = None,
@@ -3000,6 +3177,7 @@ def start_web_ui(
             host=host, port=port, ca=ca,
             audit_log=audit_log, rate_limiter=rate_limiter,
             require_auth=require_auth, pam_service=pam_service,
+            oidc_config=oidc_config,
             cmp_module=cmp_module, acme_module=acme_module,
             scep_module=scep_module, est_module=est_module,
             ocsp_module=ocsp_module, ipsec_module=ipsec_module,
@@ -3050,14 +3228,46 @@ def start_web_ui(
         pass
 
     # Update module-level flag so _page() knows whether to show Sign Out
-    global _auth_enabled
+    global _auth_enabled, _session_store
     _auth_enabled = require_auth
+
+    # Upgrade session store to DB-backed once the CA DB is available
+    if ca is not None:
+        try:
+            import auth as _auth_mod
+            _session_store = _auth_mod.DbSessionStore(ca._pki_db)
+            logger.info("Session store upgraded to DB-backed (sso_sessions)")
+        except Exception as exc:
+            logger.warning("Could not init DbSessionStore, using in-memory: %s", exc)
+
+    # Set up OIDC if configured
+    jwks_cache = None
+    flow_key   = b""
+    if oidc_config is not None and ca is not None:
+        try:
+            import auth as _auth_mod
+            import secrets as _sec
+            jwks_cache = _auth_mod.JWKSCache(ca._pki_db, oidc_config)
+            jwks_cache.startup_load()
+            # Derive flow cookie key from a stable random secret stored in CA dir
+            key_file = ca.ca_dir / ".oidc_flow_key"
+            if key_file.exists():
+                flow_key = bytes.fromhex(key_file.read_text().strip())
+            else:
+                flow_key = _sec.token_bytes(32)
+                key_file.write_text(flow_key.hex())
+                key_file.chmod(0o600)
+        except Exception as exc:
+            logger.error("OIDC setup failed: %s", exc)
 
     BoundWebUIHandler.ca                  = ca
     BoundWebUIHandler.audit_log           = audit_log
     BoundWebUIHandler.rate_limiter        = rate_limiter
     BoundWebUIHandler.require_auth        = require_auth
     BoundWebUIHandler.pam_service         = pam_service
+    BoundWebUIHandler.oidc_config         = oidc_config
+    BoundWebUIHandler.jwks_cache          = jwks_cache
+    BoundWebUIHandler.flow_cookie_key     = flow_key
     BoundWebUIHandler.cmp_base_url        = cmp_base_url   or ""
     BoundWebUIHandler.acme_base_url       = acme_base_url  or ""
     BoundWebUIHandler.scep_base_url       = scep_base_url  or ""
@@ -3082,6 +3292,7 @@ def _start_web_ui_standalone(
     rate_limiter=None,
     require_auth: bool = True,
     pam_service: str = "login",
+    oidc_config=None,
     cmp_module=None,
     acme_module=None,
     scep_module=None,
@@ -3109,8 +3320,15 @@ def _start_web_ui_standalone(
     class BoundHandler(WebUIHandler):
         pass
 
-    global _auth_enabled
+    global _auth_enabled, _session_store
     _auth_enabled = require_auth
+
+    if ca is not None:
+        try:
+            import auth as _auth_mod
+            _session_store = _auth_mod.DbSessionStore(ca._pki_db)
+        except Exception:
+            pass
 
     BoundHandler.ca               = ca
     BoundHandler.audit_log        = audit_log

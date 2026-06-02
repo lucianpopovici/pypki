@@ -11,6 +11,24 @@ This project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **OIDC SSO** (`oidc.py`, `auth.py`, `db_migrations/pki/008_sso.sql`, `docs/SSO.md`):
+  OIDC Authorization Code + PKCE (RFC 7636) authentication for the Web UI and REST API.
+  Zero new pip dependencies — JWS verification (RS256, ES256, EdDSA) uses the `cryptography`
+  library plus stdlib. Sessions are DB-backed (`sso_sessions` table); PAM logins migrate into
+  the same table. JWKS is cached in `sso_jwks_cache` with TTL refresh and kid-miss forced
+  refresh (5-minute backoff on failure). Role mapping from IdP group claims to PyPKI roles
+  via `--oidc-role-map` / `--oidc-default-role`. Flow cookie (HMAC-SHA256, 10-minute TTL)
+  carries state and PKCE verifier across the redirect. Long-lived API tokens for service
+  accounts (`pypki_admin token-create / token-list`). Admin CLI: `session-list`,
+  `session-revoke`, `token-create`, `token-list`. 38 new tests across
+  `TestOIDCTokenVerification`, `TestOIDCFlow`, `TestSessionStore`, `TestOIDCDiscovery`.
+  Setup guides for Keycloak, Okta, Entra ID, and Google Workspace in `docs/SSO.md`.
+
+### Security
+
+- JWS `alg: none` and unknown algorithm values are rejected before any signature check.
+  Only RS256, ES256, and EdDSA are accepted (`--auth oidc`).
+
 - **Crypto Agility Dashboard** (`agility.py`, `db_migrations/pki/007_crypto_classification.sql`,
   `dashboards/pypki-agility.json`, `docs/AGILITY.md`): Classifies every issued certificate
   into one of eight canonical crypto classes (`classical-rsa`, `classical-ec`,

@@ -15396,6 +15396,444 @@ class TestAgilityMetrics(unittest.TestCase):
 
 
 # ===========================================================================
+# TestOIDCTokenVerification — JWS signature verification (RFC 7515/7517)
+# ===========================================================================
+
+class TestOIDCTokenVerification(unittest.TestCase):
+    """JWS RS256 / ES256 / EdDSA token verification (stdlib + cryptography only)."""
+
+    @staticmethod
+    def _b64url(b: bytes) -> str:
+        import base64
+        return base64.urlsafe_b64encode(b).rstrip(b"=").decode()
+
+    @staticmethod
+    def _int_b64url(n: int) -> str:
+        import base64
+        length = (n.bit_length() + 7) // 8
+        return base64.urlsafe_b64encode(n.to_bytes(length, "big")).rstrip(b"=").decode()
+
+    def _make_jwt(self, header: dict, payload: dict, sign_fn) -> str:
+        import json as _json
+        h = self._b64url(_json.dumps(header).encode())
+        p = self._b64url(_json.dumps(payload).encode())
+        msg = f"{h}.{p}".encode()
+        sig = sign_fn(msg)
+        return f"{h}.{p}.{self._b64url(sig)}"
+
+    def _base_payload(self, iss: str = "https://test.example.com",
+                      aud: str = "pypki") -> dict:
+        now = int(time.time())
+        return {"iss": iss, "aud": aud, "sub": "user@test.com",
+                "exp": now + 3600, "iat": now}
+
+    # ---- RS256 ----
+
+    def test_rs256_signature_verifies(self):
+        import oidc as _oidc
+        from cryptography.hazmat.primitives.asymmetric import rsa as _rsa, padding as _pad
+        from cryptography.hazmat.primitives import hashes as _h
+        key = _rsa.generate_private_key(65537, 2048)
+        pub = key.public_key().public_numbers()
+        jwk = {"kty": "RSA", "kid": "r1",
+               "n": self._int_b64url(pub.n), "e": self._int_b64url(pub.e)}
+        token = self._make_jwt(
+            {"alg": "RS256", "kid": "r1"},
+            self._base_payload(),
+            lambda m: key.sign(m, _pad.PKCS1v15(), _h.SHA256()),
+        )
+        claims = _oidc.verify_id_token(token, [jwk], "https://test.example.com", "pypki")
+        self.assertEqual(claims["sub"], "user@test.com")
+
+    # ---- ES256 ----
+
+    def test_es256_signature_verifies(self):
+        import oidc as _oidc
+        from cryptography.hazmat.primitives.asymmetric import ec as _ec
+        from cryptography.hazmat.primitives.asymmetric.utils import decode_dss_signature
+        from cryptography.hazmat.primitives import hashes as _h
+        key = _ec.generate_private_key(_ec.SECP256R1())
+        pub = key.public_key().public_numbers()
+        jwk = {"kty": "EC", "crv": "P-256", "kid": "e1",
+               "x": self._int_b64url(pub.x), "y": self._int_b64url(pub.y)}
+        def _sign(m):
+            der = key.sign(m, _ec.ECDSA(_h.SHA256()))
+            r, s = decode_dss_signature(der)
+            return r.to_bytes(32, "big") + s.to_bytes(32, "big")
+        token = self._make_jwt({"alg": "ES256", "kid": "e1"}, self._base_payload(), _sign)
+        claims = _oidc.verify_id_token(token, [jwk], "https://test.example.com", "pypki")
+        self.assertEqual(claims["sub"], "user@test.com")
+
+    # ---- EdDSA ----
+
+    def test_eddsa_signature_verifies(self):
+        import oidc as _oidc
+        from cryptography.hazmat.primitives.asymmetric import ed25519 as _ed
+        key = _ed.Ed25519PrivateKey.generate()
+        raw = key.public_key().public_bytes_raw()
+        jwk = {"kty": "OKP", "crv": "Ed25519", "kid": "ed1", "x": self._b64url(raw)}
+        token = self._make_jwt(
+            {"alg": "EdDSA", "kid": "ed1"},
+            self._base_payload(),
+            lambda m: key.sign(m),
+        )
+        claims = _oidc.verify_id_token(token, [jwk], "https://test.example.com", "pypki")
+        self.assertEqual(claims["sub"], "user@test.com")
+
+    # ---- Security rejections ----
+
+    def test_alg_none_rejected(self):
+        import oidc as _oidc
+        h = self._b64url(b'{"alg":"none","kid":"x"}')
+        p = self._b64url(b'{"iss":"x","aud":"pypki","sub":"u","exp":9999999999,"iat":1}')
+        token = f"{h}.{p}."
+        with self.assertRaises(_oidc.AuthError):
+            _oidc.verify_id_token(token, [], "x", "pypki")
+
+    def test_unknown_alg_rejected(self):
+        import oidc as _oidc
+        h = self._b64url(b'{"alg":"HS256","kid":"x"}')
+        p = self._b64url(b'{"iss":"x","aud":"pypki","sub":"u","exp":9999999999,"iat":1}')
+        with self.assertRaises(_oidc.AuthError):
+            _oidc.verify_id_token(f"{h}.{p}.AAAA", [], "x", "pypki")
+
+    def test_expired_token_rejected(self):
+        import oidc as _oidc
+        from cryptography.hazmat.primitives.asymmetric import rsa as _rsa, padding as _pad
+        from cryptography.hazmat.primitives import hashes as _h
+        key = _rsa.generate_private_key(65537, 2048)
+        pub = key.public_key().public_numbers()
+        jwk = {"kty": "RSA", "kid": "r2",
+               "n": self._int_b64url(pub.n), "e": self._int_b64url(pub.e)}
+        payload = {"iss": "https://test.example.com", "aud": "pypki", "sub": "u",
+                   "exp": int(time.time()) - 3600, "iat": int(time.time()) - 7200}
+        token = self._make_jwt(
+            {"alg": "RS256", "kid": "r2"},
+            payload,
+            lambda m: key.sign(m, _pad.PKCS1v15(), _h.SHA256()),
+        )
+        with self.assertRaises(_oidc.AuthError):
+            _oidc.verify_id_token(token, [jwk], "https://test.example.com", "pypki")
+
+    def test_wrong_issuer_rejected(self):
+        import oidc as _oidc
+        from cryptography.hazmat.primitives.asymmetric import rsa as _rsa, padding as _pad
+        from cryptography.hazmat.primitives import hashes as _h
+        key = _rsa.generate_private_key(65537, 2048)
+        pub = key.public_key().public_numbers()
+        jwk = {"kty": "RSA", "kid": "r3",
+               "n": self._int_b64url(pub.n), "e": self._int_b64url(pub.e)}
+        token = self._make_jwt(
+            {"alg": "RS256", "kid": "r3"},
+            self._base_payload(iss="https://evil.example.com"),
+            lambda m: key.sign(m, _pad.PKCS1v15(), _h.SHA256()),
+        )
+        with self.assertRaises(_oidc.AuthError):
+            _oidc.verify_id_token(token, [jwk], "https://test.example.com", "pypki")
+
+    def test_wrong_audience_rejected(self):
+        import oidc as _oidc
+        from cryptography.hazmat.primitives.asymmetric import rsa as _rsa, padding as _pad
+        from cryptography.hazmat.primitives import hashes as _h
+        key = _rsa.generate_private_key(65537, 2048)
+        pub = key.public_key().public_numbers()
+        jwk = {"kty": "RSA", "kid": "r4",
+               "n": self._int_b64url(pub.n), "e": self._int_b64url(pub.e)}
+        token = self._make_jwt(
+            {"alg": "RS256", "kid": "r4"},
+            self._base_payload(aud="other-client"),
+            lambda m: key.sign(m, _pad.PKCS1v15(), _h.SHA256()),
+        )
+        with self.assertRaises(_oidc.AuthError):
+            _oidc.verify_id_token(token, [jwk], "https://test.example.com", "pypki")
+
+    def test_iat_in_future_rejected(self):
+        import oidc as _oidc
+        from cryptography.hazmat.primitives.asymmetric import rsa as _rsa, padding as _pad
+        from cryptography.hazmat.primitives import hashes as _h
+        key = _rsa.generate_private_key(65537, 2048)
+        pub = key.public_key().public_numbers()
+        jwk = {"kty": "RSA", "kid": "r5",
+               "n": self._int_b64url(pub.n), "e": self._int_b64url(pub.e)}
+        payload = {"iss": "https://test.example.com", "aud": "pypki", "sub": "u",
+                   "exp": int(time.time()) + 7200,
+                   "iat": int(time.time()) + 600}  # 600s in future > 300 leeway
+        token = self._make_jwt(
+            {"alg": "RS256", "kid": "r5"},
+            payload,
+            lambda m: key.sign(m, _pad.PKCS1v15(), _h.SHA256()),
+        )
+        with self.assertRaises(_oidc.AuthError):
+            _oidc.verify_id_token(token, [jwk], "https://test.example.com", "pypki")
+
+    def test_aud_list_supported(self):
+        import oidc as _oidc
+        from cryptography.hazmat.primitives.asymmetric import rsa as _rsa, padding as _pad
+        from cryptography.hazmat.primitives import hashes as _h
+        key = _rsa.generate_private_key(65537, 2048)
+        pub = key.public_key().public_numbers()
+        jwk = {"kty": "RSA", "kid": "r6",
+               "n": self._int_b64url(pub.n), "e": self._int_b64url(pub.e)}
+        payload = self._base_payload(aud=["pypki", "other-client"])
+        token = self._make_jwt(
+            {"alg": "RS256", "kid": "r6"},
+            payload,
+            lambda m: key.sign(m, _pad.PKCS1v15(), _h.SHA256()),
+        )
+        claims = _oidc.verify_id_token(token, [jwk], "https://test.example.com", "pypki")
+        self.assertEqual(claims["sub"], "user@test.com")
+
+
+# ===========================================================================
+# TestOIDCFlow — PKCE helpers, state, role mapping, flow cookie
+# ===========================================================================
+
+class TestOIDCFlow(unittest.TestCase):
+    """OIDC PKCE, authorization URL, role mapping, and flow cookie tests."""
+
+    def test_pkce_generates_s256_challenge(self):
+        import oidc as _oidc, hashlib, base64
+        verifier, challenge = _oidc.generate_pkce()
+        expected = base64.urlsafe_b64encode(
+            hashlib.sha256(verifier.encode()).digest()
+        ).rstrip(b"=").decode()
+        self.assertEqual(challenge, expected)
+
+    def test_pkce_verifier_and_challenge_differ(self):
+        import oidc as _oidc
+        v, c = _oidc.generate_pkce()
+        self.assertNotEqual(v, c)
+
+    def test_state_is_random(self):
+        import oidc as _oidc
+        states = {_oidc.generate_state() for _ in range(50)}
+        self.assertEqual(len(states), 50)
+
+    def test_authorization_url_contains_pkce(self):
+        import oidc as _oidc, urllib.parse
+        _, challenge = _oidc.generate_pkce()
+        url = _oidc.build_authorization_url(
+            "https://idp.example.com/authorize",
+            client_id="pypki",
+            redirect_uri="https://pki.example.com/callback",
+            state="teststate",
+            code_challenge=challenge,
+        )
+        qs = dict(urllib.parse.parse_qsl(urllib.parse.urlsplit(url).query))
+        self.assertEqual(qs["response_type"], "code")
+        self.assertEqual(qs["code_challenge_method"], "S256")
+        self.assertEqual(qs["code_challenge"], challenge)
+        self.assertEqual(qs["state"], "teststate")
+
+    def test_role_mapping_applies_map(self):
+        import auth as _auth
+        cfg = _auth.OIDCConfig(
+            issuer="x", client_id="x", client_secret="x", redirect_uri="x",
+            roles_claim="groups",
+            role_map={"admins": "pki:admin", "ops": "pki:operator"},
+            default_role="pki:none",
+        )
+        roles = _auth.map_roles({"groups": ["admins"]}, cfg)
+        self.assertIn("pki:admin", roles)
+
+    def test_role_mapping_default_role_for_unknown(self):
+        import auth as _auth
+        cfg = _auth.OIDCConfig(
+            issuer="x", client_id="x", client_secret="x", redirect_uri="x",
+            default_role="pki:viewer",
+        )
+        roles = _auth.map_roles({"groups": ["unknown-group"]}, cfg)
+        self.assertEqual(roles, ["pki:viewer"])
+
+    def test_role_mapping_fail_closed_pki_none(self):
+        import auth as _auth
+        cfg = _auth.OIDCConfig(
+            issuer="x", client_id="x", client_secret="x", redirect_uri="x",
+            default_role="pki:none",
+        )
+        roles = _auth.map_roles({"groups": []}, cfg)
+        self.assertEqual(roles, [])
+
+    def test_role_mapping_dotted_claim_path(self):
+        import auth as _auth
+        cfg = _auth.OIDCConfig(
+            issuer="x", client_id="x", client_secret="x", redirect_uri="x",
+            roles_claim="resource_access.pypki.roles",
+            role_map={"admin": "pki:admin"},
+            default_role="pki:none",
+        )
+        claims = {"resource_access": {"pypki": {"roles": ["admin"]}}}
+        roles = _auth.map_roles(claims, cfg)
+        self.assertIn("pki:admin", roles)
+
+    def test_flow_cookie_roundtrip(self):
+        import auth as _auth
+        key = _auth._derive_flow_key(b"test-secret")
+        val = _auth.encode_flow_cookie("state123", "verifier456", key)
+        data = _auth.decode_flow_cookie(val, key)
+        self.assertEqual(data["s"], "state123")
+        self.assertEqual(data["v"], "verifier456")
+
+    def test_flow_cookie_tamper_rejected(self):
+        import auth as _auth
+        key = _auth._derive_flow_key(b"test-secret")
+        val = _auth.encode_flow_cookie("s", "v", key)
+        # Flip one char in payload
+        parts = val.split(".")
+        parts[0] = parts[0][:-1] + ("A" if parts[0][-1] != "A" else "B")
+        with self.assertRaises(_auth.AuthError):
+            _auth.decode_flow_cookie(".".join(parts), key)
+
+    def test_flow_cookie_wrong_key_rejected(self):
+        import auth as _auth
+        key1 = _auth._derive_flow_key(b"key1")
+        key2 = _auth._derive_flow_key(b"key2")
+        val = _auth.encode_flow_cookie("s", "v", key1)
+        with self.assertRaises(_auth.AuthError):
+            _auth.decode_flow_cookie(val, key2)
+
+
+# ===========================================================================
+# TestSessionStore — DbSessionStore persistence, expiry, revocation
+# ===========================================================================
+
+class TestSessionStore(unittest.TestCase):
+    """DbSessionStore with a real SQLite DB (via the migration runner)."""
+
+    def setUp(self):
+        from migrations import MigrationRunner
+        self._tmp = tempfile.mkdtemp()
+        self.ca = _make_ca(self._tmp)
+        runner = MigrationRunner(
+            self.ca._pki_db,
+            Path(__file__).parent / "db_migrations" / "pki",
+            namespace="pki",
+        )
+        runner.apply_pending()
+        import auth as _auth
+        self.store = _auth.DbSessionStore(self.ca._pki_db)
+
+    def test_pam_session_create_and_validate(self):
+        token = self.store.create("alice", auth_backend="pam")
+        self.assertEqual(self.store.validate(token), "alice")
+
+    def test_oidc_session_stores_metadata(self):
+        import auth as _auth
+        token = self.store.create(
+            "bob@example.com", auth_backend="oidc",
+            roles=["pki:admin"],
+            idp_subject="sub-123", idp_issuer="https://idp.example.com",
+        )
+        rec = self.store.validate_record(token)
+        self.assertIsNotNone(rec)
+        self.assertEqual(rec.auth_backend, "oidc")
+        self.assertEqual(rec.idp_subject, "sub-123")
+        self.assertIn("pki:admin", rec.roles)
+
+    def test_expired_session_rejected(self):
+        import auth as _auth
+        token = self.store.create("alice", ttl_seconds=1)
+        # Directly expire it in DB
+        self.ca._pki_db.execute(
+            "UPDATE sso_sessions SET expires_at = 1 WHERE session_id = ?",
+            (token,),
+        )
+        self.assertIsNone(self.store.validate(token))
+
+    def test_revoked_session_rejected(self):
+        token = self.store.create("alice")
+        self.store.invalidate(token)
+        self.assertIsNone(self.store.validate(token))
+
+    def test_pam_and_oidc_share_table(self):
+        t1 = self.store.create("pam-user", auth_backend="pam")
+        t2 = self.store.create("oidc-user@example.com", auth_backend="oidc")
+        sessions = self.store.list_sessions()
+        backends = {s["auth_backend"] for s in sessions}
+        self.assertIn("pam", backends)
+        self.assertIn("oidc", backends)
+
+    def test_list_sessions_excludes_expired(self):
+        self.store.create("alice")
+        self.store.create("bob")
+        # Expire alice
+        rows = self.ca._pki_db.fetchall(
+            "SELECT session_id FROM sso_sessions WHERE identity = 'alice'"
+        )
+        for row in rows:
+            self.ca._pki_db.execute(
+                "UPDATE sso_sessions SET expires_at = 1 WHERE session_id = ?",
+                (row["session_id"],),
+            )
+        sessions = self.store.list_sessions()
+        identities = [s["identity"] for s in sessions]
+        self.assertIn("bob", identities)
+        self.assertNotIn("alice", identities)
+
+    def test_revoke_by_id(self):
+        token = self.store.create("alice")
+        self.store.revoke_by_id(token)
+        self.assertIsNone(self.store.validate(token))
+
+    def test_brute_force_lockout(self):
+        ip = "1.2.3.4"
+        for _ in range(self.store.MAX_FAILURES):
+            self.store.record_failure(ip)
+        self.assertTrue(self.store.is_locked_out(ip))
+        self.store.clear_failures(ip)
+        self.assertFalse(self.store.is_locked_out(ip))
+
+    def test_invalid_token_returns_none(self):
+        self.assertIsNone(self.store.validate("nonexistent-token"))
+
+
+# ===========================================================================
+# TestOIDCDiscovery — discovery fetch and JWKS utilities (unit-level)
+# ===========================================================================
+
+class TestOIDCDiscovery(unittest.TestCase):
+    """OIDC discovery and JWKS utility tests (no network; uses mocking)."""
+
+    def test_b64url_roundtrip(self):
+        import oidc as _oidc
+        data = b"\x00\xff\xfe\x80hello"
+        self.assertEqual(_oidc._b64url_decode(_oidc._b64url_encode(data)), data)
+
+    def test_aud_list_string(self):
+        import oidc as _oidc
+        self.assertEqual(_oidc._aud_list("pypki"), ["pypki"])
+
+    def test_aud_list_list(self):
+        import oidc as _oidc
+        self.assertEqual(_oidc._aud_list(["a", "b"]), ["a", "b"])
+
+    def test_aud_list_none(self):
+        import oidc as _oidc
+        self.assertEqual(_oidc._aud_list(None), [])
+
+    def test_find_jwk_by_kid(self):
+        import oidc as _oidc
+        jwks = [{"kid": "k1", "kty": "RSA"}, {"kid": "k2", "kty": "EC"}]
+        self.assertEqual(_oidc._find_jwk(jwks, "k2")["kty"], "EC")
+
+    def test_find_jwk_missing_kid_raises(self):
+        import oidc as _oidc
+        with self.assertRaises(_oidc.AuthError):
+            _oidc._find_jwk([{"kid": "k1"}], "k99")
+
+    def test_pkce_challenge_length(self):
+        import oidc as _oidc
+        _, challenge = _oidc.generate_pkce()
+        # S256 of 32 bytes → 43 chars base64url (256 bits → 32 bytes → 43 b64url chars)
+        self.assertEqual(len(challenge), 43)
+
+    def test_generate_state_length(self):
+        import oidc as _oidc
+        state = _oidc.generate_state()
+        self.assertGreater(len(state), 10)
+
+
+# ===========================================================================
 # TestRFC9336DocumentSigning — document_signing profile (RFC 9336)
 # ===========================================================================
 
