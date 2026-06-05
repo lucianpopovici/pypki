@@ -1,8 +1,12 @@
 # requirements-dev.txt — development, test, fuzz, build, and audit tools.
 # Runtime dependencies are in requirements.txt.
 #
+# SOURCE FILE: requirements-dev.in
 # Regenerate with hashes:
 #   pip-compile requirements-dev.in --generate-hashes -o requirements-dev.txt
+#
+# To install with hash enforcement (recommended in CI):
+#   pip install --require-hashes -r requirements-dev.txt
 #
 # For a CA codebase we do NOT auto-merge dependency bumps. Review each one.
 
@@ -15,6 +19,9 @@ playwright>=1.40
 # HTTP client (interop tests, get_cert.py helper)
 requests>=2.31
 urllib3>=2.0
+
+# Pinned lock file generation (used by make-hashes.sh and CI)
+pip-tools>=7.0
 
 # Fuzz testing (optional — install separately; not imported by server code)
 # atheris>=2.3.0

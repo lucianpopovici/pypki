@@ -1,0 +1,75 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  # ── Dependency security scan ───────────────────────────────────────────────
+  audit:
+    name: pip-audit (HIGH/CRITICAL gate)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install pip-audit
+        run: pip install pip-audit
+
+      - name: Audit runtime dependencies
+        # Fail on any HIGH or CRITICAL CVE in the runtime dep tree.
+        run: pip-audit -r requirements.txt --strict --vulnerability-service pypi
+
+  # ── Test suite ────────────────────────────────────────────────────────────
+  test:
+    name: Test suite (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.12", "3.13"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install runtime dependencies
+        run: pip install -r requirements.txt
+
+      - name: Install test dependencies
+        run: pip install pytest pytest-timeout
+
+      - name: Run test suite
+        run: python -m pytest test_pki_server.py -q --timeout=120
+        env:
+          # Postgres-gated tests skip cleanly when this is unset.
+          PYPKI_TEST_POSTGRES_DSN: ""
+
+  # ── Type checking ─────────────────────────────────────────────────────────
+  typecheck:
+    name: mypy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          pip install mypy
+
+      - name: Type-check core modules
+        run: |
+          mypy pki_server.py db.py --ignore-missing-imports --no-error-summary \
+            || true   # advisory only — errors are reported but don't block merge

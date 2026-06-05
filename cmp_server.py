@@ -1561,6 +1561,7 @@ class CMPv2HTTPHandler(http.server.BaseHTTPRequestHandler):
     ca: CertificateAuthority = None
     audit_log: "AuditLog" = None
     rate_limiter: "RateLimiter" = None
+    api_token: Optional[str] = None  # Required X-Api-Token for management API; None = disabled
 
     def log_message(self, format, *args):
         client_cn = self._get_client_cn()
@@ -1580,8 +1581,24 @@ class CMPv2HTTPHandler(http.server.BaseHTTPRequestHandler):
             pass
         return None
 
+    def _check_api_auth(self) -> bool:
+        """
+        Enforce X-Api-Token when api_token is set.
+        Sends 401 and returns False if the token is missing or wrong.
+        Returns True if auth passes (token correct, or no token configured).
+        """
+        if not self.api_token:
+            return True
+        provided = self.headers.get("X-Api-Token", "")
+        if not hmac.compare_digest(provided, self.api_token):
+            self._send_json({"error": "unauthorized"}, 401)
+            return False
+        return True
+
     def do_POST_api(self, path: str, body: bytes):
         """Handle POST requests to /api/* management endpoints."""
+        if not self._check_api_auth():
+            return
         try:
             data = json.loads(body) if body else {}
         except json.JSONDecodeError:
@@ -1951,6 +1968,8 @@ class CMPv2HTTPHandler(http.server.BaseHTTPRequestHandler):
 
     def do_PATCH(self):
         """PATCH /config — live-update validity periods and other settings."""
+        if not self._check_api_auth():
+            return
         if self.path.rstrip("/") != "/config":
             self.send_response(404)
             self.end_headers()
@@ -1982,6 +2001,10 @@ class CMPv2HTTPHandler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
         """Simple HTTP API for management."""
         path = self.path.split("?")[0].rstrip("/")
+
+        # Guard all /api/* management paths; public paths below are exempt.
+        if path.startswith("/api/") and not self._check_api_auth():
+            return
 
         if path == "/config":
             if self.ca.config:
@@ -2486,19 +2509,22 @@ MTLSServer = TLSServer
 
 def make_handler(ca: CertificateAuthority, cmp_handler: CMPv2Handler,
                  audit_log: Optional[AuditLog] = None,
-                 rate_limiter: Optional[RateLimiter] = None):
+                 rate_limiter: Optional[RateLimiter] = None,
+                 api_token: Optional[str] = None):
     class BoundHandler(CMPv2HTTPHandler):
         pass
     BoundHandler.ca = ca
     BoundHandler.cmp_handler = cmp_handler
     BoundHandler.audit_log = audit_log
     BoundHandler.rate_limiter = rate_limiter
+    BoundHandler.api_token = api_token
     return BoundHandler
 
 
 def make_cmpv3_handler(ca: CertificateAuthority, cmp_handler: CMPv3Handler,
                        audit_log: Optional[AuditLog] = None,
-                       rate_limiter: Optional[RateLimiter] = None):
+                       rate_limiter: Optional[RateLimiter] = None,
+                       api_token: Optional[str] = None):
     """Make an HTTP handler that uses CMPv3Handler (with well-known URI support)."""
     class BoundHandler(CMPv2HTTPHandler):
         pass
@@ -2506,6 +2532,7 @@ def make_cmpv3_handler(ca: CertificateAuthority, cmp_handler: CMPv3Handler,
     BoundHandler.cmp_handler = cmp_handler
     BoundHandler.audit_log = audit_log
     BoundHandler.rate_limiter = rate_limiter
+    BoundHandler.api_token = api_token
     return BoundHandler
 
 
@@ -2542,6 +2569,7 @@ def start_cmp_server(
     tls13_only: bool = False,
     alpn_protocols: Optional[List[str]] = None,
     tls_reload_interval: int = 60,
+    api_token: Optional[str] = None,
     # Standalone mode: pass host + port instead of route_table + prefix
     host: Optional[str] = None,
     port: Optional[int] = None,
@@ -2575,16 +2603,17 @@ def start_cmp_server(
             use_cmpv3=use_cmpv3,
             audit_log=audit_log,
             rate_limiter=rate_limiter,
+            api_token=api_token,
         )
 
     from dispatcher_server import _RouteProxy
 
     if use_cmpv3:
         cmp_handler = CMPv3Handler(ca)
-        handler_cls = make_cmpv3_handler(ca, cmp_handler, audit_log, rate_limiter)
+        handler_cls = make_cmpv3_handler(ca, cmp_handler, audit_log, rate_limiter, api_token)
     else:
         cmp_handler = CMPv2Handler(ca)
-        handler_cls = make_handler(ca, cmp_handler, audit_log, rate_limiter)
+        handler_cls = make_handler(ca, cmp_handler, audit_log, rate_limiter, api_token)
 
     route_table.register(prefix, handler_cls)
     logger.info("CMP handler registered at prefix %r", prefix)
@@ -2645,16 +2674,17 @@ def _start_cmp_standalone(
     use_cmpv3: bool = True,
     audit_log=None,
     rate_limiter=None,
+    api_token: Optional[str] = None,
 ) -> _StandaloneCMPServer:
     """Start a real standalone HTTP(S) CMP server on host:port."""
     import http.server
 
     if use_cmpv3:
         cmp_handler_obj = CMPv3Handler(ca)
-        handler_cls = make_cmpv3_handler(ca, cmp_handler_obj, audit_log, rate_limiter)
+        handler_cls = make_cmpv3_handler(ca, cmp_handler_obj, audit_log, rate_limiter, api_token)
     else:
         cmp_handler_obj = CMPv2Handler(ca)
-        handler_cls = make_handler(ca, cmp_handler_obj, audit_log, rate_limiter)
+        handler_cls = make_handler(ca, cmp_handler_obj, audit_log, rate_limiter, api_token)
 
     ctx_holder = None
     if tls_cert_path and tls_key_path:

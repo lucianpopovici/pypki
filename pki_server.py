@@ -5295,6 +5295,9 @@ def main():
     parser.add_argument("--port", type=int, default=8080, help="Port (default: 8080)")
     parser.add_argument("--cmp-prefix", default="/cmp", metavar="PREFIX",
                         help="Path prefix for CMP handler (default: /cmp)")
+    parser.add_argument("--cmp-api-token", default=None, metavar="TOKEN",
+                        help="Shared secret required in X-Api-Token header for CMP management API endpoints. "
+                             "If unset, the management API is unauthenticated (development mode only).")
     parser.add_argument("--ca-dir", default="./ca", help="CA data directory (default: ./ca)")
     parser.add_argument(
         "--pki-db-url", default=None, metavar="URL",
@@ -6506,6 +6509,7 @@ def main():
         audit_log=audit_log,
         rate_limiter=rate_limiter,
         use_cmpv3=getattr(args, "cmpv3", True),
+        api_token=getattr(args, "cmp_api_token", None),
     )
     proto_label = "CMPv3 (RFC 9480)" if getattr(args, "cmpv3", True) else "CMPv2 (RFC 4210)"
     logger.info(f"{proto_label} active on {scheme}://{args.host}:{args.port}{getattr(args, 'cmp_prefix', '/cmp')}")

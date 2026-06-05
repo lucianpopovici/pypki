@@ -1,0 +1,28 @@
+# Development, test, fuzz, build, and audit tool sources for pip-compile.
+# Regenerate requirements-dev.txt with hashes:
+#   pip-compile requirements-dev.in --generate-hashes -o requirements-dev.txt
+
+# Test runner
+pytest>=7.4
+
+# Browser-based UI tests
+playwright>=1.40
+
+# HTTP client (interop tests, get_cert.py helper)
+requests>=2.31
+urllib3>=2.0
+
+# Vulnerability scanning
+pip-audit>=2.7
+
+# SBOM generation
+cyclonedx-bom>=4.0
+
+# Pinned lock file generation
+pip-tools>=7.0
+
+# Coverage measurement
+coverage>=7.4
+
+# Type checking
+mypy>=1.8

@@ -22,6 +22,7 @@ All state comes from the shared CertificateAuthority and AuditLog objects.
 """
 
 import datetime
+import html as _html
 import http.server
 import json
 import logging
@@ -664,7 +665,7 @@ def _render_svc_form(name, fields, saved_cfg):
     """Render the configuration form rows for one service card."""
     rows = ""
     for fkey, flabel, ftype, fdefault, fph, fextra in fields:
-        cur = str(saved_cfg.get(fkey, fdefault))
+        cur = _html.escape(str(saved_cfg.get(fkey, fdefault)), quote=True)
         if ftype == "select":
             widget = _render_select(name, fkey, cur)
         else:

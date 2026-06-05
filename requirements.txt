@@ -1,7 +1,10 @@
+# Runtime dependencies only.
+# Development/test tooling lives in requirements-dev.txt.
+
+# Core CA cryptography
 cryptography>=41.0
+
+# Optional: required for CMP server (pki_server.py, cmp_server.py).
+# Imported under try/except; server starts without it but CMP parsing is disabled.
 pyasn1>=0.5
 pyasn1-modules>=0.3
-pytest>=7.0
-requests>=2.31
-playwright>=1.40
-urllib3

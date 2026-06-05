@@ -1,0 +1,69 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write   # upload release assets
+  id-token: write   # keyless cosign OIDC signing
+
+jobs:
+  # ── Build source distribution ─────────────────────────────────────────────
+  build:
+    name: Build and sign release
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install build tools
+        run: pip install cyclonedx-bom pip-audit cosign || true
+
+      - name: Create source tarball
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          tar czf pypki-${VERSION}.tar.gz \
+            --exclude='.git' --exclude='__pycache__' --exclude='.env' \
+            --exclude='*.pyc' --exclude='*.ko' --exclude='*.o' \
+            .
+          echo "TARBALL=pypki-${VERSION}.tar.gz" >> "$GITHUB_ENV"
+          echo "VERSION=${VERSION}" >> "$GITHUB_ENV"
+
+      - name: Generate CycloneDX SBOM
+        run: |
+          pip install -r requirements.txt
+          cyclonedx-py environment \
+            --outfile pypki-${VERSION}-sbom.cdx.json \
+            --format json \
+            || echo "SBOM generation failed — continuing"
+
+      - name: Vulnerability scan (release gate)
+        run: |
+          pip-audit -r requirements.txt --strict --vulnerability-service pypi
+        # Hard failure: do not release if there are known HIGH/CRITICAL CVEs.
+
+      - name: Sign tarball with cosign (keyless)
+        run: |
+          cosign sign-blob \
+            --yes \
+            --oidc-issuer https://token.actions.githubusercontent.com \
+            --output-certificate pypki-${VERSION}.tar.gz.pem \
+            --output-signature  pypki-${VERSION}.tar.gz.sig \
+            pypki-${VERSION}.tar.gz
+        env:
+          COSIGN_EXPERIMENTAL: "1"
+
+      - name: Upload release assets
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            pypki-${{ env.VERSION }}.tar.gz
+            pypki-${{ env.VERSION }}.tar.gz.sig
+            pypki-${{ env.VERSION }}.tar.gz.pem
+            pypki-${{ env.VERSION }}-sbom.cdx.json

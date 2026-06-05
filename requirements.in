@@ -1,0 +1,10 @@
+# Runtime dependency sources for pip-compile.
+# Regenerate requirements.txt with hashes:
+#   pip-compile requirements.in --generate-hashes -o requirements.txt
+
+cryptography>=44.0
+
+# Optional: CMP server (pki_server.py, cmp_server.py).
+# Imported under try/except; server starts without it but CMP parsing is disabled.
+pyasn1>=0.5
+pyasn1-modules>=0.3
