@@ -532,6 +532,12 @@ crypto-agility dashboard — all completed and committed.
   tradeoff in `MODSIG_TRUST_FINDINGS.md`.
 - Landmarks changed: `MODSIG_TRUST_MODEL.md` (spec, new), `MODSIG_TRUST_FINDINGS.md` (findings, new).
 
+### 2026-06-05 — Module-signing enrollment tooling
+
+- Done: `modsig_enroll.py` (`ModsigSigner` embed_cert=True/False, `ModsigEnroller` ca/leaf recipes with keyctl/mok/dracut artifacts, `IMAEnroller` for `.ima` keyring, `install_recipe()`). `pypki_admin` subcommands: `modsig-sign`, `modsig-enroll`, `ima-sign`, `ima-enroll`. `harness/enroll_modsig.sh` (`TRUST_MODE`, `ENROLL_METHOD`). `harness/modsig_roundtrip.sh` updated: `--trust-mode ca|leaf`, Gate B5 (per-CA insmod with embedded cert, leaf absent), verdict count trust-mode-aware. `TestModsigEnrollment` (11 tests). Sidecar `specs/CLAUDE-modsig-enrollment.md`.
+- Decided: `openssl cms -sign` without `-nocerts` is the signing path for ca mode (no patch to kernel sign-file required for the Python tooling path). IMA always per-leaf (IMA sig v2 embeds SKID directly). Dracut hooks embed cert as base64 in shell script so they survive initramfs rebuilds.
+- Landmarks changed: `modsig_enroll.py` (new), `pypki_admin.py` (4 subcommands), `harness/enroll_modsig.sh` (new), `harness/modsig_roundtrip.sh` (B5 gate), `specs/CLAUDE-modsig-enrollment.md` (new).
+
 ---
 
 ## 13. How to update this file
