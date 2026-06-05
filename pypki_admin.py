@@ -1205,6 +1205,67 @@ def build_parser() -> argparse.ArgumentParser:
                            choices=["DEBUG", "INFO", "WARNING", "ERROR"])
     cs_anchor.set_defaults(func=cmd_codesign_anchor_now)
 
+    # ── modsig / IMA enrollment ───────────────────────────────────────────────
+    ms_sign = sub.add_parser(
+        "modsig-sign",
+        help="Sign a kernel module (.ko) for module.sig_enforce enforcement.",
+    )
+    ms_sign.add_argument("module", metavar="MODULE.KO", help="Path to the .ko file.")
+    ms_sign.add_argument("--key", required=True, metavar="KEY.PEM",
+                         help="Signing private key (PEM).")
+    ms_sign.add_argument("--cert", required=True, metavar="CERT.PEM",
+                         help="Signing certificate (PEM).")
+    ms_sign.add_argument("--mode", default="leaf", choices=["ca", "leaf"],
+                         help="'ca' embeds the cert (per-CA chain); 'leaf' omits it (default).")
+    ms_sign.add_argument("--algo", default="sha512",
+                         help="Hash algorithm (default: sha512).")
+    ms_sign.add_argument("--output", default=None, metavar="OUT.KO",
+                         help="Output path (default: sign in-place).")
+    ms_sign.add_argument("--log-level", default="INFO",
+                         choices=["DEBUG", "INFO", "WARNING", "ERROR"])
+    ms_sign.set_defaults(func=cmd_modsig_sign)
+
+    ms_enroll = sub.add_parser(
+        "modsig-enroll",
+        help="Generate enrollment artifacts for module signing trust.",
+    )
+    ms_enroll.add_argument("--ca-cert", required=True, metavar="CA.DER",
+                           help="PyPKI CA root cert (DER).")
+    ms_enroll.add_argument("--leaf-cert", default=None, metavar="LEAF.DER",
+                           help="Signing leaf cert (DER); required for --mode leaf.")
+    ms_enroll.add_argument("--mode", default="leaf", choices=["ca", "leaf"],
+                           help="Trust mode (default: leaf).")
+    ms_enroll.add_argument("--install", action="store_true",
+                           help="Write dracut hook + conf to the filesystem (requires root).")
+    ms_enroll.add_argument("--log-level", default="INFO",
+                           choices=["DEBUG", "INFO", "WARNING", "ERROR"])
+    ms_enroll.set_defaults(func=cmd_modsig_enroll)
+
+    ima_sign = sub.add_parser(
+        "ima-sign",
+        help="Sign a file for IMA appraisal (sets security.ima xattr via evmctl).",
+    )
+    ima_sign.add_argument("file", metavar="FILE", help="Path to the file to sign.")
+    ima_sign.add_argument("--key", required=True, metavar="KEY.PEM",
+                          help="Signing private key (PEM).")
+    ima_sign.add_argument("--algo", default="sha256",
+                          help="Hash algorithm (default: sha256).")
+    ima_sign.add_argument("--log-level", default="INFO",
+                          choices=["DEBUG", "INFO", "WARNING", "ERROR"])
+    ima_sign.set_defaults(func=cmd_ima_sign)
+
+    ima_enroll = sub.add_parser(
+        "ima-enroll",
+        help="Generate enrollment artifacts for IMA appraisal (always per-leaf).",
+    )
+    ima_enroll.add_argument("--leaf-cert", required=True, metavar="LEAF.DER",
+                            help="Signing leaf cert (DER).")
+    ima_enroll.add_argument("--install", action="store_true",
+                            help="Write dracut hook + conf to the filesystem (requires root).")
+    ima_enroll.add_argument("--log-level", default="INFO",
+                            choices=["DEBUG", "INFO", "WARNING", "ERROR"])
+    ima_enroll.set_defaults(func=cmd_ima_enroll)
+
     return root
 
 
@@ -2885,6 +2946,101 @@ def cmd_codesign_anchor_now(args: argparse.Namespace) -> int:
     ca = CertificateAuthority(ca_dir=getattr(args, "ca_dir", "./ca"))
     chk = _ml.write_checkpoint(db, ca.ca_key)
     print(f"Checkpoint written: tree_size={chk['tree_size']} root={chk['root_hash'][:16]}…")
+    return 0
+
+
+def cmd_modsig_sign(args: argparse.Namespace) -> int:
+    """Sign a kernel module for module.sig_enforce enforcement."""
+    _setup_logging(args.log_level)
+    import modsig_enroll as _me
+    signer = _me.ModsigSigner(
+        key_path=args.key,
+        cert_path=args.cert,
+        hash_algo=args.algo,
+        embed_cert=(args.mode == "ca"),
+    )
+    result = signer.sign(args.module, output_path=args.output)
+    mode_label = "ca (cert embedded)" if args.mode == "ca" else "leaf (no cert)"
+    print(f"Signed: {result.path}  mode={mode_label}  sig_len={result.sig_len}B")
+    return 0
+
+
+def cmd_modsig_enroll(args: argparse.Namespace) -> int:
+    """Generate or install module signing enrollment artifacts."""
+    _setup_logging(args.log_level)
+    import modsig_enroll as _me
+    ca_cert_der = open(args.ca_cert, "rb").read()
+    leaf_cert_der = open(args.leaf_cert, "rb").read() if args.leaf_cert else None
+    enroller = _me.ModsigEnroller(ca_cert_der, leaf_cert_der)
+    recipe = enroller.recipe(mode=args.mode)
+
+    if args.install:
+        _me.install_recipe(recipe)
+        print(f"Installed: {recipe.cert_filename}, dracut hook, dracut conf")
+        print("Rebuild initramfs: dracut --force")
+    else:
+        print(f"=== modsig-enroll recipe (mode={recipe.mode}) ===")
+        print(f"\nSummary: {recipe.summary}")
+        print(f"\n--- Volatile (runtime, not persistent across reboots) ---")
+        print(f"  # Copy cert to target host, then:")
+        print(f"  {recipe.keyctl_volatile}")
+        if recipe.mokutil_cmd:
+            print(f"\n--- Persistent via MOK (UEFI Secure Boot) ---")
+            print(f"  {recipe.mokutil_cmd}")
+            print(f"  # Then reboot and confirm in MokManager")
+        print(f"\n--- Persistent via dracut initramfs hook ---")
+        print(f"  # Run with --install to write files, then:")
+        print(f"  dracut --force")
+        print(f"\n--- Dracut hook preview ---")
+        print(recipe.dracut_hook_sh)
+    return 0
+
+
+def cmd_ima_sign(args: argparse.Namespace) -> int:
+    """Sign a file for IMA appraisal via evmctl."""
+    _setup_logging(args.log_level)
+    import subprocess as _sp
+    if not _sp.run(["command", "-v", "evmctl"], capture_output=True, shell=False).returncode == 0:
+        # try which
+        import shutil
+        if not shutil.which("evmctl"):
+            print("ERROR: evmctl not found. Install: dnf install ima-evm-utils")
+            return 1
+    proc = _sp.run(
+        ["evmctl", "ima_sign", "--key", args.key, "-a", args.algo, args.file],
+        capture_output=True,
+        text=True,
+    )
+    if proc.returncode != 0:
+        print(f"ERROR: evmctl failed:\n{proc.stderr}")
+        return 1
+    print(f"IMA-signed: {args.file}")
+    return 0
+
+
+def cmd_ima_enroll(args: argparse.Namespace) -> int:
+    """Generate or install IMA enrollment artifacts."""
+    _setup_logging(args.log_level)
+    import modsig_enroll as _me
+    leaf_cert_der = open(args.leaf_cert, "rb").read()
+    enroller = _me.IMAEnroller(leaf_cert_der)
+    recipe = enroller.recipe()
+
+    if args.install:
+        _me.install_recipe(recipe)
+        print(f"Installed: {recipe.cert_filename}, dracut hook, dracut conf")
+        print("Rebuild initramfs: dracut --force")
+    else:
+        print(f"=== ima-enroll recipe (mode={recipe.mode}) ===")
+        print(f"\nSummary: {recipe.summary}")
+        print(f"\n--- Volatile (runtime, not persistent across reboots) ---")
+        print(f"  # Copy cert to target host, then:")
+        print(f"  {recipe.keyctl_volatile}")
+        print(f"\n--- Persistent via dracut initramfs hook ---")
+        print(f"  # Run with --install to write files, then:")
+        print(f"  dracut --force")
+        print(f"\n--- Dracut hook preview ---")
+        print(recipe.dracut_hook_sh)
     return 0
 
 

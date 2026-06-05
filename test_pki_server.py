@@ -17781,6 +17781,185 @@ class TestPQIssuanceAuditRegression(unittest.TestCase):
 
 
 # ===========================================================================
+# TestModsigEnrollment
+# ===========================================================================
+
+class TestModsigEnrollment(unittest.TestCase):
+    """Unit tests for modsig_enroll.py — module signing and enrollment tooling."""
+
+    def setUp(self):
+        import modsig_enroll
+        self.mod = modsig_enroll
+        self.td = tempfile.mkdtemp()
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.td, ignore_errors=True)
+
+    def _make_fake_ko(self) -> Path:
+        p = Path(self.td) / "fake.ko"
+        p.write_bytes(b"\x7fELF" + b"\x00" * 252)
+        return p
+
+    def _make_fake_pkcs7(self, size: int = 64) -> bytes:
+        return b"\x30" + bytes([size - 2]) + b"\x02\x01\x01" + b"\x00" * (size - 5)
+
+    # ── _strip_module_sig / _assemble_module_sig ──────────────────────────────
+
+    def test_assemble_sig_trailer(self):
+        """_assemble_module_sig produces the correct 12-byte struct + MODULE_SIG_STRING."""
+        import struct
+        body  = b"BODY" * 10
+        pkcs7 = self._make_fake_pkcs7(32)
+        out   = self.mod._assemble_module_sig(body, pkcs7)
+
+        self.assertTrue(out.endswith(self.mod.MODULE_SIG_STRING))
+        struct_bytes = out[-(12 + len(self.mod.MODULE_SIG_STRING)) : -len(self.mod.MODULE_SIG_STRING)]
+        self.assertEqual(len(struct_bytes), 12)
+        self.assertEqual(struct_bytes[2], 2)      # id_type = PKEY_ID_PKCS7
+        self.assertEqual(struct_bytes[3], 0)      # signer_len = 0
+        self.assertEqual(struct_bytes[4], 0)      # key_id_len = 0
+        sig_len = struct.unpack(">I", struct_bytes[8:12])[0]
+        self.assertEqual(sig_len, len(pkcs7))
+        self.assertEqual(out, body + pkcs7 + struct_bytes + self.mod.MODULE_SIG_STRING)
+
+    def test_strip_existing_sig(self):
+        """Round-trip: _assemble then _strip returns the original body."""
+        body  = b"MODULE_BODY_DATA" * 8
+        pkcs7 = self._make_fake_pkcs7(48)
+        assembled = self.mod._assemble_module_sig(body, pkcs7)
+        stripped  = self.mod._strip_module_sig(assembled)
+        self.assertEqual(stripped, body)
+
+    def test_strip_no_sig_is_noop(self):
+        body = b"RAW_MODULE_NO_SIG" * 4
+        self.assertEqual(self.mod._strip_module_sig(body), body)
+
+    # ── ModsigSigner ─────────────────────────────────────────────────────────
+
+    def _generate_leaf_key_cert(self) -> tuple[Path, Path]:
+        import subprocess
+        key_pem  = Path(self.td) / "leaf.key.pem"
+        cert_pem = Path(self.td) / "leaf.cert.pem"
+        subprocess.run([
+            "openssl", "req", "-newkey", "ec",
+            "-pkeyopt", "ec_paramgen_curve:P-256",
+            "-nodes", "-x509", "-days", "1",
+            "-subj", "/CN=test-modsig-leaf",
+            "-keyout", str(key_pem),
+            "-out",    str(cert_pem),
+            "-addext", "keyUsage=digitalSignature",
+            "-addext", "extendedKeyUsage=codeSigning",
+        ], check=True, capture_output=True)
+        return key_pem, cert_pem
+
+    def test_sign_module_leaf(self):
+        """Leaf mode: sign produces a valid trailer with 0 embedded certs."""
+        key_pem, cert_pem = self._generate_leaf_key_cert()
+        ko     = self._make_fake_ko()
+        signer = self.mod.ModsigSigner(key_pem, cert_pem, embed_cert=False)
+        result = signer.sign(ko)
+
+        self.assertTrue(ko.read_bytes().endswith(self.mod.MODULE_SIG_STRING))
+        self.assertEqual(result.embed_cert, False)
+        self.assertGreater(result.sig_len, 0)
+        pkcs7 = self.mod.extract_module_pkcs7(ko)
+        self.assertEqual(self.mod._count_embedded_certs(pkcs7), 0)
+
+    def test_sign_module_ca(self):
+        """CA mode: sign embeds exactly 1 cert in the PKCS#7."""
+        key_pem, cert_pem = self._generate_leaf_key_cert()
+        ko     = self._make_fake_ko()
+        signer = self.mod.ModsigSigner(key_pem, cert_pem, embed_cert=True)
+        result = signer.sign(ko)
+
+        self.assertTrue(ko.read_bytes().endswith(self.mod.MODULE_SIG_STRING))
+        self.assertEqual(result.embed_cert, True)
+        pkcs7 = self.mod.extract_module_pkcs7(ko)
+        self.assertEqual(self.mod._count_embedded_certs(pkcs7), 1)
+
+    def test_sign_output_path(self):
+        """sign() to a separate output_path leaves the source untouched."""
+        key_pem, cert_pem = self._generate_leaf_key_cert()
+        ko_src        = self._make_fake_ko()
+        ko_dst        = Path(self.td) / "signed_copy.ko"
+        original_bytes = ko_src.read_bytes()
+
+        self.mod.ModsigSigner(key_pem, cert_pem, embed_cert=False).sign(ko_src, ko_dst)
+
+        self.assertEqual(ko_src.read_bytes(), original_bytes)
+        self.assertTrue(ko_dst.read_bytes().endswith(self.mod.MODULE_SIG_STRING))
+
+    # ── ModsigEnroller ────────────────────────────────────────────────────────
+
+    def _fake_der(self, label: str) -> bytes:
+        return f"FAKE_DER_{label}".encode().ljust(64, b"\x00")
+
+    def test_enroller_recipe_leaf(self):
+        """recipe('leaf') targets .secondary_trusted_keys with the leaf cert."""
+        ca_der   = self._fake_der("ROOT")
+        leaf_der = self._fake_der("LEAF")
+        recipe   = self.mod.ModsigEnroller(ca_der, leaf_der).recipe("leaf")
+
+        self.assertEqual(recipe.mode, "leaf")
+        self.assertEqual(recipe.cert_der, leaf_der)
+        self.assertIn(".secondary_trusted_keys", recipe.keyctl_volatile)
+        self.assertIn("pypki-modsig-leaf", recipe.keyctl_volatile)
+        self.assertIsNotNone(recipe.mokutil_cmd)
+        self.assertIn(".secondary_trusted_keys", recipe.dracut_hook_sh)
+        self.assertIn("install_items", recipe.dracut_conf)
+
+    def test_enroller_recipe_ca(self):
+        """recipe('ca') targets .secondary_trusted_keys with the CA root cert."""
+        ca_der = self._fake_der("ROOT")
+        recipe = self.mod.ModsigEnroller(ca_der).recipe("ca")
+
+        self.assertEqual(recipe.mode, "ca")
+        self.assertEqual(recipe.cert_der, ca_der)
+        self.assertIn(".secondary_trusted_keys", recipe.keyctl_volatile)
+        self.assertIn("pypki-modsig-root", recipe.keyctl_volatile)
+        self.assertIsNotNone(recipe.mokutil_cmd)
+        self.assertIn(".secondary_trusted_keys", recipe.dracut_hook_sh)
+        self.assertIn("install_items", recipe.dracut_conf)
+
+    def test_enroller_recipe_leaf_requires_leaf_der(self):
+        """ModsigEnroller.recipe('leaf') raises ValueError if leaf_cert_der is omitted."""
+        with self.assertRaises(ValueError):
+            self.mod.ModsigEnroller(self._fake_der("ROOT")).recipe("leaf")
+
+    def test_ima_enroller_recipe(self):
+        """IMAEnroller.recipe() targets the .ima keyring."""
+        leaf_der = self._fake_der("IMA_LEAF")
+        recipe   = self.mod.IMAEnroller(leaf_der).recipe()
+
+        self.assertEqual(recipe.mode, "ima-leaf")
+        self.assertEqual(recipe.cert_der, leaf_der)
+        self.assertIn(".ima", recipe.keyctl_volatile)
+        self.assertIn("pypki-ima-leaf", recipe.keyctl_volatile)
+        self.assertIsNone(recipe.mokutil_cmd)
+        self.assertIn(".ima", recipe.dracut_hook_sh)
+
+    def test_dracut_hook_is_valid_sh(self):
+        """Generated dracut hook scripts pass bash -n syntax check."""
+        import subprocess
+        ca_der   = self._fake_der("ROOT")
+        leaf_der = self._fake_der("LEAF")
+        recipes  = [
+            self.mod.ModsigEnroller(ca_der, leaf_der).recipe("leaf"),
+            self.mod.ModsigEnroller(ca_der).recipe("ca"),
+            self.mod.IMAEnroller(leaf_der).recipe(),
+        ]
+        for recipe in recipes:
+            hook_path = Path(self.td) / f"hook_{recipe.mode}.sh"
+            hook_path.write_text(recipe.dracut_hook_sh)
+            result = subprocess.run(["bash", "-n", str(hook_path)], capture_output=True)
+            self.assertEqual(
+                result.returncode, 0,
+                f"mode={recipe.mode} hook failed bash -n:\n{result.stderr.decode()}"
+            )
+
+
+# ===========================================================================
 # Entry point
 # ===========================================================================
 
