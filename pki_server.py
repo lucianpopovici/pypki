@@ -79,6 +79,7 @@ import os
 import re
 import socket
 import sqlite3
+import sys
 from db import make_db, Database
 import ssl
 import struct
@@ -3257,7 +3258,7 @@ class CertificateAuthority:
         if audit:
             audit.record("issue_ml_dsa",
                          f"serial={serial} subject='{subject_str_out}' profile={profile}",
-                         requester_ip=requester_ip)
+                         requester_ip)
         logger.info("Issued ML-DSA cert serial=%d subject='%s' profile=%s", serial, subject_str_out, profile)
         return cert_der
 
@@ -3418,7 +3419,7 @@ class CertificateAuthority:
         if audit:
             audit.record("issue_composite",
                          f"serial={serial} subject='{subject_str_out}' algo={composite_name}",
-                         requester_ip=requester_ip)
+                         requester_ip)
         logger.info("Issued composite cert serial=%d subject='%s' algo=%s",
                     serial, subject_str_out, composite_name)
         return cert_der
@@ -3547,7 +3548,7 @@ class CertificateAuthority:
         if audit:
             audit.record("issue_slh_dsa",
                          f"serial={serial} subject='{subject_str_out}' param={param_name}",
-                         requester_ip=requester_ip)
+                         requester_ip)
         logger.info("Issued SLH-DSA cert serial=%d subject='%s' param=%s",
                     serial, subject_str_out, param_name)
         return cert_der
@@ -5253,6 +5254,11 @@ class CertificateAuthority:
 # Imported HERE (after all class definitions) to avoid the circular import:
 #   cmp_server.py does `from pki_server import CertificateAuthority, ...`
 #   which requires pki_server to be fully loaded first.
+# When running as __main__, register this module under its real name so that
+# cmp_server.py's `from pki_server import (...)` finds the already-loading
+# instance instead of triggering a redundant second load.
+if __name__ == "__main__" and "pki_server" not in sys.modules:
+    sys.modules["pki_server"] = sys.modules["__main__"]
 # ---------------------------------------------------------------------------
 try:
     import cmp_server as _cmp_module

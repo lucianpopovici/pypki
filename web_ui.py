@@ -1168,6 +1168,8 @@ class WebUIHandler(http.server.BaseHTTPRequestHandler):
             elif path in ("/ca/cert.pem", "/ca/cert"):
                 # Serve full chain PEM (leaf + intermediates) for intermediate CA mode.
                 self._send_raw(200, "application/x-pem-file", self.ca.ca_chain_pem)
+            elif path == "/ca/cert.der":
+                self._send_raw(200, "application/pkix-cert", self.ca.ca_cert_der)
             elif path == "/ca/crl":
                 try:
                     self._send_raw(200, "application/pkix-crl", self.ca.generate_crl())
@@ -1491,6 +1493,7 @@ class WebUIHandler(http.server.BaseHTTPRequestHandler):
                 "<td>{status}</td>"
                 "<td>"
                 '  <a href="/api/certs/{serial}/pem" class="btn btn-secondary">PEM</a> '
+                '  <a href="/api/certs/{serial}/der" class="btn btn-secondary">DER</a> '
                 '  <a href="/api/certs/{serial}/p12" class="btn btn-secondary">P12</a> '
                 "  {action}"
                 "</td>"
@@ -1920,6 +1923,7 @@ class WebUIHandler(http.server.BaseHTTPRequestHandler):
             for m, p, d in [
                 ("GET",  "/api/certs",                 "List all certificates (JSON)"),
                 ("GET",  "/api/certs/&lt;serial&gt;/pem", "Download cert PEM"),
+                ("GET",  "/api/certs/&lt;serial&gt;/der", "Download cert DER (application/pkix-cert)"),
                 ("GET",  "/api/certs/&lt;serial&gt;/p12", "Download cert + CA chain as PKCS#12"),
                 ("POST", "/api/revoke",                '{&quot;serial&quot;: N, &quot;reason&quot;: 0}'),
                 ("POST", "/api/renew",                 '{&quot;serial&quot;: N}'),
@@ -1934,6 +1938,7 @@ class WebUIHandler(http.server.BaseHTTPRequestHandler):
                 ("POST", "/api/ra/approve/&lt;id&gt;", "Approve a pending RA request"),
                 ("POST", "/api/ra/deny/&lt;id&gt;",    '{&quot;reason&quot;: &quot;optional text&quot;}'),
                 ("GET",  "/ca/cert.pem",               "CA certificate (PEM)"),
+                ("GET",  "/ca/cert.der",               "CA certificate (DER, application/pkix-cert)"),
                 ("GET",  "/ca/crl",                    "Certificate Revocation List (DER)"),
             ]
         )
@@ -1969,7 +1974,7 @@ class WebUIHandler(http.server.BaseHTTPRequestHandler):
             try:
                 serial = int(parts[3])
                 fmt    = parts[4]
-                if fmt in ("pem", "p12"):
+                if fmt in ("pem", "p12", "der"):
                     self._api_cert_download(serial, fmt)
                     return
             except (ValueError, IndexError):
@@ -2024,6 +2029,14 @@ class WebUIHandler(http.server.BaseHTTPRequestHandler):
             self.send_header("Content-Length", str(len(pem)))
             self.end_headers()
             self.wfile.write(pem)
+        elif fmt == "der":
+            self.send_response(200)
+            self.send_header("Content-Type", "application/pkix-cert")
+            self.send_header("Content-Disposition",
+                             'attachment; filename="cert-{}.der"'.format(serial))
+            self.send_header("Content-Length", str(len(der)))
+            self.end_headers()
+            self.wfile.write(der)
         elif fmt == "p12":
             try:
                 p12 = self.ca.export_pkcs12(serial)

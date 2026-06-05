@@ -250,6 +250,24 @@
         }
       }
     },
+    "/api/certs/{serial}/der": {
+      "get": {
+        "summary": "Download certificate DER",
+        "description": "Returns the raw DER-encoded certificate (application/pkix-cert). Use this when enrolling to the .ima/.evm keyring or MOK store — those tools expect DER, not PEM.",
+        "operationId": "getCertDer",
+        "tags": ["Certificates"],
+        "parameters": [
+          {"name": "serial", "in": "path", "required": true, "schema": {"type": "integer"}}
+        ],
+        "responses": {
+          "200": {
+            "description": "DER-encoded certificate",
+            "content": {"application/pkix-cert": {"schema": {"type": "string", "format": "binary"}}}
+          },
+          "404": {"description": "Not found"}
+        }
+      }
+    },
     "/api/certs/{serial}/p12": {
       "get": {
         "summary": "Download certificate + chain as PKCS#12",
@@ -737,6 +755,21 @@
           "200": {
             "description": "PEM chain",
             "content": {"application/x-pem-file": {"schema": {"type": "string"}}}
+          }
+        }
+      }
+    },
+    "/ca/cert.der": {
+      "get": {
+        "summary": "Download CA certificate (DER)",
+        "description": "Returns the CA certificate in DER encoding (application/pkix-cert). Use this for kernel trust-anchor enrollment: `keyctl padd asymmetric '' %keyring:.ima < ca.der` or `mokutil --import ca.der`.",
+        "operationId": "getCaCertDer",
+        "tags": ["Certificate Authority"],
+        "security": [],
+        "responses": {
+          "200": {
+            "description": "DER-encoded CA certificate",
+            "content": {"application/pkix-cert": {"schema": {"type": "string", "format": "binary"}}}
           }
         }
       }

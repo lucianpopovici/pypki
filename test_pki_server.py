@@ -17686,6 +17686,101 @@ class TestRFC4158CAIssuers(unittest.TestCase):
 
 
 # ===========================================================================
+# PQ Issuance Audit-Path Regression
+# ===========================================================================
+
+class TestPQIssuanceAuditRegression(unittest.TestCase):
+    """
+    Regression guard for the audit.record() bug in PQ issuance paths.
+
+    issue_ml_dsa_certificate(), issue_slh_dsa_certificate(), and
+    issue_composite_certificate() each passed requester_ip as a keyword arg
+    to AuditLog.record() whose parameter name is positional `ip`, so all
+    three paths raised TypeError before returning a cert. This class asserts:
+    (1) a parseable DER cert is returned, (2) an audit row is written, and
+    (3) the row carries the correct requester IP.
+    """
+
+    def setUp(self):
+        self._tmp = tempfile.mkdtemp()
+        # EC P-256 is much faster to generate than RSA-4096; key type doesn't
+        # affect what's under test (audit recording in the PQ issuance paths).
+        self.ca = pki.CertificateAuthority(ca_dir=self._tmp, ca_key_type="ec-p256")
+        self.audit = pki.AuditLog(Path(self._tmp))
+
+    def tearDown(self):
+        import shutil as _shutil
+        _shutil.rmtree(self._tmp, ignore_errors=True)
+
+    def _count(self):
+        return len(self.audit.recent(100_000))
+
+    def _last_ip(self):
+        return self.audit.recent(1)[0]["ip"]
+
+    @unittest.skipUnless(pki.HAS_MLDSA, "cryptography ≥ 44 required for ML-DSA")
+    def test_ml_dsa_cert_returned_and_audit_recorded(self):
+        from cryptography.hazmat.primitives.asymmetric import mldsa as _mldsa
+        from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
+        spki = (_mldsa.MLDSA65PrivateKey.generate()
+                .public_key()
+                .public_bytes(Encoding.DER, PublicFormat.SubjectPublicKeyInfo))
+
+        before = self._count()
+        cert_der = self.ca.issue_ml_dsa_certificate(
+            "CN=pq-regression-mldsa", spki,
+            audit=self.audit, requester_ip="127.0.0.1",
+        )
+
+        self.assertIsInstance(cert_der, bytes)
+        self.assertEqual(cert_der[0], 0x30)          # valid DER SEQUENCE
+        self.assertEqual(self._count(), before + 1)  # audit row written
+        self.assertEqual(self._last_ip(), "127.0.0.1")
+
+    @unittest.skipUnless(pki.HAS_MLDSA and _HAS_COMPOSITE,
+                         "cryptography ≥ 44 and composite.py required")
+    def test_composite_cert_returned_and_audit_recorded(self):
+        import composite as _comp
+        orig = pki.HAS_COMPOSITE_MLDSA
+        pki.HAS_COMPOSITE_MLDSA = True
+        try:
+            key = _comp.generate_composite_key("composite-mldsa44-ecdsa-p256")
+            spki = _comp.composite_spki_der(key)
+
+            before = self._count()
+            cert_der = self.ca.issue_composite_certificate(
+                "CN=pq-regression-composite", spki, key.name,
+                audit=self.audit, requester_ip="127.0.0.1",
+            )
+
+            self.assertIsInstance(cert_der, bytes)
+            self.assertEqual(cert_der[0], 0x30)
+            self.assertEqual(self._count(), before + 1)
+            self.assertEqual(self._last_ip(), "127.0.0.1")
+        finally:
+            pki.HAS_COMPOSITE_MLDSA = orig
+
+    def test_slh_dsa_cert_returned_and_audit_recorded(self):
+        orig = pki.HAS_SLHDSA
+        pki.HAS_SLHDSA = True
+        try:
+            spki = _slh_dsa_mod.generate("slh-dsa-sha2-128s").public_key().to_spki_der()
+
+            before = self._count()
+            cert_der = self.ca.issue_slh_dsa_certificate(
+                "CN=pq-regression-slhdsa", spki, "slh-dsa-sha2-128s",
+                audit=self.audit, requester_ip="127.0.0.1",
+            )
+
+            self.assertIsInstance(cert_der, bytes)
+            self.assertEqual(cert_der[0], 0x30)
+            self.assertEqual(self._count(), before + 1)
+            self.assertEqual(self._last_ip(), "127.0.0.1")
+        finally:
+            pki.HAS_SLHDSA = orig
+
+
+# ===========================================================================
 # Entry point
 # ===========================================================================
 
