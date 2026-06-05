@@ -447,7 +447,7 @@ Wire surface / Implementation / CLI flags / Tests / Checklist / Open questions.
 **DAL**: complete. All modules go through `make_db()`. Only `db.py`
 (implementation) and `db_bootstrap.py` (pre-DAL PRAGMA) retain `sqlite3.connect()`.
 
-**Test suite**: `test_pki_server.py`, **1222 tests**, 2 Postgres-gated
+**Test suite**: `test_pki_server.py`, **1253 tests**, 2 Postgres-gated
 tests skip without `PYPKI_TEST_POSTGRES_DSN`.
 
 **All sidecars shipped.** No pending `CLAUDE-*.md` files at root.
@@ -537,6 +537,19 @@ crypto-agility dashboard — all completed and committed.
 - Done: `modsig_enroll.py` (`ModsigSigner` embed_cert=True/False, `ModsigEnroller` ca/leaf recipes with keyctl/mok/dracut artifacts, `IMAEnroller` for `.ima` keyring, `install_recipe()`). `pypki_admin` subcommands: `modsig-sign`, `modsig-enroll`, `ima-sign`, `ima-enroll`. `harness/enroll_modsig.sh` (`TRUST_MODE`, `ENROLL_METHOD`). `harness/modsig_roundtrip.sh` updated: `--trust-mode ca|leaf`, Gate B5 (per-CA insmod with embedded cert, leaf absent), verdict count trust-mode-aware. `TestModsigEnrollment` (11 tests). Sidecar `specs/CLAUDE-modsig-enrollment.md`.
 - Decided: `openssl cms -sign` without `-nocerts` is the signing path for ca mode (no patch to kernel sign-file required for the Python tooling path). IMA always per-leaf (IMA sig v2 embeds SKID directly). Dracut hooks embed cert as base64 in shell script so they survive initramfs rebuilds.
 - Landmarks changed: `modsig_enroll.py` (new), `pypki_admin.py` (4 subcommands), `harness/enroll_modsig.sh` (new), `harness/modsig_roundtrip.sh` (B5 gate), `specs/CLAUDE-modsig-enrollment.md` (new).
+
+### 2026-06-05 — Security audit + supply-chain hardening
+
+- Decided: Live source audit against working tree (pass 2) found that the prior audit's #5 "RESOLVED" verdict was wrong — `/api/certs/<serial>/recover` and the entire CMP management API were live and unauthenticated in `cmp_server.py`. All 11 audit items addressed in this session. Audit docs (`specs/CLAUDE-issues-audit.md`, `specs/CLAUDE-audit.md`) moved to `specs/`. Root cleaned to CHANGELOG.md, CLAUDE.md, README.md only.
+- Done:
+  - **#5 CMP management API auth (Critical)**: `_check_api_auth()` + `X-Api-Token` gate on all `/api/*` POST/PATCH/GET paths in `CMPv2HTTPHandler`; public endpoints exempt; `--cmp-api-token` CLI flag; `api_token` threaded through `make_handler`, `make_cmpv3_handler`, `_start_cmp_standalone`, `start_cmp_server`; `TestCMPManagementAPIAuth` (14 tests).
+  - **#2 PQ audit-path regression (OID gap)**: Added `public_key_algorithm_oid` assertion to all three PQ regression tests (ML-DSA, composite, SLH-DSA) using imported OID constants.
+  - **#7 web_ui.py security**: `html.escape(quote=True)` on config values in `_render_svc_form`; `import html as _html` added; `TestWebUISecurityPosture` (3 tests); CORS posture verified correct (`SameSite=Strict` + no CORS headers = same-origin enforced).
+  - **#10 Supply-chain hardening (Tier 6.4)**: `requirements.in` + `requirements-dev.in` (pip-compile sources); `make-hashes.sh` (hash-pinned lockfile regeneration); `.github/workflows/ci.yml` (pip-audit HIGH/CRITICAL gate + Python 3.12/3.13 test matrix); `.github/workflows/release.yml` (CycloneDX SBOM + keyless cosign on tag push).
+  - **#11 Dependency drift**: `requirements.txt` cleaned to runtime-only (`cryptography` + optional `pyasn1`); dev deps (`pytest`, `playwright`, `requests`, `urllib3`) removed from runtime file; `pip-tools` added to dev deps.
+  - 9 non-root `.md` docs moved to `specs/` (BLOCKERS, IMA_EVM_*, MODSIG_*, RESULTS, RUNBOOK, TEST_PQ_ISSUANCE_REGRESSION).
+- Test count: 1222 → 1253 (+31: 14 CMP auth, 3 PQ OID, 3 web_ui security, 11 modsig from prior session).
+- Landmarks changed: `cmp_server.py` (auth gate), `pki_server.py` (`--cmp-api-token` flag), `web_ui.py` (html.escape), `requirements.txt` (runtime-only), `requirements.in` (new), `requirements-dev.in` (new), `make-hashes.sh` (new), `.github/workflows/ci.yml` (new), `.github/workflows/release.yml` (new), `specs/CLAUDE-issues-audit.md` (new), `specs/CLAUDE-audit.md` (new).
 
 ---
 
