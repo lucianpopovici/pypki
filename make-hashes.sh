@@ -22,6 +22,7 @@ if [[ "$TARGET" == "all" || "$TARGET" == "runtime" ]]; then
     echo "Compiling requirements.txt ..."
     pip-compile requirements.in \
         --generate-hashes \
+        --allow-unsafe \
         --no-header \
         --annotation-style line \
         -o requirements.txt
@@ -32,6 +33,7 @@ if [[ "$TARGET" == "all" || "$TARGET" == "dev" ]]; then
     echo "Compiling requirements-dev.txt ..."
     pip-compile requirements-dev.in \
         --generate-hashes \
+        --allow-unsafe \
         --no-header \
         --annotation-style line \
         -o requirements-dev.txt

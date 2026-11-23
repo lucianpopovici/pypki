@@ -26,3 +26,6 @@ coverage>=7.4
 
 # Type checking
 mypy>=1.8
+
+# Optional SLH-DSA backend (slh_dsa.py); without it the SLH-DSA tests skip.
+slh-dsa>=0.2

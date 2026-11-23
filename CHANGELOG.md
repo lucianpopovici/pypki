@@ -11,6 +11,13 @@ This project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **`slh-dsa` dev dependency** (`requirements-dev.in`, `requirements-dev.txt`): the
+  optional SLH-DSA backend used by `slh_dsa.py` is now in the hash-pinned dev lock
+  (0.2.5, no transitive deps) so CI exercises the SLH-DSA tests. It stays optional at
+  runtime (not in `requirements.txt`); `TestSLHDSAX509`, `TestSLHDSAInterop` and
+  `TestPQIssuanceAuditRegression.test_slh_dsa_cert_returned_and_audit_recorded` now skip
+  cleanly when the package is missing.
+
 - **OIDC SSO** (`oidc.py`, `auth.py`, `db_migrations/pki/008_sso.sql`, `docs/SSO.md`):
   OIDC Authorization Code + PKCE (RFC 7636) authentication for the Web UI and REST API.
   Zero new pip dependencies — JWS verification (RS256, ES256, EdDSA) uses the `cryptography`

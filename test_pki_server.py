@@ -12684,6 +12684,7 @@ def _make_slhdsa_ca(tmp):
     return pki.CertificateAuthority(ca_dir=tmp, ca_key_type="ec-p256")
 
 
+@unittest.skipUnless(_slh_dsa_mod.HAS_SLHDSA, "optional slh-dsa package not installed (pip install slh-dsa)")
 class TestSLHDSAX509(unittest.TestCase):
     """SLH-DSA parameter sets, key generation, DER encoding, and issuance."""
 
@@ -12940,6 +12941,7 @@ class TestSLHDSAX509(unittest.TestCase):
         self.assertEqual(pub.key_identifier(), expected_ski)
 
 
+@unittest.skipUnless(_slh_dsa_mod.HAS_SLHDSA, "optional slh-dsa package not installed (pip install slh-dsa)")
 class TestSLHDSAInterop(unittest.TestCase):
     """
     SLH-DSA interop verification using static test vectors.
@@ -17826,6 +17828,7 @@ class TestPQIssuanceAuditRegression(unittest.TestCase):
         finally:
             pki.HAS_COMPOSITE_MLDSA = orig
 
+    @unittest.skipUnless(_slh_dsa_mod.HAS_SLHDSA, "optional slh-dsa package not installed (pip install slh-dsa)")
     def test_slh_dsa_cert_returned_and_audit_recorded(self):
         from cryptography.x509 import load_der_x509_certificate
         param = "slh-dsa-sha2-128s"
